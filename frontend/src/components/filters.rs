@@ -21,14 +21,14 @@ pub fn filters_bar(props: &Props) -> Html {
         })
     };
 
-    let on_category_change = {
+    let on_genre_change = {
         let filters = props.filters.clone();
         let cb = props.on_filters_change.clone();
         Callback::from(move |e: Event| {
             let select: web_sys::HtmlSelectElement = e.target_unchecked_into();
             let v = select.value();
             let mut next = filters.clone();
-            next.category = if v.is_empty() { None } else { Some(v) };
+            next.genre = if v.is_empty() { None } else { Some(v) };
             cb.emit(next);
         })
     };
@@ -50,7 +50,7 @@ pub fn filters_bar(props: &Props) -> Html {
             let v = select.value();
             let s = match v.as_str() {
                 "name_asc" => SortBy::NameAsc,
-                "score_desc" => SortBy::ScoreDesc,
+                "rating_desc" => SortBy::RatingDesc,
                 _ => SortBy::Relevance,
             };
             cb.emit(s);
@@ -65,7 +65,7 @@ pub fn filters_bar(props: &Props) -> Html {
                     <input
                         class="input"
                         type="search"
-                        placeholder="Search title, tags, category…"
+                        placeholder="Search title, director, genre, tags…"
                         value={props.query.clone()}
                         oninput={on_search_input}
                     />
@@ -76,19 +76,20 @@ pub fn filters_bar(props: &Props) -> Html {
                     <select class="select" onchange={on_sort_change} value={props.sort_by.as_str()}>
                         <option value="relevance">{ "Relevance" }</option>
                         <option value="name_asc">{ "Name (A → Z)" }</option>
-                        <option value="score_desc">{ "Score (high → low)" }</option>
+                        <option value="rating_desc">{ "Rating (high → low)" }</option>
                     </select>
                 </label>
             </div>
 
             <div class="filters__row filters__row--secondary">
                 <label class="field">
-                    <span class="field__label">{ "Category" }</span>
-                    <select class="select" onchange={on_category_change} value={props.filters.category.clone().unwrap_or_default()}>
+                    <span class="field__label">{ "Genre" }</span>
+                    <select class="select" onchange={on_genre_change} value={props.filters.genre.clone().unwrap_or_default()}>
                         <option value="">{ "All" }</option>
-                        <option value="Design">{ "Design" }</option>
-                        <option value="UI">{ "UI" }</option>
-                        <option value="Dev">{ "Dev" }</option>
+                        <option value="Action">{ "Action" }</option>
+                        <option value="Crime">{ "Crime" }</option>
+                        <option value="Drama">{ "Drama" }</option>
+                        <option value="Sci-Fi">{ "Sci-Fi" }</option>
                     </select>
                 </label>
 

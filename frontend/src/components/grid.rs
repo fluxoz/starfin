@@ -54,7 +54,9 @@ pub fn elements_grid(props: &Props) -> Html {
                                 <span class="muted">{ format_duration(item.duration_secs) }</span>
                                 <span class="muted">{ "·" }</span>
                             }
-                            <span class="muted">{ item.director.clone() }</span>
+                            if !item.director.is_empty() {
+                                <span class="muted">{ item.director.clone() }</span>
+                            }
                         </div>
 
                         <div class="card__tags">

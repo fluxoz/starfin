@@ -220,11 +220,9 @@ async fn run_player(
 
     // Fetch and append the remaining segments in the background.
     for (i, url) in seg_uris[initial_count..].iter().enumerate() {
+        let seg_num = i + initial_count;
         let data = fetch_bytes(url).await.map_err(|e| {
-            format!(
-                "Segment {} fetch failed: {e}",
-                i + initial_count
-            )
+            format!("Segment {seg_num} fetch failed: {e}")
         })?;
         append_segment(&sb, &data).await?;
     }

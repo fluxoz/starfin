@@ -198,11 +198,19 @@ async fn get_thumbnail(
 
     let thumb_path = state.cache_dir.join(format!("{}.jpg", *id));
     if !thumb_path.exists() {
+        let abs_str = match abs_path.to_str() {
+            Some(s) => s.to_owned(),
+            None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
+        };
+        let thumb_str = match thumb_path.to_str() {
+            Some(s) => s.to_owned(),
+            None => return HttpResponse::InternalServerError().body("cache path is not valid UTF-8"),
+        };
         let status = Command::new("ffmpeg")
             .args([
                 "-y",
                 "-i",
-                abs_path.to_str().unwrap_or(""),
+                &abs_str,
                 "-ss",
                 "00:00:05",
                 "-vframes",
@@ -211,7 +219,7 @@ async fn get_thumbnail(
                 "2",
                 "-vf",
                 "scale=640:-1",
-                thumb_path.to_str().unwrap_or(""),
+                &thumb_str,
             ])
             .status()
             .await;
@@ -257,11 +265,28 @@ async fn get_playlist(
         let seg_pattern = hls_dir.join("seg_%05d.m4s");
         let init_file = hls_dir.join("init.mp4");
 
+        let abs_str = match abs_path.to_str() {
+            Some(s) => s.to_owned(),
+            None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
+        };
+        let init_str = match init_file.to_str() {
+            Some(s) => s.to_owned(),
+            None => return HttpResponse::InternalServerError().body("cache path is not valid UTF-8"),
+        };
+        let seg_str = match seg_pattern.to_str() {
+            Some(s) => s.to_owned(),
+            None => return HttpResponse::InternalServerError().body("cache path is not valid UTF-8"),
+        };
+        let playlist_str = match playlist_path.to_str() {
+            Some(s) => s.to_owned(),
+            None => return HttpResponse::InternalServerError().body("cache path is not valid UTF-8"),
+        };
+
         let status = Command::new("ffmpeg")
             .args([
                 "-y",
                 "-i",
-                abs_path.to_str().unwrap_or(""),
+                &abs_str,
                 "-c:v",
                 "libx264",
                 "-profile:v",
@@ -279,10 +304,10 @@ async fn get_playlist(
                 "-hls_list_size",
                 "0",
                 "-hls_fmp4_init_filename",
-                init_file.to_str().unwrap_or(""),
+                &init_str,
                 "-hls_segment_filename",
-                seg_pattern.to_str().unwrap_or(""),
-                playlist_path.to_str().unwrap_or(""),
+                &seg_str,
+                &playlist_str,
             ])
             .status()
             .await;
@@ -334,7 +359,7 @@ async fn get_segment(
     let (id, filename) = params.into_inner();
 
     // Reject path traversal and unexpected extensions.
-    if filename.contains('/') || filename.contains("..") {
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
         return HttpResponse::BadRequest().body("invalid filename");
     }
     if !filename.ends_with(".m4s") && filename != "init.mp4" {
@@ -419,7 +444,9 @@ async fn main() -> std::io::Result<()> {
 
     println!("→ Library : {}", library_path.display());
     println!("→ Cache   : {}", cache_dir.display());
-    println!("→ Listening on http://0.0.0.0:{port}");
+    // Bind to loopback by default; set BIND_ADDR=0.0.0.0 to expose to the network.
+    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+    println!("→ Listening on http://{bind_addr}:{port}");
 
     HttpServer::new(move || {
         App::new()
@@ -438,7 +465,7 @@ async fn main() -> std::io::Result<()> {
             )
             .route("/{tail:.*}", web::get().to(frontend))
     })
-    .bind(("0.0.0.0", port))?
+    .bind((bind_addr.as_str(), port))?
     .run()
     .await
 }

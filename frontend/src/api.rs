@@ -65,4 +65,3 @@ fn apply_filters(
 
     data
 }
-

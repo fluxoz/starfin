@@ -83,4 +83,3 @@ pub fn elements_grid(props: &Props) -> Html {
         </section>
     }
 }
-

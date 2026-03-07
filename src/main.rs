@@ -262,20 +262,14 @@ async fn get_playlist(
 
         // Transcode to fragmented-MP4 HLS (MSE-compatible in all modern browsers).
         // -profile:v baseline  → codec string "avc1.42E01E" – the most compatible H.264 variant.
-        let seg_pattern = hls_dir.join("seg_%05d.m4s");
-        let init_file = hls_dir.join("init.mp4");
+        // NOTE: ffmpeg -hls_fmp4_init_filename and -hls_segment_filename expect RELATIVE paths
+        // (relative to the output playlist directory), not absolute paths.
+        let init_file = "init.mp4";
+        let seg_pattern = "seg_%05d.m4s";
 
         let abs_str = match abs_path.to_str() {
             Some(s) => s.to_owned(),
             None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
-        };
-        let init_str = match init_file.to_str() {
-            Some(s) => s.to_owned(),
-            None => return HttpResponse::InternalServerError().body("cache path is not valid UTF-8"),
-        };
-        let seg_str = match seg_pattern.to_str() {
-            Some(s) => s.to_owned(),
-            None => return HttpResponse::InternalServerError().body("cache path is not valid UTF-8"),
         };
         let playlist_str = match playlist_path.to_str() {
             Some(s) => s.to_owned(),
@@ -304,9 +298,9 @@ async fn get_playlist(
                 "-hls_list_size",
                 "0",
                 "-hls_fmp4_init_filename",
-                &init_str,
+                init_file,
                 "-hls_segment_filename",
-                &seg_str,
+                seg_pattern,
                 &playlist_str,
             ])
             .status()

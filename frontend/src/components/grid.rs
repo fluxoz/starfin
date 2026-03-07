@@ -17,6 +17,16 @@ fn format_duration(secs: u32) -> String {
     }
 }
 
+fn format_duration(secs: u32) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    if h > 0 {
+        format!("{}h {}m", h, m)
+    } else {
+        format!("{}m", m)
+    }
+}
+
 #[function_component(ElementsGrid)]
 pub fn elements_grid(props: &Props) -> Html {
     if props.items.is_empty() {

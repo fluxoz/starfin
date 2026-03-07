@@ -67,8 +67,8 @@ pub fn app() -> Html {
             <header class="topbar">
                 <div class="topbar__inner">
                     <div class="brand">
-                        <div class="brand__logo">{ "Grid" }</div>
-                        <div class="brand__sub">{ "Search + Filter + Sort" }</div>
+                        <div class="brand__logo">{ "Starfin" }</div>
+                        <div class="brand__sub">{ "Your personal video library" }</div>
                     </div>
 
                     <FiltersBar

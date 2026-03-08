@@ -97,11 +97,6 @@ pub fn app() -> Html {
                     <div class="topbar__center">{ "ARC / SYSTEMS FOR PRODUCTION" }</div>
                     <div class="topbar__right">{ "SERIAL NO. 001" }</div>
                 </div>
-                
-                <div class="brand">
-                    <div class="brand__logo">{ "Starfin" }</div>
-                    <div class="brand__sub">{ "Your personal video library" }</div>
-                </div>
 
                 <FiltersBar
                     query={(*query).clone()}

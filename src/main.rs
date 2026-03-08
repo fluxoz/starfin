@@ -438,6 +438,8 @@ async fn get_segment(
     // Transcode just this segment on-demand
     // Use -ss before -i for fast seeking, then encode just SEGMENT_DURATION seconds
     // Output as fMP4 segment (compatible with MSE)
+    // CRITICAL: Use -output_ts_offset to set the correct presentation timestamp for each segment
+    // Without this, all segments would start at timestamp 0 and overlap in the SourceBuffer
     let output = Command::new("ffmpeg")
         .current_dir(&hls_dir)
         .stdin(std::process::Stdio::null())  // Don't read from stdin
@@ -455,6 +457,9 @@ async fn get_segment(
             "-c:a", "aac",
             "-f", "mp4",
             "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            // Set the output timestamp offset to match the segment's position in the stream
+            // This ensures each segment has the correct PTS for seamless playback and seeking
+            "-output_ts_offset", &format!("{:.3}", start_time),
             &filename,
         ])
         .output()

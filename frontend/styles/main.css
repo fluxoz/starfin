@@ -18,8 +18,8 @@
   display: none;
 }
 
-/* Dark mode theme */
-.dark-mode-toggle:checked ~ * {
+/* Dark mode theme - target .app specifically for better performance */
+.dark-mode-toggle:checked ~ .app {
   --bg: #1a1a1a;
   --panel: rgba(255,255,255,.03);
   --panel-2: rgba(255,255,255,.06);
@@ -32,46 +32,46 @@
   --shadow: 0 2px 8px rgba(0,0,0,.5);
 }
 
-.dark-mode-toggle:checked ~ .sidebar {
+.dark-mode-toggle:checked ~ .app .sidebar {
   background: #ff6b35;
 }
 
-.dark-mode-toggle:checked ~ .topbar {
+.dark-mode-toggle:checked ~ .app .topbar {
   background: #2a2a2a;
   border-bottom: 2px solid rgba(255,255,255,.2);
 }
 
-.dark-mode-toggle:checked ~ .topbar .topbar__inner {
+.dark-mode-toggle:checked ~ .app .topbar__inner {
   color: var(--text);
 }
 
-.dark-mode-toggle:checked ~ * .card {
+.dark-mode-toggle:checked ~ .app .card {
   background: rgba(255,255,255,.08);
   border-color: rgba(255,255,255,.2);
 }
 
-.dark-mode-toggle:checked ~ * .card__subtitle {
+.dark-mode-toggle:checked ~ .app .card__subtitle {
   color: rgba(255,255,255,.7);
 }
 
-.dark-mode-toggle:checked ~ * .input,
-.dark-mode-toggle:checked ~ * .select {
+.dark-mode-toggle:checked ~ .app .input,
+.dark-mode-toggle:checked ~ .app .select {
   background: rgba(255,255,255,.08);
   border-color: rgba(255,255,255,.2);
   color: var(--text);
 }
 
-.dark-mode-toggle:checked ~ * .chip {
+.dark-mode-toggle:checked ~ .app .chip {
   background: rgba(255,255,255,.08);
   border-color: rgba(255,255,255,.2);
 }
 
-.dark-mode-toggle:checked ~ * .notice {
+.dark-mode-toggle:checked ~ .app .notice {
   background: rgba(255,255,255,.08);
   border-color: rgba(255,255,255,.2);
 }
 
-.dark-mode-toggle:checked ~ * .empty {
+.dark-mode-toggle:checked ~ .app .empty {
   background: rgba(255,255,255,.05);
 }
 
@@ -230,13 +230,13 @@ body{
   letter-spacing: 1px;
 }
 
-.dark-mode-toggle:checked ~ .topbar .theme-toggle{
+.dark-mode-toggle:checked ~ .app .theme-toggle{
   background: rgba(255,255,255,.1);
   border-color: rgba(255,255,255,.3);
   color: var(--text);
 }
 
-.dark-mode-toggle:checked ~ .topbar .theme-toggle:hover{
+.dark-mode-toggle:checked ~ .app .theme-toggle:hover{
   background: rgba(255,255,255,.15);
   border-color: var(--accent);
 }

@@ -313,8 +313,15 @@ async fn get_playlist(
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 eprintln!("ffmpeg failed: {}", stderr);
+                // Return last 10 lines of stderr for better debugging
+                let last_lines: Vec<&str> = stderr.lines().rev().take(10).collect();
+                let error_summary = if last_lines.is_empty() {
+                    "unknown error".to_string()
+                } else {
+                    last_lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+                };
                 return HttpResponse::ServiceUnavailable()
-                    .body(format!("transcoding failed: {}", stderr.lines().last().unwrap_or("unknown error")));
+                    .body(format!("transcoding failed:\n{}", error_summary));
             }
             Err(e) => {
                 eprintln!("failed to execute ffmpeg: {}", e);

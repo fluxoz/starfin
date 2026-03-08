@@ -1,7 +1,7 @@
 use crate::api;
 use crate::components;
 
-use components::{filters::FiltersBar, grid::ElementsGrid};
+use components::{filters::FiltersBar, grid::ElementsGrid, video_player::VideoPlayer};
 use crate::models::{Element, Filters, SortBy};
 
 use wasm_bindgen_futures::spawn_local;
@@ -16,6 +16,7 @@ pub fn app() -> Html {
     let items = use_state(|| Vec::<Element>::new());
     let loading = use_state(|| false);
     let error = use_state(|| Option::<String>::None);
+    let selected = use_state(|| Option::<Element>::None);
 
     // Fetch on load and whenever query/filters/sort changes
     {
@@ -62,8 +63,27 @@ pub fn app() -> Html {
         Callback::from(move |v: SortBy| sort_by.set(v))
     };
 
+    let on_watch = {
+        let selected = selected.clone();
+        Callback::from(move |item: Element| selected.set(Some(item)))
+    };
+
+    let on_close_player = {
+        let selected = selected.clone();
+        Callback::from(move |_| selected.set(None))
+    };
+
     html! {
         <div class="app">
+            // Video player overlay — rendered on top of the library when a video is selected.
+            if let Some(video) = &*selected {
+                <VideoPlayer
+                    video_id={video.id.clone()}
+                    title={video.title.clone()}
+                    on_close={on_close_player}
+                />
+            }
+
             <header class="topbar">
                 <div class="topbar__inner">
                     <div class="brand">
@@ -93,9 +113,10 @@ pub fn app() -> Html {
                 if *loading {
                     <div class="notice notice--loading">{ "Loading…" }</div>
                 } else {
-                    <ElementsGrid items={(*items).clone()} />
+                    <ElementsGrid items={(*items).clone()} on_watch={on_watch} />
                 }
             </main>
         </div>
     }
 }
+

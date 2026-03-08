@@ -252,6 +252,7 @@ async fn get_playlist(
     };
 
     let hls_dir = state.cache_dir.join(id.as_str());
+    println!("HLS_DIR: {:?}", hls_dir);
     let playlist_path = hls_dir.join("playlist.m3u8");
 
     if !playlist_path.exists() {
@@ -451,7 +452,10 @@ async fn main() -> std::io::Result<()> {
     let library_path = PathBuf::from(
         std::env::var("VIDEO_LIBRARY_PATH").unwrap_or_else(|_| "./videos".into()),
     );
-    let cache_dir = std::env::temp_dir().join("starfin_cache");
+
+    // let cache_dir = std::env::temp_dir().join("starfin_cache");
+    let cache_dir = PathBuf::new().join("starfin_cache");
+    println!("CACHE DIR: {:?}", cache_dir);
 
     if !library_path.exists() {
         std::fs::create_dir_all(&library_path)?;

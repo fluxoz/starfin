@@ -139,15 +139,29 @@ fn time_to_segment_index(time: f64, total_segments: usize) -> usize {
 }
 
 /// Check if a specific segment is actually buffered in the video element.
-/// A segment is considered buffered if its start time falls within any buffered range.
+/// A segment is considered sufficiently buffered if enough of it falls within
+/// a buffered range to allow smooth playback. We check that at least the start
+/// of the segment is buffered (the streaming loop will continue loading
+/// subsequent segments as needed).
 fn is_segment_buffered(video: &HtmlVideoElement, segment_index: usize) -> bool {
     let segment_start = segment_index as f64 * SEGMENT_DURATION;
+    let segment_end = segment_start + SEGMENT_DURATION;
     let buffered = video.buffered();
     for i in 0..buffered.length() {
+        // TimeRanges.start() and .end() can fail if index is out of bounds,
+        // but we're iterating within length() so this should not happen.
+        // If it does fail, we skip this range and continue checking others.
         if let (Ok(start), Ok(end)) = (buffered.start(i), buffered.end(i)) {
-            // Check if the segment start time is within this buffered range
+            // Consider segment buffered if the buffered range covers at least
+            // the start of the segment and extends into it meaningfully.
+            // We use a small threshold to avoid re-fetching segments that are
+            // nearly fully buffered.
             if segment_start >= start && segment_start < end {
-                return true;
+                // If the buffer extends to cover most of the segment, consider it buffered
+                let buffered_portion = (end - segment_start).min(segment_end - segment_start);
+                if buffered_portion >= SEGMENT_DURATION * 0.5 {
+                    return true;
+                }
             }
         }
     }

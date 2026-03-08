@@ -237,11 +237,14 @@ async fn get_thumbnail(
     }
 }
 
+/// Segment duration in seconds for on-demand HLS generation.
+const SEGMENT_DURATION: f64 = 6.0;
+
 /// `GET /api/videos/{id}/playlist.m3u8`
 ///
-/// Transcodes the source file to fMP4-HLS on first request (result is cached).
-/// Segment URIs in the playlist are rewritten to absolute API paths so the
-/// Rust/WASM frontend never has to resolve relative URLs.
+/// Generates an HLS playlist dynamically based on video duration.
+/// The init segment is generated quickly (just codec info, no media).
+/// Media segments are transcoded on-demand when requested.
 async fn get_playlist(
     id: web::Path<String>,
     state: web::Data<AppState>,
@@ -251,17 +254,23 @@ async fn get_playlist(
         None => return HttpResponse::NotFound().body("video not found"),
     };
 
+    // Get video duration via ffprobe (metadata is not needed for playlist generation)
+    let (duration_secs, _metadata) = probe_video(&abs_path).await;
+    if duration_secs == 0 {
+        return HttpResponse::ServiceUnavailable()
+            .body("Could not determine video duration. Ensure ffprobe is installed and the video file is valid.");
+    }
+
     let hls_dir = state.cache_dir.join(id.as_str());
-    let playlist_path = hls_dir.join("playlist.m3u8");
+    if let Err(e) = tokio::fs::create_dir_all(&hls_dir).await {
+        return HttpResponse::InternalServerError()
+            .body(format!("cache dir error: {e}"));
+    }
 
-    if !playlist_path.exists() {
-        if let Err(e) = tokio::fs::create_dir_all(&hls_dir).await {
-            return HttpResponse::InternalServerError()
-                .body(format!("cache dir error: {e}"));
-        }
-
-        // Canonicalize to an absolute path so ffmpeg can locate the source file
-        // even after we change its working directory to hls_dir.
+    // Generate init segment if it doesn't exist
+    // This creates a tiny fMP4 file with just the moov atom (codec info)
+    let init_path = hls_dir.join("init.mp4");
+    if !init_path.exists() {
         let resolved_path = match abs_path.canonicalize() {
             Ok(p) => p,
             Err(e) => {
@@ -274,107 +283,88 @@ async fn get_playlist(
             None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
         };
 
-        // Transcode to fragmented-MP4 HLS (MSE-compatible in all modern browsers).
-        // -profile:v baseline  → codec string "avc1.42E01E" – the most compatible H.264 variant.
-        //
-        // Run ffmpeg with hls_dir as the working directory and use bare filenames for
-        // -hls_fmp4_init_filename and -hls_segment_filename.  This ensures all output
-        // files land in hls_dir and the playlist contains plain filenames (e.g.
-        // "init.mp4", "seg_00000.m4s") that the rewriting step below can handle
-        // correctly.  Passing full paths to -hls_fmp4_init_filename causes ffmpeg to
-        // interpret them relative to the playlist directory, producing a nested path
-        // that does not exist and failing with "Failed to open segment".
+        // Generate a very short fMP4 segment to extract codec info
+        // Using -frames:v 1 to encode only one video frame (faster than -t 0.001)
         let output = Command::new("ffmpeg")
             .current_dir(&hls_dir)
+            .stdin(std::process::Stdio::null())  // Don't read from stdin
             .args([
                 "-y",
-                "-i",
-                &abs_str,
-                "-c:v",
-                "libx264",
-                "-profile:v",
-                "baseline",
-                "-level",
-                "3.1",
-                "-c:a",
-                "aac",
-                "-f",
-                "hls",
-                "-hls_segment_type",
-                "fmp4",
-                "-hls_time",
-                "6",
-                "-hls_list_size",
-                "0",
-                "-hls_fmp4_init_filename",
+                "-nostdin",  // Disable stdin interaction
+                "-i", &abs_str,
+                "-frames:v", "1",  // Only encode 1 video frame
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",  // Ensure baseline-compatible pixel format
+                "-profile:v", "baseline",
+                "-level", "3.1",
+                "-preset", "ultrafast",  // Fastest preset for init segment
+                "-c:a", "aac",
+                "-f", "mp4",
+                "-movflags", "frag_keyframe+empty_moov+default_base_moof",
                 "init.mp4",
-                "-hls_segment_filename",
-                "seg_%05d.m4s",
-                "playlist.m3u8",
             ])
             .output()
             .await;
 
         match output {
             Ok(out) if out.status.success() => {
-                // Transcoding succeeded
+                // Init segment generated successfully
             }
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                eprintln!("ffmpeg failed: {}", stderr);
-                // Return last 10 lines of stderr for better debugging
-                let last_lines: Vec<&str> = stderr.lines().rev().take(10).collect();
-                let error_summary = if last_lines.is_empty() {
-                    "unknown error".to_string()
-                } else {
-                    last_lines.into_iter().rev().collect::<Vec<_>>().join("\n")
-                };
+                eprintln!("ffmpeg init segment failed: {}", stderr);
                 return HttpResponse::ServiceUnavailable()
-                    .body(format!("transcoding failed:\n{}", error_summary));
+                    .body("failed to generate init segment");
             }
             Err(e) => {
-                eprintln!("failed to execute ffmpeg: {}", e);
                 return HttpResponse::ServiceUnavailable()
-                    .body(format!("failed to execute ffmpeg: {}", e));
+                    .body(format!("failed to generate init segment: {e}"));
             }
         }
     }
 
-    let raw = match tokio::fs::read_to_string(&playlist_path).await {
-        Ok(c) => c,
-        Err(_) => return HttpResponse::InternalServerError().body("failed to read playlist"),
-    };
+    // Calculate number of segments based on duration
+    let duration = duration_secs as f64;
+    let num_segments = (duration / SEGMENT_DURATION).ceil() as usize;
 
-    // Rewrite every relative segment URI to an absolute API path.
-    let rewritten: String = raw
-        .lines()
-        .map(|line| {
-            let trimmed = line.trim();
-            if let Some(inner) = trimmed
-                .strip_prefix("#EXT-X-MAP:URI=\"")
-                .and_then(|s| s.strip_suffix('"'))
-            {
-                // e.g. #EXT-X-MAP:URI="init.mp4"
-                return format!(
-                    "#EXT-X-MAP:URI=\"/api/videos/{}/segments/{}\"",
-                    id, inner
-                );
-            }
-            if !trimmed.starts_with('#') && !trimmed.is_empty() {
-                return format!("/api/videos/{}/segments/{}", id, trimmed);
-            }
-            line.to_owned()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Build the playlist dynamically
+    let mut playlist = String::new();
+    playlist.push_str("#EXTM3U\n");
+    playlist.push_str("#EXT-X-VERSION:7\n");
+    playlist.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", SEGMENT_DURATION.ceil() as u32));
+    playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+    playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+    playlist.push_str(&format!(
+        "#EXT-X-MAP:URI=\"/api/videos/{}/segments/init.mp4\"\n",
+        id
+    ));
+
+    for i in 0..num_segments {
+        let seg_start = i as f64 * SEGMENT_DURATION;
+        let seg_duration = if i == num_segments - 1 {
+            // Last segment may be shorter
+            duration - seg_start
+        } else {
+            SEGMENT_DURATION
+        };
+
+        playlist.push_str(&format!("#EXTINF:{:.3},\n", seg_duration));
+        playlist.push_str(&format!(
+            "/api/videos/{}/segments/seg_{:05}.m4s\n",
+            id, i
+        ));
+    }
+
+    playlist.push_str("#EXT-X-ENDLIST\n");
 
     HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
         .insert_header((header::CACHE_CONTROL, "no-cache"))
-        .body(rewritten)
+        .body(playlist)
 }
 
-/// `GET /api/videos/{id}/segments/{filename}` — serve an fMP4 segment or init file.
+/// `GET /api/videos/{id}/segments/{filename}` — serve an fMP4 segment on-demand.
+/// Segments are transcoded on-demand if they don't exist in the cache.
 async fn get_segment(
     params: web::Path<(String, String)>,
     state: web::Data<AppState>,
@@ -389,16 +379,113 @@ async fn get_segment(
         return HttpResponse::BadRequest().body("invalid segment type");
     }
 
-    let seg_path = state.cache_dir.join(&id).join(&filename);
-    match tokio::fs::read(&seg_path).await {
-        Ok(data) => HttpResponse::Ok()
+    let hls_dir = state.cache_dir.join(&id);
+    let seg_path = hls_dir.join(&filename);
+
+    // If segment exists, serve it immediately
+    if let Ok(data) = tokio::fs::read(&seg_path).await {
+        return HttpResponse::Ok()
             .content_type("video/mp4")
             .insert_header((
                 header::CACHE_CONTROL,
                 "public, max-age=31536000, immutable",
             ))
-            .body(data),
-        Err(_) => HttpResponse::NotFound().body("segment not found"),
+            .body(data);
+    }
+
+    // For init.mp4, it should have been created with the playlist request
+    if filename == "init.mp4" {
+        return HttpResponse::NotFound().body("init segment not found - request playlist first");
+    }
+
+    // Parse segment index from filename (e.g., "seg_00042.m4s" -> 42)
+    let seg_index: usize = match filename
+        .strip_prefix("seg_")
+        .and_then(|s| s.strip_suffix(".m4s"))
+        .and_then(|s| s.parse().ok())
+    {
+        Some(idx) => idx,
+        None => return HttpResponse::BadRequest().body("invalid segment filename format"),
+    };
+
+    // Find the source video
+    let (abs_path, _) = match find_video(&state, &id).await {
+        Some(v) => v,
+        None => return HttpResponse::NotFound().body("video not found"),
+    };
+
+    let resolved_path = match abs_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+                .body(format!("failed to resolve video path: {e}"))
+        }
+    };
+    let abs_str = match resolved_path.to_str() {
+        Some(s) => s.to_owned(),
+        None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
+    };
+
+    // Calculate segment time range
+    let start_time = seg_index as f64 * SEGMENT_DURATION;
+
+    // Create cache directory if needed
+    if let Err(e) = tokio::fs::create_dir_all(&hls_dir).await {
+        return HttpResponse::InternalServerError()
+            .body(format!("cache dir error: {e}"));
+    }
+
+    // Transcode just this segment on-demand
+    // Use -ss before -i for fast seeking, then encode just SEGMENT_DURATION seconds
+    // Output as fMP4 segment (compatible with MSE)
+    let output = Command::new("ffmpeg")
+        .current_dir(&hls_dir)
+        .stdin(std::process::Stdio::null())  // Don't read from stdin
+        .args([
+            "-y",
+            "-nostdin",  // Disable stdin interaction
+            "-ss", &format!("{:.3}", start_time),
+            "-i", &abs_str,
+            "-t", &format!("{:.3}", SEGMENT_DURATION),
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",  // Ensure baseline-compatible pixel format
+            "-profile:v", "baseline",
+            "-level", "3.1",
+            "-preset", "fast",  // Faster encoding for on-demand
+            "-c:a", "aac",
+            "-f", "mp4",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            &filename,
+        ])
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            // Segment generated successfully, serve it
+            match tokio::fs::read(&seg_path).await {
+                Ok(data) => HttpResponse::Ok()
+                    .content_type("video/mp4")
+                    .insert_header((
+                        header::CACHE_CONTROL,
+                        "public, max-age=31536000, immutable",
+                    ))
+                    .body(data),
+                Err(e) => HttpResponse::InternalServerError()
+                    .body(format!("failed to read generated segment: {e}")),
+            }
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("ffmpeg segment {} failed: {}", seg_index, stderr);
+            HttpResponse::ServiceUnavailable()
+                .body(format!("segment {} transcoding failed", seg_index))
+        }
+        Err(e) => {
+            eprintln!("failed to execute ffmpeg for segment {}: {}", seg_index, e);
+            HttpResponse::ServiceUnavailable()
+                .body(format!("failed to execute ffmpeg: {e}"))
+        }
     }
 }
 

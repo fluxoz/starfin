@@ -494,6 +494,31 @@ async fn get_segment(
     }
 }
 
+/// `DELETE /api/videos/{id}/cache` — clear HLS cache for a video
+/// This forces regeneration of all segments (useful when segment format changes)
+async fn clear_video_cache(
+    id: web::Path<String>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    // Validate ID to prevent path traversal attacks
+    // UUIDs only contain hex characters and hyphens
+    if !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return HttpResponse::BadRequest().body("invalid video id format");
+    }
+    
+    let hls_dir = state.cache_dir.join(id.as_str());
+    
+    // Attempt to remove the directory, handling both success and "not found" as OK
+    match tokio::fs::remove_dir_all(&hls_dir).await {
+        Ok(_) => HttpResponse::Ok().body("cache cleared"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            HttpResponse::Ok().body("cache already empty")
+        }
+        Err(e) => HttpResponse::InternalServerError()
+            .body(format!("failed to clear cache: {e}")),
+    }
+}
+
 // ── Thumbnail sprite generation ──────────────────────────────────────────────
 
 /// Thumbnail sprite configuration
@@ -910,6 +935,10 @@ async fn main() -> std::io::Result<()> {
             .route(
                 "/api/videos/{id}/segments/{filename}",
                 web::get().to(get_segment),
+            )
+            .route(
+                "/api/videos/{id}/cache",
+                web::delete().to(clear_video_cache),
             )
             .route("/{tail:.*}", web::get().to(frontend))
     })

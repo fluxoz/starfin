@@ -25,6 +25,8 @@ web-sys = { version = "0.3", features = [
     "HtmlMediaElement",
     "MediaSource",
     "SourceBuffer",
+    "SourceBufferList",
+    "TimeRanges",
     "MediaStreamConstraints",
     "MediaTrackConstraints",
     "MediaDevices",
@@ -49,5 +51,5 @@ wasm-logger = "0.2"
 yew = { version = "0.21.0", features = ["csr"] }
 js-sys = "0.3.77"
 urlencoding = "2"
-gloo-timers = "0.3.0"
+gloo-timers = { version = "0.3.0", features = ["futures"] }
 chrono = { version = "0.4", features = ["serde", "wasmbind"] }

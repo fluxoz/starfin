@@ -262,10 +262,9 @@ async fn get_playlist(
 
         // Transcode to fragmented-MP4 HLS (MSE-compatible in all modern browsers).
         // -profile:v baseline  → codec string "avc1.42E01E" – the most compatible H.264 variant.
-        // When the playlist path is absolute, ffmpeg writes init/segment files
-        // in the same directory as the playlist.
-        let init_file = "init.mp4";
-        let seg_pattern = "seg_%05d.m4s";
+        // Use absolute paths for init file and segment pattern so ffmpeg writes to cache dir.
+        let init_path = hls_dir.join("init.mp4");
+        let seg_pattern_path = hls_dir.join("seg_%05d.m4s");
 
         let abs_str = match abs_path.to_str() {
             Some(s) => s.to_owned(),
@@ -274,6 +273,14 @@ async fn get_playlist(
         let playlist_str = match playlist_path.to_str() {
             Some(s) => s.to_owned(),
             None => return HttpResponse::InternalServerError().body("cache path is not valid UTF-8"),
+        };
+        let init_str = match init_path.to_str() {
+            Some(s) => s.to_owned(),
+            None => return HttpResponse::InternalServerError().body("init path is not valid UTF-8"),
+        };
+        let seg_pattern_str = match seg_pattern_path.to_str() {
+            Some(s) => s.to_owned(),
+            None => return HttpResponse::InternalServerError().body("segment pattern path is not valid UTF-8"),
         };
 
         let output = Command::new("ffmpeg")
@@ -298,9 +305,9 @@ async fn get_playlist(
                 "-hls_list_size",
                 "0",
                 "-hls_fmp4_init_filename",
-                init_file,
+                &init_str,
                 "-hls_segment_filename",
-                seg_pattern,
+                &seg_pattern_str,
                 &playlist_str,
             ])
             .output()

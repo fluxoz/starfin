@@ -2,12 +2,12 @@ use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
 use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, Function, Promise, Uint8Array};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
-use web_sys::{HtmlVideoElement, MediaSource, MouseEvent, SourceBuffer};
+use web_sys::{console, window, HtmlVideoElement, MediaSource, MouseEvent, SourceBuffer};
 use yew::prelude::*;
 
 // ── Buffer management constants ──────────────────────────────────────────────
@@ -136,6 +136,36 @@ fn get_buffer_ahead(video: &HtmlVideoElement) -> f64 {
 fn time_to_segment_index(time: f64, total_segments: usize) -> usize {
     let index = (time / SEGMENT_DURATION).floor() as usize;
     index.min(total_segments.saturating_sub(1))
+}
+
+/// Check if a specific segment is actually buffered in the video element.
+/// A segment is considered sufficiently buffered if enough of it falls within
+/// a buffered range to allow smooth playback. We check that at least the start
+/// of the segment is buffered (the streaming loop will continue loading
+/// subsequent segments as needed).
+fn is_segment_buffered(video: &HtmlVideoElement, segment_index: usize) -> bool {
+    let segment_start = segment_index as f64 * SEGMENT_DURATION;
+    let segment_end = segment_start + SEGMENT_DURATION;
+    let buffered = video.buffered();
+    for i in 0..buffered.length() {
+        // TimeRanges.start() and .end() can fail if index is out of bounds,
+        // but we're iterating within length() so this should not happen.
+        // If it does fail, we skip this range and continue checking others.
+        if let (Ok(start), Ok(end)) = (buffered.start(i), buffered.end(i)) {
+            // Consider segment buffered if the buffered range covers at least
+            // the start of the segment and extends into it meaningfully.
+            // We use a small threshold to avoid re-fetching segments that are
+            // nearly fully buffered.
+            if segment_start >= start && segment_start < end {
+                // If the buffer extends to cover most of the segment, consider it buffered
+                let buffered_portion = (end - segment_start).min(segment_end - segment_start);
+                if buffered_portion >= SEGMENT_DURATION * 0.5 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Remove buffered data that is more than `BUFFER_BEHIND_SECONDS` behind the
@@ -331,6 +361,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let duration = use_state(|| 0.0_f64);
     let buffered_end = use_state(|| 0.0_f64);
     let is_playing = use_state(|| false);
+    
+    // Drag state for progress bar scrubbing
+    let is_dragging = use_state(|| false);
+    let drag_time = use_state(|| 0.0_f64);
+    // Track if we just finished dragging (to prevent click from firing after drag)
+    let just_dragged = use_state(|| false);
 
     // Effect to run the player logic
     {
@@ -349,19 +385,23 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         });
     }
 
-    // Effect to update time/duration state periodically
+    // Effect to update time/duration state periodically (skip during drag)
     {
         let video_ref = video_ref.clone();
         let current_time = current_time.clone();
         let duration = duration.clone();
         let buffered_end = buffered_end.clone();
         let is_playing = is_playing.clone();
+        let is_dragging = is_dragging.clone();
 
         use_effect_with(video_ref.clone(), move |video_ref| {
             let video_ref = video_ref.clone();
             let interval = Interval::new(250, move || {
                 if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-                    current_time.set(video.current_time());
+                    // Only update current_time if not dragging
+                    if !*is_dragging {
+                        current_time.set(video.current_time());
+                    }
                     let dur = video.duration();
                     if dur.is_finite() && dur > 0.0 {
                         duration.set(dur);
@@ -391,20 +431,187 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
-    // Seek on progress bar click
-    let on_progress_click = {
+    // Helper function to calculate seek time from mouse position
+    fn calculate_seek_time(
+        e: &MouseEvent,
+        progress_el: &web_sys::HtmlElement,
+        video_duration: f64,
+    ) -> Option<f64> {
+        let rect = progress_el.get_bounding_client_rect();
+        let click_x = e.client_x() as f64 - rect.left();
+        let width = rect.width();
+        if width > 0.0 && video_duration.is_finite() && video_duration > 0.0 {
+            let seek_ratio = (click_x / width).clamp(0.0, 1.0);
+            Some(seek_ratio * video_duration)
+        } else {
+            None
+        }
+    }
+
+    // Mouse down on progress bar - start dragging
+    // We add global event listeners SYNCHRONOUSLY here to avoid race conditions
+    let on_progress_mousedown = {
         let video_ref = video_ref.clone();
         let progress_ref = progress_ref.clone();
+        let is_dragging = is_dragging.clone();
+        let drag_time = drag_time.clone();
+        let current_time = current_time.clone();
+        let duration_state = duration.clone();
+        let just_dragged = just_dragged.clone();
+        
         Callback::from(move |e: MouseEvent| {
-            if let Some(progress_el) = progress_ref.cast::<web_sys::HtmlElement>() {
-                if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-                    let video_duration = video.duration();
+            console::log_1(&"[SEEKER DEBUG] mousedown fired on progress bar".into());
+            e.prevent_default();
+            
+            let progress_el = match progress_ref.cast::<web_sys::HtmlElement>() {
+                Some(el) => el,
+                None => {
+                    console::log_1(&"[SEEKER DEBUG] Could not get progress element".into());
+                    return;
+                }
+            };
+            
+            let video = match video_ref.cast::<HtmlVideoElement>() {
+                Some(v) => v,
+                None => {
+                    console::log_1(&"[SEEKER DEBUG] Could not get video element".into());
+                    return;
+                }
+            };
+            
+            let video_duration = video.duration();
+            console::log_1(&format!("[SEEKER DEBUG] video duration: {}", video_duration).into());
+            
+            if !video_duration.is_finite() || video_duration <= 0.0 {
+                console::log_1(&"[SEEKER DEBUG] Invalid video duration".into());
+                return;
+            }
+            
+            // Calculate initial seek position
+            let rect = progress_el.get_bounding_client_rect();
+            let click_x = e.client_x() as f64 - rect.left();
+            let width = rect.width();
+            
+            if width <= 0.0 {
+                console::log_1(&"[SEEKER DEBUG] Invalid progress bar width".into());
+                return;
+            }
+            
+            let seek_ratio = (click_x / width).clamp(0.0, 1.0);
+            let initial_seek_time = seek_ratio * video_duration;
+            
+            console::log_1(&format!("[SEEKER DEBUG] Setting is_dragging=true, seek_time={}", initial_seek_time).into());
+            is_dragging.set(true);
+            drag_time.set(initial_seek_time);
+            current_time.set(initial_seek_time);
+            
+            // Use Rc<Cell> for shared mutable state between closures
+            // This is needed because UseStateHandle::set() doesn't update the value immediately
+            let shared_seek_time: Rc<Cell<f64>> = Rc::new(Cell::new(initial_seek_time));
+            let shared_seek_time_move = shared_seek_time.clone();
+            let shared_seek_time_up = shared_seek_time.clone();
+            
+            // Clone references for the closures
+            let progress_ref_move = progress_ref.clone();
+            let duration_for_move = *duration_state;
+            let drag_time_move = drag_time.clone();
+            let current_time_move = current_time.clone();
+            let is_dragging_up = is_dragging.clone();
+            let video_ref_up = video_ref.clone();
+            let just_dragged_up = just_dragged.clone();
+            
+            // Create closures stored in Rc<RefCell> so they can clean themselves up
+            let closures: Rc<RefCell<Option<(Closure<dyn Fn(MouseEvent)>, Closure<dyn Fn(MouseEvent)>)>>> = 
+                Rc::new(RefCell::new(None));
+            let closures_for_mouseup = closures.clone();
+            
+            // Mousemove handler - update drag position
+            let on_mousemove = Closure::<dyn Fn(MouseEvent)>::new(move |e: MouseEvent| {
+                if let Some(progress_el) = progress_ref_move.cast::<web_sys::HtmlElement>() {
                     let rect = progress_el.get_bounding_client_rect();
                     let click_x = e.client_x() as f64 - rect.left();
                     let width = rect.width();
-                    if width > 0.0 && video_duration.is_finite() && video_duration > 0.0 {
+                    if width > 0.0 && duration_for_move > 0.0 {
                         let seek_ratio = (click_x / width).clamp(0.0, 1.0);
-                        let seek_time = seek_ratio * video_duration;
+                        let seek_time = seek_ratio * duration_for_move;
+                        console::log_1(&format!("[SEEKER DEBUG] mousemove: seek_time={:.2}", seek_time).into());
+                        shared_seek_time_move.set(seek_time);  // Update shared state
+                        drag_time_move.set(seek_time);
+                        current_time_move.set(seek_time);
+                    }
+                }
+            });
+            
+            // Mouseup handler - finish dragging and seek
+            let on_mouseup = Closure::<dyn Fn(MouseEvent)>::new(move |_: MouseEvent| {
+                console::log_1(&"[SEEKER DEBUG] mouseup fired".into());
+                
+                is_dragging_up.set(false);
+                just_dragged_up.set(true);
+                let seek_time = shared_seek_time_up.get();  // Read from shared state
+                console::log_1(&format!("[SEEKER DEBUG] mouseup: seeking to {:.2}", seek_time).into());
+                
+                if let Some(video) = video_ref_up.cast::<HtmlVideoElement>() {
+                    video.set_current_time(seek_time);
+                    console::log_1(&"[SEEKER DEBUG] mouseup: set_current_time called".into());
+                }
+                
+                // Clean up event listeners
+                if let Some((mousemove_closure, mouseup_closure)) = closures_for_mouseup.borrow_mut().take() {
+                    if let Some(win) = window() {
+                        let _ = win.remove_event_listener_with_callback(
+                            "mousemove",
+                            mousemove_closure.as_ref().unchecked_ref(),
+                        );
+                        let _ = win.remove_event_listener_with_callback(
+                            "mouseup",
+                            mouseup_closure.as_ref().unchecked_ref(),
+                        );
+                        console::log_1(&"[SEEKER DEBUG] Event listeners removed".into());
+                    }
+                }
+            });
+            
+            // Add event listeners to window SYNCHRONOUSLY
+            if let Some(win) = window() {
+                console::log_1(&"[SEEKER DEBUG] Adding event listeners to window SYNCHRONOUSLY".into());
+                let _ = win.add_event_listener_with_callback(
+                    "mousemove",
+                    on_mousemove.as_ref().unchecked_ref(),
+                );
+                let _ = win.add_event_listener_with_callback(
+                    "mouseup",
+                    on_mouseup.as_ref().unchecked_ref(),
+                );
+                
+                // Store closures to prevent them from being dropped
+                *closures.borrow_mut() = Some((on_mousemove, on_mouseup));
+                console::log_1(&"[SEEKER DEBUG] Event listeners added successfully".into());
+            } else {
+                console::log_1(&"[SEEKER DEBUG] ERROR: Could not get window".into());
+            }
+        })
+    };
+
+    // Click on progress bar - immediate seek (for clicks without drag)
+    let on_progress_click = {
+        let video_ref = video_ref.clone();
+        let progress_ref = progress_ref.clone();
+        let just_dragged = just_dragged.clone();
+        Callback::from(move |e: MouseEvent| {
+            console::log_1(&format!("[SEEKER DEBUG] click fired, just_dragged={}", *just_dragged).into());
+            // Don't handle click if we just finished dragging
+            if *just_dragged {
+                console::log_1(&"[SEEKER DEBUG] click: ignoring due to just_dragged".into());
+                just_dragged.set(false);
+                return;
+            }
+            if let Some(progress_el) = progress_ref.cast::<web_sys::HtmlElement>() {
+                if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
+                    let video_duration = video.duration();
+                    console::log_1(&format!("[SEEKER DEBUG] click: video_duration={}", video_duration).into());
+                    if let Some(seek_time) = calculate_seek_time(&e, &progress_el, video_duration) {
+                        console::log_1(&format!("[SEEKER DEBUG] click: seeking to {:.2}", seek_time).into());
                         video.set_current_time(seek_time);
                     }
                 }
@@ -464,6 +671,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     ref={progress_ref}
                     class="player-progress"
                     onclick={on_progress_click}
+                    onmousedown={on_progress_mousedown}
                 >
                     <div 
                         class="player-progress__buffered"
@@ -504,10 +712,6 @@ impl BufferState {
 
     fn mark_loaded(&mut self, index: usize) {
         self.loaded_segments.insert(index);
-    }
-
-    fn is_loaded(&self, index: usize) -> bool {
-        self.loaded_segments.contains(&index)
     }
 
     fn all_loaded(&self) -> bool {
@@ -635,11 +839,14 @@ async fn run_player(
                     break;
                 }
                 
-                let mut state = buffer_state.borrow_mut();
-                if state.is_loaded(seg_idx) {
+                // Check if segment is actually in the buffer - this handles the case
+                // where a user seeks to a position that was previously loaded but has
+                // since been evicted from the buffer by remove_old_buffer.
+                if is_segment_buffered(&video, seg_idx) {
                     continue;
                 }
                 
+                let mut state = buffer_state.borrow_mut();
                 // Mark as loaded before dropping the borrow
                 state.mark_loaded(seg_idx);
                 drop(state);

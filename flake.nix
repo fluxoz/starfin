@@ -33,6 +33,7 @@
         tmux
         trunk
         wasm-pack
+        ffmpeg
       ];
       
       # Add critical environment variables for linking

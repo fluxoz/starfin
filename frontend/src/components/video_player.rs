@@ -67,6 +67,12 @@ fn parse_m3u8(text: &str) -> (Option<String>, Vec<String>) {
 /// Arm the `updateend` future, then call `appendBuffer`.  Awaiting the
 /// returned future blocks until the SourceBuffer finishes processing.
 async fn append_segment(sb: &SourceBuffer, data: &[u8]) -> Result<(), String> {
+    // If the SourceBuffer is currently updating, wait for it to finish.
+    if sb.updating() {
+        let wait_update = updateend_future(sb);
+        wait_update.await.map_err(|e| format!("waiting for update: {e:?}"))?;
+    }
+    
     // Register the listener *before* appending so it cannot fire and be missed.
     let waiter = updateend_future(sb);
     let arr = Uint8Array::from(data);

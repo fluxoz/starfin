@@ -114,7 +114,6 @@ pub fn app() -> Html {
                                 aria-pressed={dark_mode.to_string()}
                             >
                                 <span class={if *dark_mode { "theme-toggle__switch active" } else { "theme-toggle__switch" }}></span>
-                                <span class="theme-toggle__label">{ "THEME" }</span>
                             </button>
                         </div>
                     </div>

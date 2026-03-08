@@ -1,10 +1,32 @@
 use gloo_net::http::Request;
+use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, Function, Promise, Uint8Array};
+use std::cell::RefCell;
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{HtmlVideoElement, MediaSource, SourceBuffer};
 use yew::prelude::*;
+
+// ── Buffer management constants ──────────────────────────────────────────────
+// These values control how much video data we keep buffered.
+// By limiting the buffer size, we avoid QuotaExceededError on large videos.
+
+/// How many seconds of video to buffer ahead of the current playback position.
+const BUFFER_AHEAD_SECONDS: f64 = 30.0;
+
+/// How many seconds of video to keep buffered behind the current playback position.
+const BUFFER_BEHIND_SECONDS: f64 = 10.0;
+
+/// Minimum buffer level (in seconds) before we start loading more segments.
+const MIN_BUFFER_AHEAD: f64 = 10.0;
+
+/// Duration of each segment in seconds (matches backend ffmpeg -hls_time setting).
+const SEGMENT_DURATION: f64 = 6.0;
+
+/// How often (in milliseconds) to check buffer status and load new segments.
+const BUFFER_CHECK_INTERVAL_MS: u32 = 500;
 
 // ── Low-level helpers ────────────────────────────────────────────────────────
 
@@ -70,6 +92,85 @@ fn parse_m3u8(text: &str) -> (Option<String>, Vec<String>) {
     (init_uri, segs)
 }
 
+/// Get the end time of the buffered data at the current playback position.
+/// Returns 0.0 if nothing is buffered at the current position.
+fn get_buffer_end(video: &HtmlVideoElement) -> f64 {
+    let current_time = video.current_time();
+    let buffered = video.buffered();
+    for i in 0..buffered.length() {
+        if let (Ok(start), Ok(end)) = (buffered.start(i), buffered.end(i)) {
+            // Check if current position falls within this buffered range
+            if current_time >= start && current_time <= end {
+                return end;
+            }
+        }
+    }
+    0.0
+}
+
+/// Calculate how many seconds are buffered ahead of the current playback position.
+fn get_buffer_ahead(video: &HtmlVideoElement) -> f64 {
+    let buffer_end = get_buffer_end(video);
+    let current_time = video.current_time();
+    (buffer_end - current_time).max(0.0)
+}
+
+/// Determine which segment index corresponds to a given time position.
+fn time_to_segment_index(time: f64, total_segments: usize) -> usize {
+    let index = (time / SEGMENT_DURATION).floor() as usize;
+    index.min(total_segments.saturating_sub(1))
+}
+
+/// Remove buffered data that is more than `BUFFER_BEHIND_SECONDS` behind the
+/// current playback position. This frees up buffer space for new segments.
+async fn remove_old_buffer(sb: &SourceBuffer, current_time: f64) -> Result<(), String> {
+    // Wait for any pending update to complete
+    while sb.updating() {
+        updateend_future(sb)
+            .await
+            .map_err(|e| format!("waiting for update before remove: {e:?}"))?;
+    }
+
+    // Calculate the cutoff point - we want to keep BUFFER_BEHIND_SECONDS of data
+    let remove_end = (current_time - BUFFER_BEHIND_SECONDS).max(0.0);
+    
+    if remove_end <= 0.0 {
+        return Ok(());
+    }
+
+    // Try to remove the old data
+    if let Err(e) = sb.remove(0.0, remove_end) {
+        // Ignore errors from remove (it's best-effort cleanup)
+        log::warn!("remove buffer failed: {e:?}");
+        return Ok(());
+    }
+
+    // Wait for the remove operation to complete
+    while sb.updating() {
+        updateend_future(sb)
+            .await
+            .map_err(|e| format!("waiting for remove to complete: {e:?}"))?;
+    }
+
+    Ok(())
+}
+
+/// Check if the error is a QuotaExceededError.
+fn is_quota_exceeded_error(error: &JsValue) -> bool {
+    if let Some(err_str) = error.as_string() {
+        return err_str.contains("QuotaExceededError") || err_str.contains("quota");
+    }
+    // Try to get the error name if it's an Error object
+    if let Ok(name) = js_sys::Reflect::get(error, &JsValue::from_str("name")) {
+        if let Some(name_str) = name.as_string() {
+            return name_str == "QuotaExceededError";
+        }
+    }
+    // Check if the debug representation contains QuotaExceededError
+    let debug_str = format!("{error:?}");
+    debug_str.contains("QuotaExceededError") || debug_str.contains("Quota")
+}
+
 /// Arm both the `updateend` (success) and `error` (failure) futures, then
 /// call `appendBuffer`.  Awaiting the returned future blocks until the
 /// SourceBuffer finishes processing.
@@ -122,6 +223,72 @@ async fn append_segment(sb: &SourceBuffer, data: &[u8]) -> Result<(), String> {
     sb.set_onupdateend(None);
     sb.set_onerror(None);
     result.map_err(|e| format!("SourceBuffer decode error: {e:?}"))?;
+    Ok(())
+}
+
+/// Append a segment with QuotaExceededError handling.
+/// If quota is exceeded, removes old buffer data and retries.
+async fn append_segment_with_quota_handling(
+    sb: &SourceBuffer,
+    data: &[u8],
+    video: &HtmlVideoElement,
+) -> Result<(), String> {
+    // First attempt to append
+    match try_append_segment(sb, data).await {
+        Ok(()) => Ok(()),
+        Err((err_str, err_val)) => {
+            if is_quota_exceeded_error(&err_val) {
+                // QuotaExceededError - try to free up buffer space
+                log::info!("QuotaExceededError detected, removing old buffer data...");
+                
+                // Remove data behind the current playback position
+                remove_old_buffer(sb, video.current_time()).await?;
+                
+                // Retry the append
+                append_segment(sb, data).await
+            } else {
+                Err(err_str)
+            }
+        }
+    }
+}
+
+/// Try to append a segment, returning both error string and JsValue on failure.
+async fn try_append_segment(sb: &SourceBuffer, data: &[u8]) -> Result<(), (String, JsValue)> {
+    // If the SourceBuffer is currently updating, wait for it to finish.
+    while sb.updating() {
+        updateend_future(sb)
+            .await
+            .map_err(|e| (format!("waiting for update: {e:?}"), e))?;
+    }
+
+    let updateend_p = Promise::new(&mut |resolve: Function, _: Function| {
+        let cb = Closure::once_into_js(move || {
+            resolve.call0(&JsValue::NULL).ok();
+        });
+        sb.set_onupdateend(Some(cb.unchecked_ref()));
+    });
+    let error_p = Promise::new(&mut |_: Function, reject: Function| {
+        let cb = Closure::once_into_js(move || {
+            // Reject with an error indicator - the actual error details are
+            // available on the SourceBuffer/MediaSource error properties
+            reject.call1(&JsValue::NULL, &JsValue::from_str("SourceBuffer error event")).ok();
+        });
+        sb.set_onerror(Some(cb.unchecked_ref()));
+    });
+    let race = Promise::race(&Array::of2(updateend_p.as_ref(), error_p.as_ref()));
+
+    let arr = Uint8Array::from(data);
+    if let Err(e) = sb.append_buffer_with_array_buffer_view(arr.unchecked_ref()) {
+        sb.set_onupdateend(None);
+        sb.set_onerror(None);
+        return Err((format!("appendBuffer: {e:?}"), e));
+    }
+
+    let result = JsFuture::from(race).await;
+    sb.set_onupdateend(None);
+    sb.set_onerror(None);
+    result.map_err(|e| (format!("SourceBuffer decode error: {e:?}"), e))?;
     Ok(())
 }
 
@@ -194,6 +361,35 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
 // ── Player logic (async) ─────────────────────────────────────────────────────
 
+/// State for tracking which segments have been loaded.
+struct BufferState {
+    /// Set of segment indices that have been loaded.
+    loaded_segments: std::collections::HashSet<usize>,
+    /// Total number of segments in the playlist.
+    total_segments: usize,
+}
+
+impl BufferState {
+    fn new(total_segments: usize) -> Self {
+        Self {
+            loaded_segments: std::collections::HashSet::new(),
+            total_segments,
+        }
+    }
+
+    fn mark_loaded(&mut self, index: usize) {
+        self.loaded_segments.insert(index);
+    }
+
+    fn is_loaded(&self, index: usize) -> bool {
+        self.loaded_segments.contains(&index)
+    }
+
+    fn all_loaded(&self) -> bool {
+        self.loaded_segments.len() >= self.total_segments
+    }
+}
+
 /// All async work for setting up and feeding the MSE player.
 /// Separated from the component to keep error handling clean.
 async fn run_player(
@@ -256,27 +452,87 @@ async fn run_player(
         append_segment(&sb, &data).await?;
     }
 
+    // Initialize buffer state tracking
+    let buffer_state = Rc::new(RefCell::new(BufferState::new(seg_uris.len())));
+    
     // Stream the first few media segments so playback can begin quickly.
     let initial_count = 2.min(seg_uris.len());
     for (i, url) in seg_uris[..initial_count].iter().enumerate() {
         status.set(format!("Buffering segment {}/{}…", i + 1, seg_uris.len()));
         let data = fetch_bytes(url).await?;
-        append_segment(&sb, &data).await?;
+        append_segment_with_quota_handling(&sb, &data, &video).await?;
+        buffer_state.borrow_mut().mark_loaded(i);
     }
 
     // Playback is ready – clear the status overlay.
     status.set(String::new());
 
-    // Fetch and append the remaining segments in the background.
-    for (i, url) in seg_uris[initial_count..].iter().enumerate() {
-        let seg_num = i + initial_count;
-        let data = fetch_bytes(url).await.map_err(|e| {
-            format!("Segment {seg_num} fetch failed: {e}")
-        })?;
-        append_segment(&sb, &data).await?;
+    // ── Demand-based streaming loop ──────────────────────────────────────────
+    // Instead of loading all segments at once, we continuously monitor the
+    // playback position and buffer level, loading segments as needed.
+    // This prevents QuotaExceededError by maintaining a sliding buffer window.
+    
+    loop {
+        // Check if we need to load more segments
+        let current_time = video.current_time();
+        let buffer_ahead = get_buffer_ahead(&video);
+        let buffer_state_ref = buffer_state.borrow();
+        
+        // If we've loaded all segments, signal end of stream and exit
+        if buffer_state_ref.all_loaded() {
+            drop(buffer_state_ref);
+            // Wait for any pending updates before ending stream
+            while sb.updating() {
+                updateend_future(&sb)
+                    .await
+                    .map_err(|e| format!("waiting for final update: {e:?}"))?;
+            }
+            ms.end_of_stream().map_err(|e| format!("endOfStream: {e:?}"))?;
+            web_sys::Url::revoke_object_url(&obj_url).ok();
+            return Ok(());
+        }
+        
+        // If buffer is low, load more segments
+        if buffer_ahead < MIN_BUFFER_AHEAD {
+            drop(buffer_state_ref);
+            
+            // First, try to remove old buffered data to make room
+            remove_old_buffer(&sb, current_time).await?;
+            
+            // Calculate which segments we need to load
+            let current_segment = time_to_segment_index(current_time, seg_uris.len());
+            let target_buffer_end = current_time + BUFFER_AHEAD_SECONDS;
+            let target_segment = time_to_segment_index(target_buffer_end, seg_uris.len());
+            
+            // Load segments from current position up to target
+            for seg_idx in current_segment..=target_segment {
+                if seg_idx >= seg_uris.len() {
+                    break;
+                }
+                
+                let mut state = buffer_state.borrow_mut();
+                if state.is_loaded(seg_idx) {
+                    continue;
+                }
+                
+                // Mark as loaded before dropping the borrow
+                state.mark_loaded(seg_idx);
+                drop(state);
+                
+                // Fetch and append the segment
+                let url = &seg_uris[seg_idx];
+                let data = fetch_bytes(url).await.map_err(|e| {
+                    format!("Segment {seg_idx} fetch failed: {e}")
+                })?;
+                
+                append_segment_with_quota_handling(&sb, &data, &video).await?;
+            }
+        } else {
+            drop(buffer_state_ref);
+        }
+        
+        // Small delay before checking buffer status again
+        // This prevents busy-waiting while still being responsive
+        TimeoutFuture::new(BUFFER_CHECK_INTERVAL_MS).await;
     }
-
-    ms.end_of_stream().map_err(|e| format!("endOfStream: {e:?}"))?;
-    web_sys::Url::revoke_object_url(&obj_url).ok();
-    Ok(())
 }

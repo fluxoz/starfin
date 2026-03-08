@@ -276,6 +276,21 @@ pub struct ThumbnailInfo {
     pub interval: f64,
 }
 
+// ── Subtitle Track Info ──────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct SubtitleTrack {
+    pub index: u32,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub codec: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct SubtitleTracksResponse {
+    pub tracks: Vec<SubtitleTrack>,
+}
+
 // ── Component ────────────────────────────────────────────────────────────────
 
 #[derive(Properties, PartialEq)]
@@ -342,6 +357,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // Video ended state
     let video_ended = use_state(|| false);
 
+    // Thumbnail sprite image (for canvas rendering)
+    let thumbnail_image = use_state(|| Option::<web_sys::HtmlImageElement>::None);
+
+    // Subtitle state
+    let subtitle_tracks = use_state(|| Vec::<SubtitleTrack>::new());
+    let active_subtitle = use_state(|| Option::<u32>::None); // index of active subtitle, None = off
+    let captions_menu_open = use_state(|| false);
+
     // Run the MSE player logic
     {
         let video_ref = video_ref.clone();
@@ -349,14 +372,42 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let status = status.clone();
         let error = error.clone();
         let thumbnail_info = thumbnail_info.clone();
+        let thumbnail_image = thumbnail_image.clone();
+        let subtitle_tracks = subtitle_tracks.clone();
 
         use_effect_with(props.video_id.clone(), move |_| {
-            // Fetch thumbnail info
+            // Fetch thumbnail info and load sprite
             let thumbnail_info_clone = thumbnail_info.clone();
+            let thumbnail_image_clone = thumbnail_image.clone();
             let video_id_clone = video_id.clone();
+            let video_id_for_subs = video_id.clone();
+            let subtitle_tracks_clone = subtitle_tracks.clone();
+            
             spawn_local(async move {
                 if let Ok(info) = fetch_thumbnail_info(&video_id_clone).await {
+                    // Load the sprite image
+                    if let Ok(img) = web_sys::HtmlImageElement::new() {
+                        let url = info.url.clone();
+                        img.set_cross_origin(Some("anonymous"));
+                        img.set_src(&url);
+                        
+                        // Store image after it loads
+                        let thumbnail_image_onload = thumbnail_image_clone.clone();
+                        let img_clone = img.clone();
+                        let onload = Closure::once(Box::new(move || {
+                            thumbnail_image_onload.set(Some(img_clone));
+                        }) as Box<dyn FnOnce()>);
+                        img.set_onload(Some(onload.as_ref().unchecked_ref()));
+                        onload.forget();
+                    }
                     thumbnail_info_clone.set(Some(info));
+                }
+            });
+
+            // Fetch subtitle tracks
+            spawn_local(async move {
+                if let Ok(tracks) = fetch_subtitle_tracks(&video_id_for_subs).await {
+                    subtitle_tracks_clone.set(tracks);
                 }
             });
 
@@ -367,6 +418,59 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             });
             || ()
         });
+    }
+
+    // Effect to draw thumbnail on canvas when hovering
+    {
+        let thumbnail_canvas_ref = thumbnail_canvas_ref.clone();
+        let thumbnail_info = thumbnail_info.clone();
+        let thumbnail_image = thumbnail_image.clone();
+        let hover_time = hover_time.clone();
+        let is_hovering_progress = is_hovering_progress.clone();
+        let is_dragging = is_dragging.clone();
+
+        use_effect_with(
+            ((*hover_time).clone(), (*is_hovering_progress).clone(), (*is_dragging).clone()),
+            move |_| {
+                if !*is_hovering_progress && !*is_dragging {
+                    return;
+                }
+
+                if let (Some(info), Some(img)) = (&*thumbnail_info, &*thumbnail_image) {
+                    if let Some(canvas) = thumbnail_canvas_ref.cast::<web_sys::HtmlCanvasElement>() {
+                        if let Ok(Some(ctx)) = canvas.get_context("2d") {
+                            if let Ok(ctx) = ctx.dyn_into::<web_sys::CanvasRenderingContext2d>() {
+                                // Calculate which thumbnail to show based on hover time
+                                let thumb_index = if info.interval > 0.0 {
+                                    ((*hover_time) / info.interval).floor() as u32
+                                } else {
+                                    0
+                                };
+                                
+                                let max_index = info.columns * info.rows - 1;
+                                let thumb_index = thumb_index.min(max_index);
+                                
+                                let col = thumb_index % info.columns;
+                                let row = thumb_index / info.columns;
+                                
+                                let sx = (col * info.thumb_width) as f64;
+                                let sy = (row * info.thumb_height) as f64;
+                                
+                                // Clear canvas and draw the thumbnail portion
+                                ctx.clear_rect(0.0, 0.0, canvas.width() as f64, canvas.height() as f64);
+                                let _ = ctx.draw_image_with_html_image_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                                    img,
+                                    sx, sy,
+                                    info.thumb_width as f64, info.thumb_height as f64,
+                                    0.0, 0.0,
+                                    canvas.width() as f64, canvas.height() as f64,
+                                );
+                            }
+                        }
+                    }
+                }
+            },
+        );
     }
 
     // Update time/duration periodically
@@ -626,6 +730,26 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         let dur = video.duration();
                         if dur.is_finite() {
                             video.set_current_time(dur);
+                        }
+                    }
+                    // P - Toggle Picture-in-Picture
+                    "p" | "P" => {
+                        e.prevent_default();
+                        let doc = web_sys::window().unwrap().document().unwrap();
+                        let pip_element = js_sys::Reflect::get(&doc, &JsValue::from_str("pictureInPictureElement"))
+                            .ok()
+                            .and_then(|v| if v.is_null() || v.is_undefined() { None } else { Some(v) });
+                        
+                        if pip_element.is_some() {
+                            let _ = js_sys::Reflect::get(&doc, &JsValue::from_str("exitPictureInPicture"))
+                                .ok()
+                                .and_then(|f| f.dyn_ref::<Function>().cloned())
+                                .map(|f| f.call0(&doc));
+                        } else {
+                            let _ = js_sys::Reflect::get(&video, &JsValue::from_str("requestPictureInPicture"))
+                                .ok()
+                                .and_then(|f| f.dyn_ref::<Function>().cloned())
+                                .map(|f| f.call0(&video));
                         }
                     }
                     _ => {}
@@ -1087,6 +1211,94 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
+    // Picture-in-Picture toggle
+    let on_pip_toggle = {
+        let video_ref = video_ref.clone();
+        Callback::from(move |_| {
+            if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
+                // Check if PiP is currently active
+                let doc = web_sys::window().unwrap().document().unwrap();
+                let pip_element = js_sys::Reflect::get(&doc, &JsValue::from_str("pictureInPictureElement"))
+                    .ok()
+                    .and_then(|v| if v.is_null() || v.is_undefined() { None } else { Some(v) });
+                
+                if pip_element.is_some() {
+                    // Exit PiP
+                    let _ = js_sys::Reflect::get(&doc, &JsValue::from_str("exitPictureInPicture"))
+                        .ok()
+                        .and_then(|f| f.dyn_ref::<Function>().cloned())
+                        .map(|f| f.call0(&doc));
+                } else {
+                    // Enter PiP
+                    let _ = js_sys::Reflect::get(&video, &JsValue::from_str("requestPictureInPicture"))
+                        .ok()
+                        .and_then(|f| f.dyn_ref::<Function>().cloned())
+                        .map(|f| f.call0(&video));
+                }
+            }
+        })
+    };
+
+    // Captions menu toggle
+    let on_captions_toggle = {
+        let captions_menu_open = captions_menu_open.clone();
+        let settings_open = settings_open.clone();
+        let speed_menu_open = speed_menu_open.clone();
+        Callback::from(move |e: MouseEvent| {
+            e.stop_propagation();
+            captions_menu_open.set(!*captions_menu_open);
+            settings_open.set(false);
+            speed_menu_open.set(false);
+        })
+    };
+
+    // Caption track selection
+    let on_caption_select = {
+        let video_ref = video_ref.clone();
+        let active_subtitle = active_subtitle.clone();
+        let captions_menu_open = captions_menu_open.clone();
+        let video_id = props.video_id.clone();
+        Callback::from(move |track_index: Option<u32>| {
+            captions_menu_open.set(false);
+            active_subtitle.set(track_index);
+            
+            // Add or remove text track from video element
+            if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
+                // Remove all existing text tracks
+                let text_tracks = video.text_tracks();
+                if let Some(tracks) = text_tracks {
+                    for i in 0..tracks.length() {
+                        if let Some(track) = tracks.get(i) {
+                            // Hide all tracks
+                            track.set_mode(web_sys::TextTrackMode::Hidden);
+                        }
+                    }
+                }
+                
+                if let Some(index) = track_index {
+                    // Create a track element and add it
+                    let doc = web_sys::window().unwrap().document().unwrap();
+                    if let Ok(track_el) = doc.create_element("track") {
+                        track_el.set_attribute("kind", "captions").ok();
+                        track_el.set_attribute("src", &format!("/api/videos/{}/subtitles/{}.vtt", video_id, index)).ok();
+                        track_el.set_attribute("default", "").ok();
+                        
+                        // Append to video element
+                        video.append_child(&track_el).ok();
+                        
+                        // Enable the track after appending
+                        let text_tracks = video.text_tracks();
+                        if let Some(tracks) = text_tracks {
+                            if let Some(track) = tracks.get(tracks.length() - 1) {
+                                track.set_mode(web_sys::TextTrackMode::Showing);
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    };
+
     // Calculate progress percentages
     let progress_percent = if *duration > 0.0 {
         (*current_time / *duration * 100.0).min(100.0)
@@ -1333,6 +1545,54 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
                         </div>
 
+                        // Captions button (only show if subtitles available)
+                        if !subtitle_tracks.is_empty() {
+                            <div class="player-captions">
+                                <button
+                                    class={if active_subtitle.is_some() { "player-controls__btn player-controls__btn--active" } else { "player-controls__btn" }}
+                                    onclick={on_captions_toggle}
+                                    title="Captions (c)"
+                                >
+                                    { "CC" }
+                                </button>
+                                if *captions_menu_open {
+                                    <div class="player-captions__menu">
+                                        <button
+                                            class={if active_subtitle.is_none() { "player-captions__option player-captions__option--active" } else { "player-captions__option" }}
+                                            onclick={Callback::from({
+                                                let on_select = on_caption_select.clone();
+                                                move |e: MouseEvent| {
+                                                    e.stop_propagation();
+                                                    on_select.emit(None);
+                                                }
+                                            })}
+                                        >
+                                            { "Off" }
+                                        </button>
+                                        { for subtitle_tracks.iter().map(|track| {
+                                            let on_select = on_caption_select.clone();
+                                            let is_active = *active_subtitle == Some(track.index);
+                                            let label = track.title.clone()
+                                                .or_else(|| track.language.clone())
+                                                .unwrap_or_else(|| format!("Track {}", track.index + 1));
+                                            let track_index = track.index;
+                                            html! {
+                                                <button
+                                                    class={if is_active { "player-captions__option player-captions__option--active" } else { "player-captions__option" }}
+                                                    onclick={Callback::from(move |e: MouseEvent| {
+                                                        e.stop_propagation();
+                                                        on_select.emit(Some(track_index));
+                                                    })}
+                                                >
+                                                    { label }
+                                                </button>
+                                            }
+                                        })}
+                                    </div>
+                                }
+                            </div>
+                        }
+
                         // Settings button
                         <div class="player-settings">
                             <button
@@ -1355,6 +1615,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 </div>
                             }
                         </div>
+
+                        // Picture-in-Picture button
+                        <button class="player-controls__btn" onclick={on_pip_toggle} title="Picture-in-Picture (p)">
+                            { "🖼" }
+                        </button>
 
                         // Fullscreen button
                         <button class="player-controls__btn" onclick={on_fullscreen_toggle} title="Fullscreen (f)">
@@ -1385,6 +1650,26 @@ async fn fetch_thumbnail_info(video_id: &str) -> Result<ThumbnailInfo, String> {
         .await
         .map_err(|e| format!("JSON parse error: {e:?}"))?;
     Ok(info)
+}
+
+// ── Subtitle Track Fetching ──────────────────────────────────────────────────
+
+async fn fetch_subtitle_tracks(video_id: &str) -> Result<Vec<SubtitleTrack>, String> {
+    let url = format!("/api/videos/{video_id}/subtitles");
+    let resp = Request::get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("fetch error: {e:?}"))?;
+
+    if !resp.ok() {
+        return Err(format!("HTTP {} for {url}", resp.status()));
+    }
+
+    let response: SubtitleTracksResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("JSON parse error: {e:?}"))?;
+    Ok(response.tracks)
 }
 
 // ── Player Logic ─────────────────────────────────────────────────────────────

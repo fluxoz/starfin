@@ -55,6 +55,8 @@ web-sys = { version = "0.3", features = [
     "TextTrackList",
     "TextTrackCue",
     "TextTrackCueList",
+    "TextTrackMode",
+    "HtmlTrackElement",
     "AddEventListenerOptions",
     "EventListenerOptions",
     "Screen",

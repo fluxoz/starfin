@@ -647,6 +647,164 @@ async fn get_thumbnail_sprite(
     }
 }
 
+// ── Subtitle extraction ──────────────────────────────────────────────────────
+
+/// Response for subtitle tracks info
+#[derive(Clone, Serialize)]
+struct SubtitleTrack {
+    index: u32,
+    language: Option<String>,
+    title: Option<String>,
+    codec: String,
+}
+
+#[derive(Clone, Serialize)]
+struct SubtitleTracksResponse {
+    tracks: Vec<SubtitleTrack>,
+}
+
+/// `GET /api/videos/{id}/subtitles` — list available subtitle tracks
+async fn list_subtitles(
+    id: web::Path<String>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let (abs_path, _) = match find_video(&state, &id).await {
+        Some(v) => v,
+        None => return HttpResponse::NotFound().body("video not found"),
+    };
+
+    let resolved_path = match abs_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+                .body(format!("failed to resolve video path: {e}"))
+        }
+    };
+    let abs_str = match resolved_path.to_str() {
+        Some(s) => s.to_owned(),
+        None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
+    };
+
+    // Use ffprobe to get subtitle stream info
+    let output = Command::new("ffprobe")
+        .args([
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            "-select_streams", "s",
+            &abs_str,
+        ])
+        .output()
+        .await;
+
+    let Ok(output) = output else {
+        return HttpResponse::ServiceUnavailable().body("ffprobe not available");
+    };
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null);
+
+    let mut tracks = Vec::new();
+    if let Some(streams) = json["streams"].as_array() {
+        for (i, stream) in streams.iter().enumerate() {
+            let language = stream["tags"]["language"].as_str().map(str::to_owned);
+            let title = stream["tags"]["title"].as_str().map(str::to_owned);
+            let codec = stream["codec_name"].as_str().unwrap_or("unknown").to_owned();
+            
+            tracks.push(SubtitleTrack {
+                index: i as u32,
+                language,
+                title,
+                codec,
+            });
+        }
+    }
+
+    HttpResponse::Ok().json(SubtitleTracksResponse { tracks })
+}
+
+/// `GET /api/videos/{id}/subtitles/{index}.vtt` — get subtitle track as WebVTT
+async fn get_subtitle(
+    params: web::Path<(String, u32)>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let (id, track_index) = params.into_inner();
+
+    let (abs_path, _) = match find_video(&state, &id).await {
+        Some(v) => v,
+        None => return HttpResponse::NotFound().body("video not found"),
+    };
+
+    let sub_dir = state.cache_dir.join(format!("{}_subs", id));
+    let vtt_path = sub_dir.join(format!("{}.vtt", track_index));
+
+    // Check if subtitle already exists
+    if let Ok(data) = tokio::fs::read_to_string(&vtt_path).await {
+        return HttpResponse::Ok()
+            .content_type("text/vtt")
+            .insert_header((header::CACHE_CONTROL, "public, max-age=86400"))
+            .body(data);
+    }
+
+    // Create cache directory
+    if let Err(e) = tokio::fs::create_dir_all(&sub_dir).await {
+        return HttpResponse::InternalServerError().body(format!("cache dir error: {e}"));
+    }
+
+    let resolved_path = match abs_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+                .body(format!("failed to resolve video path: {e}"))
+        }
+    };
+    let abs_str = match resolved_path.to_str() {
+        Some(s) => s.to_owned(),
+        None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
+    };
+
+    let vtt_path_str = match vtt_path.to_str() {
+        Some(s) => s.to_owned(),
+        None => return HttpResponse::InternalServerError().body("vtt path is not valid UTF-8"),
+    };
+
+    // Extract and convert subtitle to WebVTT using ffmpeg
+    let output = Command::new("ffmpeg")
+        .stdin(std::process::Stdio::null())
+        .args([
+            "-y",
+            "-nostdin",
+            "-i", &abs_str,
+            "-map", &format!("0:s:{}", track_index),
+            "-c:s", "webvtt",
+            &vtt_path_str,
+        ])
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            match tokio::fs::read_to_string(&vtt_path).await {
+                Ok(data) => HttpResponse::Ok()
+                    .content_type("text/vtt")
+                    .insert_header((header::CACHE_CONTROL, "public, max-age=86400"))
+                    .body(data),
+                Err(e) => HttpResponse::InternalServerError()
+                    .body(format!("failed to read subtitle: {e}")),
+            }
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("ffmpeg subtitle extraction failed: {}", stderr);
+            HttpResponse::ServiceUnavailable().body("subtitle extraction failed")
+        }
+        Err(e) => {
+            eprintln!("failed to execute ffmpeg for subtitle: {}", e);
+            HttpResponse::ServiceUnavailable().body(format!("failed to execute ffmpeg: {e}"))
+        }
+    }
+}
+
 // ── Static asset serving ─────────────────────────────────────────────────────
 
 fn content_type(path: &str) -> header::HeaderValue {
@@ -731,6 +889,14 @@ async fn main() -> std::io::Result<()> {
             .route(
                 "/api/videos/{id}/thumbnails/sprite.jpg",
                 web::get().to(get_thumbnail_sprite),
+            )
+            .route(
+                "/api/videos/{id}/subtitles",
+                web::get().to(list_subtitles),
+            )
+            .route(
+                "/api/videos/{id}/subtitles/{index}.vtt",
+                web::get().to(get_subtitle),
             )
             .route(
                 "/api/videos/{id}/playlist.m3u8",

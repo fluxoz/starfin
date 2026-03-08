@@ -57,9 +57,12 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("binary error: {e:?}"))
 }
 
-fn parse_m3u8(text: &str) -> (Option<String>, Vec<String>) {
+/// Parse M3U8 playlist and return (init_uri, segment_uris, total_duration_secs)
+fn parse_m3u8(text: &str) -> (Option<String>, Vec<String>, f64) {
     let mut init_uri: Option<String> = None;
     let mut segs: Vec<String> = Vec::new();
+    let mut total_duration: f64 = 0.0;
+    let mut current_extinf: Option<f64> = None;
 
     for line in text.lines() {
         let line = line.trim();
@@ -67,11 +70,22 @@ fn parse_m3u8(text: &str) -> (Option<String>, Vec<String>) {
             if let Some(uri) = rest.strip_suffix('"') {
                 init_uri = Some(uri.to_owned());
             }
+        } else if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            // Parse duration from #EXTINF:6.000, format
+            if let Some(duration_str) = rest.split(',').next() {
+                if let Ok(dur) = duration_str.trim().parse::<f64>() {
+                    current_extinf = Some(dur);
+                }
+            }
         } else if !line.starts_with('#') && !line.is_empty() {
             segs.push(line.to_owned());
+            // Add segment duration to total
+            if let Some(dur) = current_extinf.take() {
+                total_duration += dur;
+            }
         }
     }
-    (init_uri, segs)
+    (init_uri, segs, total_duration)
 }
 
 fn format_time(seconds: f64) -> String {
@@ -1849,7 +1863,7 @@ async fn run_player(
     let playlist_bytes = fetch_bytes(&playlist_url).await?;
     let playlist_text =
         String::from_utf8(playlist_bytes).map_err(|e| format!("playlist UTF-8: {e}"))?;
-    let (init_uri, seg_uris) = parse_m3u8(&playlist_text);
+    let (init_uri, seg_uris, total_duration) = parse_m3u8(&playlist_text);
 
     if seg_uris.is_empty() {
         return Err("Playlist contains no segments.".into());
@@ -1862,7 +1876,7 @@ async fn run_player(
     video.set_src(&obj_url);
 
     // Helper to revoke URL on error - wrap inner logic
-    let result = run_player_inner(&ms, &video, &obj_url, mime, init_uri, seg_uris, status).await;
+    let result = run_player_inner(&ms, &video, &obj_url, mime, init_uri, seg_uris, total_duration, status).await;
     
     // Always revoke the object URL when done (success or error)
     web_sys::Url::revoke_object_url(&obj_url).ok();
@@ -1878,12 +1892,19 @@ async fn run_player_inner(
     mime: &str,
     init_uri: Option<String>,
     seg_uris: Vec<String>,
+    total_duration: f64,
     status: UseStateHandle<String>,
 ) -> Result<(), String> {
     // Wait for MediaSource to open
     sourceopen_future(ms)
         .await
         .map_err(|e| format!("sourceopen: {e:?}"))?;
+
+    // Set the MediaSource duration so the video element knows the total length
+    // This enables the progress bar and seeking
+    if total_duration > 0.0 {
+        ms.set_duration(total_duration);
+    }
 
     let sb = ms
         .add_source_buffer(mime)

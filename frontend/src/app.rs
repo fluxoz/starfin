@@ -75,6 +75,13 @@ pub fn app() -> Html {
 
     html! {
         <div class="app">
+            // Left sidebar with ARC branding
+            <aside class="sidebar">
+                <div class="sidebar__logo">{ "ARC" }</div>
+                <div class="sidebar__text">{ "PRODUCT OVERVIEW" }</div>
+                <div class="sidebar__arrow">{ "↗" }</div>
+            </aside>
+
             // Video player overlay — rendered on top of the library when a video is selected.
             if let Some(video) = &*selected {
                 <VideoPlayer
@@ -86,20 +93,24 @@ pub fn app() -> Html {
 
             <header class="topbar">
                 <div class="topbar__inner">
-                    <div class="brand">
-                        <div class="brand__logo">{ "Starfin" }</div>
-                        <div class="brand__sub">{ "Your personal video library" }</div>
-                    </div>
-
-                    <FiltersBar
-                        query={(*query).clone()}
-                        filters={(*filters).clone()}
-                        sort_by={(*sort_by).clone()}
-                        on_query_change={on_query_change}
-                        on_filters_change={on_filters_change}
-                        on_sort_change={on_sort_change}
-                    />
+                    <div class="topbar__left">{ "PI INDUSTRIAL ROBOT" }</div>
+                    <div class="topbar__center">{ "ARC / SYSTEMS FOR PRODUCTION" }</div>
+                    <div class="topbar__right">{ "SERIAL NO. 001" }</div>
                 </div>
+                
+                <div class="brand">
+                    <div class="brand__logo">{ "Starfin" }</div>
+                    <div class="brand__sub">{ "Your personal video library" }</div>
+                </div>
+
+                <FiltersBar
+                    query={(*query).clone()}
+                    filters={(*filters).clone()}
+                    sort_by={(*sort_by).clone()}
+                    on_query_change={on_query_change}
+                    on_filters_change={on_filters_change}
+                    on_sort_change={on_sort_change}
+                />
             </header>
 
             <main class="content">

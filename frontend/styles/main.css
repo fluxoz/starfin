@@ -141,12 +141,14 @@ body{
 }
 
 .sidebar__logo{
-  font-size: 32px;
+  font-size: 18px;
   font-weight: 900;
   color: white;
-  writing-mode: horizontal-tb;
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
   margin-bottom: auto;
-  letter-spacing: 2px;
+  letter-spacing: 3px;
+  padding: 10px 0;
 }
 
 .sidebar__text{
@@ -203,42 +205,57 @@ body{
 }
 
 .theme-toggle{
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  cursor: pointer;
-  padding: 6px 10px;
-  border: 2px solid rgba(0,0,0,.2);
-  border-radius: var(--radius);
-  background: rgba(0,0,0,.05);
-  transition: all 0.2s ease;
+  position: relative;
+  display: inline-block;
+  width: 50px;
+  height: 24px;
 }
 
-.theme-toggle:hover{
-  background: rgba(0,0,0,.1);
+.theme-toggle__switch{
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0,0,0,.2);
+  border: 2px solid rgba(0,0,0,.3);
+  border-radius: 24px;
+  transition: all 0.3s ease;
+}
+
+.theme-toggle__switch::before{
+  content: "";
+  position: absolute;
+  height: 16px;
+  width: 16px;
+  left: 2px;
+  bottom: 2px;
+  background: white;
+  border-radius: 50%;
+  transition: all 0.3s ease;
+  box-shadow: 0 1px 3px rgba(0,0,0,.3);
+}
+
+.dark-mode-toggle:checked ~ .app .theme-toggle__switch{
+  background: var(--accent);
   border-color: var(--accent);
 }
 
-.theme-toggle__icon{
-  font-size: 16px;
-  line-height: 1;
+.dark-mode-toggle:checked ~ .app .theme-toggle__switch::before{
+  transform: translateX(26px);
 }
 
-.theme-toggle__text{
+.theme-toggle__label{
+  position: absolute;
+  right: -45px;
+  top: 50%;
+  transform: translateY(-50%);
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 1px;
-}
-
-.dark-mode-toggle:checked ~ .app .theme-toggle{
-  background: rgba(255,255,255,.1);
-  border-color: rgba(255,255,255,.3);
-  color: var(--text);
-}
-
-.dark-mode-toggle:checked ~ .app .theme-toggle:hover{
-  background: rgba(255,255,255,.15);
-  border-color: var(--accent);
+  white-space: nowrap;
+  pointer-events: none;
 }
 
 .content{

@@ -74,47 +74,48 @@ pub fn app() -> Html {
     };
 
     html! {
-        <div class="app">
+        <>
             // Dark mode toggle (CSS-only using checkbox hack)
             <input type="checkbox" id="dark-mode-toggle" class="dark-mode-toggle" />
             
-            // Left sidebar with Starfin branding
-            <aside class="sidebar">
-                <div class="sidebar__logo">{ "STARFIN" }</div>
-                <div class="sidebar__text">{ "MEDIA COLLECTION" }</div>
-                <div class="sidebar__arrow">{ "↗" }</div>
-            </aside>
+            <div class="app">
+                // Left sidebar with Starfin branding
+                <aside class="sidebar">
+                    <div class="sidebar__logo">{ "STARFIN" }</div>
+                    <div class="sidebar__text">{ "MEDIA COLLECTION" }</div>
+                    <div class="sidebar__arrow">{ "↗" }</div>
+                </aside>
 
-            // Video player overlay — rendered on top of the library when a video is selected.
-            if let Some(video) = &*selected {
-                <VideoPlayer
-                    video_id={video.id.clone()}
-                    title={video.title.clone()}
-                    on_close={on_close_player}
-                />
-            }
+                // Video player overlay — rendered on top of the library when a video is selected.
+                if let Some(video) = &*selected {
+                    <VideoPlayer
+                        video_id={video.id.clone()}
+                        title={video.title.clone()}
+                        on_close={on_close_player}
+                    />
+                }
 
-            <header class="topbar">
-                <div class="topbar__inner">
-                    <div class="topbar__left">{ "STARFIN MEDIA SERVER" }</div>
-                    <div class="topbar__center">{ "PERSONAL VIDEO LIBRARY" }</div>
-                    <div class="topbar__right">
-                        <label for="dark-mode-toggle" class="theme-toggle">
-                            <span class="theme-toggle__icon">{ "◐" }</span>
-                            <span class="theme-toggle__text">{ "THEME" }</span>
-                        </label>
+                <header class="topbar">
+                    <div class="topbar__inner">
+                        <div class="topbar__left">{ "STARFIN MEDIA SERVER" }</div>
+                        <div class="topbar__center">{ "PERSONAL VIDEO LIBRARY" }</div>
+                        <div class="topbar__right">
+                            <label for="dark-mode-toggle" class="theme-toggle">
+                                <span class="theme-toggle__switch"></span>
+                                <span class="theme-toggle__label">{ "THEME" }</span>
+                            </label>
+                        </div>
                     </div>
-                </div>
 
-                <FiltersBar
-                    query={(*query).clone()}
-                    filters={(*filters).clone()}
-                    sort_by={(*sort_by).clone()}
-                    on_query_change={on_query_change}
-                    on_filters_change={on_filters_change}
-                    on_sort_change={on_sort_change}
-                />
-            </header>
+                    <FiltersBar
+                        query={(*query).clone()}
+                        filters={(*filters).clone()}
+                        sort_by={(*sort_by).clone()}
+                        on_query_change={on_query_change}
+                        on_filters_change={on_filters_change}
+                        on_sort_change={on_sort_change}
+                    />
+                </header>
 
             <main class="content">
                 if let Some(err) = &*error {
@@ -130,7 +131,8 @@ pub fn app() -> Html {
                     <ElementsGrid items={(*items).clone()} on_watch={on_watch} />
                 }
             </main>
-        </div>
+            </div>
+        </>
     }
 }
 

@@ -486,7 +486,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
         use_effect_with(video_ref.clone(), move |video_ref| {
             let video_ref = video_ref.clone();
-            let interval = Interval::new(100, move || {
+            // 150ms gives good responsiveness while being more efficient than 100ms
+            let interval = Interval::new(150, move || {
                 if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
                     if !*is_dragging {
                         current_time.set(video.current_time());
@@ -1742,8 +1743,27 @@ async fn run_player(
         .map_err(|e| format!("createObjectURL: {e:?}"))?;
     video.set_src(&obj_url);
 
+    // Helper to revoke URL on error - wrap inner logic
+    let result = run_player_inner(&ms, &video, &obj_url, mime, init_uri, seg_uris, status).await;
+    
+    // Always revoke the object URL when done (success or error)
+    web_sys::Url::revoke_object_url(&obj_url).ok();
+    
+    result
+}
+
+/// Inner player logic - separated so we can ensure URL cleanup in the outer function
+async fn run_player_inner(
+    ms: &MediaSource,
+    video: &HtmlVideoElement,
+    _obj_url: &str,
+    mime: &str,
+    init_uri: Option<String>,
+    seg_uris: Vec<String>,
+    status: UseStateHandle<String>,
+) -> Result<(), String> {
     // Wait for MediaSource to open
-    sourceopen_future(&ms)
+    sourceopen_future(ms)
         .await
         .map_err(|e| format!("sourceopen: {e:?}"))?;
 
@@ -1770,7 +1790,7 @@ async fn run_player(
             seg_uris.len()
         ));
         let data = fetch_bytes(url).await?;
-        append_segment_with_quota_handling(&sb, &data, &video).await?;
+        append_segment_with_quota_handling(&sb, &data, video).await?;
         buffer_state.borrow_mut().mark_loaded(i);
     }
 
@@ -1780,7 +1800,7 @@ async fn run_player(
     // Demand-based streaming loop
     loop {
         let current_time = video.current_time();
-        let buffer_ahead = get_buffer_ahead(&video);
+        let buffer_ahead = get_buffer_ahead(video);
         let buffer_state_ref = buffer_state.borrow();
 
         if buffer_state_ref.all_loaded() {
@@ -1792,7 +1812,7 @@ async fn run_player(
             }
             ms.end_of_stream()
                 .map_err(|e| format!("endOfStream: {e:?}"))?;
-            web_sys::Url::revoke_object_url(&obj_url).ok();
+            // URL cleanup is handled by the outer run_player function
             return Ok(());
         }
 
@@ -1810,7 +1830,7 @@ async fn run_player(
                     break;
                 }
 
-                if is_segment_buffered(&video, seg_idx) {
+                if is_segment_buffered(video, seg_idx) {
                     continue;
                 }
 
@@ -1823,7 +1843,7 @@ async fn run_player(
                     .await
                     .map_err(|e| format!("Segment {seg_idx} fetch failed: {e}"))?;
 
-                append_segment_with_quota_handling(&sb, &data, &video).await?;
+                append_segment_with_quota_handling(&sb, &data, video).await?;
             }
         } else {
             drop(buffer_state_ref);

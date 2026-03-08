@@ -13,6 +13,68 @@
   --shadow: 0 2px 4px rgba(0,0,0,.2);
 }
 
+/* Dark mode checkbox (hidden) */
+.dark-mode-toggle {
+  display: none;
+}
+
+/* Dark mode theme */
+.dark-mode-toggle:checked ~ * {
+  --bg: #1a1a1a;
+  --panel: rgba(255,255,255,.03);
+  --panel-2: rgba(255,255,255,.06);
+  --text: #e8e8e8;
+  --muted: #b0b0b0;
+  --border: rgba(255,255,255,.15);
+  --accent: #ff6b35;
+  --accent-2: #2a2a2a;
+  --danger: #ff5555;
+  --shadow: 0 2px 8px rgba(0,0,0,.5);
+}
+
+.dark-mode-toggle:checked ~ .sidebar {
+  background: #ff6b35;
+}
+
+.dark-mode-toggle:checked ~ .topbar {
+  background: #2a2a2a;
+  border-bottom: 2px solid rgba(255,255,255,.2);
+}
+
+.dark-mode-toggle:checked ~ .topbar .topbar__inner {
+  color: var(--text);
+}
+
+.dark-mode-toggle:checked ~ * .card {
+  background: rgba(255,255,255,.08);
+  border-color: rgba(255,255,255,.2);
+}
+
+.dark-mode-toggle:checked ~ * .card__subtitle {
+  color: rgba(255,255,255,.7);
+}
+
+.dark-mode-toggle:checked ~ * .input,
+.dark-mode-toggle:checked ~ * .select {
+  background: rgba(255,255,255,.08);
+  border-color: rgba(255,255,255,.2);
+  color: var(--text);
+}
+
+.dark-mode-toggle:checked ~ * .chip {
+  background: rgba(255,255,255,.08);
+  border-color: rgba(255,255,255,.2);
+}
+
+.dark-mode-toggle:checked ~ * .notice {
+  background: rgba(255,255,255,.08);
+  border-color: rgba(255,255,255,.2);
+}
+
+.dark-mode-toggle:checked ~ * .empty {
+  background: rgba(255,255,255,.05);
+}
+
 *{ box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; }
 body{
@@ -135,6 +197,48 @@ body{
 .topbar__right{
   flex: 1;
   text-align: right;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+.theme-toggle{
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  padding: 6px 10px;
+  border: 2px solid rgba(0,0,0,.2);
+  border-radius: var(--radius);
+  background: rgba(0,0,0,.05);
+  transition: all 0.2s ease;
+}
+
+.theme-toggle:hover{
+  background: rgba(0,0,0,.1);
+  border-color: var(--accent);
+}
+
+.theme-toggle__icon{
+  font-size: 16px;
+  line-height: 1;
+}
+
+.theme-toggle__text{
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+
+.dark-mode-toggle:checked ~ .topbar .theme-toggle{
+  background: rgba(255,255,255,.1);
+  border-color: rgba(255,255,255,.3);
+  color: var(--text);
+}
+
+.dark-mode-toggle:checked ~ .topbar .theme-toggle:hover{
+  background: rgba(255,255,255,.15);
+  border-color: var(--accent);
 }
 
 .content{

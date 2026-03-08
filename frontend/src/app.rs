@@ -75,10 +75,13 @@ pub fn app() -> Html {
 
     html! {
         <div class="app">
-            // Left sidebar with ARC branding
+            // Dark mode toggle (CSS-only using checkbox hack)
+            <input type="checkbox" id="dark-mode-toggle" class="dark-mode-toggle" />
+            
+            // Left sidebar with Starfin branding
             <aside class="sidebar">
-                <div class="sidebar__logo">{ "ARC" }</div>
-                <div class="sidebar__text">{ "PRODUCT OVERVIEW" }</div>
+                <div class="sidebar__logo">{ "STARFIN" }</div>
+                <div class="sidebar__text">{ "MEDIA COLLECTION" }</div>
                 <div class="sidebar__arrow">{ "↗" }</div>
             </aside>
 
@@ -93,9 +96,14 @@ pub fn app() -> Html {
 
             <header class="topbar">
                 <div class="topbar__inner">
-                    <div class="topbar__left">{ "PI INDUSTRIAL ROBOT" }</div>
-                    <div class="topbar__center">{ "ARC / SYSTEMS FOR PRODUCTION" }</div>
-                    <div class="topbar__right">{ "SERIAL NO. 001" }</div>
+                    <div class="topbar__left">{ "STARFIN MEDIA SERVER" }</div>
+                    <div class="topbar__center">{ "PERSONAL VIDEO LIBRARY" }</div>
+                    <div class="topbar__right">
+                        <label for="dark-mode-toggle" class="theme-toggle">
+                            <span class="theme-toggle__icon">{ "◐" }</span>
+                            <span class="theme-toggle__text">{ "THEME" }</span>
+                        </label>
+                    </div>
                 </div>
 
                 <FiltersBar

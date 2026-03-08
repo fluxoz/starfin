@@ -254,11 +254,11 @@ async fn get_playlist(
         None => return HttpResponse::NotFound().body("video not found"),
     };
 
-    // Get video duration via ffprobe
-    let (duration_secs, _) = probe_video(&abs_path).await;
+    // Get video duration via ffprobe (metadata is not needed for playlist generation)
+    let (duration_secs, _metadata) = probe_video(&abs_path).await;
     if duration_secs == 0 {
         return HttpResponse::ServiceUnavailable()
-            .body("Could not determine video duration");
+            .body("Could not determine video duration. Ensure ffprobe is installed and the video file is valid.");
     }
 
     let hls_dir = state.cache_dir.join(id.as_str());
@@ -428,7 +428,7 @@ async fn get_segment(
 
     // Calculate segment time range
     let start_time = seg_index as f64 * SEGMENT_DURATION;
-    
+
     // Create cache directory if needed
     if let Err(e) = tokio::fs::create_dir_all(&hls_dir).await {
         return HttpResponse::InternalServerError()
@@ -479,7 +479,7 @@ async fn get_segment(
             let stderr = String::from_utf8_lossy(&out.stderr);
             eprintln!("ffmpeg segment {} failed: {}", seg_index, stderr);
             HttpResponse::ServiceUnavailable()
-                .body(format!("segment transcoding failed"))
+                .body(format!("segment {} transcoding failed", seg_index))
         }
         Err(e) => {
             eprintln!("failed to execute ffmpeg for segment {}: {}", seg_index, e);

@@ -395,16 +395,16 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let on_progress_click = {
         let video_ref = video_ref.clone();
         let progress_ref = progress_ref.clone();
-        let duration = *duration;
         Callback::from(move |e: MouseEvent| {
             if let Some(progress_el) = progress_ref.cast::<web_sys::HtmlElement>() {
                 if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
+                    let video_duration = video.duration();
                     let rect = progress_el.get_bounding_client_rect();
                     let click_x = e.client_x() as f64 - rect.left();
                     let width = rect.width();
-                    if width > 0.0 && duration > 0.0 {
+                    if width > 0.0 && video_duration.is_finite() && video_duration > 0.0 {
                         let seek_ratio = (click_x / width).clamp(0.0, 1.0);
-                        let seek_time = seek_ratio * duration;
+                        let seek_time = seek_ratio * video_duration;
                         video.set_current_time(seek_time);
                     }
                 }

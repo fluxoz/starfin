@@ -14,9 +14,10 @@ use yew::prelude::*;
 // ── Buffer management constants ──────────────────────────────────────────────
 const BUFFER_AHEAD_SECONDS: f64 = 30.0;
 const BUFFER_BEHIND_SECONDS: f64 = 10.0;
-const MIN_BUFFER_AHEAD: f64 = 10.0;
+const MIN_BUFFER_AHEAD: f64 = 5.0; // Reduced for faster seeking response
 const SEGMENT_DURATION: f64 = 6.0;
-const BUFFER_CHECK_INTERVAL_MS: u32 = 500;
+const BUFFER_CHECK_INTERVAL_MS: u32 = 100; // Faster checks for responsive seeking
+const MIN_BUFFER_CLEANUP_THRESHOLD: f64 = 1.0; // Minimum seconds before we clean up old buffer
 
 // ── Playback speed options ───────────────────────────────────────────────────
 const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
@@ -1675,25 +1676,27 @@ async fn fetch_subtitle_tracks(video_id: &str) -> Result<Vec<SubtitleTrack>, Str
 
 // ── Player Logic ─────────────────────────────────────────────────────────────
 
-struct BufferState {
-    loaded_segments: std::collections::HashSet<usize>,
+/// Track which segments have been fetched in the current session
+/// This helps avoid re-fetching but we still check actual buffer state
+struct FetchedSegments {
+    fetched: std::collections::HashSet<usize>,
     total_segments: usize,
 }
 
-impl BufferState {
+impl FetchedSegments {
     fn new(total_segments: usize) -> Self {
         Self {
-            loaded_segments: std::collections::HashSet::new(),
+            fetched: std::collections::HashSet::new(),
             total_segments,
         }
     }
 
-    fn mark_loaded(&mut self, index: usize) {
-        self.loaded_segments.insert(index);
+    fn mark_fetched(&mut self, index: usize) {
+        self.fetched.insert(index);
     }
 
-    fn all_loaded(&self) -> bool {
-        self.loaded_segments.len() >= self.total_segments
+    fn all_fetched(&self) -> bool {
+        self.fetched.len() >= self.total_segments
     }
 }
 
@@ -1778,10 +1781,10 @@ async fn run_player_inner(
         append_segment(&sb, &data).await?;
     }
 
-    // Initialize buffer state
-    let buffer_state = Rc::new(RefCell::new(BufferState::new(seg_uris.len())));
+    // Track which segments have been fetched (to know when we can call end_of_stream)
+    let fetched_segments = Rc::new(RefCell::new(FetchedSegments::new(seg_uris.len())));
 
-    // Load initial segments
+    // Load initial segments to start playback
     let initial_count = 2.min(seg_uris.len());
     for (i, url) in seg_uris[..initial_count].iter().enumerate() {
         status.set(format!(
@@ -1791,64 +1794,138 @@ async fn run_player_inner(
         ));
         let data = fetch_bytes(url).await?;
         append_segment_with_quota_handling(&sb, &data, video).await?;
-        buffer_state.borrow_mut().mark_loaded(i);
+        fetched_segments.borrow_mut().mark_fetched(i);
     }
 
     // Clear status - playback ready
     status.set(String::new());
 
-    // Demand-based streaming loop
+    // Track if we've signaled end of stream
+    let mut end_of_stream_signaled = false;
+
+    // Demand-based streaming loop - runs continuously while video is active
     loop {
         let current_time = video.current_time();
-        let buffer_ahead = get_buffer_ahead(video);
-        let buffer_state_ref = buffer_state.borrow();
-
-        if buffer_state_ref.all_loaded() {
-            drop(buffer_state_ref);
-            while sb.updating() {
-                updateend_future(&sb)
-                    .await
-                    .map_err(|e| format!("waiting for final update: {e:?}"))?;
-            }
-            ms.end_of_stream()
-                .map_err(|e| format!("endOfStream: {e:?}"))?;
-            // URL cleanup is handled by the outer run_player function
-            return Ok(());
+        let video_duration = video.duration();
+        
+        // Check if video element is still valid
+        if !video_duration.is_finite() || video_duration <= 0.0 {
+            // Video might be detached, wait and check again
+            TimeoutFuture::new(BUFFER_CHECK_INTERVAL_MS).await;
+            continue;
         }
 
+        // Calculate which segments we need around current position
+        let current_segment = time_to_segment_index(current_time, seg_uris.len());
+        let target_buffer_end = current_time + BUFFER_AHEAD_SECONDS;
+        let target_segment = time_to_segment_index(target_buffer_end, seg_uris.len());
+
+        // Check buffer state and fetch needed segments
+        let buffer_ahead = get_buffer_ahead(video);
+        
+        // If buffer is low, fetch segments around current position
         if buffer_ahead < MIN_BUFFER_AHEAD {
-            drop(buffer_state_ref);
+            // First, clean up old buffer data (but be careful not to remove too much)
+            let remove_before = (current_time - BUFFER_BEHIND_SECONDS).max(0.0);
+            if remove_before > MIN_BUFFER_CLEANUP_THRESHOLD {
+                // Only remove if there's significant data behind to avoid thrashing
+                let _ = safe_remove_buffer(&sb, 0.0, remove_before).await;
+            }
 
-            remove_old_buffer(&sb, current_time).await?;
-
-            let current_segment = time_to_segment_index(current_time, seg_uris.len());
-            let target_buffer_end = current_time + BUFFER_AHEAD_SECONDS;
-            let target_segment = time_to_segment_index(target_buffer_end, seg_uris.len());
-
+            // Fetch segments from current position forward
             for seg_idx in current_segment..=target_segment {
                 if seg_idx >= seg_uris.len() {
                     break;
                 }
 
+                // Always check actual buffer state - segment might have been evicted
                 if is_segment_buffered(video, seg_idx) {
+                    // Segment is already in buffer, mark as fetched and skip
+                    fetched_segments.borrow_mut().mark_fetched(seg_idx);
                     continue;
                 }
 
-                let mut state = buffer_state.borrow_mut();
-                state.mark_loaded(seg_idx);
-                drop(state);
-
+                // Fetch and append the segment
                 let url = &seg_uris[seg_idx];
-                let data = fetch_bytes(url)
-                    .await
-                    .map_err(|e| format!("Segment {seg_idx} fetch failed: {e}"))?;
-
-                append_segment_with_quota_handling(&sb, &data, video).await?;
+                match fetch_bytes(url).await {
+                    Ok(data) => {
+                        if let Err(e) = append_segment_with_quota_handling(&sb, &data, video).await {
+                            // Log error but continue - might recover
+                            log::warn!("Failed to append segment {}: {}", seg_idx, e);
+                        } else {
+                            fetched_segments.borrow_mut().mark_fetched(seg_idx);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to fetch segment {}: {}", seg_idx, e);
+                    }
+                }
             }
-        } else {
-            drop(buffer_state_ref);
         }
 
+        // Check if we should signal end of stream
+        // Only do this when ALL segments have been fetched AND video is near the end
+        // We check near-end first to avoid expensive all_buffered check on every iteration
+        if !end_of_stream_signaled 
+            && current_time > video_duration * 0.9  // Only check when near end (90%+)
+            && fetched_segments.borrow().all_fetched() 
+        {
+            // Verify all segments are actually in the buffer
+            let all_buffered = (0..seg_uris.len()).all(|i| is_segment_buffered(video, i));
+            
+            if all_buffered {
+                // Wait for any pending operations
+                while sb.updating() {
+                    updateend_future(&sb)
+                        .await
+                        .map_err(|e| format!("waiting for final update: {e:?}"))?;
+                }
+                
+                if let Err(e) = ms.end_of_stream() {
+                    log::warn!("end_of_stream failed: {:?}", e);
+                } else {
+                    end_of_stream_signaled = true;
+                }
+            }
+        }
+
+        // Check if video has ended
+        if video.ended() {
+            return Ok(());
+        }
+
+        // Wait before next check
         TimeoutFuture::new(BUFFER_CHECK_INTERVAL_MS).await;
     }
+}
+
+/// Safely remove buffer data, handling errors gracefully.
+/// Buffer removal errors are non-fatal - the browser may reject removal for various
+/// reasons (invalid range, buffer not appendable, etc.) but playback can continue.
+async fn safe_remove_buffer(sb: &SourceBuffer, start: f64, end: f64) -> Result<(), String> {
+    // Wait for any pending operations
+    while sb.updating() {
+        updateend_future(sb)
+            .await
+            .map_err(|e| format!("waiting for update before remove: {e:?}"))?;
+    }
+
+    // Try to remove - this might fail if range is invalid or buffer is in wrong state.
+    // This is safe to ignore because:
+    // 1. The buffer will eventually be cleaned up by quota management
+    // 2. Playback continues normally even with extra buffered data
+    // 3. The browser handles memory limits automatically
+    if let Err(e) = sb.remove(start, end) {
+        log::debug!("Buffer removal skipped (non-fatal): {:?} - range [{:.1}s, {:.1}s]", e, start, end);
+        return Ok(());
+    }
+
+    // Wait for remove to complete
+    while sb.updating() {
+        updateend_future(sb)
+            .await
+            .map_err(|e| format!("waiting for remove to complete: {e:?}"))?;
+    }
+
+    Ok(())
 }

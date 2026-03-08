@@ -252,6 +252,7 @@ async fn get_playlist(
     };
 
     let hls_dir = state.cache_dir.join(id.as_str());
+    println!("HLS_DIR: {:?}", hls_dir);
     let playlist_path = hls_dir.join("playlist.m3u8");
 
     if !playlist_path.exists() {
@@ -262,10 +263,9 @@ async fn get_playlist(
 
         // Transcode to fragmented-MP4 HLS (MSE-compatible in all modern browsers).
         // -profile:v baseline  → codec string "avc1.42E01E" – the most compatible H.264 variant.
-        // NOTE: ffmpeg -hls_fmp4_init_filename and -hls_segment_filename expect RELATIVE paths
-        // (relative to the output playlist directory), not absolute paths.
-        let init_file = "init.mp4";
-        let seg_pattern = "seg_%05d.m4s";
+        // Use absolute paths for init file and segment pattern so ffmpeg writes to cache dir.
+        let init_path = hls_dir.join("init.mp4");
+        let seg_pattern_path = hls_dir.join("seg_%05d.m4s");
 
         let abs_str = match abs_path.to_str() {
             Some(s) => s.to_owned(),
@@ -275,8 +275,16 @@ async fn get_playlist(
             Some(s) => s.to_owned(),
             None => return HttpResponse::InternalServerError().body("cache path is not valid UTF-8"),
         };
+        let init_str = match init_path.to_str() {
+            Some(s) => s.to_owned(),
+            None => return HttpResponse::InternalServerError().body("init path is not valid UTF-8"),
+        };
+        let seg_pattern_str = match seg_pattern_path.to_str() {
+            Some(s) => s.to_owned(),
+            None => return HttpResponse::InternalServerError().body("segment pattern path is not valid UTF-8"),
+        };
 
-        let status = Command::new("ffmpeg")
+        let output = Command::new("ffmpeg")
             .args([
                 "-y",
                 "-i",
@@ -298,16 +306,36 @@ async fn get_playlist(
                 "-hls_list_size",
                 "0",
                 "-hls_fmp4_init_filename",
-                init_file,
+                &init_str,
                 "-hls_segment_filename",
-                seg_pattern,
+                &seg_pattern_str,
                 &playlist_str,
             ])
-            .status()
+            .output()
             .await;
 
-        if status.map(|s| !s.success()).unwrap_or(true) {
-            return HttpResponse::ServiceUnavailable().body("transcoding failed");
+        match output {
+            Ok(out) if out.status.success() => {
+                // Transcoding succeeded
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!("ffmpeg failed: {}", stderr);
+                // Return last 10 lines of stderr for better debugging
+                let last_lines: Vec<&str> = stderr.lines().rev().take(10).collect();
+                let error_summary = if last_lines.is_empty() {
+                    "unknown error".to_string()
+                } else {
+                    last_lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+                };
+                return HttpResponse::ServiceUnavailable()
+                    .body(format!("transcoding failed:\n{}", error_summary));
+            }
+            Err(e) => {
+                eprintln!("failed to execute ffmpeg: {}", e);
+                return HttpResponse::ServiceUnavailable()
+                    .body(format!("failed to execute ffmpeg: {}", e));
+            }
         }
     }
 
@@ -424,7 +452,10 @@ async fn main() -> std::io::Result<()> {
     let library_path = PathBuf::from(
         std::env::var("VIDEO_LIBRARY_PATH").unwrap_or_else(|_| "./videos".into()),
     );
-    let cache_dir = std::env::temp_dir().join("starfin_cache");
+
+    // let cache_dir = std::env::temp_dir().join("starfin_cache");
+    let cache_dir = PathBuf::new().join("starfin_cache");
+    println!("CACHE DIR: {:?}", cache_dir);
 
     if !library_path.exists() {
         std::fs::create_dir_all(&library_path)?;

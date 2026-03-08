@@ -17,6 +17,9 @@ pub fn app() -> Html {
     let loading = use_state(|| false);
     let error = use_state(|| Option::<String>::None);
     let selected = use_state(|| Option::<Element>::None);
+    
+    // Dark mode state
+    let dark_mode = use_state(|| false);
 
     // Fetch on load and whenever query/filters/sort changes
     {
@@ -72,23 +75,48 @@ pub fn app() -> Html {
         let selected = selected.clone();
         Callback::from(move |_| selected.set(None))
     };
+    
+    let on_toggle_dark_mode = {
+        let dark_mode = dark_mode.clone();
+        Callback::from(move |_| dark_mode.set(!*dark_mode))
+    };
+    
+    let app_class = if *dark_mode { "app dark-mode" } else { "app" };
 
     html! {
-        <div class="app">
-            // Video player overlay — rendered on top of the library when a video is selected.
-            if let Some(video) = &*selected {
-                <VideoPlayer
-                    video_id={video.id.clone()}
-                    title={video.title.clone()}
-                    on_close={on_close_player}
-                />
-            }
+        <>
+            <div class={app_class}>
+                // Left sidebar with Starfin branding
+                <aside class="sidebar">
+                    <div class="sidebar__logo">{ "STARFIN" }</div>
+                    <div class="sidebar__text">{ "MEDIA COLLECTION" }</div>
+                    <div class="sidebar__arrow">{ "↗" }</div>
+                </aside>
 
-            <header class="topbar">
-                <div class="topbar__inner">
-                    <div class="brand">
-                        <div class="brand__logo">{ "Starfin" }</div>
-                        <div class="brand__sub">{ "Your personal video library" }</div>
+                // Video player overlay — rendered on top of the library when a video is selected.
+                if let Some(video) = &*selected {
+                    <VideoPlayer
+                        video_id={video.id.clone()}
+                        title={video.title.clone()}
+                        on_close={on_close_player}
+                    />
+                }
+
+                <header class="topbar">
+                    <div class="topbar__inner">
+                        <div class="topbar__left">{ "STARFIN MEDIA SERVER" }</div>
+                        <div class="topbar__center">{ "PERSONAL VIDEO LIBRARY" }</div>
+                        <div class="topbar__right">
+                            <button 
+                                class="theme-toggle" 
+                                onclick={on_toggle_dark_mode.clone()}
+                                aria-label={if *dark_mode { "Switch to light mode" } else { "Switch to dark mode" }}
+                                aria-pressed={dark_mode.to_string()}
+                            >
+                                <span class={if *dark_mode { "theme-toggle__switch active" } else { "theme-toggle__switch" }}></span>
+                                <span class="theme-toggle__label">{ "THEME" }</span>
+                            </button>
+                        </div>
                     </div>
 
                     <FiltersBar
@@ -99,8 +127,7 @@ pub fn app() -> Html {
                         on_filters_change={on_filters_change}
                         on_sort_change={on_sort_change}
                     />
-                </div>
-            </header>
+                </header>
 
             <main class="content">
                 if let Some(err) = &*error {
@@ -116,7 +143,8 @@ pub fn app() -> Html {
                     <ElementsGrid items={(*items).clone()} on_watch={on_watch} />
                 }
             </main>
-        </div>
+            </div>
+        </>
     }
 }
 

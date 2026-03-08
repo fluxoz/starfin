@@ -262,14 +262,14 @@ async fn get_playlist(
 
         // Canonicalize to an absolute path so ffmpeg can locate the source file
         // even after we change its working directory to hls_dir.
-        let abs_path = match abs_path.canonicalize() {
+        let resolved_path = match abs_path.canonicalize() {
             Ok(p) => p,
             Err(e) => {
                 return HttpResponse::InternalServerError()
                     .body(format!("failed to resolve video path: {e}"))
             }
         };
-        let abs_str = match abs_path.to_str() {
+        let abs_str = match resolved_path.to_str() {
             Some(s) => s.to_owned(),
             None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
         };

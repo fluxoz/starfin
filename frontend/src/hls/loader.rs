@@ -139,8 +139,8 @@ impl FragmentLoader {
             return Ok(cached.clone());
         }
         
-        // Load the key
-        let data = self.fetch_with_retry(uri, None, self.config.frag_load_max_retry).await?;
+        // Load the key (ignore retry count for keys)
+        let (data, _) = self.fetch_with_retry(uri, None, self.config.frag_load_max_retry).await?;
         
         if data.len() != 16 {
             return Err(HlsError::network(
@@ -180,7 +180,7 @@ impl FragmentLoader {
             self.config.frag_load_max_retry
         };
         
-        let data = self.fetch_with_retry(url, byte_range, max_retries).await?;
+        let (data, retry_count) = self.fetch_with_retry(url, byte_range, max_retries).await?;
         
         let end_time = js_sys::Date::now();
         let load_time = end_time - start_time;
@@ -197,28 +197,31 @@ impl FragmentLoader {
                 load_time,
                 loaded_bytes,
                 bandwidth,
-                retry_count: 0, // TODO: track actual retries
+                retry_count,
             },
             context,
         })
     }
     
     /// Fetch data with retry
+    /// Returns (data, retry_count)
     async fn fetch_with_retry(
         &self,
         url: &str,
         byte_range: Option<(u64, u64)>,
         max_retries: u32,
-    ) -> HlsResult<Vec<u8>> {
+    ) -> HlsResult<(Vec<u8>, u32)> {
         let mut last_error = None;
         let mut delay = self.config.retry_delay;
+        let mut retry_count = 0;
         
         for attempt in 0..=max_retries {
             match self.fetch_bytes(url, byte_range).await {
-                Ok(data) => return Ok(data),
+                Ok(data) => return Ok((data, retry_count)),
                 Err(e) => {
                     last_error = Some(e);
                     if attempt < max_retries {
+                        retry_count += 1;
                         // Wait before retry with exponential backoff
                         gloo_timers::future::TimeoutFuture::new(delay).await;
                         delay = ((delay as f64 * self.config.retry_backoff_factor) as u32)

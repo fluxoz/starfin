@@ -392,8 +392,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let quality_levels = use_state(|| Vec::<QualityLevel>::new());
     let current_quality = use_state(|| -1_i32); // -1 = auto, otherwise level index
     let quality_menu_open = use_state(|| false);
-    #[allow(unused_variables)]
-    let bandwidth_estimate = use_state(|| 0_u64); // bits per second (used for ABR display)
+    // Note: bandwidth_estimate will be populated by the ABR controller when integrated
+    // Currently serves as placeholder for displaying current bandwidth in the UI
+    let _bandwidth_estimate = use_state(|| 0_u64); // bits per second
 
     // Run the MSE player logic
     {

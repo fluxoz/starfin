@@ -456,9 +456,9 @@ impl AbrController {
         
         // Normal ABR selection
         let effective_bw = bandwidth * self.bandwidth_factor;
-        let ideal_level = self.find_level_for_bandwidth(effective_bw, &allowed);
+        let selected_level = self.find_level_for_bandwidth(effective_bw, &allowed);
         
-        match ideal_level {
+        match selected_level {
             Some(level) if level != self.current_level => {
                 let reason = if level > self.current_level {
                     SwitchReason::BandwidthIncrease

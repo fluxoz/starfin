@@ -307,8 +307,17 @@ fn read_null_terminated_string(data: &[u8], offset: &mut usize) -> Option<String
 }
 
 /// Parse hex string to bytes
+/// Returns empty vec if the hex string is invalid
 fn parse_hex(s: &str) -> Vec<u8> {
     let s = s.trim_start_matches("0x").trim_start_matches("0X");
+    
+    // Handle odd-length strings by padding with leading zero
+    let s = if s.len() % 2 != 0 {
+        format!("0{}", s)
+    } else {
+        s.to_string()
+    };
+    
     (0..s.len())
         .step_by(2)
         .filter_map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())

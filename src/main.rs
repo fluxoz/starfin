@@ -271,12 +271,9 @@ async fn get_playlist(
             Some(s) => s.to_owned(),
             None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
         };
-        let playlist_str = match playlist_path.to_str() {
-            Some(s) => s.to_owned(),
-            None => return HttpResponse::InternalServerError().body("cache path is not valid UTF-8"),
-        };
 
         let status = Command::new("ffmpeg")
+            .current_dir(&hls_dir)
             .args([
                 "-y",
                 "-i",
@@ -301,7 +298,7 @@ async fn get_playlist(
                 init_file,
                 "-hls_segment_filename",
                 seg_pattern,
-                &playlist_str,
+                "playlist.m3u8",
             ])
             .status()
             .await;

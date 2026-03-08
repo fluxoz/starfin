@@ -1097,3 +1097,48 @@ body{
 .player-captions__option--active::before{
   content: "✓ ";
 }
+
+/* ── Quality selector menu ────────────────────────────────────────────────── */
+.player-quality{
+  position: relative;
+}
+
+.player-quality__menu{
+  position: absolute;
+  bottom: 100%;
+  right: 0;
+  background: rgba(28,28,28,.95);
+  border-radius: 8px;
+  padding: 8px 0;
+  min-width: 120px;
+  box-shadow: 0 4px 20px rgba(0,0,0,.4);
+  z-index: 30;
+  margin-bottom: 8px;
+}
+
+.player-quality__option{
+  display: block;
+  width: 100%;
+  padding: 10px 20px;
+  background: transparent;
+  border: none;
+  color: #fff;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease;
+  font-family: inherit;
+}
+
+.player-quality__option:hover{
+  background: rgba(255,255,255,.1);
+}
+
+.player-quality__option--active{
+  background: rgba(255,255,255,.15);
+  font-weight: 600;
+}
+
+.player-quality__option--active::before{
+  content: "✓ ";
+}

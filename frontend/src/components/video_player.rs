@@ -292,6 +292,28 @@ pub struct SubtitleTracksResponse {
     pub tracks: Vec<SubtitleTrack>,
 }
 
+// ── Quality Level Info ───────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct QualityLevel {
+    pub index: usize,
+    pub name: String,
+    pub bitrate: u64,
+    pub resolution: Option<(u32, u32)>,
+}
+
+impl QualityLevel {
+    pub fn display_name(&self) -> String {
+        if let Some((_, height)) = self.resolution {
+            format!("{}p", height)
+        } else if self.bitrate > 0 {
+            format!("{}kbps", self.bitrate / 1000)
+        } else {
+            self.name.clone()
+        }
+    }
+}
+
 // ── Component ────────────────────────────────────────────────────────────────
 
 #[derive(Properties, PartialEq)]
@@ -365,6 +387,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let subtitle_tracks = use_state(|| Vec::<SubtitleTrack>::new());
     let active_subtitle = use_state(|| Option::<u32>::None); // index of active subtitle, None = off
     let captions_menu_open = use_state(|| false);
+
+    // Quality level state for adaptive streaming
+    let quality_levels = use_state(|| Vec::<QualityLevel>::new());
+    let current_quality = use_state(|| -1_i32); // -1 = auto, otherwise level index
+    let quality_menu_open = use_state(|| false);
+    #[allow(unused_variables)]
+    let bandwidth_estimate = use_state(|| 0_u64); // bits per second (used for ABR display)
 
     // Run the MSE player logic
     {
@@ -906,14 +935,42 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
-    // Settings toggle
-    let on_settings_toggle = {
+    // Quality menu toggle
+    let on_quality_toggle = {
+        let quality_menu_open = quality_menu_open.clone();
         let settings_open = settings_open.clone();
         let speed_menu_open = speed_menu_open.clone();
         Callback::from(move |e: MouseEvent| {
             e.stop_propagation();
+            quality_menu_open.set(!*quality_menu_open);
+            settings_open.set(false);
+            speed_menu_open.set(false);
+        })
+    };
+
+    // Quality selection
+    let on_quality_select = {
+        let current_quality = current_quality.clone();
+        let quality_menu_open = quality_menu_open.clone();
+        Callback::from(move |level: i32| {
+            current_quality.set(level);
+            quality_menu_open.set(false);
+            // Note: Actual quality switching would be handled by the HLS controller
+            // For now, this just updates the UI state
+            log::info!("Quality level selected: {}", if level < 0 { "Auto".to_string() } else { format!("{}", level) });
+        })
+    };
+
+    // Settings toggle
+    let on_settings_toggle = {
+        let settings_open = settings_open.clone();
+        let speed_menu_open = speed_menu_open.clone();
+        let quality_menu_open = quality_menu_open.clone();
+        Callback::from(move |e: MouseEvent| {
+            e.stop_propagation();
             settings_open.set(!*settings_open);
             speed_menu_open.set(false);
+            quality_menu_open.set(false);
         })
     };
 
@@ -921,9 +978,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let on_container_click = {
         let settings_open = settings_open.clone();
         let speed_menu_open = speed_menu_open.clone();
+        let quality_menu_open = quality_menu_open.clone();
         Callback::from(move |_: MouseEvent| {
             settings_open.set(false);
             speed_menu_open.set(false);
+            quality_menu_open.set(false);
         })
     };
 
@@ -1595,6 +1654,53 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             </div>
                         }
 
+                        // Quality selector button
+                        <div class="player-quality">
+                            <button
+                                class="player-controls__btn player-controls__btn--text"
+                                onclick={on_quality_toggle}
+                                title="Quality"
+                            >
+                                { if *current_quality < 0 { "Auto".to_string() } else { 
+                                    quality_levels.get(*current_quality as usize)
+                                        .map(|l| l.display_name())
+                                        .unwrap_or_else(|| "Auto".to_string())
+                                }}
+                            </button>
+                            if *quality_menu_open {
+                                <div class="player-quality__menu">
+                                    <button
+                                        class={if *current_quality < 0 { "player-quality__option player-quality__option--active" } else { "player-quality__option" }}
+                                        onclick={Callback::from({
+                                            let on_select = on_quality_select.clone();
+                                            move |e: MouseEvent| {
+                                                e.stop_propagation();
+                                                on_select.emit(-1);
+                                            }
+                                        })}
+                                    >
+                                        { "Auto" }
+                                    </button>
+                                    { for quality_levels.iter().enumerate().map(|(i, level)| {
+                                        let on_select = on_quality_select.clone();
+                                        let is_active = *current_quality == i as i32;
+                                        let level_clone = level.clone();
+                                        html! {
+                                            <button
+                                                class={if is_active { "player-quality__option player-quality__option--active" } else { "player-quality__option" }}
+                                                onclick={Callback::from(move |e: MouseEvent| {
+                                                    e.stop_propagation();
+                                                    on_select.emit(i as i32);
+                                                })}
+                                            >
+                                                { level_clone.display_name() }
+                                            </button>
+                                        }
+                                    })}
+                                </div>
+                            }
+                        </div>
+
                         // Settings button
                         <div class="player-settings">
                             <button
@@ -1608,7 +1714,15 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 <div class="player-settings__menu">
                                     <div class="player-settings__item">
                                         <span>{ "Quality" }</span>
-                                        <span class="player-settings__value">{ "Auto" }</span>
+                                        <span class="player-settings__value">{ 
+                                            if *current_quality < 0 { 
+                                                "Auto".to_string() 
+                                            } else { 
+                                                quality_levels.get(*current_quality as usize)
+                                                    .map(|l| l.display_name())
+                                                    .unwrap_or_else(|| "Auto".to_string())
+                                            }
+                                        }</span>
                                     </div>
                                     <div class="player-settings__item">
                                         <span>{ "Speed" }</span>

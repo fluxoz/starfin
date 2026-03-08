@@ -138,6 +138,22 @@ fn time_to_segment_index(time: f64, total_segments: usize) -> usize {
     index.min(total_segments.saturating_sub(1))
 }
 
+/// Check if a specific segment is actually buffered in the video element.
+/// A segment is considered buffered if its start time falls within any buffered range.
+fn is_segment_buffered(video: &HtmlVideoElement, segment_index: usize) -> bool {
+    let segment_start = segment_index as f64 * SEGMENT_DURATION;
+    let buffered = video.buffered();
+    for i in 0..buffered.length() {
+        if let (Ok(start), Ok(end)) = (buffered.start(i), buffered.end(i)) {
+            // Check if the segment start time is within this buffered range
+            if segment_start >= start && segment_start < end {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Remove buffered data that is more than `BUFFER_BEHIND_SECONDS` behind the
 /// current playback position. This frees up buffer space for new segments.
 async fn remove_old_buffer(sb: &SourceBuffer, current_time: f64) -> Result<(), String> {
@@ -506,10 +522,6 @@ impl BufferState {
         self.loaded_segments.insert(index);
     }
 
-    fn is_loaded(&self, index: usize) -> bool {
-        self.loaded_segments.contains(&index)
-    }
-
     fn all_loaded(&self) -> bool {
         self.loaded_segments.len() >= self.total_segments
     }
@@ -635,11 +647,14 @@ async fn run_player(
                     break;
                 }
                 
-                let mut state = buffer_state.borrow_mut();
-                if state.is_loaded(seg_idx) {
+                // Check if segment is actually in the buffer - this handles the case
+                // where a user seeks to a position that was previously loaded but has
+                // since been evicted from the buffer by remove_old_buffer.
+                if is_segment_buffered(&video, seg_idx) {
                     continue;
                 }
                 
+                let mut state = buffer_state.borrow_mut();
                 // Mark as loaded before dropping the borrow
                 state.mark_loaded(seg_idx);
                 drop(state);

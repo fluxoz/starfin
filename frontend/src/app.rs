@@ -17,6 +17,9 @@ pub fn app() -> Html {
     let loading = use_state(|| false);
     let error = use_state(|| Option::<String>::None);
     let selected = use_state(|| Option::<Element>::None);
+    
+    // Dark mode state
+    let dark_mode = use_state(|| false);
 
     // Fetch on load and whenever query/filters/sort changes
     {
@@ -72,13 +75,17 @@ pub fn app() -> Html {
         let selected = selected.clone();
         Callback::from(move |_| selected.set(None))
     };
+    
+    let on_toggle_dark_mode = {
+        let dark_mode = dark_mode.clone();
+        Callback::from(move |_| dark_mode.set(!*dark_mode))
+    };
+    
+    let app_class = if *dark_mode { "app dark-mode" } else { "app" };
 
     html! {
         <>
-            // Dark mode toggle (CSS-only using checkbox hack)
-            <input type="checkbox" id="dark-mode-toggle" class="dark-mode-toggle" />
-            
-            <div class="app">
+            <div class={app_class}>
                 // Left sidebar with Starfin branding
                 <aside class="sidebar">
                     <div class="sidebar__logo">{ "STARFIN" }</div>
@@ -100,10 +107,10 @@ pub fn app() -> Html {
                         <div class="topbar__left">{ "STARFIN MEDIA SERVER" }</div>
                         <div class="topbar__center">{ "PERSONAL VIDEO LIBRARY" }</div>
                         <div class="topbar__right">
-                            <label for="dark-mode-toggle" class="theme-toggle">
-                                <span class="theme-toggle__switch"></span>
+                            <div class="theme-toggle" onclick={on_toggle_dark_mode.clone()}>
+                                <span class={if *dark_mode { "theme-toggle__switch active" } else { "theme-toggle__switch" }}></span>
                                 <span class="theme-toggle__label">{ "THEME" }</span>
-                            </label>
+                            </div>
                         </div>
                     </div>
 

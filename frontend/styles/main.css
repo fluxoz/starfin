@@ -13,13 +13,8 @@
   --shadow: 0 2px 4px rgba(0,0,0,.2);
 }
 
-/* Dark mode checkbox (hidden) */
-.dark-mode-toggle {
-  display: none;
-}
-
-/* Dark mode theme - target .app specifically for better performance */
-.dark-mode-toggle:checked ~ .app {
+/* Dark mode theme */
+.app.dark-mode {
   --bg: #1a1a1a;
   --panel: rgba(255,255,255,.03);
   --panel-2: rgba(255,255,255,.06);
@@ -32,46 +27,46 @@
   --shadow: 0 2px 8px rgba(0,0,0,.5);
 }
 
-.dark-mode-toggle:checked ~ .app .sidebar {
+.app.dark-mode .sidebar {
   background: #ff6b35;
 }
 
-.dark-mode-toggle:checked ~ .app .topbar {
+.app.dark-mode .topbar {
   background: #2a2a2a;
   border-bottom: 2px solid rgba(255,255,255,.2);
 }
 
-.dark-mode-toggle:checked ~ .app .topbar__inner {
+.app.dark-mode .topbar__inner {
   color: var(--text);
 }
 
-.dark-mode-toggle:checked ~ .app .card {
+.app.dark-mode .card {
   background: rgba(255,255,255,.08);
   border-color: rgba(255,255,255,.2);
 }
 
-.dark-mode-toggle:checked ~ .app .card__subtitle {
+.app.dark-mode .card__subtitle {
   color: rgba(255,255,255,.7);
 }
 
-.dark-mode-toggle:checked ~ .app .input,
-.dark-mode-toggle:checked ~ .app .select {
+.app.dark-mode .input,
+.app.dark-mode .select {
   background: rgba(255,255,255,.08);
   border-color: rgba(255,255,255,.2);
   color: var(--text);
 }
 
-.dark-mode-toggle:checked ~ .app .chip {
+.app.dark-mode .chip {
   background: rgba(255,255,255,.08);
   border-color: rgba(255,255,255,.2);
 }
 
-.dark-mode-toggle:checked ~ .app .notice {
+.app.dark-mode .notice {
   background: rgba(255,255,255,.08);
   border-color: rgba(255,255,255,.2);
 }
 
-.dark-mode-toggle:checked ~ .app .empty {
+.app.dark-mode .empty {
   background: rgba(255,255,255,.05);
 }
 
@@ -93,6 +88,8 @@ body{
   grid-template-areas: 
     "sidebar header"
     "sidebar main";
+  background: var(--bg);
+  transition: background 0.3s ease;
 }
 
 @media (max-width: 640px){
@@ -209,6 +206,7 @@ body{
   display: inline-block;
   width: 50px;
   height: 24px;
+  cursor: pointer;
 }
 
 .theme-toggle__switch{
@@ -237,12 +235,12 @@ body{
   box-shadow: 0 1px 3px rgba(0,0,0,.3);
 }
 
-.dark-mode-toggle:checked ~ .app .theme-toggle__switch{
+.theme-toggle__switch.active{
   background: var(--accent);
   border-color: var(--accent);
 }
 
-.dark-mode-toggle:checked ~ .app .theme-toggle__switch::before{
+.theme-toggle__switch.active::before{
   transform: translateX(26px);
 }
 

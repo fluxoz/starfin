@@ -748,7 +748,7 @@ body{
   display: flex;
   flex-direction: column;
   background: linear-gradient(to top, rgba(0,0,0,.9) 0%, rgba(0,0,0,.6) 60%, transparent 100%);
-  padding: 40px 12px 12px;
+  padding: 40px 12px 20px;
   transition: opacity 0.3s ease, transform 0.3s ease;
   z-index: 10;
 }
@@ -891,11 +891,13 @@ body{
   background: transparent;
   color: #fff;
   font-size: 18px;
+  line-height: 1;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  overflow: visible;
   transition: background 0.15s ease;
 }
 

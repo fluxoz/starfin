@@ -262,8 +262,8 @@ async fn get_playlist(
 
         // Transcode to fragmented-MP4 HLS (MSE-compatible in all modern browsers).
         // -profile:v baseline  → codec string "avc1.42E01E" – the most compatible H.264 variant.
-        // NOTE: ffmpeg -hls_fmp4_init_filename and -hls_segment_filename expect RELATIVE paths
-        // (relative to the output playlist directory), not absolute paths.
+        // When the playlist path is absolute, ffmpeg writes init/segment files
+        // in the same directory as the playlist.
         let init_file = "init.mp4";
         let seg_pattern = "seg_%05d.m4s";
 
@@ -271,9 +271,12 @@ async fn get_playlist(
             Some(s) => s.to_owned(),
             None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
         };
+        let playlist_str = match playlist_path.to_str() {
+            Some(s) => s.to_owned(),
+            None => return HttpResponse::InternalServerError().body("cache path is not valid UTF-8"),
+        };
 
-        let status = Command::new("ffmpeg")
-            .current_dir(&hls_dir)
+        let output = Command::new("ffmpeg")
             .args([
                 "-y",
                 "-i",
@@ -298,13 +301,26 @@ async fn get_playlist(
                 init_file,
                 "-hls_segment_filename",
                 seg_pattern,
-                "playlist.m3u8",
+                &playlist_str,
             ])
-            .status()
+            .output()
             .await;
 
-        if status.map(|s| !s.success()).unwrap_or(true) {
-            return HttpResponse::ServiceUnavailable().body("transcoding failed");
+        match output {
+            Ok(out) if out.status.success() => {
+                // Transcoding succeeded
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!("ffmpeg failed: {}", stderr);
+                return HttpResponse::ServiceUnavailable()
+                    .body(format!("transcoding failed: {}", stderr.lines().last().unwrap_or("unknown error")));
+            }
+            Err(e) => {
+                eprintln!("failed to execute ffmpeg: {}", e);
+                return HttpResponse::ServiceUnavailable()
+                    .body(format!("failed to execute ffmpeg: {}", e));
+            }
         }
     }
 

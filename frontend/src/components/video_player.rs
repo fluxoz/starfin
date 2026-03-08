@@ -1,4 +1,5 @@
 use gloo_net::http::Request;
+use gloo_timers::callback::Interval;
 use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, Function, Promise, Uint8Array};
 use std::cell::RefCell;
@@ -6,7 +7,7 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
-use web_sys::{HtmlVideoElement, MediaSource, SourceBuffer};
+use web_sys::{HtmlVideoElement, MediaSource, MouseEvent, SourceBuffer};
 use yew::prelude::*;
 
 // ── Buffer management constants ──────────────────────────────────────────────
@@ -90,6 +91,22 @@ fn parse_m3u8(text: &str) -> (Option<String>, Vec<String>) {
         }
     }
     (init_uri, segs)
+}
+
+/// Format a time in seconds as MM:SS or HH:MM:SS.
+fn format_time(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "0:00".to_string();
+    }
+    let total_secs = seconds as u64;
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}:{mins:02}:{secs:02}")
+    } else {
+        format!("{mins}:{secs:02}")
+    }
 }
 
 /// Get the end time of the buffered data at the current playback position.
@@ -304,10 +321,18 @@ pub struct VideoPlayerProps {
 #[function_component(VideoPlayer)]
 pub fn video_player(props: &VideoPlayerProps) -> Html {
     let video_ref = use_node_ref();
+    let progress_ref = use_node_ref();
     // Human-readable status shown while buffering.
     let status = use_state(|| "Preparing stream…".to_string());
     let error = use_state(|| Option::<String>::None);
+    
+    // Playback state for custom controls
+    let current_time = use_state(|| 0.0_f64);
+    let duration = use_state(|| 0.0_f64);
+    let buffered_end = use_state(|| 0.0_f64);
+    let is_playing = use_state(|| false);
 
+    // Effect to run the player logic
     {
         let video_ref = video_ref.clone();
         let video_id = props.video_id.clone();
@@ -324,8 +349,83 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         });
     }
 
+    // Effect to update time/duration state periodically
+    {
+        let video_ref = video_ref.clone();
+        let current_time = current_time.clone();
+        let duration = duration.clone();
+        let buffered_end = buffered_end.clone();
+        let is_playing = is_playing.clone();
+
+        use_effect_with(video_ref.clone(), move |video_ref| {
+            let video_ref = video_ref.clone();
+            let interval = Interval::new(250, move || {
+                if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
+                    current_time.set(video.current_time());
+                    let dur = video.duration();
+                    if dur.is_finite() && dur > 0.0 {
+                        duration.set(dur);
+                    }
+                    buffered_end.set(get_buffer_end(&video));
+                    is_playing.set(!video.paused());
+                }
+            });
+            move || drop(interval)
+        });
+    }
+
     let on_close = props.on_close.clone();
     let title = props.title.clone();
+
+    // Play/pause toggle
+    let on_play_pause = {
+        let video_ref = video_ref.clone();
+        Callback::from(move |_| {
+            if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
+                if video.paused() {
+                    let _ = video.play();
+                } else {
+                    let _ = video.pause();
+                }
+            }
+        })
+    };
+
+    // Seek on progress bar click
+    let on_progress_click = {
+        let video_ref = video_ref.clone();
+        let progress_ref = progress_ref.clone();
+        let duration = *duration;
+        Callback::from(move |e: MouseEvent| {
+            if let Some(progress_el) = progress_ref.cast::<web_sys::HtmlElement>() {
+                if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
+                    let rect = progress_el.get_bounding_client_rect();
+                    let click_x = e.client_x() as f64 - rect.left();
+                    let width = rect.width();
+                    if width > 0.0 && duration > 0.0 {
+                        let seek_ratio = (click_x / width).clamp(0.0, 1.0);
+                        let seek_time = seek_ratio * duration;
+                        video.set_current_time(seek_time);
+                    }
+                }
+            }
+        })
+    };
+
+    // Calculate progress percentages
+    let progress_percent = if *duration > 0.0 {
+        (*current_time / *duration * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+    let buffered_percent = if *duration > 0.0 {
+        (*buffered_end / *duration * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+
+    let time_display = format!("{} / {}", format_time(*current_time), format_time(*duration));
+    let play_pause_label = if *is_playing { "⏸" } else { "▶" };
 
     html! {
         <div class="player-overlay">
@@ -352,9 +452,34 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
             <video
                 ref={video_ref}
-                controls={true}
                 class="video-el"
             />
+
+            // Custom controls bar
+            <div class="player-controls">
+                <button class="player-controls__btn" onclick={on_play_pause}>
+                    { play_pause_label }
+                </button>
+                <div 
+                    ref={progress_ref}
+                    class="player-progress"
+                    onclick={on_progress_click}
+                >
+                    <div 
+                        class="player-progress__buffered"
+                        style={format!("width: {}%", buffered_percent)}
+                    />
+                    <div 
+                        class="player-progress__played"
+                        style={format!("width: {}%", progress_percent)}
+                    />
+                    <div 
+                        class="player-progress__thumb"
+                        style={format!("left: {}%", progress_percent)}
+                    />
+                </div>
+                <span class="player-controls__time">{ time_display }</span>
+            </div>
         </div>
     }
 }

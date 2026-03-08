@@ -25,6 +25,9 @@ const MIN_BUFFER_AHEAD: f64 = 10.0;
 /// Duration of each segment in seconds (matches backend ffmpeg -hls_time setting).
 const SEGMENT_DURATION: f64 = 6.0;
 
+/// How often (in milliseconds) to check buffer status and load new segments.
+const BUFFER_CHECK_INTERVAL_MS: u32 = 500;
+
 // ── Low-level helpers ────────────────────────────────────────────────────────
 
 /// Returns a [`JsFuture`] that resolves the next time `event` fires on a
@@ -267,7 +270,9 @@ async fn try_append_segment(sb: &SourceBuffer, data: &[u8]) -> Result<(), (Strin
     });
     let error_p = Promise::new(&mut |_: Function, reject: Function| {
         let cb = Closure::once_into_js(move || {
-            reject.call0(&JsValue::NULL).ok();
+            // Reject with an error indicator - the actual error details are
+            // available on the SourceBuffer/MediaSource error properties
+            reject.call1(&JsValue::NULL, &JsValue::from_str("SourceBuffer error event")).ok();
         });
         sb.set_onerror(Some(cb.unchecked_ref()));
     });
@@ -528,6 +533,6 @@ async fn run_player(
         
         // Small delay before checking buffer status again
         // This prevents busy-waiting while still being responsive
-        TimeoutFuture::new(500).await;
+        TimeoutFuture::new(BUFFER_CHECK_INTERVAL_MS).await;
     }
 }

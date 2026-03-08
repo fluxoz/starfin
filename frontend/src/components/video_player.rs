@@ -1,5 +1,5 @@
 use gloo_net::http::Request;
-use js_sys::{Function, Promise, Uint8Array};
+use js_sys::{Array, Function, Promise, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
@@ -35,11 +35,17 @@ fn updateend_future(sb: &SourceBuffer) -> JsFuture {
 }
 
 /// Fetch raw bytes from a URL via the browser's native fetch.
+/// Returns an error if the request fails **or** the server responds with a
+/// non-2xx status code (so that 404 / 5xx error bodies are never mistaken
+/// for valid segment data).
 async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     let resp = Request::get(url)
         .send()
         .await
         .map_err(|e| format!("fetch error: {e:?}"))?;
+    if !resp.ok() {
+        return Err(format!("HTTP {} for {url}", resp.status()));
+    }
     resp.binary().await.map_err(|e| format!("binary error: {e:?}"))
 }
 
@@ -64,21 +70,58 @@ fn parse_m3u8(text: &str) -> (Option<String>, Vec<String>) {
     (init_uri, segs)
 }
 
-/// Arm the `updateend` future, then call `appendBuffer`.  Awaiting the
-/// returned future blocks until the SourceBuffer finishes processing.
+/// Arm both the `updateend` (success) and `error` (failure) futures, then
+/// call `appendBuffer`.  Awaiting the returned future blocks until the
+/// SourceBuffer finishes processing.
+///
+/// Using `Promise.race` between the two event handlers means that a
+/// SourceBuffer decode error is surfaced immediately as an `Err` rather than
+/// being silently swallowed.  Without this, a decode error fires `error` then
+/// `updateend`; the old code would see `updateend` and return `Ok(())`, never
+/// detecting the failure.  On Chromium-based browsers a decode error also
+/// triggers an internal `endOfStream("decode")` call which transitions the
+/// `MediaSource` to `"ended"`, causing the *next* `appendBuffer` to throw
+/// `InvalidStateError`.
 async fn append_segment(sb: &SourceBuffer, data: &[u8]) -> Result<(), String> {
     // If the SourceBuffer is currently updating, wait for it to finish.
-    if sb.updating() {
-        let wait_update = updateend_future(sb);
-        wait_update.await.map_err(|e| format!("waiting for update: {e:?}"))?;
+    while sb.updating() {
+        updateend_future(sb)
+            .await
+            .map_err(|e| format!("waiting for update: {e:?}"))?;
     }
-    
-    // Register the listener *before* appending so it cannot fire and be missed.
-    let waiter = updateend_future(sb);
+
+    // Register *both* listeners before calling appendBuffer so neither event
+    // can be missed.
+    //   • updateend_p resolves → append succeeded
+    //   • error_p   rejects  → SourceBuffer decode error
+    let updateend_p = Promise::new(&mut |resolve: Function, _: Function| {
+        let cb = Closure::once_into_js(move || {
+            resolve.call0(&JsValue::NULL).ok();
+        });
+        sb.set_onupdateend(Some(cb.unchecked_ref()));
+    });
+    let error_p = Promise::new(&mut |_: Function, reject: Function| {
+        let cb = Closure::once_into_js(move || {
+            reject.call0(&JsValue::NULL).ok();
+        });
+        sb.set_onerror(Some(cb.unchecked_ref()));
+    });
+    let race = Promise::race(&Array::of2(updateend_p.as_ref(), error_p.as_ref()));
+
     let arr = Uint8Array::from(data);
-    sb.append_buffer_with_array_buffer_view(arr.unchecked_ref())
-        .map_err(|e| format!("appendBuffer: {e:?}"))?;
-    waiter.await.map_err(|e| format!("updateend: {e:?}"))?;
+    if let Err(e) = sb.append_buffer_with_array_buffer_view(arr.unchecked_ref()) {
+        // appendBuffer threw synchronously (e.g. InvalidStateError because the
+        // MediaSource is no longer open).  Clear both handlers before returning.
+        sb.set_onupdateend(None);
+        sb.set_onerror(None);
+        return Err(format!("appendBuffer: {e:?}"));
+    }
+
+    let result = JsFuture::from(race).await;
+    // Clean up whichever handler did not fire.
+    sb.set_onupdateend(None);
+    sb.set_onerror(None);
+    result.map_err(|e| format!("SourceBuffer decode error: {e:?}"))?;
     Ok(())
 }
 

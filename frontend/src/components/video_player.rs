@@ -365,6 +365,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // Drag state for progress bar scrubbing
     let is_dragging = use_state(|| false);
     let drag_time = use_state(|| 0.0_f64);
+    // Track if we just finished dragging (to prevent click from firing after drag)
+    let just_dragged = use_state(|| false);
 
     // Effect to run the player logic
     {
@@ -476,6 +478,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let drag_time = drag_time.clone();
         let current_time = current_time.clone();
         let duration_state = duration.clone();
+        let just_dragged = just_dragged.clone();
 
         use_effect_with(is_dragging.clone(), move |is_dragging| {
             // Store event listeners in RefCell so we can clean them up
@@ -491,6 +494,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 let video_ref_up = video_ref.clone();
                 let progress_ref_move = progress_ref.clone();
                 let duration_state_move = duration_state.clone();
+                let just_dragged_up = just_dragged.clone();
 
                 // Mousemove handler - update drag position
                 let on_mousemove = Closure::<dyn Fn(MouseEvent)>::new(move |e: MouseEvent| {
@@ -517,6 +521,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         return;
                     }
                     is_dragging_up.set(false);
+                    just_dragged_up.set(true);
                     let seek_time = *drag_time_up;
                     if let Some(video) = video_ref_up.cast::<HtmlVideoElement>() {
                         video.set_current_time(seek_time);
@@ -562,10 +567,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let on_progress_click = {
         let video_ref = video_ref.clone();
         let progress_ref = progress_ref.clone();
-        let is_dragging = is_dragging.clone();
+        let just_dragged = just_dragged.clone();
         Callback::from(move |e: MouseEvent| {
             // Don't handle click if we just finished dragging
-            if *is_dragging {
+            if *just_dragged {
+                just_dragged.set(false);
                 return;
             }
             if let Some(progress_el) = progress_ref.cast::<web_sys::HtmlElement>() {

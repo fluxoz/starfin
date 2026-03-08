@@ -111,7 +111,7 @@ pub fn app() -> Html {
                                 class="theme-toggle" 
                                 onclick={on_toggle_dark_mode.clone()}
                                 aria-label={if *dark_mode { "Switch to light mode" } else { "Switch to dark mode" }}
-                                aria-pressed={if *dark_mode { "true" } else { "false" }}
+                                aria-pressed={dark_mode.to_string()}
                             >
                                 <span class={if *dark_mode { "theme-toggle__switch active" } else { "theme-toggle__switch" }}></span>
                                 <span class="theme-toggle__label">{ "THEME" }</span>

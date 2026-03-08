@@ -252,7 +252,6 @@ async fn get_playlist(
     };
 
     let hls_dir = state.cache_dir.join(id.as_str());
-    println!("HLS_DIR: {:?}", hls_dir);
     let playlist_path = hls_dir.join("playlist.m3u8");
 
     if !playlist_path.exists() {
@@ -261,30 +260,32 @@ async fn get_playlist(
                 .body(format!("cache dir error: {e}"));
         }
 
-        // Transcode to fragmented-MP4 HLS (MSE-compatible in all modern browsers).
-        // -profile:v baseline  → codec string "avc1.42E01E" – the most compatible H.264 variant.
-        // Use absolute paths for init file and segment pattern so ffmpeg writes to cache dir.
-        let init_path = hls_dir.join("init.mp4");
-        let seg_pattern_path = hls_dir.join("seg_%05d.m4s");
-
-        let abs_str = match abs_path.to_str() {
+        // Canonicalize to an absolute path so ffmpeg can locate the source file
+        // even after we change its working directory to hls_dir.
+        let resolved_path = match abs_path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return HttpResponse::InternalServerError()
+                    .body(format!("failed to resolve video path: {e}"))
+            }
+        };
+        let abs_str = match resolved_path.to_str() {
             Some(s) => s.to_owned(),
             None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
         };
-        let playlist_str = match playlist_path.to_str() {
-            Some(s) => s.to_owned(),
-            None => return HttpResponse::InternalServerError().body("cache path is not valid UTF-8"),
-        };
-        let init_str = match init_path.to_str() {
-            Some(s) => s.to_owned(),
-            None => return HttpResponse::InternalServerError().body("init path is not valid UTF-8"),
-        };
-        let seg_pattern_str = match seg_pattern_path.to_str() {
-            Some(s) => s.to_owned(),
-            None => return HttpResponse::InternalServerError().body("segment pattern path is not valid UTF-8"),
-        };
 
+        // Transcode to fragmented-MP4 HLS (MSE-compatible in all modern browsers).
+        // -profile:v baseline  → codec string "avc1.42E01E" – the most compatible H.264 variant.
+        //
+        // Run ffmpeg with hls_dir as the working directory and use bare filenames for
+        // -hls_fmp4_init_filename and -hls_segment_filename.  This ensures all output
+        // files land in hls_dir and the playlist contains plain filenames (e.g.
+        // "init.mp4", "seg_00000.m4s") that the rewriting step below can handle
+        // correctly.  Passing full paths to -hls_fmp4_init_filename causes ffmpeg to
+        // interpret them relative to the playlist directory, producing a nested path
+        // that does not exist and failing with "Failed to open segment".
         let output = Command::new("ffmpeg")
+            .current_dir(&hls_dir)
             .args([
                 "-y",
                 "-i",
@@ -306,10 +307,10 @@ async fn get_playlist(
                 "-hls_list_size",
                 "0",
                 "-hls_fmp4_init_filename",
-                &init_str,
+                "init.mp4",
                 "-hls_segment_filename",
-                &seg_pattern_str,
-                &playlist_str,
+                "seg_%05d.m4s",
+                "playlist.m3u8",
             ])
             .output()
             .await;
@@ -450,12 +451,10 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or(8089);
 
     let library_path = PathBuf::from(
-        std::env::var("VIDEO_LIBRARY_PATH").unwrap_or_else(|_| "./videos".into()),
+        std::env::var("VIDEO_LIBRARY_PATH").unwrap_or_else(|_| "./test_videos".into()),
     );
 
-    // let cache_dir = std::env::temp_dir().join("starfin_cache");
     let cache_dir = PathBuf::new().join("starfin_cache");
-    println!("CACHE DIR: {:?}", cache_dir);
 
     if !library_path.exists() {
         std::fs::create_dir_all(&library_path)?;

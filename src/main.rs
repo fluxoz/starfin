@@ -1217,7 +1217,7 @@ async fn generate_sprite(id: &str, abs_path: &Path, cache_dir: &Path) -> bool {
     // file is fully written.  An interrupted or failed ffmpeg run would
     // otherwise leave a partial `sprite.jpg` that the status check would
     // mistake for a completed sprite.
-    let tmp_path = sprite_dir.join("sprite.jpg.tmp");
+    let tmp_path = sprite_dir.join("sprite.tmp.jpg");
     let tmp_path_str = match tmp_path.to_str() {
         Some(s) => s.to_owned(),
         None => return false,

@@ -86,6 +86,9 @@ extern "C" {
     #[wasm_bindgen(constructor, js_class = "Hls")]
     fn new() -> HlsJs;
 
+    #[wasm_bindgen(constructor, js_class = "Hls")]
+    fn new_with_config(config: &JsValue) -> HlsJs;
+
     #[wasm_bindgen(method, js_class = "Hls", js_name = loadSource)]
     fn load_source(this: &HlsJs, url: &str);
 
@@ -97,6 +100,12 @@ extern "C" {
 
     #[wasm_bindgen(method, js_class = "Hls")]
     fn on(this: &HlsJs, event: &str, callback: &Function);
+
+    #[wasm_bindgen(method, js_class = "Hls", js_name = recoverMediaError)]
+    fn recover_media_error(this: &HlsJs);
+
+    #[wasm_bindgen(method, js_class = "Hls", js_name = startLoad)]
+    fn start_load(this: &HlsJs, start_position: f64);
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -264,8 +273,20 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     return;
                 }
 
-                // Create HLS.js instance
-                let hls = HlsJs::new();
+                // Create HLS.js instance with configuration
+                let config = js_sys::Object::new();
+                // Enable debug logs in development
+                js_sys::Reflect::set(&config, &JsValue::from_str("debug"), &JsValue::from_bool(false)).ok();
+                // Lower the max buffer length to reduce memory usage and improve seeking
+                js_sys::Reflect::set(&config, &JsValue::from_str("maxBufferLength"), &JsValue::from_f64(30.0)).ok();
+                // Reduce buffer size to avoid issues with rapid seeking
+                js_sys::Reflect::set(&config, &JsValue::from_str("maxMaxBufferLength"), &JsValue::from_f64(60.0)).ok();
+                // Enable more aggressive buffer cleanup
+                js_sys::Reflect::set(&config, &JsValue::from_str("maxBufferSize"), &JsValue::from_f64(60.0 * 1000.0 * 1000.0)).ok();
+                // Set lower liveSyncDuration to improve seeking responsiveness
+                js_sys::Reflect::set(&config, &JsValue::from_str("liveSyncDurationCount"), &JsValue::from_f64(3.0)).ok();
+
+                let hls = HlsJs::new_with_config(&config);
                 
                 // Set up event handlers
                 let status_for_manifest = status_clone.clone();
@@ -278,6 +299,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 manifest_parsed_cb.forget();
 
                 let error_for_handler = error_clone.clone();
+                // Store hls as JsValue for use in closure
+                let hls_js_value: JsValue = hls.clone().into();
                 let error_cb = Closure::wrap(Box::new(move |_event: JsValue, data: JsValue| {
                     // Get error details from data
                     let fatal = js_sys::Reflect::get(&data, &JsValue::from_str("fatal"))
@@ -285,16 +308,32 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     
+                    let error_type = js_sys::Reflect::get(&data, &JsValue::from_str("type"))
+                        .ok()
+                        .and_then(|v| v.as_string())
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    
+                    let error_details = js_sys::Reflect::get(&data, &JsValue::from_str("details"))
+                        .ok()
+                        .and_then(|v| v.as_string())
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    
                     if fatal {
-                        let error_type = js_sys::Reflect::get(&data, &JsValue::from_str("type"))
-                            .ok()
-                            .and_then(|v| v.as_string())
-                            .unwrap_or_else(|| "Unknown".to_string());
-                        
-                        error_for_handler.set(Some(format!(
-                            "HLS playback error: {}. Please try refreshing the page.",
-                            error_type
-                        )));
+                        // Try to recover from media errors
+                        if error_type == "mediaError" {
+                            log::warn!("Fatal media error detected, attempting recovery: {}", error_details);
+                            if let Ok(hls_for_recovery) = hls_js_value.clone().dyn_into::<HlsJs>() {
+                                hls_for_recovery.recover_media_error();
+                            }
+                        } else {
+                            error_for_handler.set(Some(format!(
+                                "HLS playback error: {}. Please try refreshing the page.",
+                                error_type
+                            )));
+                        }
+                    } else {
+                        // Log non-fatal errors for debugging
+                        log::debug!("Non-fatal HLS error: {} - {}", error_type, error_details);
                     }
                 }) as Box<dyn Fn(JsValue, JsValue)>);
                 hls.on("hlsError", error_cb.as_ref().unchecked_ref());

@@ -536,6 +536,10 @@ body{
   font-family: 'SymbolsNerdFontMono', monospace;
   font-size: 18px;
   line-height: 1;
+  width: 1em;
+  height: 1em;
+  transform-origin: 50% 50%;
+  box-sizing: border-box;
 }
 .processing-status--processed{
   color: #4caf50;

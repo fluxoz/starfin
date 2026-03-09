@@ -47,21 +47,23 @@ pub fn processing_status(props: &Props) -> Html {
                 class="processing-status processing-status--processed"
                 title="Fully processed"
                 aria-label="Fully processed"
-            >{ "\u{f05e0}" }</span>
+            >{ "\u{F05E0}" }</span>
         },
         Some("processing") => html! {
             <span
                 class="processing-status processing-status--processing"
                 title="Processing"
                 aria-label="Processing"
-            >{ "\u{f0453}" }</span>
+            >{ "\u{F1378}" }</span>
         },
-        Some("pending") => html! {
-            <span
-                class="processing-status processing-status--pending"
-                title="Awaiting processing"
-                aria-label="Awaiting processing"
-            >{ "\u{f0320}" }</span>
+        Some("pending") => {
+            html! {
+                <span
+                    class="processing-status processing-status--pending"
+                    title="Awaiting processing"
+                    aria-label="Awaiting processing"
+                >{ "\u{f1853}" }</span>
+            }
         },
         _ => html! {},
     }

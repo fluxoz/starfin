@@ -38,6 +38,29 @@ pub struct ProgressUpdate {
     pub sprite: SpriteProgressMsg,
 }
 
+/// Hardware acceleration info returned by `GET /api/hwaccel`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct HwAccelInfo {
+    pub label: String,
+    pub encoder: String,
+}
+
+/// Fetch the detected hardware acceleration backend from `/api/hwaccel`.
+pub async fn fetch_hwaccel() -> Result<HwAccelInfo, String> {
+    let resp = Request::get("/api/hwaccel")
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e:?}"))?;
+
+    if !resp.ok() {
+        return Err(format!("HTTP error: {}", resp.status()));
+    }
+
+    resp.json()
+        .await
+        .map_err(|e| format!("Invalid JSON: {e:?}"))
+}
+
 /// Fetch all videos from the API, then apply filtering and sorting locally.
 pub async fn fetch_elements(
     query: &str,

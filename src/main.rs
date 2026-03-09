@@ -13,6 +13,122 @@ use tokio::process::Command;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+// ── Hardware acceleration ─────────────────────────────────────────────────────
+
+/// The hardware acceleration backend detected at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HwAccel {
+    /// NVIDIA GPU via NVENC/CUDA
+    Nvidia,
+    /// AMD or Intel GPU on Linux via VAAPI
+    Vaapi,
+    /// Intel GPU via Quick Sync Video
+    Qsv,
+    /// Apple GPU via VideoToolbox (macOS)
+    VideoToolbox,
+    /// AMD GPU on Windows via AMF
+    Amf,
+    /// Pure software fallback (libx264)
+    Software,
+}
+
+impl HwAccel {
+    /// Human-readable label shown in the dashboard.
+    fn label(&self) -> &'static str {
+        match self {
+            HwAccel::Nvidia       => "NVIDIA (NVENC)",
+            HwAccel::Vaapi        => "AMD/Intel (VAAPI)",
+            HwAccel::Qsv          => "Intel (QSV)",
+            HwAccel::VideoToolbox => "Apple (VideoToolbox)",
+            HwAccel::Amf          => "AMD (AMF)",
+            HwAccel::Software     => "CPU (software)",
+        }
+    }
+
+    /// The `-c:v` encoder name to pass to ffmpeg for transcoding.
+    fn encoder(&self) -> &'static str {
+        match self {
+            HwAccel::Nvidia       => "h264_nvenc",
+            HwAccel::Vaapi        => "h264_vaapi",
+            HwAccel::Qsv          => "h264_qsv",
+            HwAccel::VideoToolbox => "h264_videotoolbox",
+            HwAccel::Amf          => "h264_amf",
+            HwAccel::Software     => "libx264",
+        }
+    }
+
+    /// Extra args to insert BEFORE `-i` for hardware-accelerated decoding.
+    fn hwaccel_decode_args(&self) -> &'static [&'static str] {
+        match self {
+            HwAccel::Nvidia => &["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"],
+            HwAccel::Vaapi  => &["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi",
+                                  "-hwaccel_device", "/dev/dri/renderD128"],
+            HwAccel::Qsv          => &["-hwaccel", "qsv"],
+            HwAccel::VideoToolbox => &["-hwaccel", "videotoolbox"],
+            HwAccel::Amf          => &["-hwaccel", "d3d11va"],
+            HwAccel::Software     => &[],
+        }
+    }
+
+    /// Extra quality/preset args appended after `-c:v <encoder>`.
+    /// For the software encoder this also includes the compatibility args
+    /// needed for broad HLS player support.
+    fn encoder_quality_args(&self) -> &'static [&'static str] {
+        match self {
+            HwAccel::Nvidia        => &["-preset", "p4", "-tune", "ll"],
+            HwAccel::Vaapi         => &["-vf", "format=nv12|vaapi,hwupload", "-profile:v", "66"],
+            HwAccel::Qsv           => &["-preset", "veryfast"],
+            HwAccel::VideoToolbox  => &["-realtime", "true"],
+            HwAccel::Amf           => &["-quality", "speed"],
+            HwAccel::Software      => &["-preset", "veryfast",
+                                        "-pix_fmt", "yuv420p",
+                                        "-profile:v", "baseline",
+                                        "-level", "3.1"],
+        }
+    }
+}
+
+/// Probe which GPU encoder is available by attempting a tiny null-transcode
+/// with each backend in priority order. Called once at startup.
+async fn detect_hwaccel() -> HwAccel {
+    let candidates: &[(&str, &[&str], HwAccel)] = &[
+        ("h264_nvenc",        &["-hwaccel", "cuda"],        HwAccel::Nvidia),
+        ("h264_vaapi",        &["-hwaccel", "vaapi",
+                                "-hwaccel_device", "/dev/dri/renderD128"], HwAccel::Vaapi),
+        ("h264_qsv",          &["-hwaccel", "qsv"],         HwAccel::Qsv),
+        ("h264_videotoolbox", &["-hwaccel", "videotoolbox"],HwAccel::VideoToolbox),
+        ("h264_amf",          &["-hwaccel", "d3d11va"],     HwAccel::Amf),
+    ];
+
+    for (encoder, hwaccel_args, variant) in candidates {
+        let mut args: Vec<&str> = Vec::new();
+        args.extend_from_slice(hwaccel_args);
+        args.extend_from_slice(&[
+            "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+            "-c:v", encoder,
+            "-f", "null", "-",
+        ]);
+
+        let ok = tokio::process::Command::new("ffmpeg")
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if ok {
+            println!("→ GPU acceleration: {} ({})", variant.label(), encoder);
+            return variant.clone();
+        }
+    }
+
+    println!("→ GPU acceleration: CPU (software fallback)");
+    HwAccel::Software
+}
+
 // ── Embedded frontend assets ─────────────────────────────────────────────────
 
 #[derive(RustEmbed)]
@@ -83,6 +199,8 @@ struct AppState {
     sprite_progress: Arc<RwLock<SpriteProgress>>,
     /// Notified to (re-)start the sprite generation batch.
     sprite_trigger: Arc<tokio::sync::Notify>,
+    /// Detected hardware acceleration backend (detected once at startup).
+    hwaccel: HwAccel,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -390,6 +508,7 @@ async fn generate_quick_thumbnail(id: &str, video_path: &Path, cache_dir: &Path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .args([
+            "-hwaccel", "auto",
             "-y", "-ss", &seek_secs, "-i", &video_str,
             "-frames:v", "1", "-q:v", "2",
             &thumb_str,
@@ -437,6 +556,8 @@ async fn generate_deep_thumbnail(id: &str, video_path: &Path, cache_dir: &Path) 
     let analysis = Command::new("ffmpeg")
         .stdin(std::process::Stdio::null())
         .args([
+            "-hwaccel",
+            "auto",
             "-ss",
             &format!("{:.3}", start),
             "-t",
@@ -474,6 +595,8 @@ async fn generate_deep_thumbnail(id: &str, video_path: &Path, cache_dir: &Path) 
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .args([
+            "-hwaccel",
+            "auto",
             "-y",
             "-ss",
             &format!("{:.3}", best_time),
@@ -911,29 +1034,36 @@ async fn get_segment(
     // - `-f mpegts` for self-contained MPEG Transport Stream output
     // - `-force_key_frames expr:gte(t,0)` to ensure segment starts with a keyframe
     let ts_offset = format!("{:.3}", start_time);
-    let output = Command::new("ffmpeg")
-        .current_dir(&hls_dir)
-        .stdin(std::process::Stdio::null())
-        .args([
-            "-y",
-            "-nostdin",
-            "-ss", &format!("{:.3}", start_time),
-            "-i", &abs_str,
-            "-t", &format!("{:.3}", SEGMENT_DURATION),
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-profile:v", "baseline",
-            "-level", "3.1",
-            "-preset", "veryfast",
-            "-force_key_frames", "expr:gte(t,0)",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-output_ts_offset", &ts_offset,
-            "-f", "mpegts",
-            &filename,
-        ])
-        .output()
-        .await;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.current_dir(&hls_dir)
+       .stdin(std::process::Stdio::null());
+
+    // Prepend GPU decode args before the input
+    for arg in state.hwaccel.hwaccel_decode_args() {
+        cmd.arg(arg);
+    }
+
+    cmd.args([
+        "-y", "-nostdin",
+        "-ss", &format!("{:.3}", start_time),
+        "-i", &abs_str,
+        "-t", &format!("{:.3}", SEGMENT_DURATION),
+    ]);
+
+    // GPU encoder
+    cmd.args(["-c:v", state.hwaccel.encoder()]);
+    cmd.args(state.hwaccel.encoder_quality_args());
+
+    cmd.args([
+        "-force_key_frames", "expr:gte(t,0)",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-output_ts_offset", &ts_offset,
+        "-f", "mpegts",
+        &filename,
+    ]);
+
+    let output = cmd.output().await;
 
     match output {
         Ok(out) if out.status.success() => {
@@ -965,6 +1095,14 @@ async fn get_segment(
 }
 
 // ── Cache management ─────────────────────────────────────────────────────────
+
+/// `GET /api/hwaccel` — returns the detected hardware acceleration backend.
+async fn get_hwaccel(state: web::Data<AppState>) -> impl Responder {
+    HttpResponse::Ok().json(serde_json::json!({
+        "label":   state.hwaccel.label(),
+        "encoder": state.hwaccel.encoder(),
+    }))
+}
 
 /// `DELETE /api/videos/{id}/cache` — clear cached segments for a video.
 ///
@@ -1223,6 +1361,8 @@ async fn generate_sprite(id: &str, abs_path: &Path, cache_dir: &Path) -> bool {
         .args([
             "-y",
             "-nostdin",
+            "-hwaccel",
+            "auto",
             "-i",
             &abs_str,
             "-vf",
@@ -1540,6 +1680,9 @@ async fn main() -> std::io::Result<()> {
     println!("→ Found {} video(s)", initial_items.len());
     let video_cache: Arc<RwLock<Vec<VideoItem>>> = Arc::new(RwLock::new(initial_items));
 
+    println!("→ Detecting GPU hardware acceleration…");
+    let hwaccel = detect_hwaccel().await;
+
     let thumb_progress = Arc::new(RwLock::new(ThumbProgress {
         current: 0,
         total: 0,
@@ -1566,6 +1709,7 @@ async fn main() -> std::io::Result<()> {
         thumb_trigger: Arc::clone(&thumb_trigger),
         sprite_progress: Arc::clone(&sprite_progress),
         sprite_trigger: Arc::clone(&sprite_trigger),
+        hwaccel,
     });
 
     // Background task: re-scan the library every 60 seconds.
@@ -1670,6 +1814,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(state.clone())
             .wrap(Logger::default())
             .route("/api/health", web::get().to(|| async { "ok" }))
+            .route("/api/hwaccel", web::get().to(get_hwaccel))
             .route("/api/scan/ws", web::get().to(scan_ws))
             .route("/api/progress/ws", web::get().to(progress_ws))
             .route("/api/thumbnails/progress", web::get().to(get_thumb_progress))

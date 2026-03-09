@@ -529,7 +529,22 @@ body{
   align-items: center;
   gap: 6px;
   font-size: 11px;
-  padding: 0 12px 8px;
+  padding: 8px 12px;
+}
+
+.card__meta-item{
+  color: var(--muted);
+  font-weight: 700;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.card__meta-item--highlight{
+  color: var(--accent);
+}
+.card__meta-sep{
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .badge{
@@ -639,9 +654,9 @@ body{
 
 /* ── Video card thumbnail ──────────────────────────────────────────────────── */
 .card__thumb{
-  height: 200px;
-  min-height: 160px;
-  max-height: 240px;
+  height: 240px;
+  min-height: 180px;
+  max-height: 280px;
   background-color: rgba(0,0,0,.1);
   background-size: cover;
   background-position: center;
@@ -652,8 +667,8 @@ body{
 
 @media (max-width: 640px){
   .card__thumb{
-    height: 160px;
-    max-height: 180px;
+    height: 180px;
+    max-height: 200px;
   }
 }
 
@@ -1269,6 +1284,7 @@ body{
   background: var(--bg);
   color: var(--text);
   font-size: 20px;
+  letter-spacing: 10px;
   font-weight: 900;
   cursor: pointer;
   display: flex;

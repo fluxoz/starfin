@@ -1179,11 +1179,21 @@ async fn generate_sprite(id: &str, abs_path: &Path, cache_dir: &Path) -> bool {
             &sprite_path_str,
         ])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
         .output()
         .await;
 
-    matches!(output, Ok(out) if out.status.success())
+    match output {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("ffmpeg sprite generation failed for {id}: {stderr}");
+            false
+        }
+        Err(e) => {
+            eprintln!("failed to execute ffmpeg for sprite {id}: {e}");
+            false
+        }
+    }
 }
 
 /// Background worker that proactively generates sprite sheets for every video.

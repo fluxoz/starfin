@@ -631,6 +631,10 @@ body{
 @keyframes card-spin{
   to{ transform: rotate(360deg); }
 }
+@media (prefers-reduced-motion: reduce){
+  .card__preview-canvas{ transition: none; }
+  .card__preview-spinner{ animation: none; }
+}
 
 /* ── Watch button variant ────────────────────────────────────────────────── */
 .btn--watch{

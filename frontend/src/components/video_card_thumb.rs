@@ -1,7 +1,7 @@
 use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
 use serde::Deserialize;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
@@ -9,6 +9,9 @@ use yew::prelude::*;
 
 /// How many milliseconds each sprite frame is shown during the hover preview.
 const FRAME_INTERVAL_MS: u32 = 500;
+
+/// Maximum number of polling iterations when waiting for the sprite image to load.
+const IMAGE_LOAD_MAX_POLLS: u32 = 200; // 200 × 50 ms = 10 s
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 struct ThumbnailInfo {
@@ -56,46 +59,62 @@ pub fn video_card_thumb(props: &VideoCardThumbProps) -> Html {
     // Whether we are currently loading the sprite (to avoid duplicate fetches).
     let loading = use_state(|| false);
 
+    // Whether loading the sprite failed.
+    let load_failed = use_state(|| false);
+
     let thumbnail_url = format!("/api/videos/{}/thumbnail", props.video_id);
 
     // ── Fetch sprite on first hover ──────────────────────────────────────────
     {
         let hovering = hovering.clone();
         let loading = loading.clone();
+        let load_failed = load_failed.clone();
         let sprite_data = sprite_data.clone();
         let sprite_loaded = sprite_loaded.clone();
         let video_id = props.video_id.clone();
 
         use_effect_with(
-            (*hovering, *sprite_loaded, *loading),
-            move |(is_hovering, is_loaded, is_loading)| {
-                if *is_hovering && !*is_loaded && !*is_loading {
+            (*hovering, *sprite_loaded, *loading, *load_failed),
+            move |(is_hovering, is_loaded, is_loading, has_failed)| {
+                if *is_hovering && !*is_loaded && !*is_loading && !*has_failed {
                     loading.set(true);
                     let sprite_data = sprite_data.clone();
                     let sprite_loaded = sprite_loaded.clone();
                     let loading = loading.clone();
+                    let load_failed = load_failed.clone();
                     spawn_local(async move {
-                        if let Ok(info) = fetch_thumbnail_info(&video_id).await {
-                            let img = web_sys::HtmlImageElement::new().unwrap();
-                            img.set_cross_origin(Some("anonymous"));
-                            img.set_src(&info.url);
+                        match fetch_thumbnail_info(&video_id).await {
+                            Ok(info) => {
+                                let img = web_sys::HtmlImageElement::new().unwrap();
+                                img.set_cross_origin(Some("anonymous"));
+                                img.set_src(&info.url);
 
-                            // Poll until the image has loaded
-                            loop {
-                                if img.complete() && img.natural_width() > 0 {
-                                    break;
+                                // Poll until the image has loaded (with timeout)
+                                let mut polls = 0_u32;
+                                loop {
+                                    if img.complete() && img.natural_width() > 0 {
+                                        break;
+                                    }
+                                    polls += 1;
+                                    if polls >= IMAGE_LOAD_MAX_POLLS {
+                                        loading.set(false);
+                                        load_failed.set(true);
+                                        return;
+                                    }
+                                    gloo_timers::future::TimeoutFuture::new(50).await;
                                 }
-                                gloo_timers::future::TimeoutFuture::new(50).await;
-                            }
 
-                            sprite_data.set(Some(Rc::new(RefCell::new(SpriteData {
-                                info,
-                                image: img,
-                            }))));
-                            sprite_loaded.set(true);
-                            loading.set(false);
-                        } else {
-                            loading.set(false);
+                                sprite_data.set(Some(Rc::new(RefCell::new(SpriteData {
+                                    info,
+                                    image: img,
+                                }))));
+                                sprite_loaded.set(true);
+                                loading.set(false);
+                            }
+                            Err(_) => {
+                                loading.set(false);
+                                load_failed.set(true);
+                            }
                         }
                     });
                 }
@@ -124,8 +143,17 @@ pub fn video_card_thumb(props: &VideoCardThumbProps) -> Html {
 
                         frame_index.set(0);
 
+                        // Use an Rc<Cell<>> counter so the interval callback
+                        // can read/write the current value without relying on
+                        // the UseStateHandle's deref (which returns the value
+                        // at the time the effect last ran).
+                        let counter = Rc::new(Cell::new(0_u32));
+                        let counter_inner = counter.clone();
+
                         _interval_guard = Some(Interval::new(FRAME_INTERVAL_MS, move || {
-                            frame_index.set((*frame_index + 1) % total_frames);
+                            let next = (counter_inner.get() + 1) % total_frames;
+                            counter_inner.set(next);
+                            frame_index.set(next);
                         }));
                     }
                 }
@@ -214,7 +242,7 @@ pub fn video_card_thumb(props: &VideoCardThumbProps) -> Html {
                 width="320"
                 height="180"
             />
-            if *hovering && !*sprite_loaded {
+            if *hovering && !*sprite_loaded && !*load_failed {
                 <div class="card__preview-loading">
                     <span class="card__preview-spinner" />
                 </div>

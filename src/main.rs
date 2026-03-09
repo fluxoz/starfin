@@ -4,10 +4,10 @@ use actix_web::{
 };
 use rust_embed::RustEmbed;
 use mime_guess::MimeGuess;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use uuid::Uuid;
@@ -35,6 +35,16 @@ struct VideoItem {
     director: String,
 }
 
+// ── Scan progress ─────────────────────────────────────────────────────────────
+
+/// Tracks the progress of the currently running library scan.
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct ScanProgress {
+    scanning: bool,
+    current: u32,
+    total: u32,
+}
+
 // ── Cache eviction constants ─────────────────────────────────────────────────
 
 /// How long a video's segments may sit in cache without a new request before
@@ -53,6 +63,8 @@ struct AppState {
     /// Tracks the last time a segment was served for each video ID.
     /// Used by the background idle-eviction sweep.
     last_segment_access: RwLock<HashMap<String, Instant>>,
+    /// Live progress of the most-recent library scan triggered via the API.
+    scan_progress: Arc<Mutex<ScanProgress>>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -131,15 +143,26 @@ async fn probe_video(path: &Path) -> (u32, FfprobeMeta) {
 
 // ── Library scanning ─────────────────────────────────────────────────────────
 
-async fn scan_library(library_path: &Path) -> Vec<VideoItem> {
+async fn scan_library(
+    library_path: &Path,
+    progress: Option<Arc<Mutex<ScanProgress>>>,
+) -> Vec<VideoItem> {
     let entries: Vec<_> = WalkDir::new(library_path)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file() && is_video(e.path()))
         .collect();
 
+    let total = entries.len() as u32;
+    if let Some(ref pg) = progress {
+        let mut pg = pg.lock().expect("scan_progress lock poisoned");
+        pg.scanning = true;
+        pg.current = 0;
+        pg.total = total;
+    }
+
     let mut items = Vec::new();
-    for entry in entries {
+    for (idx, entry) in entries.into_iter().enumerate() {
         let abs = entry.path().to_path_buf();
         let rel = abs
             .strip_prefix(library_path)
@@ -168,7 +191,17 @@ async fn scan_library(library_path: &Path) -> Vec<VideoItem> {
             duration_secs,
             director: meta.director.unwrap_or_default(),
         });
+
+        if let Some(ref pg) = progress {
+            pg.lock().expect("scan_progress lock poisoned").current = (idx + 1) as u32;
+        }
     }
+
+    if let Some(ref pg) = progress {
+        let mut pg = pg.lock().expect("scan_progress lock poisoned");
+        pg.scanning = false;
+    }
+
     items
 }
 
@@ -204,9 +237,23 @@ async fn list_videos(state: web::Data<AppState>) -> impl Responder {
 
 /// `POST /api/scan` — trigger an immediate re-scan of the media library.
 async fn scan_videos(state: web::Data<AppState>) -> impl Responder {
-    let items = scan_library(&state.library_path).await;
+    let items = scan_library(
+        &state.library_path,
+        Some(Arc::clone(&state.scan_progress)),
+    )
+    .await;
     *state.video_cache.write().expect("video cache lock poisoned") = items;
     HttpResponse::Ok().json(serde_json::json!({ "status": "ok" }))
+}
+
+/// `GET /api/scan/progress` — return the live progress of the current scan.
+async fn get_scan_progress(state: web::Data<AppState>) -> impl Responder {
+    let progress = state
+        .scan_progress
+        .lock()
+        .expect("scan_progress lock poisoned")
+        .clone();
+    HttpResponse::Ok().json(progress)
 }
 
 /// `GET /api/videos/{id}/thumbnail` — JPEG thumbnail via ffmpeg.
@@ -903,15 +950,17 @@ async fn main() -> std::io::Result<()> {
 
     // Initial library scan at startup.
     println!("→ Scanning library…");
-    let initial_items = scan_library(&library_path).await;
+    let initial_items = scan_library(&library_path, None).await;
     println!("→ Found {} video(s)", initial_items.len());
     let video_cache: Arc<RwLock<Vec<VideoItem>>> = Arc::new(RwLock::new(initial_items));
+    let scan_progress: Arc<Mutex<ScanProgress>> = Arc::new(Mutex::new(ScanProgress::default()));
 
     let state = web::Data::new(AppState {
         library_path: library_path.clone(),
         cache_dir: cache_dir.clone(),
         video_cache: Arc::clone(&video_cache),
         last_segment_access: RwLock::new(HashMap::new()),
+        scan_progress: Arc::clone(&scan_progress),
     });
 
     // Background task: re-scan the library every 60 seconds.
@@ -922,7 +971,7 @@ async fn main() -> std::io::Result<()> {
         interval.tick().await; // skip the immediate tick
         loop {
             interval.tick().await;
-            let items = scan_library(&bg_library_path).await;
+            let items = scan_library(&bg_library_path, None).await;
             *bg_cache.write().expect("video cache lock poisoned") = items;
         }
     });
@@ -985,6 +1034,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(Logger::default())
             .route("/api/health", web::get().to(|| async { "ok" }))
             .route("/api/scan", web::post().to(scan_videos))
+            .route("/api/scan/progress", web::get().to(get_scan_progress))
             .route("/api/videos", web::get().to(list_videos))
             .route("/api/videos/{id}/thumbnail", web::get().to(get_thumbnail))
             .route(

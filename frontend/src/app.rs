@@ -19,6 +19,7 @@ pub fn app() -> Html {
     let error = use_state(|| Option::<String>::None);
     let selected = use_state(|| Option::<Element>::None);
     let scanning = use_state(|| false);
+    let scan_progress = use_state(|| Option::<(u32, u32)>::None);
 
     // Dark mode state
     let dark_mode = use_state(|| false);
@@ -82,6 +83,28 @@ pub fn app() -> Html {
         });
     }
 
+    // Progress polling: while a scan is running, fetch progress every 500 ms.
+    {
+        let scan_progress = scan_progress.clone();
+        use_effect_with(*scanning, move |&is_scanning| {
+            let interval = if is_scanning {
+                let scan_progress = scan_progress.clone();
+                Some(Interval::new(500, move || {
+                    let scan_progress = scan_progress.clone();
+                    spawn_local(async move {
+                        if let Ok(p) = api::fetch_scan_progress().await {
+                            scan_progress.set(Some((p.current, p.total)));
+                        }
+                    });
+                }))
+            } else {
+                scan_progress.set(None);
+                None
+            };
+            move || drop(interval)
+        });
+    }
+
     let on_query_change = {
         let query = query.clone();
         Callback::from(move |v: String| query.set(v))
@@ -140,6 +163,16 @@ pub fn app() -> Html {
 
     let app_class = if *dark_mode { "app dark-mode" } else { "app" };
 
+    // Compute progress percentage and label for the scan progress bar.
+    let (scan_pct, scan_label) = match *scan_progress {
+        Some((current, total)) if total > 0 => (
+            (current as f64 / total as f64 * 100.0) as u32,
+            format!("{} / {} files", current, total),
+        ),
+        Some(_) => (0, "Counting files…".to_string()),
+        None => (0, String::new()),
+    };
+
     html! {
         <>
             <div class={app_class}>
@@ -163,14 +196,24 @@ pub fn app() -> Html {
                     <div class="topbar__inner">
                         <div class="topbar__left">{ "STARFIN MEDIA SERVER" }</div>
                         <div class="topbar__right">
-                            <button
-                                class={if *scanning { "scan-btn scan-btn--scanning" } else { "scan-btn" }}
-                                onclick={on_scan}
-                                disabled={*scanning}
-                                aria-label="Scan for new media"
-                            >
-                                { if *scanning { "SCANNING…" } else { "SCAN MEDIA" } }
-                            </button>
+                            <div class="scan-area">
+                                <button
+                                    class={if *scanning { "scan-btn scan-btn--scanning" } else { "scan-btn" }}
+                                    onclick={on_scan}
+                                    disabled={*scanning}
+                                    aria-label="Scan for new media"
+                                >
+                                    { if *scanning { "SCANNING…" } else { "SCAN MEDIA" } }
+                                </button>
+                                if *scanning {
+                                    <div class="scan-progress" role="progressbar" aria-label="Scan progress" aria-valuenow={scan_pct.to_string()} aria-valuemin="0" aria-valuemax="100">
+                                        <div class="scan-progress__track">
+                                            <div class="scan-progress__fill" style={format!("width: {}%", scan_pct)} />
+                                        </div>
+                                        <span class="scan-progress__label">{ &scan_label }</span>
+                                    </div>
+                                }
+                            </div>
                             <button 
                                 class="theme-toggle" 
                                 onclick={on_toggle_dark_mode.clone()}

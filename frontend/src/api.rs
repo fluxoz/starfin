@@ -7,6 +7,13 @@ struct ElementsResponse {
     items: Vec<Element>,
 }
 
+/// The live scan progress reported by the server.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ScanProgressData {
+    pub current: u32,
+    pub total: u32,
+}
+
 /// Trigger an immediate re-scan of the media library on the server.
 pub async fn trigger_scan() -> Result<(), String> {
     let resp = Request::post("/api/scan")
@@ -19,6 +26,22 @@ pub async fn trigger_scan() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Fetch the live progress of the current scan from the server.
+pub async fn fetch_scan_progress() -> Result<ScanProgressData, String> {
+    let resp = Request::get("/api/scan/progress")
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e:?}"))?;
+
+    if !resp.ok() {
+        return Err(format!("HTTP error: {}", resp.status()));
+    }
+
+    resp.json::<ScanProgressData>()
+        .await
+        .map_err(|e| format!("Invalid JSON: {e:?}"))
 }
 
 /// Fetch all videos from the API, then apply filtering and sorting locally.

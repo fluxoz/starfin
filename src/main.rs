@@ -1078,11 +1078,13 @@ async fn get_sprite_status(
 /// `GET /api/videos/{id}/processing-status` — processing status for a video.
 ///
 /// Returns one of three states:
-/// - `{"status":"processed"}` — deep analysis complete (`.deep` marker present)
-/// - `{"status":"processing"}` — quick thumbnail exists but deep pass pending
-/// - `{"status":"pending"}`   — no thumbnail at all yet
+/// - `{"status":"processed"}` — both deep thumbnail (`.deep` marker) and sprite
+///   sheet (`_thumbs/sprite.jpg`) are present for the video
+/// - `{"status":"processing"}` — not fully processed, but a background worker
+///   (thumbnail or sprite) is currently active
+/// - `{"status":"pending"}`   — not fully processed and no worker is running
 ///
-/// This is a cheap filesystem check; it never triggers any ffmpeg work.
+/// This is a cheap filesystem + lock-read check; it never triggers ffmpeg.
 async fn get_processing_status(
     id: web::Path<String>,
     state: web::Data<AppState>,
@@ -1092,14 +1094,29 @@ async fn get_processing_status(
     }
 
     let deep_marker = state.cache_dir.join(format!("{}.deep", *id));
-    let thumb_path = state.cache_dir.join(format!("{}.jpg", *id));
+    let sprite_path = state
+        .cache_dir
+        .join(format!("{}_thumbs", *id))
+        .join("sprite.jpg");
 
-    let status = if deep_marker.exists() {
+    let status = if deep_marker.exists() && sprite_path.exists() {
         "processed"
-    } else if thumb_path.exists() {
-        "processing"
     } else {
-        "pending"
+        let thumb_active = state
+            .thumb_progress
+            .read()
+            .map(|p| p.active)
+            .unwrap_or(false);
+        let sprite_active = state
+            .sprite_progress
+            .read()
+            .map(|p| p.active)
+            .unwrap_or(false);
+        if thumb_active || sprite_active {
+            "processing"
+        } else {
+            "pending"
+        }
     };
 
     HttpResponse::Ok().json(serde_json::json!({ "status": status }))

@@ -14,9 +14,9 @@ pub struct Props {
 
 /// Small badge that shows the thumbnail/processing state for a video card.
 ///
-/// - `✓` (green)  — deep analysis complete, best-quality thumbnail ready
-/// - `⟳` (amber)  — quick thumbnail done, deep pass still pending
-/// - `○` (grey)   — no thumbnail generated yet (awaiting processing)
+/// - `✓` (green)  — fully processed: deep thumbnail and sprite both complete
+/// - `⟳` (amber)  — a background worker is currently active
+/// - `○` (grey)   — awaiting processing (no worker currently running)
 #[function_component(ProcessingStatus)]
 pub fn processing_status(props: &Props) -> Html {
     let status: UseStateHandle<Option<String>> = use_state(|| None);

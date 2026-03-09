@@ -542,6 +542,10 @@ body{
 .card__meta-item--highlight{
   color: var(--accent);
 }
+.card__meta-sep{
+  color: var(--muted);
+  font-size: 11px;
+}
 
 .badge{
   font-size: 10px;

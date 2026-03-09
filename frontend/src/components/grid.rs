@@ -20,7 +20,8 @@ fn format_duration(secs: u32) -> String {
 }
 
 fn format_date(timestamp: u64) -> Option<String> {
-    DateTime::from_timestamp(timestamp as i64, 0)
+    let secs = i64::try_from(timestamp).ok()?;
+    DateTime::from_timestamp(secs, 0)
         .map(|dt| dt.format("%b %d, %Y").to_string())
 }
 
@@ -54,9 +55,15 @@ pub fn elements_grid(props: &Props) -> Html {
                                 <span class="card__meta-item card__meta-item--highlight">{ format_duration(item.duration_secs) }</span>
                             }
                             if item.year > 0 {
+                                if item.duration_secs > 0 {
+                                    <span class="card__meta-sep">{ "·" }</span>
+                                }
                                 <span class="card__meta-item">{ item.year }</span>
                             }
                             if let Some(date_str) = format_date(item.date_added) {
+                                if item.duration_secs > 0 || item.year > 0 {
+                                    <span class="card__meta-sep">{ "·" }</span>
+                                }
                                 <span class="card__meta-item">{ format!("Added {}", date_str) }</span>
                             }
                         </div>

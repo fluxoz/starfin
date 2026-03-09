@@ -571,27 +571,25 @@ async fn run_thumb_worker(
 
         // ── Phase 1: quick thumbnails ─────────────────────────────────────
 
-        let quick_entries: Vec<_> = WalkDir::new(&library_path)
+        let (quick_done, quick_entries): (Vec<_>, Vec<_>) = WalkDir::new(&library_path)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file() && is_video(e.path()))
-            .filter(|e| {
+            .partition(|e| {
                 let abs = e.path();
                 let rel = abs
                     .strip_prefix(&library_path)
                     .unwrap_or(abs)
                     .to_string_lossy();
                 let id = video_id(&rel);
-                !cache_dir.join(format!("{}.jpg", id)).exists()
-            })
-            .collect();
+                cache_dir.join(format!("{}.jpg", id)).exists()
+            });
 
-        let quick_total = quick_entries.len() as u32;
         {
             let mut p = progress.write().expect("thumb_progress lock poisoned");
-            p.current = 0;
-            p.total = quick_total;
-            p.active = quick_total > 0;
+            p.current = quick_done.len() as u32;
+            p.total = (quick_done.len() + quick_entries.len()) as u32;
+            p.active = !quick_entries.is_empty();
             p.phase = "quick";
         }
 
@@ -615,27 +613,25 @@ async fn run_thumb_worker(
 
         // ── Phase 2: deep thumbnails ──────────────────────────────────────
 
-        let deep_entries: Vec<_> = WalkDir::new(&library_path)
+        let (deep_done, deep_entries): (Vec<_>, Vec<_>) = WalkDir::new(&library_path)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file() && is_video(e.path()))
-            .filter(|e| {
+            .partition(|e| {
                 let abs = e.path();
                 let rel = abs
                     .strip_prefix(&library_path)
                     .unwrap_or(abs)
                     .to_string_lossy();
                 let id = video_id(&rel);
-                !cache_dir.join(format!("{}.deep", id)).exists()
-            })
-            .collect();
+                cache_dir.join(format!("{}.deep", id)).exists()
+            });
 
-        let deep_total = deep_entries.len() as u32;
         {
             let mut p = progress.write().expect("thumb_progress lock poisoned");
-            p.current = 0;
-            p.total = deep_total;
-            p.active = deep_total > 0;
+            p.current = deep_done.len() as u32;
+            p.total = (deep_done.len() + deep_entries.len()) as u32;
+            p.active = !deep_entries.is_empty();
             p.phase = "deep";
         }
 
@@ -1210,30 +1206,28 @@ async fn run_sprite_worker(
     loop {
         trigger.notified().await;
 
-        let entries: Vec<_> = WalkDir::new(&library_path)
+        let (sprite_done, entries): (Vec<_>, Vec<_>) = WalkDir::new(&library_path)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file() && is_video(e.path()))
-            .filter(|e| {
+            .partition(|e| {
                 let abs = e.path();
                 let rel = abs
                     .strip_prefix(&library_path)
                     .unwrap_or(abs)
                     .to_string_lossy();
                 let id = video_id(&rel);
-                !cache_dir
+                cache_dir
                     .join(format!("{}_thumbs", id))
                     .join("sprite.jpg")
                     .exists()
-            })
-            .collect();
+            });
 
-        let total = entries.len() as u32;
         {
             let mut p = progress.write().expect("sprite_progress lock poisoned");
-            p.current = 0;
-            p.total = total;
-            p.active = total > 0;
+            p.current = sprite_done.len() as u32;
+            p.total = (sprite_done.len() + entries.len()) as u32;
+            p.active = !entries.is_empty();
         }
 
         for entry in entries {

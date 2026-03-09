@@ -12,10 +12,14 @@ pub struct Props {
     pub video_id: String,
 }
 
+/// SVG path data for the nf-md-sync_circle icon (U+F1378), extracted from the
+/// vendored SymbolsNerdFontMono-Regular.woff2. Paired with viewBox="0 -410 2048 2048".
+const SYNC_CIRCLE_PATH: &str = "M0 614Q0 335 137.0 99.5Q274 -136 509.5 -273.0Q745 -410 1024.0 -410.0Q1303 -410 1538.5 -273.0Q1774 -136 1911.0 99.5Q2048 335 2048.0 614.0Q2048 893 1911.0 1128.5Q1774 1364 1538.5 1501.0Q1303 1638 1024 1638Q822 1638 632.0 1561.0Q442 1484 298.0 1340.0Q154 1196 77.0 1006.0Q0 816 0 614ZM1394 436Q1433 523 1433 614Q1433 782 1312.5 902.5Q1192 1023 1024 1023V821L702 1128L1024 1436V1229Q1192 1229 1334.0 1147.5Q1476 1066 1557.5 924.0Q1639 782 1639.0 609.0Q1639 436 1543 287ZM409 614Q409 792 505 941L654 792Q615 705 615 614Q615 446 735.5 325.5Q856 205 1024 205V407L1332 100L1024 -208V-1Q856 -1 714.0 80.5Q572 162 490.5 304.0Q409 446 409 614Z";
+
 /// Small badge that shows the thumbnail/processing state for a video card.
 ///
 /// - nf-md-check_circle `\u{f05e0}` (green)   — fully processed: deep thumbnail and sprite both complete
-/// - nf-md-sync_circle `\u{f1378}` (orange)   — a background worker is currently active (spins once/s)
+/// - nf-md-sync_circle SVG path (orange)       — a background worker is currently active (spins CCW once/s)
 /// - nf-md-circle_double `\u{f0e95}` (grey)   — awaiting processing (no worker currently running)
 #[function_component(ProcessingStatus)]
 pub fn processing_status(props: &Props) -> Html {
@@ -50,11 +54,15 @@ pub fn processing_status(props: &Props) -> Html {
             >{ "\u{F05E0}" }</span>
         },
         Some("processing") => html! {
-            <span
+            <svg
                 class="processing-status processing-status--processing"
-                title="Processing"
+                viewBox="0 -410 2048 2048"
                 aria-label="Processing"
-            >{ "\u{F1378}" }</span>
+                role="img"
+            >
+                <title>{"Processing"}</title>
+                <path fill="currentColor" d={SYNC_CIRCLE_PATH} />
+            </svg>
         },
         Some("pending") => {
             html! {

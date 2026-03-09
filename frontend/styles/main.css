@@ -545,16 +545,16 @@ body{
   color: #4caf50;
 }
 
-@keyframes icon-spin {
+@keyframes processing-spin {
   to {
-    transform: rotate(1turn);
+    transform: rotate(-1turn);
   }
 }
 
 .processing-status--processing{
   color: #ff6b35;
-  animation: icon-spin 1.5s linear infinite;
-  transform-origin: 50% 55%;
+  animation: processing-spin 1s linear infinite;
+  transform-origin: 50% 50%;
   will-change: transform;
 }
 .processing-status--pending{

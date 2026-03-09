@@ -238,13 +238,18 @@ async fn get_thumbnail(
 }
 
 /// Segment duration in seconds for on-demand HLS generation.
+/// Apple recommends 6 seconds; common range is 2–10 seconds.
+/// Jellyfin/Plex default to 6 second segments.
 const SEGMENT_DURATION: f64 = 6.0;
 
 /// `GET /api/videos/{id}/playlist.m3u8`
 ///
-/// Generates an HLS playlist dynamically based on video duration.
-/// The init segment is generated quickly (just codec info, no media).
-/// Media segments are transcoded on-demand when requested.
+/// Generates an HLS VOD playlist using MPEG-TS segments.
+///
+/// This follows the Jellyfin/Plex approach:
+/// - MPEG-TS segment format (self-contained, no init segment required)
+/// - HLS version 3 for maximum compatibility
+/// - Segments are transcoded on-demand when first requested
 async fn get_playlist(
     id: web::Path<String>,
     state: web::Data<AppState>,
@@ -267,77 +272,20 @@ async fn get_playlist(
             .body(format!("cache dir error: {e}"));
     }
 
-    // Generate init segment if it doesn't exist
-    // This creates a tiny fMP4 file with just the moov atom (codec info)
-    let init_path = hls_dir.join("init.mp4");
-    if !init_path.exists() {
-        let resolved_path = match abs_path.canonicalize() {
-            Ok(p) => p,
-            Err(e) => {
-                return HttpResponse::InternalServerError()
-                    .body(format!("failed to resolve video path: {e}"))
-            }
-        };
-        let abs_str = match resolved_path.to_str() {
-            Some(s) => s.to_owned(),
-            None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
-        };
-
-        // Generate a very short fMP4 segment to extract codec info
-        // Using -frames:v 1 to encode only one video frame (faster than -t 0.001)
-        let output = Command::new("ffmpeg")
-            .current_dir(&hls_dir)
-            .stdin(std::process::Stdio::null())  // Don't read from stdin
-            .args([
-                "-y",
-                "-nostdin",  // Disable stdin interaction
-                "-i", &abs_str,
-                "-frames:v", "1",  // Only encode 1 video frame
-                "-c:v", "libx264",
-                "-pix_fmt", "yuv420p",  // Ensure baseline-compatible pixel format
-                "-profile:v", "baseline",
-                "-level", "3.1",
-                "-preset", "ultrafast",  // Fastest preset for init segment
-                "-c:a", "aac",
-                "-f", "mp4",
-                "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-                "init.mp4",
-            ])
-            .output()
-            .await;
-
-        match output {
-            Ok(out) if out.status.success() => {
-                // Init segment generated successfully
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                eprintln!("ffmpeg init segment failed: {}", stderr);
-                return HttpResponse::ServiceUnavailable()
-                    .body("failed to generate init segment");
-            }
-            Err(e) => {
-                return HttpResponse::ServiceUnavailable()
-                    .body(format!("failed to generate init segment: {e}"));
-            }
-        }
-    }
-
     // Calculate number of segments based on duration
     let duration = duration_secs as f64;
     let num_segments = (duration / SEGMENT_DURATION).ceil() as usize;
 
-    // Build the playlist dynamically
+    // Build the HLS VOD playlist with MPEG-TS segments.
+    // No init segment is needed — each .ts segment is self-contained with
+    // embedded codec info and PTS timestamps, unlike fMP4 which requires a
+    // separate init segment with moov atom and sequential baseMediaDecodeTime.
     let mut playlist = String::new();
     playlist.push_str("#EXTM3U\n");
-    playlist.push_str("#EXT-X-VERSION:7\n");
+    playlist.push_str("#EXT-X-VERSION:3\n");
     playlist.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", SEGMENT_DURATION.ceil() as u32));
     playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
     playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
-    playlist.push_str(&format!(
-        "#EXT-X-MAP:URI=\"/api/videos/{}/segments/init.mp4\"\n",
-        id
-    ));
 
     for i in 0..num_segments {
         let seg_start = i as f64 * SEGMENT_DURATION;
@@ -350,7 +298,7 @@ async fn get_playlist(
 
         playlist.push_str(&format!("#EXTINF:{:.3},\n", seg_duration));
         playlist.push_str(&format!(
-            "/api/videos/{}/segments/seg_{:05}.m4s\n",
+            "/api/videos/{}/segments/seg_{:05}.ts\n",
             id, i
         ));
     }
@@ -363,8 +311,12 @@ async fn get_playlist(
         .body(playlist)
 }
 
-/// `GET /api/videos/{id}/segments/{filename}` — serve an fMP4 segment on-demand.
+/// `GET /api/videos/{id}/segments/{filename}` — serve an MPEG-TS segment on-demand.
+///
 /// Segments are transcoded on-demand if they don't exist in the cache.
+/// Uses MPEG-TS format (like Jellyfin) for self-contained segments with
+/// embedded codec info and PTS timestamps, avoiding the fMP4
+/// baseMediaDecodeTime issues that cause playback freezes.
 async fn get_segment(
     params: web::Path<(String, String)>,
     state: web::Data<AppState>,
@@ -375,17 +327,17 @@ async fn get_segment(
     if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
         return HttpResponse::BadRequest().body("invalid filename");
     }
-    if !filename.ends_with(".m4s") && filename != "init.mp4" {
+    if !filename.ends_with(".ts") {
         return HttpResponse::BadRequest().body("invalid segment type");
     }
 
     let hls_dir = state.cache_dir.join(&id);
     let seg_path = hls_dir.join(&filename);
 
-    // If segment exists, serve it immediately
+    // If segment exists, serve it immediately from cache
     if let Ok(data) = tokio::fs::read(&seg_path).await {
         return HttpResponse::Ok()
-            .content_type("video/mp4")
+            .content_type("video/mp2t")
             .insert_header((
                 header::CACHE_CONTROL,
                 "public, max-age=31536000, immutable",
@@ -393,15 +345,10 @@ async fn get_segment(
             .body(data);
     }
 
-    // For init.mp4, it should have been created with the playlist request
-    if filename == "init.mp4" {
-        return HttpResponse::NotFound().body("init segment not found - request playlist first");
-    }
-
-    // Parse segment index from filename (e.g., "seg_00042.m4s" -> 42)
+    // Parse segment index from filename (e.g., "seg_00042.ts" -> 42)
     let seg_index: usize = match filename
         .strip_prefix("seg_")
-        .and_then(|s| s.strip_suffix(".m4s"))
+        .and_then(|s| s.strip_suffix(".ts"))
         .and_then(|s| s.parse().ok())
     {
         Some(idx) => idx,
@@ -427,7 +374,9 @@ async fn get_segment(
     };
 
     // Calculate segment time range
+    // start_time is always non-negative (seg_index * SEGMENT_DURATION, both >= 0)
     let start_time = seg_index as f64 * SEGMENT_DURATION;
+    debug_assert!(start_time >= 0.0 && start_time.is_finite());
 
     // Create cache directory if needed
     if let Err(e) = tokio::fs::create_dir_all(&hls_dir).await {
@@ -435,26 +384,36 @@ async fn get_segment(
             .body(format!("cache dir error: {e}"));
     }
 
-    // Transcode just this segment on-demand
-    // Use -ss before -i for fast seeking, then encode just SEGMENT_DURATION seconds
-    // Output as fMP4 segment (compatible with MSE)
+    // Transcode just this segment on-demand using MPEG-TS output format.
+    //
+    // This follows the Jellyfin approach (using ffmpeg's HLS/MPEG-TS muxer):
+    // - `-ss` before `-i` for fast input seeking to the segment start
+    // - `-t` to limit output to one segment duration
+    // - `-output_ts_offset` to set correct absolute PTS timestamps
+    //   (without this, each segment's PTS would start from 0 instead of
+    //    the correct position in the stream timeline)
+    // - `-f mpegts` for self-contained MPEG Transport Stream output
+    // - `-force_key_frames expr:gte(t,0)` to ensure segment starts with a keyframe
+    let ts_offset = format!("{:.3}", start_time);
     let output = Command::new("ffmpeg")
         .current_dir(&hls_dir)
-        .stdin(std::process::Stdio::null())  // Don't read from stdin
+        .stdin(std::process::Stdio::null())
         .args([
             "-y",
-            "-nostdin",  // Disable stdin interaction
+            "-nostdin",
             "-ss", &format!("{:.3}", start_time),
             "-i", &abs_str,
             "-t", &format!("{:.3}", SEGMENT_DURATION),
             "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",  // Ensure baseline-compatible pixel format
+            "-pix_fmt", "yuv420p",
             "-profile:v", "baseline",
             "-level", "3.1",
-            "-preset", "fast",  // Faster encoding for on-demand
+            "-preset", "veryfast",
+            "-force_key_frames", "expr:gte(t,0)",
             "-c:a", "aac",
-            "-f", "mp4",
-            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-b:a", "128k",
+            "-output_ts_offset", &ts_offset,
+            "-f", "mpegts",
             &filename,
         ])
         .output()
@@ -465,7 +424,7 @@ async fn get_segment(
             // Segment generated successfully, serve it
             match tokio::fs::read(&seg_path).await {
                 Ok(data) => HttpResponse::Ok()
-                    .content_type("video/mp4")
+                    .content_type("video/mp2t")
                     .insert_header((
                         header::CACHE_CONTROL,
                         "public, max-age=31536000, immutable",

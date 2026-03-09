@@ -1,3 +1,4 @@
+use crate::components::processing_status::ProcessingStatus;
 use crate::components::video_card_thumb::VideoCardThumb;
 use crate::models::Element;
 use chrono::DateTime;
@@ -48,6 +49,7 @@ pub fn elements_grid(props: &Props) -> Html {
 
                         <div class="card__top">
                             <div class="card__title">{ item.title.clone() }</div>
+                            <ProcessingStatus video_id={item.id.clone()} />
                         </div>
 
                         <div class="card__meta">

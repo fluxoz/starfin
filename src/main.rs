@@ -55,6 +55,8 @@ struct ThumbProgress {
     active: bool,
     /// Which generation phase is running: `"quick"` or `"deep"`.
     phase: &'static str,
+    /// The video ID currently being processed, or `None` when idle.
+    current_id: Option<String>,
 }
 
 /// Tracks the progress of the sprite generation background job.
@@ -62,6 +64,8 @@ struct SpriteProgress {
     current: u32,
     total: u32,
     active: bool,
+    /// The video ID currently being processed, or `None` when idle.
+    current_id: Option<String>,
 }
 
 struct AppState {
@@ -602,9 +606,14 @@ async fn run_thumb_worker(
                 .to_string();
             let id = video_id(&rel);
 
+            {
+                let mut p = progress.write().expect("thumb_progress lock poisoned");
+                p.current_id = Some(id.clone());
+            }
             generate_quick_thumbnail(&id, &abs, &cache_dir).await;
 
             let mut p = progress.write().expect("thumb_progress lock poisoned");
+            p.current_id = None;
             p.current += 1;
             if p.current >= p.total {
                 p.active = false;
@@ -644,9 +653,14 @@ async fn run_thumb_worker(
                 .to_string();
             let id = video_id(&rel);
 
+            {
+                let mut p = progress.write().expect("thumb_progress lock poisoned");
+                p.current_id = Some(id.clone());
+            }
             generate_deep_thumbnail(&id, &abs, &cache_dir).await;
 
             let mut p = progress.write().expect("thumb_progress lock poisoned");
+            p.current_id = None;
             p.current += 1;
             if p.current >= p.total {
                 p.active = false;
@@ -1075,6 +1089,54 @@ async fn get_sprite_status(
     HttpResponse::Ok().json(serde_json::json!({ "ready": ready }))
 }
 
+/// `GET /api/videos/{id}/processing-status` — processing status for a video.
+///
+/// Returns one of three states:
+/// - `{"status":"processed"}` — both deep thumbnail (`.deep` marker) and sprite
+///   sheet (`_thumbs/sprite.jpg`) are present for the video
+/// - `{"status":"processing"}` — a background worker is actively processing
+///   this specific video right now (thumbnail or sprite)
+/// - `{"status":"pending"}`   — not fully processed and no worker is currently
+///   on this video
+///
+/// This is a cheap filesystem + lock-read check; it never triggers ffmpeg.
+async fn get_processing_status(
+    id: web::Path<String>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    if Uuid::parse_str(&id).is_err() {
+        return HttpResponse::BadRequest().body("invalid video id");
+    }
+
+    let deep_marker = state.cache_dir.join(format!("{}.deep", *id));
+    let sprite_path = state
+        .cache_dir
+        .join(format!("{}_thumbs", *id))
+        .join("sprite.jpg");
+
+    let status = if deep_marker.exists() && sprite_path.exists() {
+        "processed"
+    } else {
+        let thumb_on_this = state
+            .thumb_progress
+            .read()
+            .map(|p| p.current_id.as_deref() == Some(id.as_str()))
+            .unwrap_or(false);
+        let sprite_on_this = state
+            .sprite_progress
+            .read()
+            .map(|p| p.current_id.as_deref() == Some(id.as_str()))
+            .unwrap_or(false);
+        if thumb_on_this || sprite_on_this {
+            "processing"
+        } else {
+            "pending"
+        }
+    };
+
+    HttpResponse::Ok().json(serde_json::json!({ "status": status }))
+}
+
 /// `GET /api/videos/{id}/thumbnails/sprite.jpg` — get thumbnail sprite image
 async fn get_thumbnail_sprite(
     id: web::Path<String>,
@@ -1239,9 +1301,14 @@ async fn run_sprite_worker(
                 .to_string();
             let id = video_id(&rel);
 
+            {
+                let mut p = progress.write().expect("sprite_progress lock poisoned");
+                p.current_id = Some(id.clone());
+            }
             generate_sprite(&id, &abs, &cache_dir).await;
 
             let mut p = progress.write().expect("sprite_progress lock poisoned");
+            p.current_id = None;
             p.current += 1;
             if p.current >= p.total {
                 p.active = false;
@@ -1478,6 +1545,7 @@ async fn main() -> std::io::Result<()> {
         total: 0,
         active: false,
         phase: "quick",
+        current_id: None,
     }));
     let thumb_trigger = Arc::new(tokio::sync::Notify::new());
 
@@ -1485,6 +1553,7 @@ async fn main() -> std::io::Result<()> {
         current: 0,
         total: 0,
         active: false,
+        current_id: None,
     }));
     let sprite_trigger = Arc::new(tokio::sync::Notify::new());
 
@@ -1613,6 +1682,10 @@ async fn main() -> std::io::Result<()> {
             .route(
                 "/api/videos/{id}/thumbnails/sprite-status",
                 web::get().to(get_sprite_status),
+            )
+            .route(
+                "/api/videos/{id}/processing-status",
+                web::get().to(get_processing_status),
             )
             .route(
                 "/api/videos/{id}/thumbnails/sprite.jpg",

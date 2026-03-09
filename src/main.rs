@@ -57,6 +57,13 @@ struct ThumbProgress {
     phase: &'static str,
 }
 
+/// Tracks the progress of the sprite generation background job.
+struct SpriteProgress {
+    current: u32,
+    total: u32,
+    active: bool,
+}
+
 struct AppState {
     library_path: PathBuf,
     cache_dir: PathBuf,
@@ -68,6 +75,10 @@ struct AppState {
     thumb_progress: Arc<RwLock<ThumbProgress>>,
     /// Notified to (re-)start the deep thumbnail generation batch.
     thumb_trigger: Arc<tokio::sync::Notify>,
+    /// Progress counters for the background sprite generation worker.
+    sprite_progress: Arc<RwLock<SpriteProgress>>,
+    /// Notified to (re-)start the sprite generation batch.
+    sprite_trigger: Arc<tokio::sync::Notify>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -242,6 +253,7 @@ async fn scan_ws(
     let library_path = state.library_path.clone();
     let video_cache = Arc::clone(&state.video_cache);
     let thumb_trigger = Arc::clone(&state.thumb_trigger);
+    let sprite_trigger = Arc::clone(&state.sprite_trigger);
 
     actix_web::rt::spawn(async move {
         // Enumerate all video files up-front so we can report a total.
@@ -302,6 +314,9 @@ async fn scan_ws(
 
         // Re-trigger deep thumbnail generation for any newly discovered videos.
         thumb_trigger.notify_one();
+
+        // Re-trigger sprite generation for any newly discovered videos.
+        sprite_trigger.notify_one();
 
         // Close the WebSocket — the client uses this signal to know the scan is done.
         let _ = session.close(None).await;
@@ -667,6 +682,55 @@ async fn get_thumb_progress(state: web::Data<AppState>) -> impl Responder {
         active: p.active,
         phase: p.phase.to_owned(),
     })
+}
+
+/// `GET /api/progress/ws` — persistent WebSocket that streams live progress
+/// updates from the thumbnail and sprite background workers at 500 ms intervals.
+///
+/// Each frame is a JSON text message:
+/// ```json
+/// {
+///   "thumb":  { "current": N, "total": M, "active": bool, "phase": "quick" },
+///   "sprite": { "current": N, "total": M, "active": bool }
+/// }
+/// ```
+async fn progress_ws(
+    req: HttpRequest,
+    body: web::Payload,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (response, mut session, _msg_stream) = actix_ws::handle(&req, body)?;
+
+    let thumb_progress = Arc::clone(&state.thumb_progress);
+    let sprite_progress = Arc::clone(&state.sprite_progress);
+
+    actix_web::rt::spawn(async move {
+        let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(500));
+        loop {
+            ticker.tick().await;
+
+            let (tc, tt, ta, tph) = {
+                let p = thumb_progress.read().expect("thumb_progress lock poisoned");
+                (p.current, p.total, p.active, p.phase)
+            };
+            let (sc, st, sa) = {
+                let p = sprite_progress.read().expect("sprite_progress lock poisoned");
+                (p.current, p.total, p.active)
+            };
+
+            let msg = serde_json::json!({
+                "thumb":  { "current": tc, "total": tt, "active": ta, "phase": tph },
+                "sprite": { "current": sc, "total": st, "active": sa }
+            })
+            .to_string();
+
+            if session.text(msg).await.is_err() {
+                break; // Client disconnected.
+            }
+        }
+    });
+
+    Ok(response)
 }
 
 /// Segment duration in seconds for on-demand HLS generation.
@@ -1036,27 +1100,50 @@ async fn get_thumbnail_sprite(
             .body(data);
     }
 
-    // Create sprite directory
-    if let Err(e) = tokio::fs::create_dir_all(&sprite_dir).await {
-        return HttpResponse::InternalServerError().body(format!("cache dir error: {e}"));
+    // Generate the sprite using the shared helper (creates dir, runs ffmpeg).
+    if generate_sprite(&id, &abs_path, &state.cache_dir).await {
+        match tokio::fs::read(&sprite_path).await {
+            Ok(data) => HttpResponse::Ok()
+                .content_type("image/jpeg")
+                .insert_header((header::CACHE_CONTROL, "public, max-age=86400"))
+                .body(data),
+            Err(e) => HttpResponse::InternalServerError()
+                .body(format!("failed to read sprite: {e}")),
+        }
+    } else {
+        HttpResponse::ServiceUnavailable().body("sprite generation failed")
+    }
+}
+
+/// Generates the thumbnail sprite sheet for a video.
+///
+/// Creates `{cache_dir}/{id}_thumbs/sprite.jpg` by running `ffmpeg` with the
+/// tile filter.  Returns `true` on success, `false` on any error.  Skips
+/// generation if the file already exists.
+async fn generate_sprite(id: &str, abs_path: &Path, cache_dir: &Path) -> bool {
+    let sprite_dir = cache_dir.join(format!("{}_thumbs", id));
+    let sprite_path = sprite_dir.join("sprite.jpg");
+
+    if sprite_path.exists() {
+        return true;
     }
 
-    // Get video duration
-    let (duration_secs, _) = probe_video(&abs_path).await;
+    if tokio::fs::create_dir_all(&sprite_dir).await.is_err() {
+        return false;
+    }
+
+    let (duration_secs, _) = probe_video(abs_path).await;
     if duration_secs == 0 {
-        return HttpResponse::ServiceUnavailable().body("Could not determine video duration");
+        return false;
     }
 
     let resolved_path = match abs_path.canonicalize() {
         Ok(p) => p,
-        Err(e) => {
-            return HttpResponse::InternalServerError()
-                .body(format!("failed to resolve video path: {e}"))
-        }
+        Err(_) => return false,
     };
     let abs_str = match resolved_path.to_str() {
         Some(s) => s.to_owned(),
-        None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
+        None => return false,
     };
 
     let duration = duration_secs as f64;
@@ -1064,15 +1151,13 @@ async fn get_thumbnail_sprite(
     let columns = THUMBNAILS_PER_ROW.min(num_thumbnails);
     let rows = (num_thumbnails as f64 / columns as f64).ceil() as u32;
 
-    // Generate thumbnail sprite using ffmpeg
-    // This creates a grid of thumbnails using the tile filter
     let fps = 1.0 / THUMBNAIL_INTERVAL;
     let tile_layout = format!("{}x{}", columns, rows);
     let scale = format!("scale={}:{}", THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
 
     let sprite_path_str = match sprite_path.to_str() {
         Some(s) => s.to_owned(),
-        None => return HttpResponse::InternalServerError().body("sprite path is not valid UTF-8"),
+        None => return false,
     };
 
     let output = Command::new("ffmpeg")
@@ -1083,36 +1168,90 @@ async fn get_thumbnail_sprite(
             "-i",
             &abs_str,
             "-vf",
-            &format!("fps={},{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,tile={}", 
-                fps, scale, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, tile_layout),
+            &format!(
+                "fps={},{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,tile={}",
+                fps, scale, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, tile_layout
+            ),
             "-frames:v",
             "1",
             "-q:v",
             "5",
             &sprite_path_str,
         ])
+        .stdout(std::process::Stdio::null())
         .output()
         .await;
 
     match output {
-        Ok(out) if out.status.success() => {
-            match tokio::fs::read(&sprite_path).await {
-                Ok(data) => HttpResponse::Ok()
-                    .content_type("image/jpeg")
-                    .insert_header((header::CACHE_CONTROL, "public, max-age=86400"))
-                    .body(data),
-                Err(e) => HttpResponse::InternalServerError()
-                    .body(format!("failed to read sprite: {e}")),
-            }
-        }
+        Ok(out) if out.status.success() => true,
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            eprintln!("ffmpeg sprite generation failed: {}", stderr);
-            HttpResponse::ServiceUnavailable().body("sprite generation failed")
+            eprintln!("ffmpeg sprite generation failed for {id}: {stderr}");
+            false
         }
         Err(e) => {
-            eprintln!("failed to execute ffmpeg for sprite: {}", e);
-            HttpResponse::ServiceUnavailable().body(format!("failed to execute ffmpeg: {e}"))
+            eprintln!("failed to execute ffmpeg for sprite {id}: {e}");
+            false
+        }
+    }
+}
+
+/// Background worker that proactively generates sprite sheets for every video.
+///
+/// Mirrors `run_thumb_worker`: waits for a notification, walks the library,
+/// skips videos whose `{id}_thumbs/sprite.jpg` already exists, generates the
+/// rest, and updates progress counters as it goes.
+async fn run_sprite_worker(
+    library_path: PathBuf,
+    cache_dir: PathBuf,
+    progress: Arc<RwLock<SpriteProgress>>,
+    trigger: Arc<tokio::sync::Notify>,
+) {
+    loop {
+        trigger.notified().await;
+
+        let entries: Vec<_> = WalkDir::new(&library_path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file() && is_video(e.path()))
+            .filter(|e| {
+                let abs = e.path();
+                let rel = abs
+                    .strip_prefix(&library_path)
+                    .unwrap_or(abs)
+                    .to_string_lossy();
+                let id = video_id(&rel);
+                !cache_dir
+                    .join(format!("{}_thumbs", id))
+                    .join("sprite.jpg")
+                    .exists()
+            })
+            .collect();
+
+        let total = entries.len() as u32;
+        {
+            let mut p = progress.write().expect("sprite_progress lock poisoned");
+            p.current = 0;
+            p.total = total;
+            p.active = total > 0;
+        }
+
+        for entry in entries {
+            let abs = entry.path().to_path_buf();
+            let rel = abs
+                .strip_prefix(&library_path)
+                .unwrap_or(&abs)
+                .to_string_lossy()
+                .to_string();
+            let id = video_id(&rel);
+
+            generate_sprite(&id, &abs, &cache_dir).await;
+
+            let mut p = progress.write().expect("sprite_progress lock poisoned");
+            p.current += 1;
+            if p.current >= p.total {
+                p.active = false;
+            }
         }
     }
 }
@@ -1348,6 +1487,13 @@ async fn main() -> std::io::Result<()> {
     }));
     let thumb_trigger = Arc::new(tokio::sync::Notify::new());
 
+    let sprite_progress = Arc::new(RwLock::new(SpriteProgress {
+        current: 0,
+        total: 0,
+        active: false,
+    }));
+    let sprite_trigger = Arc::new(tokio::sync::Notify::new());
+
     let state = web::Data::new(AppState {
         library_path: library_path.clone(),
         cache_dir: cache_dir.clone(),
@@ -1355,11 +1501,15 @@ async fn main() -> std::io::Result<()> {
         last_segment_access: RwLock::new(HashMap::new()),
         thumb_progress: Arc::clone(&thumb_progress),
         thumb_trigger: Arc::clone(&thumb_trigger),
+        sprite_progress: Arc::clone(&sprite_progress),
+        sprite_trigger: Arc::clone(&sprite_trigger),
     });
 
     // Background task: re-scan the library every 60 seconds.
     let bg_library_path = library_path.clone();
     let bg_cache = Arc::clone(&video_cache);
+    let bg_thumb_trigger = Arc::clone(&thumb_trigger);
+    let bg_sprite_trigger = Arc::clone(&sprite_trigger);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         interval.tick().await; // skip the immediate tick
@@ -1367,6 +1517,8 @@ async fn main() -> std::io::Result<()> {
             interval.tick().await;
             let items = scan_library(&bg_library_path).await;
             *bg_cache.write().expect("video cache lock poisoned") = items;
+            bg_thumb_trigger.notify_one();
+            bg_sprite_trigger.notify_one();
         }
     });
 
@@ -1381,6 +1533,20 @@ async fn main() -> std::io::Result<()> {
         });
         // Kick off the first batch immediately after startup.
         thumb_trigger.notify_one();
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── Sprite background worker ──────────────────────────────────────────────
+    {
+        let worker_library = library_path.clone();
+        let worker_cache = cache_dir.clone();
+        let worker_progress = Arc::clone(&sprite_progress);
+        let worker_trigger = Arc::clone(&sprite_trigger);
+        tokio::spawn(async move {
+            run_sprite_worker(worker_library, worker_cache, worker_progress, worker_trigger).await;
+        });
+        // Kick off the first batch immediately after startup.
+        sprite_trigger.notify_one();
     }
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1442,6 +1608,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(Logger::default())
             .route("/api/health", web::get().to(|| async { "ok" }))
             .route("/api/scan/ws", web::get().to(scan_ws))
+            .route("/api/progress/ws", web::get().to(progress_ws))
             .route("/api/thumbnails/progress", web::get().to(get_thumb_progress))
             .route("/api/videos", web::get().to(list_videos))
             .route("/api/videos/{id}/thumbnail", web::get().to(get_thumbnail))

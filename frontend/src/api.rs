@@ -1,4 +1,4 @@
-use crate::models::{Element, Filters, SortBy};
+use crate::models::{Element, SortBy};
 use gloo_net::http::Request;
 use serde::Deserialize;
 
@@ -17,7 +17,6 @@ pub struct ScanProgressData {
 /// Fetch all videos from the API, then apply filtering and sorting locally.
 pub async fn fetch_elements(
     query: &str,
-    filters: &Filters,
     sort_by: SortBy,
 ) -> Result<Vec<Element>, String> {
     let resp = Request::get("/api/videos")
@@ -34,7 +33,7 @@ pub async fn fetch_elements(
         .await
         .map_err(|e| format!("Invalid JSON: {e:?}"))?;
 
-    Ok(apply_filters(parsed.items, query, filters, sort_by))
+    Ok(apply_filters(parsed.items, query, sort_by))
 }
 
 // ── Local filtering & sorting ────────────────────────────────────────────────
@@ -42,17 +41,8 @@ pub async fn fetch_elements(
 fn apply_filters(
     mut data: Vec<Element>,
     query: &str,
-    filters: &Filters,
     sort_by: SortBy,
 ) -> Vec<Element> {
-    if let Some(genre) = &filters.genre {
-        data.retain(|e| e.genre.eq_ignore_ascii_case(genre));
-    }
-
-    if filters.only_favorites {
-        data.retain(|e| e.rating >= 9.0);
-    }
-
     let q = query.trim().to_lowercase();
     if !q.is_empty() {
         data.retain(|e| {
@@ -65,9 +55,9 @@ fn apply_filters(
     }
 
     match sort_by {
-        SortBy::Relevance => data.sort_by(|a, b| b.rating.total_cmp(&a.rating)),
+        SortBy::DateAddedNewest => data.sort_by(|a, b| b.date_added.cmp(&a.date_added)),
+        SortBy::DateAddedOldest => data.sort_by(|a, b| a.date_added.cmp(&b.date_added)),
         SortBy::NameAsc => data.sort_by(|a, b| a.title.cmp(&b.title)),
-        SortBy::RatingDesc => data.sort_by(|a, b| b.rating.total_cmp(&a.rating)),
     }
 
     data

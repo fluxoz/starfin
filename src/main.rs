@@ -5,7 +5,10 @@ use actix_web::{
 use rust_embed::RustEmbed;
 use mime_guess::MimeGuess;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -32,11 +35,23 @@ struct VideoItem {
     director: String,
 }
 
+// ── Cache eviction constants ─────────────────────────────────────────────────
+
+/// How long a video's segments may sit in cache without a new request before
+/// they are automatically removed.
+const CACHE_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60); // 10 minutes
+
+/// How often the background sweep task wakes up to evict idle caches.
+const CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(60); // 1 minute
+
 // ── App state ────────────────────────────────────────────────────────────────
 
 struct AppState {
     library_path: PathBuf,
     cache_dir: PathBuf,
+    /// Tracks the last time a segment was served for each video ID.
+    /// Used by the background idle-eviction sweep.
+    last_segment_access: RwLock<HashMap<String, Instant>>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -334,6 +349,16 @@ async fn get_segment(
     let hls_dir = state.cache_dir.join(&id);
     let seg_path = hls_dir.join(&filename);
 
+    // Record that this video was actively streamed right now so the
+    // idle-eviction sweep resets its 10-minute countdown.
+    {
+        let mut map = state
+            .last_segment_access
+            .write()
+            .expect("last_segment_access lock poisoned");
+        map.insert(id.clone(), Instant::now());
+    }
+
     // If segment exists, serve it immediately from cache
     if let Ok(data) = tokio::fs::read(&seg_path).await {
         return HttpResponse::Ok()
@@ -445,6 +470,51 @@ async fn get_segment(
             HttpResponse::ServiceUnavailable()
                 .body(format!("failed to execute ffmpeg: {e}"))
         }
+    }
+}
+
+// ── Cache management ─────────────────────────────────────────────────────────
+
+/// `DELETE /api/videos/{id}/cache` — clear cached segments for a video.
+///
+/// Removes the directory `cache_dir/{id}/` which holds transcoded MPEG-TS
+/// segments.  Called by the frontend when the user navigates away from the
+/// player so that disk space is reclaimed immediately.
+async fn clear_cache(
+    id: web::Path<String>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let id = id.into_inner();
+
+    // Validate that the ID is a well-formed UUID to prevent path-traversal.
+    if Uuid::parse_str(&id).is_err() {
+        return HttpResponse::BadRequest().body("invalid video id");
+    }
+
+    let cache_subdir = state.cache_dir.join(&id);
+
+    match tokio::fs::remove_dir_all(&cache_subdir).await {
+        Ok(_) => {
+            // Also cancel idle-eviction tracking so a stale entry doesn't
+            // trigger a redundant removal on the next sweep.
+            state
+                .last_segment_access
+                .write()
+                .expect("last_segment_access lock poisoned")
+                .remove(&id);
+            HttpResponse::NoContent().finish()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Nothing cached – that's fine, treat as success.
+            state
+                .last_segment_access
+                .write()
+                .expect("last_segment_access lock poisoned")
+                .remove(&id);
+            HttpResponse::NoContent().finish()
+        }
+        Err(e) => HttpResponse::InternalServerError()
+            .body(format!("failed to clear cache: {e}")),
     }
 }
 
@@ -826,7 +896,54 @@ async fn main() -> std::io::Result<()> {
     let state = web::Data::new(AppState {
         library_path: library_path.clone(),
         cache_dir: cache_dir.clone(),
+        last_segment_access: RwLock::new(HashMap::new()),
     });
+
+    // ── Idle-eviction background task ────────────────────────────────────────
+    // Every CACHE_SWEEP_INTERVAL, remove the cached segments of any video that
+    // has not had a segment request for at least CACHE_IDLE_TIMEOUT.
+    {
+        let sweep_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(CACHE_SWEEP_INTERVAL);
+            loop {
+                interval.tick().await;
+
+                // Collect IDs whose caches have gone idle.
+                // The read lock is held only for the in-memory scan; it is
+                // released (by dropping `map`) before any filesystem work.
+                let idle_ids: Vec<String> = {
+                    let map = sweep_state
+                        .last_segment_access
+                        .read()
+                        .expect("last_segment_access lock poisoned");
+                    map.iter()
+                        .filter(|(_, t)| t.elapsed() >= CACHE_IDLE_TIMEOUT)
+                        .map(|(id, _)| id.clone())
+                        .collect()
+                };
+
+                for id in idle_ids {
+                    let cache_subdir = sweep_state.cache_dir.join(&id);
+                    match tokio::fs::remove_dir_all(&cache_subdir).await {
+                        Ok(_) => {
+                            println!("→ Cache evicted (idle): {id}");
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            eprintln!("cache eviction error for {id}: {e}");
+                        }
+                    }
+                    sweep_state
+                        .last_segment_access
+                        .write()
+                        .expect("last_segment_access lock poisoned")
+                        .remove(&id);
+                }
+            }
+        });
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     println!("→ Library : {}", library_path.display());
     println!("→ Cache   : {}", cache_dir.display());
@@ -864,6 +981,10 @@ async fn main() -> std::io::Result<()> {
             .route(
                 "/api/videos/{id}/segments/{filename}",
                 web::get().to(get_segment),
+            )
+            .route(
+                "/api/videos/{id}/cache",
+                web::delete().to(clear_cache),
             )
             .route("/{tail:.*}", web::get().to(frontend))
     })

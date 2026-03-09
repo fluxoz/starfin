@@ -7,6 +7,7 @@ use crate::models::{Element, SortBy};
 use futures::StreamExt;
 use gloo_net::websocket::{futures::WebSocket, Message};
 use gloo_timers::callback::Interval;
+use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
@@ -30,6 +31,35 @@ pub fn app() -> Html {
 
     // Dark mode state
     let dark_mode = use_state(|| false);
+
+    // Scroll-to-top button visibility state
+    let show_scroll_top = use_state(|| false);
+
+    // Listen for scroll events on the window to toggle the back-to-top button.
+    {
+        let show_scroll_top = show_scroll_top.clone();
+        use_effect_with((), move |_| {
+            let window = web_sys::window().expect("no window");
+
+            let cb = Closure::<dyn Fn()>::new(move || {
+                if let Some(w) = web_sys::window() {
+                    let scroll_y = w.scroll_y().unwrap_or(0.0);
+                    show_scroll_top.set(scroll_y > 300.0);
+                }
+            });
+
+            let func: &js_sys::Function = cb.as_ref().unchecked_ref();
+            let _ = window.add_event_listener_with_callback("scroll", func);
+            let func_clone = func.clone();
+
+            move || {
+                if let Some(w) = web_sys::window() {
+                    let _ = w.remove_event_listener_with_callback("scroll", &func_clone);
+                }
+                drop(cb);
+            }
+        });
+    }
 
     // Fetch on load and whenever query/sort changes
     {
@@ -131,6 +161,15 @@ pub fn app() -> Html {
         let dark_mode = dark_mode.clone();
         Callback::from(move |_| dark_mode.set(!*dark_mode))
     };
+
+    let on_scroll_top = Callback::from(move |_: MouseEvent| {
+        if let Some(window) = web_sys::window() {
+            let opts = web_sys::ScrollToOptions::new();
+            opts.set_top(0.0);
+            opts.set_behavior(web_sys::ScrollBehavior::Smooth);
+            window.scroll_to_with_scroll_to_options(&opts);
+        }
+    });
 
     let on_scan = {
         let scanning = scanning.clone();
@@ -296,6 +335,14 @@ pub fn app() -> Html {
                 }
             </main>
             </div>
+
+                <button
+                    class={if *show_scroll_top { "scroll-top-btn scroll-top-btn--visible" } else { "scroll-top-btn" }}
+                    onclick={on_scroll_top}
+                    aria-label="Scroll to top"
+                >
+                    { "▲" }
+                </button>
         </>
     }
 }

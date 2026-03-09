@@ -1194,3 +1194,39 @@ body{
 .player-captions__option--active::before{
   content: "✓ ";
 }
+
+/* ── Scroll-to-top floating button ── */
+.scroll-top-btn{
+  position: fixed;
+  bottom: 32px;
+  right: 32px;
+  z-index: 100;
+  width: 44px;
+  height: 44px;
+  border: 1.5px solid var(--text);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 20px;
+  font-weight: 900;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: var(--shadow);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(12px);
+  transition: opacity .25s ease, transform .25s ease, background .15s, color .15s;
+}
+
+.scroll-top-btn--visible{
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+.scroll-top-btn:hover{
+  background: var(--text);
+  color: var(--bg);
+}

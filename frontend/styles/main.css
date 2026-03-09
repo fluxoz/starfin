@@ -1284,6 +1284,7 @@ body{
   background: var(--bg);
   color: var(--text);
   font-size: 20px;
+  letter-spacing: 10px;
   font-weight: 900;
   cursor: pointer;
   display: flex;

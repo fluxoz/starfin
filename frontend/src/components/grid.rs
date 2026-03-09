@@ -1,5 +1,6 @@
 use crate::components::video_card_thumb::VideoCardThumb;
 use crate::models::Element;
+use chrono::DateTime;
 use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
@@ -16,6 +17,11 @@ fn format_duration(secs: u32) -> String {
     } else {
         format!("{}m", m)
     }
+}
+
+fn format_date(timestamp: u64) -> Option<String> {
+    DateTime::from_timestamp(timestamp as i64, 0)
+        .map(|dt| dt.format("%b %d, %Y").to_string())
 }
 
 #[function_component(ElementsGrid)]
@@ -41,26 +47,18 @@ pub fn elements_grid(props: &Props) -> Html {
 
                         <div class="card__top">
                             <div class="card__title">{ item.title.clone() }</div>
-                            <div class="badge">{ item.genre.clone() }</div>
                         </div>
-                        <div class="card__subtitle">{ item.description.clone() }</div>
 
                         <div class="card__meta">
-                            if item.year > 0 {
-                                <span class="muted">{ item.year }</span>
-                                <span class="muted">{ "·" }</span>
-                            }
                             if item.duration_secs > 0 {
-                                <span class="muted">{ format_duration(item.duration_secs) }</span>
-                                <span class="muted">{ "·" }</span>
+                                <span class="card__meta-item card__meta-item--highlight">{ format_duration(item.duration_secs) }</span>
                             }
-                            if !item.director.is_empty() {
-                                <span class="muted">{ item.director.clone() }</span>
+                            if item.year > 0 {
+                                <span class="card__meta-item">{ item.year }</span>
                             }
-                        </div>
-
-                        <div class="card__tags">
-                            { for item.tags.iter().map(|t| html!{ <span class="tag" key={t.clone()}>{ t }</span> }) }
+                            if let Some(date_str) = format_date(item.date_added) {
+                                <span class="card__meta-item">{ format!("Added {}", date_str) }</span>
+                            }
                         </div>
 
                         <div class="card__footer">

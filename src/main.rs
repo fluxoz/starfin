@@ -372,7 +372,7 @@ async fn generate_quick_thumbnail(id: &str, video_path: &Path, cache_dir: &Path)
         .stderr(std::process::Stdio::null())
         .args([
             "-y", "-ss", &seek_secs, "-i", &video_str,
-            "-frames:v", "1", "-q:v", "2", "-vf", "scale=640:-1",
+            "-frames:v", "1", "-q:v", "2",
             &thumb_str,
         ])
         .status()
@@ -464,8 +464,6 @@ async fn generate_deep_thumbnail(id: &str, video_path: &Path, cache_dir: &Path) 
             "1",
             "-q:v",
             "2",
-            "-vf",
-            "scale=640:-1",
             &thumb_str,
         ])
         .status()
@@ -941,8 +939,8 @@ async fn clear_cache(
 
 /// Thumbnail sprite configuration
 const THUMBNAIL_INTERVAL: f64 = 10.0; // Generate thumbnail every 10 seconds
-const THUMBNAIL_WIDTH: u32 = 160;
-const THUMBNAIL_HEIGHT: u32 = 90;
+const THUMBNAIL_WIDTH: u32 = 320;
+const THUMBNAIL_HEIGHT: u32 = 180;
 const THUMBNAILS_PER_ROW: u32 = 10;
 
 /// Response for thumbnail sprite info

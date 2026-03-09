@@ -10,6 +10,9 @@ use gloo_timers::callback::Interval;
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
+/// How often (ms) the frontend polls `/api/thumbnails/progress`.
+const THUMB_PROGRESS_POLL_INTERVAL_MS: u32 = 2_000;
+
 #[function_component(App)]
 pub fn app() -> Html {
     let query = use_state(|| "".to_string());
@@ -21,6 +24,9 @@ pub fn app() -> Html {
     let selected = use_state(|| Option::<Element>::None);
     let scanning = use_state(|| false);
     let scan_progress = use_state(|| Option::<(u32, u32)>::None);
+
+    // Thumbnail generation progress state
+    let thumb_progress = use_state(|| Option::<(u32, u32)>::None);
 
     // Dark mode state
     let dark_mode = use_state(|| false);
@@ -76,6 +82,27 @@ pub fn app() -> Html {
                 });
             });
             // Keep the interval alive for the lifetime of the component.
+            move || drop(interval)
+        });
+    }
+
+    // Poll for deep thumbnail generation progress every 2 seconds.
+    {
+        let thumb_progress = thumb_progress.clone();
+
+        use_effect_with((), move |_| {
+            let interval = Interval::new(THUMB_PROGRESS_POLL_INTERVAL_MS, move || {
+                let thumb_progress = thumb_progress.clone();
+                spawn_local(async move {
+                    if let Ok(data) = api::fetch_thumb_progress().await {
+                        if data.active {
+                            thumb_progress.set(Some((data.current, data.total)));
+                        } else {
+                            thumb_progress.set(None);
+                        }
+                    }
+                });
+            });
             move || drop(interval)
         });
     }
@@ -172,6 +199,16 @@ pub fn app() -> Html {
         None => (0, String::new()),
     };
 
+    // Compute progress percentage and label for the thumbnail generation bar.
+    let (thumb_pct, thumb_label) = match *thumb_progress {
+        Some((current, total)) if total > 0 => (
+            (current as f64 / total as f64 * 100.0) as u32,
+            format!("Thumbnails: {} / {}", current, total),
+        ),
+        Some(_) => (0, "Generating thumbnails…".to_string()),
+        None => (0, String::new()),
+    };
+
     html! {
         <>
             <div class={app_class}>
@@ -210,6 +247,14 @@ pub fn app() -> Html {
                                             <div class="scan-progress__fill" style={format!("width: {}%", scan_pct)} />
                                         </div>
                                         <span class="scan-progress__label">{ &scan_label }</span>
+                                    </div>
+                                }
+                                if thumb_progress.is_some() {
+                                    <div class="scan-progress" role="progressbar" aria-label="Thumbnail generation progress" aria-valuenow={thumb_pct.to_string()} aria-valuemin="0" aria-valuemax="100">
+                                        <div class="scan-progress__track">
+                                            <div class="scan-progress__fill" style={format!("width: {}%", thumb_pct)} />
+                                        </div>
+                                        <span class="scan-progress__label">{ &thumb_label }</span>
                                     </div>
                                 }
                             </div>

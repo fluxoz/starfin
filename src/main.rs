@@ -48,6 +48,13 @@ const CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(60); // 1 minute
 
 // ── App state ────────────────────────────────────────────────────────────────
 
+/// Tracks the progress of the deep thumbnail generation background job.
+struct ThumbProgress {
+    current: u32,
+    total: u32,
+    active: bool,
+}
+
 struct AppState {
     library_path: PathBuf,
     cache_dir: PathBuf,
@@ -55,6 +62,10 @@ struct AppState {
     /// Tracks the last time a segment was served for each video ID.
     /// Used by the background idle-eviction sweep.
     last_segment_access: RwLock<HashMap<String, Instant>>,
+    /// Progress counters for the background deep-thumbnail generation worker.
+    thumb_progress: Arc<RwLock<ThumbProgress>>,
+    /// Notified to (re-)start the deep thumbnail generation batch.
+    thumb_trigger: Arc<tokio::sync::Notify>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -228,6 +239,7 @@ async fn scan_ws(
 
     let library_path = state.library_path.clone();
     let video_cache = Arc::clone(&state.video_cache);
+    let thumb_trigger = Arc::clone(&state.thumb_trigger);
 
     actix_web::rt::spawn(async move {
         // Enumerate all video files up-front so we can report a total.
@@ -286,6 +298,9 @@ async fn scan_ws(
         // Commit the updated library to the shared cache.
         *video_cache.write().expect("video cache lock poisoned") = items;
 
+        // Re-trigger deep thumbnail generation for any newly discovered videos.
+        thumb_trigger.notify_one();
+
         // Close the WebSocket — the client uses this signal to know the scan is done.
         let _ = session.close(None).await;
     });
@@ -293,13 +308,12 @@ async fn scan_ws(
     Ok(response)
 }
 
-/// `GET /api/videos/{id}/thumbnail` — JPEG thumbnail via ffmpeg.
+/// `GET /api/videos/{id}/thumbnail` — quick JPEG thumbnail via ffmpeg.
 ///
-/// Uses a single ffmpeg pass with the `thumbnail` filter: seeks to 10% of the
-/// video to skip intros, then analyses 80% of the total duration (i.e. from
-/// 10% to 90%) to avoid end-credits, samples one frame every 5 seconds, and
-/// lets the `thumbnail` filter pick the most representative frame from the
-/// first 50 samples (~4 min of content).
+/// Seeks to a deterministic pseudo-random position within 20–80% of the video
+/// runtime (based on the video ID) and grabs a single frame.  This is fast
+/// enough to serve on demand.  The background deep-thumbnail worker will later
+/// replace this file with a better frame chosen via signalstats analysis.
 async fn get_thumbnail(
     id: web::Path<String>,
     state: web::Data<AppState>,
@@ -322,29 +336,30 @@ async fn get_thumbnail(
 
         let (duration_secs, _) = probe_video(&abs_path).await;
         let duration = duration_secs as f64;
-        // Skip the first 10% (intro) and analyse the next 80% of the video
-        // (i.e. from 10% to 90%), so end-credits are excluded.
-        // Both values are floored to at least 1 s to handle very short clips.
-        let skip_secs = format!("{:.3}", (duration * 0.10).max(1.0));
-        let analyze_secs = format!("{:.3}", (duration * 0.80).max(1.0));
 
-        // Single-pass: seek → sample 1 fps/5 s → thumbnail filter picks best →
-        // scale → write JPEG.  No separate analysis pass needed.
+        // Derive a deterministic fraction in [0.20, 0.80) from the video ID
+        // so every restart returns the same quick thumbnail for the same file.
+        let id_fraction = Uuid::parse_str(&*id)
+            .ok()
+            .map(|u| u.as_bytes()[0] as f64 / 255.0)
+            .unwrap_or(0.5);
+        let seek_secs = format!("{:.3}", (duration * (0.20 + id_fraction * 0.60)).max(1.0));
+
+        // Single seek + grab one frame — fast, no multi-frame analysis.
         let status = Command::new("ffmpeg")
+            .stdin(std::process::Stdio::null())
             .args([
                 "-y",
                 "-ss",
-                &skip_secs,
-                "-t",
-                &analyze_secs,
+                &seek_secs,
                 "-i",
                 &abs_str,
-                "-vf",
-                "fps=1/5,thumbnail=n=50,scale=640:-1",
                 "-frames:v",
                 "1",
                 "-q:v",
                 "2",
+                "-vf",
+                "scale=640:-1",
                 &thumb_str,
             ])
             .status()
@@ -361,6 +376,233 @@ async fn get_thumbnail(
             .body(data),
         Err(_) => HttpResponse::NotFound().body("thumbnail not found"),
     }
+}
+
+// ── Deep thumbnail generation (background job) ────────────────────────────────
+
+/// Two-pass ffmpeg thumbnail that uses `signalstats` to pick the most visually
+/// appealing frame from the 20–80% window of the video:
+///
+/// Pass 1 — analyse frames at 1 fps/5 s and emit signal statistics to stderr.
+/// Parse SATAVG (colour saturation) and BRNG (out-of-range pixel ratio) for
+/// each frame.  Prefer frames with high saturation and low BRNG (i.e. neither
+/// overexposed nor underexposed).
+///
+/// Pass 2 — seek directly to the chosen timestamp and write a single JPEG.
+///
+/// A side-car marker file `{id}.deep` is created on success so the job is
+/// skipped on subsequent runs.
+async fn generate_deep_thumbnail(id: &str, video_path: &Path, cache_dir: &Path) -> bool {
+    let deep_marker = cache_dir.join(format!("{}.deep", id));
+    if deep_marker.exists() {
+        return true;
+    }
+
+    let (duration_secs, _) = probe_video(video_path).await;
+    if duration_secs == 0 {
+        return false;
+    }
+
+    let duration = duration_secs as f64;
+    let start = duration * 0.20;
+    let length = duration * 0.60; // analyze 20 % – 80 %
+
+    let video_str = match video_path.to_str() {
+        Some(s) => s.to_owned(),
+        None => return false,
+    };
+
+    // Pass 1: run signalstats on one frame every 5 seconds within the window.
+    let analysis = Command::new("ffmpeg")
+        .stdin(std::process::Stdio::null())
+        .args([
+            "-ss",
+            &format!("{:.3}", start),
+            "-t",
+            &format!("{:.3}", length),
+            "-i",
+            &video_str,
+            "-vf",
+            "fps=1/5,signalstats",
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .await;
+
+    let default_time = start + length * 0.5;
+    let best_time = match analysis {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            find_best_frame_time(&stderr, default_time)
+        }
+        Err(_) => default_time,
+    };
+
+    let thumb_path = cache_dir.join(format!("{}.jpg", id));
+    let thumb_str = match thumb_path.to_str() {
+        Some(s) => s.to_owned(),
+        None => return false,
+    };
+
+    // Pass 2: extract the chosen frame.
+    let status = Command::new("ffmpeg")
+        .stdin(std::process::Stdio::null())
+        .args([
+            "-y",
+            "-ss",
+            &format!("{:.3}", best_time),
+            "-i",
+            &video_str,
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            "-vf",
+            "scale=640:-1",
+            &thumb_str,
+        ])
+        .status()
+        .await;
+
+    if status.map(|s| s.success()).unwrap_or(false) {
+        let _ = tokio::fs::write(&deep_marker, b"").await;
+        true
+    } else {
+        false
+    }
+}
+
+/// Maximum fraction of out-of-range pixels (BRNG) a frame may have to be
+/// considered well-exposed.  Frames above this threshold are skipped.
+const MAX_BRNG: f64 = 5.0;
+
+/// Parse the signalstats stderr output and return the `pts_time` of the frame
+/// with the highest `SATAVG` whose `BRNG` (out-of-range pixel fraction) is
+/// below `MAX_BRNG`.  Falls back to `default_time` when no qualifying frame
+/// is found.
+fn find_best_frame_time(stderr: &str, default_time: f64) -> f64 {
+    let mut best_time: Option<f64> = None;
+    let mut best_satavg = -1.0_f64;
+
+    for line in stderr.lines() {
+        if !line.contains("signalstats") {
+            continue;
+        }
+        let Some(pts_time) = parse_float_field(line, "pts_time:") else {
+            continue;
+        };
+        let Some(satavg) = parse_float_field(line, "SATAVG:") else {
+            continue;
+        };
+        // When BRNG is absent treat the frame as over/under-exposed.
+        let brng = parse_float_field(line, "BRNG:").unwrap_or(f64::MAX);
+
+        // Skip overexposed / underexposed frames.
+        if brng > MAX_BRNG {
+            continue;
+        }
+        if satavg > best_satavg {
+            best_satavg = satavg;
+            best_time = Some(pts_time);
+        }
+    }
+
+    best_time.unwrap_or(default_time)
+}
+
+/// Extract a `f64` value from a signalstats output line immediately after the
+/// given `field` label (e.g. `"pts_time:"`, `"SATAVG:"`).
+fn parse_float_field(line: &str, field: &str) -> Option<f64> {
+    let idx = line.find(field)?;
+    let after = &line[idx + field.len()..];
+    let end = after
+        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+        .unwrap_or(after.len());
+    after[..end].parse().ok()
+}
+
+/// Background worker that processes videos one at a time, replacing the quick
+/// thumbnail with a higher-quality signalstats-derived frame.
+///
+/// Waits for a notification via `trigger`, then scans the library for any
+/// video whose `.deep` marker file is absent, and processes each one
+/// sequentially.  The progress counters in `AppState::thumb_progress` are
+/// updated as work proceeds so the frontend can display a progress bar.
+async fn run_thumb_worker(
+    library_path: PathBuf,
+    cache_dir: PathBuf,
+    progress: Arc<RwLock<ThumbProgress>>,
+    trigger: Arc<tokio::sync::Notify>,
+) {
+    loop {
+        trigger.notified().await;
+
+        // Collect every video that still needs a deep thumbnail.
+        let entries: Vec<_> = WalkDir::new(&library_path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file() && is_video(e.path()))
+            .filter(|e| {
+                let abs = e.path();
+                let rel = abs
+                    .strip_prefix(&library_path)
+                    .unwrap_or(abs)
+                    .to_string_lossy();
+                let id = video_id(&rel);
+                !cache_dir.join(format!("{}.deep", id)).exists()
+            })
+            .collect();
+
+        let total = entries.len() as u32;
+        {
+            let mut p = progress.write().expect("thumb_progress lock poisoned");
+            p.current = 0;
+            p.total = total;
+            p.active = total > 0;
+        }
+
+        for entry in entries {
+            let abs = entry.path().to_path_buf();
+            let rel = abs
+                .strip_prefix(&library_path)
+                .unwrap_or(&abs)
+                .to_string_lossy()
+                .to_string();
+            let id = video_id(&rel);
+
+            generate_deep_thumbnail(&id, &abs, &cache_dir).await;
+
+            let mut p = progress.write().expect("thumb_progress lock poisoned");
+            p.current += 1;
+            if p.current >= p.total {
+                p.active = false;
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `GET /api/thumbnails/progress` — current deep-thumbnail generation progress.
+///
+/// Returns `{"current":N,"total":M,"active":bool}`.  The frontend polls this
+/// every few seconds to drive the progress bar on the homepage.
+#[derive(Clone, Serialize)]
+struct ThumbProgressResponse {
+    current: u32,
+    total: u32,
+    active: bool,
+}
+
+async fn get_thumb_progress(state: web::Data<AppState>) -> impl Responder {
+    let p = state.thumb_progress.read().expect("thumb_progress lock poisoned");
+    HttpResponse::Ok().json(ThumbProgressResponse {
+        current: p.current,
+        total: p.total,
+        active: p.active,
+    })
 }
 
 /// Segment duration in seconds for on-demand HLS generation.
@@ -1010,11 +1252,20 @@ async fn main() -> std::io::Result<()> {
     println!("→ Found {} video(s)", initial_items.len());
     let video_cache: Arc<RwLock<Vec<VideoItem>>> = Arc::new(RwLock::new(initial_items));
 
+    let thumb_progress = Arc::new(RwLock::new(ThumbProgress {
+        current: 0,
+        total: 0,
+        active: false,
+    }));
+    let thumb_trigger = Arc::new(tokio::sync::Notify::new());
+
     let state = web::Data::new(AppState {
         library_path: library_path.clone(),
         cache_dir: cache_dir.clone(),
         video_cache: Arc::clone(&video_cache),
         last_segment_access: RwLock::new(HashMap::new()),
+        thumb_progress: Arc::clone(&thumb_progress),
+        thumb_trigger: Arc::clone(&thumb_trigger),
     });
 
     // Background task: re-scan the library every 60 seconds.
@@ -1029,6 +1280,20 @@ async fn main() -> std::io::Result<()> {
             *bg_cache.write().expect("video cache lock poisoned") = items;
         }
     });
+
+    // ── Deep thumbnail background worker ─────────────────────────────────────
+    {
+        let worker_library = library_path.clone();
+        let worker_cache = cache_dir.clone();
+        let worker_progress = Arc::clone(&thumb_progress);
+        let worker_trigger = Arc::clone(&thumb_trigger);
+        tokio::spawn(async move {
+            run_thumb_worker(worker_library, worker_cache, worker_progress, worker_trigger).await;
+        });
+        // Kick off the first batch immediately after startup.
+        thumb_trigger.notify_one();
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     // ── Idle-eviction background task ────────────────────────────────────────
     // Every CACHE_SWEEP_INTERVAL, remove the cached segments of any video that
@@ -1088,6 +1353,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(Logger::default())
             .route("/api/health", web::get().to(|| async { "ok" }))
             .route("/api/scan/ws", web::get().to(scan_ws))
+            .route("/api/thumbnails/progress", web::get().to(get_thumb_progress))
             .route("/api/videos", web::get().to(list_videos))
             .route("/api/videos/{id}/thumbnail", web::get().to(get_thumbnail))
             .route(

@@ -162,7 +162,6 @@ pub fn app() -> Html {
                 <header class="topbar">
                     <div class="topbar__inner">
                         <div class="topbar__left">{ "STARFIN MEDIA SERVER" }</div>
-                        <div class="topbar__center">{ "PERSONAL VIDEO LIBRARY" }</div>
                         <div class="topbar__right">
                             <button
                                 class={if *scanning { "scan-btn scan-btn--scanning" } else { "scan-btn" }}

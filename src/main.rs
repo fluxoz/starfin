@@ -448,6 +448,37 @@ async fn get_segment(
     }
 }
 
+// ── Cache management ─────────────────────────────────────────────────────────
+
+/// `DELETE /api/videos/{id}/cache` — clear cached segments for a video.
+///
+/// Removes the directory `cache_dir/{id}/` which holds transcoded MPEG-TS
+/// segments.  Called by the frontend when the user navigates away from the
+/// player so that disk space is reclaimed immediately.
+async fn clear_cache(
+    id: web::Path<String>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let id = id.into_inner();
+
+    // Validate that the ID is a well-formed UUID to prevent path-traversal.
+    if Uuid::parse_str(&id).is_err() {
+        return HttpResponse::BadRequest().body("invalid video id");
+    }
+
+    let cache_subdir = state.cache_dir.join(&id);
+
+    match tokio::fs::remove_dir_all(&cache_subdir).await {
+        Ok(_) => HttpResponse::NoContent().finish(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Nothing cached – that's fine, treat as success.
+            HttpResponse::NoContent().finish()
+        }
+        Err(e) => HttpResponse::InternalServerError()
+            .body(format!("failed to clear cache: {e}")),
+    }
+}
+
 // ── Thumbnail sprite generation ──────────────────────────────────────────────
 
 /// Thumbnail sprite configuration
@@ -864,6 +895,10 @@ async fn main() -> std::io::Result<()> {
             .route(
                 "/api/videos/{id}/segments/{filename}",
                 web::get().to(get_segment),
+            )
+            .route(
+                "/api/videos/{id}/cache",
+                web::delete().to(clear_cache),
             )
             .route("/{tail:.*}", web::get().to(frontend))
     })

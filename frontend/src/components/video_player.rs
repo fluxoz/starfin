@@ -792,6 +792,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     }
 
     let on_close = props.on_close.clone();
+    let video_id_for_close = props.video_id.clone();
     let title = props.title.clone();
 
     // Play/Pause toggle
@@ -1388,7 +1389,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             <div class={if *controls_visible { "player-header" } else { "player-header player-header--hidden" }}>
                 <button
                     class="btn btn--back"
-                    onclick={Callback::from(move |_| on_close.emit(()))}
+                    onclick={Callback::from(move |_| {
+                        let vid = video_id_for_close.clone();
+                        spawn_local(async move {
+                            clear_video_cache(&vid).await;
+                        });
+                        on_close.emit(());
+                    })}
                 >
                     { "← Back" }
                 </button>
@@ -1686,4 +1693,22 @@ async fn fetch_subtitle_tracks(video_id: &str) -> Result<Vec<SubtitleTrack>, Str
         .await
         .map_err(|e| format!("JSON parse error: {e:?}"))?;
     Ok(response.tracks)
+}
+
+// ── Cache management ─────────────────────────────────────────────────────────
+
+/// Ask the server to delete the cached segments for `video_id`.
+/// Errors are silently ignored – cache clearing is best-effort.
+///
+/// This is intentionally fire-and-forget: in the browser the underlying
+/// `fetch()` request is owned by the browser networking stack and will
+/// complete independently of the WASM component lifecycle, so starting
+/// it with `spawn_local` before unmounting the player is safe.
+async fn clear_video_cache(video_id: &str) {
+    let url = format!("/api/videos/{video_id}/cache");
+    if let Err(e) = Request::delete(&url).send().await {
+        web_sys::console::warn_1(
+            &format!("Failed to clear cache for {video_id}: {e:?}").into(),
+        );
+    }
 }

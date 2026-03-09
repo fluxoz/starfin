@@ -2,7 +2,7 @@ use crate::api;
 use crate::components;
 
 use components::{filters::FiltersBar, grid::ElementsGrid, video_player::VideoPlayer};
-use crate::models::{Element, Filters, SortBy};
+use crate::models::{Element, SortBy};
 
 use futures::StreamExt;
 use gloo_net::websocket::{futures::WebSocket, Message};
@@ -13,8 +13,7 @@ use yew::prelude::*;
 #[function_component(App)]
 pub fn app() -> Html {
     let query = use_state(|| "".to_string());
-    let filters = use_state(Filters::default);
-    let sort_by = use_state(|| SortBy::Relevance);
+    let sort_by = use_state(|| SortBy::DateAddedNewest);
 
     let items = use_state(|| Vec::<Element>::new());
     let loading = use_state(|| false);
@@ -26,26 +25,24 @@ pub fn app() -> Html {
     // Dark mode state
     let dark_mode = use_state(|| false);
 
-    // Fetch on load and whenever query/filters/sort changes
+    // Fetch on load and whenever query/sort changes
     {
         let query = query.clone();
-        let filters = filters.clone();
         let sort_by = sort_by.clone();
 
         let items = items.clone();
         let loading = loading.clone();
         let error = error.clone();
 
-        use_effect_with(((*query).clone(), (*filters).clone(), (*sort_by).clone()), move |_| {
+        use_effect_with(((*query).clone(), (*sort_by).clone()), move |_| {
             let query = (*query).clone();
-            let filters = (*filters).clone();
             let sort_by = (*sort_by).clone();
 
             loading.set(true);
             error.set(None);
 
             spawn_local(async move {
-                match api::fetch_elements(&query, &filters, sort_by).await {
+                match api::fetch_elements(&query, sort_by).await {
                     Ok(data) => items.set(data),
                     Err(e) => error.set(Some(e)),
                 }
@@ -59,7 +56,6 @@ pub fn app() -> Html {
     // Auto-refresh: re-fetch the video list every 60 seconds.
     {
         let query = query.clone();
-        let filters = filters.clone();
         let sort_by = sort_by.clone();
         let items = items.clone();
         let scanning = scanning.clone();
@@ -71,11 +67,10 @@ pub fn app() -> Html {
                     return;
                 }
                 let query = (*query).clone();
-                let filters = (*filters).clone();
                 let sort_by = (*sort_by).clone();
                 let items = items.clone();
                 spawn_local(async move {
-                    if let Ok(data) = api::fetch_elements(&query, &filters, sort_by).await {
+                    if let Ok(data) = api::fetch_elements(&query, sort_by).await {
                         items.set(data);
                     }
                 });
@@ -88,11 +83,6 @@ pub fn app() -> Html {
     let on_query_change = {
         let query = query.clone();
         Callback::from(move |v: String| query.set(v))
-    };
-
-    let on_filters_change = {
-        let filters = filters.clone();
-        Callback::from(move |v: Filters| filters.set(v))
     };
 
     let on_sort_change = {
@@ -119,7 +109,6 @@ pub fn app() -> Html {
         let scanning = scanning.clone();
         let items = items.clone();
         let query = query.clone();
-        let filters = filters.clone();
         let sort_by = sort_by.clone();
         let scan_progress = scan_progress.clone();
         Callback::from(move |_: MouseEvent| {
@@ -129,7 +118,6 @@ pub fn app() -> Html {
             let scanning = scanning.clone();
             let items = items.clone();
             let query = (*query).clone();
-            let filters = (*filters).clone();
             let sort_by = (*sort_by).clone();
             let scan_progress = scan_progress.clone();
 
@@ -163,7 +151,7 @@ pub fn app() -> Html {
                 }
 
                 // Refresh the media list now that the cache is updated.
-                if let Ok(data) = api::fetch_elements(&query, &filters, sort_by).await {
+                if let Ok(data) = api::fetch_elements(&query, sort_by).await {
                     items.set(data);
                 }
                 scan_progress.set(None);
@@ -238,10 +226,8 @@ pub fn app() -> Html {
 
                     <FiltersBar
                         query={(*query).clone()}
-                        filters={(*filters).clone()}
                         sort_by={(*sort_by).clone()}
                         on_query_change={on_query_change}
-                        on_filters_change={on_filters_change}
                         on_sort_change={on_sort_change}
                     />
                 </header>

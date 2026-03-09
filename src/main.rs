@@ -8,7 +8,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::process::Command;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -33,6 +33,8 @@ struct VideoItem {
     year: u16,
     duration_secs: u32,
     director: String,
+    /// Unix timestamp (seconds) of the file's last modification time.
+    date_added: u64,
 }
 
 // ── Cache eviction constants ─────────────────────────────────────────────────
@@ -71,6 +73,17 @@ fn is_video(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| EXTS.contains(&e.to_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+/// Returns the file's modification time as a Unix timestamp (seconds).
+/// Falls back to `0` if metadata is unavailable.
+fn file_date_added(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ── ffprobe metadata ─────────────────────────────────────────────────────────
@@ -167,6 +180,7 @@ async fn scan_library(library_path: &Path) -> Vec<VideoItem> {
             year: meta.year.unwrap_or(0),
             duration_secs,
             director: meta.director.unwrap_or_default(),
+            date_added: file_date_added(&abs),
         });
     }
     items
@@ -259,6 +273,7 @@ async fn scan_ws(
                 year: meta.year.unwrap_or(0),
                 duration_secs,
                 director: meta.director.unwrap_or_default(),
+                date_added: file_date_added(&abs),
             });
 
             let current = (idx + 1) as u32;

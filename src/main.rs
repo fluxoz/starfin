@@ -294,6 +294,12 @@ async fn scan_ws(
 }
 
 /// `GET /api/videos/{id}/thumbnail` — JPEG thumbnail via ffmpeg.
+///
+/// Uses a single ffmpeg pass with the `thumbnail` filter: seeks to 10% of the
+/// video to skip intros, then analyses 80% of the total duration (i.e. from
+/// 10% to 90%) to avoid end-credits, samples one frame every 5 seconds, and
+/// lets the `thumbnail` filter pick the most representative frame from the
+/// first 50 samples (~4 min of content).
 async fn get_thumbnail(
     id: web::Path<String>,
     state: web::Data<AppState>,
@@ -313,19 +319,32 @@ async fn get_thumbnail(
             Some(s) => s.to_owned(),
             None => return HttpResponse::InternalServerError().body("cache path is not valid UTF-8"),
         };
+
+        let (duration_secs, _) = probe_video(&abs_path).await;
+        let duration = duration_secs as f64;
+        // Skip the first 10% (intro) and analyse the next 80% of the video
+        // (i.e. from 10% to 90%), so end-credits are excluded.
+        // Both values are floored to at least 1 s to handle very short clips.
+        let skip_secs = format!("{:.3}", (duration * 0.10).max(1.0));
+        let analyze_secs = format!("{:.3}", (duration * 0.80).max(1.0));
+
+        // Single-pass: seek → sample 1 fps/5 s → thumbnail filter picks best →
+        // scale → write JPEG.  No separate analysis pass needed.
         let status = Command::new("ffmpeg")
             .args([
                 "-y",
+                "-ss",
+                &skip_secs,
+                "-t",
+                &analyze_secs,
                 "-i",
                 &abs_str,
-                "-ss",
-                "00:00:05",
-                "-vframes",
+                "-vf",
+                "fps=1/5,thumbnail=n=50,scale=640:-1",
+                "-frames:v",
                 "1",
                 "-q:v",
                 "2",
-                "-vf",
-                "scale=640:-1",
                 &thumb_str,
             ])
             .status()
@@ -1105,3 +1124,5 @@ async fn main() -> std::io::Result<()> {
     .run()
     .await
 }
+
+

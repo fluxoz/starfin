@@ -525,26 +525,23 @@ body{
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
-  font-size: 11px;
-  font-weight: 700;
+  font-size: 18px;
   line-height: 1;
-  letter-spacing: 5px;
-  border: 1px solid currentColor;
 }
 .processing-status--processed{
   color: #4caf50;
-  border-color: #4caf50;
 }
 .processing-status--processing{
-  color: #ff9800;
-  border-color: #ff9800;
+  color: #ff6b35;
+  animation: processing-spin 1s linear infinite;
 }
 .processing-status--pending{
-  color: rgba(255,255,255,.4);
-  border-color: rgba(255,255,255,.4);
+  color: #555555;
+}
+
+@keyframes processing-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
 }
 
 .card__subtitle{ 

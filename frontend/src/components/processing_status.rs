@@ -14,9 +14,9 @@ pub struct Props {
 
 /// Small badge that shows the thumbnail/processing state for a video card.
 ///
-/// - `✓` (green)  — fully processed: deep thumbnail and sprite both complete
-/// - `⟳` (amber)  — a background worker is currently active
-/// - `○` (grey)   — awaiting processing (no worker currently running)
+/// - nf-md-check_circle `\u{f05e0}` (green)   — fully processed: deep thumbnail and sprite both complete
+/// - nf-md-sync_circle `\u{f0453}` (orange)   — a background worker is currently active (spins once/s)
+/// - nf-md-circle_double `\u{f0320}` (grey)   — awaiting processing (no worker currently running)
 #[function_component(ProcessingStatus)]
 pub fn processing_status(props: &Props) -> Html {
     let status: UseStateHandle<Option<String>> = use_state(|| None);
@@ -47,21 +47,21 @@ pub fn processing_status(props: &Props) -> Html {
                 class="processing-status processing-status--processed"
                 title="Fully processed"
                 aria-label="Fully processed"
-            >{ "✓" }</span>
+            >{ "\u{f05e0}" }</span>
         },
         Some("processing") => html! {
             <span
                 class="processing-status processing-status--processing"
                 title="Processing"
                 aria-label="Processing"
-            >{ "⟳" }</span>
+            >{ "\u{f0453}" }</span>
         },
         Some("pending") => html! {
             <span
                 class="processing-status processing-status--pending"
                 title="Awaiting processing"
                 aria-label="Awaiting processing"
-            >{ "○" }</span>
+            >{ "\u{f0320}" }</span>
         },
         _ => html! {},
     }

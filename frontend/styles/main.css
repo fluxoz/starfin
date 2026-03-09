@@ -515,7 +515,37 @@ body{
   letter-spacing: 1px;
   text-transform: uppercase;
   font-size: 13px;
+  min-width: 0;
+  flex: 1;
 }
+
+/* ── Processing status badge ─────────────────────────────────────────────── */
+.processing-status{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  border: 1px solid currentColor;
+}
+.processing-status--processed{
+  color: #4caf50;
+  border-color: #4caf50;
+}
+.processing-status--processing{
+  color: #ff9800;
+  border-color: #ff9800;
+}
+.processing-status--pending{
+  color: rgba(255,255,255,.4);
+  border-color: rgba(255,255,255,.4);
+}
+
 .card__subtitle{ 
   color: rgba(255,255,255,.7); 
   font-size: 11px; 

@@ -1075,6 +1075,36 @@ async fn get_sprite_status(
     HttpResponse::Ok().json(serde_json::json!({ "ready": ready }))
 }
 
+/// `GET /api/videos/{id}/processing-status` — processing status for a video.
+///
+/// Returns one of three states:
+/// - `{"status":"processed"}` — deep analysis complete (`.deep` marker present)
+/// - `{"status":"processing"}` — quick thumbnail exists but deep pass pending
+/// - `{"status":"pending"}`   — no thumbnail at all yet
+///
+/// This is a cheap filesystem check; it never triggers any ffmpeg work.
+async fn get_processing_status(
+    id: web::Path<String>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    if Uuid::parse_str(&id).is_err() {
+        return HttpResponse::BadRequest().body("invalid video id");
+    }
+
+    let deep_marker = state.cache_dir.join(format!("{}.deep", *id));
+    let thumb_path = state.cache_dir.join(format!("{}.jpg", *id));
+
+    let status = if deep_marker.exists() {
+        "processed"
+    } else if thumb_path.exists() {
+        "processing"
+    } else {
+        "pending"
+    };
+
+    HttpResponse::Ok().json(serde_json::json!({ "status": status }))
+}
+
 /// `GET /api/videos/{id}/thumbnails/sprite.jpg` — get thumbnail sprite image
 async fn get_thumbnail_sprite(
     id: web::Path<String>,
@@ -1613,6 +1643,10 @@ async fn main() -> std::io::Result<()> {
             .route(
                 "/api/videos/{id}/thumbnails/sprite-status",
                 web::get().to(get_sprite_status),
+            )
+            .route(
+                "/api/videos/{id}/processing-status",
+                web::get().to(get_processing_status),
             )
             .route(
                 "/api/videos/{id}/thumbnails/sprite.jpg",

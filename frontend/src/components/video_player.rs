@@ -1,78 +1,18 @@
 use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
 use gloo_timers::future::TimeoutFuture;
-use js_sys::{Array, Function, Promise, Uint8Array};
+use js_sys::Function;
 use serde::Deserialize;
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::{spawn_local, JsFuture};
-use web_sys::{window, HtmlVideoElement, KeyboardEvent, MediaSource, MouseEvent, SourceBuffer};
+use wasm_bindgen_futures::spawn_local;
+use web_sys::{window, HtmlVideoElement, KeyboardEvent, MouseEvent};
 use yew::prelude::*;
-
-// ── Buffer management constants ──────────────────────────────────────────────
-const BUFFER_AHEAD_SECONDS: f64 = 30.0;
-const BUFFER_BEHIND_SECONDS: f64 = 10.0;
-const MIN_BUFFER_AHEAD: f64 = 5.0; // Reduced for faster seeking response
-const SEGMENT_DURATION: f64 = 6.0;
-const BUFFER_CHECK_INTERVAL_MS: u32 = 100; // Faster checks for responsive seeking
-const MIN_BUFFER_CLEANUP_THRESHOLD: f64 = 1.0; // Minimum seconds before we clean up old buffer
 
 // ── Playback speed options ───────────────────────────────────────────────────
 const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
 
-// ── Low-level helpers ────────────────────────────────────────────────────────
-
-fn sourceopen_future(ms: &MediaSource) -> JsFuture {
-    let p = Promise::new(&mut |resolve: Function, _: Function| {
-        let cb = Closure::once_into_js(move || {
-            resolve.call0(&JsValue::NULL).ok();
-        });
-        ms.set_onsourceopen(Some(cb.unchecked_ref()));
-    });
-    JsFuture::from(p)
-}
-
-fn updateend_future(sb: &SourceBuffer) -> JsFuture {
-    let p = Promise::new(&mut |resolve: Function, _: Function| {
-        let cb = Closure::once_into_js(move || {
-            resolve.call0(&JsValue::NULL).ok();
-        });
-        sb.set_onupdateend(Some(cb.unchecked_ref()));
-    });
-    JsFuture::from(p)
-}
-
-async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let resp = Request::get(url)
-        .send()
-        .await
-        .map_err(|e| format!("fetch error: {e:?}"))?;
-    if !resp.ok() {
-        return Err(format!("HTTP {} for {url}", resp.status()));
-    }
-    resp.binary()
-        .await
-        .map_err(|e| format!("binary error: {e:?}"))
-}
-
-fn parse_m3u8(text: &str) -> (Option<String>, Vec<String>) {
-    let mut init_uri: Option<String> = None;
-    let mut segs: Vec<String> = Vec::new();
-
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("#EXT-X-MAP:URI=\"") {
-            if let Some(uri) = rest.strip_suffix('"') {
-                init_uri = Some(uri.to_owned());
-            }
-        } else if !line.starts_with('#') && !line.is_empty() {
-            segs.push(line.to_owned());
-        }
-    }
-    (init_uri, segs)
-}
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn format_time(seconds: f64) -> String {
     if !seconds.is_finite() || seconds < 0.0 {
@@ -102,167 +42,6 @@ fn get_buffer_end(video: &HtmlVideoElement) -> f64 {
     0.0
 }
 
-fn get_buffer_ahead(video: &HtmlVideoElement) -> f64 {
-    let buffer_end = get_buffer_end(video);
-    let current_time = video.current_time();
-    (buffer_end - current_time).max(0.0)
-}
-
-fn time_to_segment_index(time: f64, total_segments: usize) -> usize {
-    let index = (time / SEGMENT_DURATION).floor() as usize;
-    index.min(total_segments.saturating_sub(1))
-}
-
-fn is_segment_buffered(video: &HtmlVideoElement, segment_index: usize) -> bool {
-    let segment_start = segment_index as f64 * SEGMENT_DURATION;
-    let segment_end = segment_start + SEGMENT_DURATION;
-    let buffered = video.buffered();
-    for i in 0..buffered.length() {
-        if let (Ok(start), Ok(end)) = (buffered.start(i), buffered.end(i)) {
-            if segment_start >= start && segment_start < end {
-                let buffered_portion = (end - segment_start).min(segment_end - segment_start);
-                if buffered_portion >= SEGMENT_DURATION * 0.5 {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-async fn remove_old_buffer(sb: &SourceBuffer, current_time: f64) -> Result<(), String> {
-    while sb.updating() {
-        updateend_future(sb)
-            .await
-            .map_err(|e| format!("waiting for update before remove: {e:?}"))?;
-    }
-
-    let remove_end = (current_time - BUFFER_BEHIND_SECONDS).max(0.0);
-
-    if remove_end <= 0.0 {
-        return Ok(());
-    }
-
-    if let Err(e) = sb.remove(0.0, remove_end) {
-        log::warn!("remove buffer failed: {e:?}");
-        return Ok(());
-    }
-
-    while sb.updating() {
-        updateend_future(sb)
-            .await
-            .map_err(|e| format!("waiting for remove to complete: {e:?}"))?;
-    }
-
-    Ok(())
-}
-
-fn is_quota_exceeded_error(error: &JsValue) -> bool {
-    if let Some(err_str) = error.as_string() {
-        return err_str.contains("QuotaExceededError") || err_str.contains("quota");
-    }
-    if let Ok(name) = js_sys::Reflect::get(error, &JsValue::from_str("name")) {
-        if let Some(name_str) = name.as_string() {
-            return name_str == "QuotaExceededError";
-        }
-    }
-    let debug_str = format!("{error:?}");
-    debug_str.contains("QuotaExceededError") || debug_str.contains("Quota")
-}
-
-async fn append_segment(sb: &SourceBuffer, data: &[u8]) -> Result<(), String> {
-    while sb.updating() {
-        updateend_future(sb)
-            .await
-            .map_err(|e| format!("waiting for update: {e:?}"))?;
-    }
-
-    let updateend_p = Promise::new(&mut |resolve: Function, _: Function| {
-        let cb = Closure::once_into_js(move || {
-            resolve.call0(&JsValue::NULL).ok();
-        });
-        sb.set_onupdateend(Some(cb.unchecked_ref()));
-    });
-    let error_p = Promise::new(&mut |_: Function, reject: Function| {
-        let cb = Closure::once_into_js(move || {
-            reject
-                .call1(&JsValue::NULL, &JsValue::from_str("SourceBuffer error event"))
-                .ok();
-        });
-        sb.set_onerror(Some(cb.unchecked_ref()));
-    });
-    let race = Promise::race(&Array::of2(updateend_p.as_ref(), error_p.as_ref()));
-
-    let arr = Uint8Array::from(data);
-    if let Err(e) = sb.append_buffer_with_array_buffer_view(arr.unchecked_ref()) {
-        sb.set_onupdateend(None);
-        sb.set_onerror(None);
-        return Err(format!("appendBuffer: {e:?}"));
-    }
-
-    let result = JsFuture::from(race).await;
-    sb.set_onupdateend(None);
-    sb.set_onerror(None);
-    result.map_err(|e| format!("SourceBuffer decode error: {e:?}"))?;
-    Ok(())
-}
-
-async fn append_segment_with_quota_handling(
-    sb: &SourceBuffer,
-    data: &[u8],
-    video: &HtmlVideoElement,
-) -> Result<(), String> {
-    match try_append_segment(sb, data).await {
-        Ok(()) => Ok(()),
-        Err((err_str, err_val)) => {
-            if is_quota_exceeded_error(&err_val) {
-                log::info!("QuotaExceededError detected, removing old buffer data...");
-                remove_old_buffer(sb, video.current_time()).await?;
-                append_segment(sb, data).await
-            } else {
-                Err(err_str)
-            }
-        }
-    }
-}
-
-async fn try_append_segment(sb: &SourceBuffer, data: &[u8]) -> Result<(), (String, JsValue)> {
-    while sb.updating() {
-        updateend_future(sb)
-            .await
-            .map_err(|e| (format!("waiting for update: {e:?}"), e))?;
-    }
-
-    let updateend_p = Promise::new(&mut |resolve: Function, _: Function| {
-        let cb = Closure::once_into_js(move || {
-            resolve.call0(&JsValue::NULL).ok();
-        });
-        sb.set_onupdateend(Some(cb.unchecked_ref()));
-    });
-    let error_p = Promise::new(&mut |_: Function, reject: Function| {
-        let cb = Closure::once_into_js(move || {
-            reject
-                .call1(&JsValue::NULL, &JsValue::from_str("SourceBuffer error event"))
-                .ok();
-        });
-        sb.set_onerror(Some(cb.unchecked_ref()));
-    });
-    let race = Promise::race(&Array::of2(updateend_p.as_ref(), error_p.as_ref()));
-
-    let arr = Uint8Array::from(data);
-    if let Err(e) = sb.append_buffer_with_array_buffer_view(arr.unchecked_ref()) {
-        sb.set_onupdateend(None);
-        sb.set_onerror(None);
-        return Err((format!("appendBuffer: {e:?}"), e));
-    }
-
-    let result = JsFuture::from(race).await;
-    sb.set_onupdateend(None);
-    sb.set_onerror(None);
-    result.map_err(|e| (format!("SourceBuffer decode error: {e:?}"), e))?;
-    Ok(())
-}
-
 // ── Thumbnail Preview State ──────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -290,6 +69,32 @@ pub struct SubtitleTrack {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct SubtitleTracksResponse {
     pub tracks: Vec<SubtitleTrack>,
+}
+
+// ── HLS.js bindings ──────────────────────────────────────────────────────────
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = Hls)]
+    fn isSupported() -> bool;
+
+    #[wasm_bindgen(js_name = Hls)]
+    type HlsJs;
+
+    #[wasm_bindgen(constructor, js_class = "Hls")]
+    fn new() -> HlsJs;
+
+    #[wasm_bindgen(method, js_class = "Hls", js_name = loadSource)]
+    fn load_source(this: &HlsJs, url: &str);
+
+    #[wasm_bindgen(method, js_class = "Hls", js_name = attachMedia)]
+    fn attach_media(this: &HlsJs, video: &HtmlVideoElement);
+
+    #[wasm_bindgen(method, js_class = "Hls")]
+    fn destroy(this: &HlsJs);
+
+    #[wasm_bindgen(method, js_class = "Hls")]
+    fn on(this: &HlsJs, event: &str, callback: &Function);
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -366,7 +171,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let active_subtitle = use_state(|| Option::<u32>::None); // index of active subtitle, None = off
     let captions_menu_open = use_state(|| false);
 
-    // Run the MSE player logic
+    // HLS.js instance storage
+    let hls_instance = use_state(|| Option::<JsValue>::None);
+
+    // Initialize HLS.js player
     {
         let video_ref = video_ref.clone();
         let video_id = props.video_id.clone();
@@ -375,6 +183,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let thumbnail_info = thumbnail_info.clone();
         let thumbnail_image = thumbnail_image.clone();
         let subtitle_tracks = subtitle_tracks.clone();
+        let hls_instance = hls_instance.clone();
 
         use_effect_with(props.video_id.clone(), move |_| {
             // Fetch thumbnail info and load sprite
@@ -412,12 +221,102 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 }
             });
 
+            // Initialize HLS.js
+            let video_ref_clone = video_ref.clone();
+            let status_clone = status.clone();
+            let error_clone = error.clone();
+            let hls_instance_clone = hls_instance.clone();
+            let video_id_for_hls = video_id.clone();
+
             spawn_local(async move {
-                if let Err(msg) = run_player(video_ref, &video_id, status).await {
-                    error.set(Some(msg));
+                // Give time for video element to be created
+                TimeoutFuture::new(50).await;
+
+                let video = match video_ref_clone.cast::<HtmlVideoElement>() {
+                    Some(v) => v,
+                    None => {
+                        error_clone.set(Some("Video element not found".to_string()));
+                        return;
+                    }
+                };
+
+                let playlist_url = format!("/api/videos/{}/playlist.m3u8", video_id_for_hls);
+
+                // Check if the browser has native HLS support (Safari)
+                if !video
+                    .can_play_type("application/vnd.apple.mpegurl")
+                    .is_empty()
+                {
+                    // Safari: use native HLS
+                    video.set_src(&playlist_url);
+                    status_clone.set(String::new());
+                    let _ = video.play();
+                    return;
                 }
+
+                // Check if HLS.js is supported
+                if !isSupported() {
+                    error_clone.set(Some(
+                        "Your browser does not support HLS playback. Please use a modern browser.".to_string()
+                    ));
+                    return;
+                }
+
+                // Create HLS.js instance
+                let hls = HlsJs::new();
+                
+                // Set up event handlers
+                let status_for_manifest = status_clone.clone();
+                let video_for_play = video.clone();
+                let manifest_parsed_cb = Closure::once(Box::new(move || {
+                    status_for_manifest.set(String::new());
+                    let _ = video_for_play.play();
+                }) as Box<dyn FnOnce()>);
+                hls.on("hlsManifestParsed", manifest_parsed_cb.as_ref().unchecked_ref());
+                manifest_parsed_cb.forget();
+
+                let error_for_handler = error_clone.clone();
+                let error_cb = Closure::wrap(Box::new(move |_event: JsValue, data: JsValue| {
+                    // Get error details from data
+                    let fatal = js_sys::Reflect::get(&data, &JsValue::from_str("fatal"))
+                        .ok()
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    
+                    if fatal {
+                        let error_type = js_sys::Reflect::get(&data, &JsValue::from_str("type"))
+                            .ok()
+                            .and_then(|v| v.as_string())
+                            .unwrap_or_else(|| "Unknown".to_string());
+                        
+                        error_for_handler.set(Some(format!(
+                            "HLS playback error: {}. Please try refreshing the page.",
+                            error_type
+                        )));
+                    }
+                }) as Box<dyn Fn(JsValue, JsValue)>);
+                hls.on("hlsError", error_cb.as_ref().unchecked_ref());
+                error_cb.forget();
+
+                // Attach media and load source
+                status_clone.set("Loading stream…".to_string());
+                hls.attach_media(&video);
+                hls.load_source(&playlist_url);
+                
+                // Store HLS instance for cleanup
+                hls_instance_clone.set(Some(hls.into()));
             });
-            || ()
+
+            // Cleanup function
+            let hls_instance_for_cleanup = hls_instance.clone();
+            move || {
+                // Destroy HLS instance on component unmount
+                if let Some(hls_val) = &*hls_instance_for_cleanup {
+                    if let Ok(hls) = hls_val.clone().dyn_into::<HlsJs>() {
+                        hls.destroy();
+                    }
+                }
+            }
         });
     }
 
@@ -487,7 +386,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
         use_effect_with(video_ref.clone(), move |video_ref| {
             let video_ref = video_ref.clone();
-            // 150ms gives good responsiveness while being more efficient than 100ms
             let interval = Interval::new(150, move || {
                 if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
                     if !*is_dragging {
@@ -594,7 +492,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         let skip = if e.shift_key() { 10.0 } else { 5.0 };
                         video.set_current_time((video.current_time() - skip).max(0.0));
                         skip_indicator.set(Some(("backward".to_string(), 25.0)));
-                        // Clear indicator after animation
                         let skip_indicator_clone = skip_indicator.clone();
                         spawn_local(async move {
                             TimeoutFuture::new(500).await;
@@ -1018,7 +915,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             drag_time.set(initial_seek_time);
             current_time.set(initial_seek_time);
 
-            let shared_seek_time: Rc<Cell<f64>> = Rc::new(Cell::new(initial_seek_time));
+            let shared_seek_time: std::rc::Rc<std::cell::Cell<f64>> = std::rc::Rc::new(std::cell::Cell::new(initial_seek_time));
             let shared_seek_time_move = shared_seek_time.clone();
             let shared_seek_time_up = shared_seek_time.clone();
 
@@ -1032,9 +929,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let hover_time_move = hover_time.clone();
             let hover_position_move = hover_position.clone();
 
-            let closures: Rc<
-                RefCell<Option<(Closure<dyn Fn(MouseEvent)>, Closure<dyn Fn(MouseEvent)>)>>,
-            > = Rc::new(RefCell::new(None));
+            let closures: std::rc::Rc<
+                std::cell::RefCell<Option<(Closure<dyn Fn(MouseEvent)>, Closure<dyn Fn(MouseEvent)>)>>,
+            > = std::rc::Rc::new(std::cell::RefCell::new(None));
             let closures_for_mouseup = closures.clone();
 
             let on_mousemove = Closure::<dyn Fn(MouseEvent)>::new(move |e: MouseEvent| {
@@ -1672,260 +1569,4 @@ async fn fetch_subtitle_tracks(video_id: &str) -> Result<Vec<SubtitleTrack>, Str
         .await
         .map_err(|e| format!("JSON parse error: {e:?}"))?;
     Ok(response.tracks)
-}
-
-// ── Player Logic ─────────────────────────────────────────────────────────────
-
-/// Track which segments have been fetched in the current session
-/// This helps avoid re-fetching but we still check actual buffer state
-struct FetchedSegments {
-    fetched: std::collections::HashSet<usize>,
-    total_segments: usize,
-}
-
-impl FetchedSegments {
-    fn new(total_segments: usize) -> Self {
-        Self {
-            fetched: std::collections::HashSet::new(),
-            total_segments,
-        }
-    }
-
-    fn mark_fetched(&mut self, index: usize) {
-        self.fetched.insert(index);
-    }
-
-    fn all_fetched(&self) -> bool {
-        self.fetched.len() >= self.total_segments
-    }
-}
-
-async fn run_player(
-    video_ref: NodeRef,
-    video_id: &str,
-    status: UseStateHandle<String>,
-) -> Result<(), String> {
-    let playlist_url = format!("/api/videos/{video_id}/playlist.m3u8");
-
-    let video = video_ref
-        .cast::<HtmlVideoElement>()
-        .ok_or("video element unavailable")?;
-
-    // Safari: native HLS support
-    if !video
-        .can_play_type("application/vnd.apple.mpegurl")
-        .is_empty()
-    {
-        video.set_src(&playlist_url);
-        status.set(String::new());
-        return Ok(());
-    }
-
-    // Other browsers: fMP4 HLS via MSE
-    let mime = r#"video/mp4; codecs="avc1.42E01E,mp4a.40.2""#;
-    if !MediaSource::is_type_supported(mime) {
-        return Err(
-            "Your browser does not support the required video codec (H.264 + AAC in fMP4).".into(),
-        );
-    }
-
-    // Fetch and parse playlist
-    status.set("Fetching playlist…".into());
-    let playlist_bytes = fetch_bytes(&playlist_url).await?;
-    let playlist_text =
-        String::from_utf8(playlist_bytes).map_err(|e| format!("playlist UTF-8: {e}"))?;
-    let (init_uri, seg_uris) = parse_m3u8(&playlist_text);
-
-    if seg_uris.is_empty() {
-        return Err("Playlist contains no segments.".into());
-    }
-
-    // Create MediaSource
-    let ms = MediaSource::new().map_err(|e| format!("MediaSource::new: {e:?}"))?;
-    let obj_url = web_sys::Url::create_object_url_with_source(&ms)
-        .map_err(|e| format!("createObjectURL: {e:?}"))?;
-    video.set_src(&obj_url);
-
-    // Helper to revoke URL on error - wrap inner logic
-    let result = run_player_inner(&ms, &video, &obj_url, mime, init_uri, seg_uris, status).await;
-    
-    // Always revoke the object URL when done (success or error)
-    web_sys::Url::revoke_object_url(&obj_url).ok();
-    
-    result
-}
-
-/// Inner player logic - separated so we can ensure URL cleanup in the outer function
-async fn run_player_inner(
-    ms: &MediaSource,
-    video: &HtmlVideoElement,
-    _obj_url: &str,
-    mime: &str,
-    init_uri: Option<String>,
-    seg_uris: Vec<String>,
-    status: UseStateHandle<String>,
-) -> Result<(), String> {
-    // Wait for MediaSource to open
-    sourceopen_future(ms)
-        .await
-        .map_err(|e| format!("sourceopen: {e:?}"))?;
-
-    let sb = ms
-        .add_source_buffer(mime)
-        .map_err(|e| format!("addSourceBuffer: {e:?}"))?;
-
-    // Append init segment
-    if let Some(init_url) = init_uri {
-        status.set("Loading init segment…".into());
-        let data = fetch_bytes(&init_url).await?;
-        append_segment(&sb, &data).await?;
-    }
-
-    // Track which segments have been fetched (to know when we can call end_of_stream)
-    let fetched_segments = Rc::new(RefCell::new(FetchedSegments::new(seg_uris.len())));
-
-    // Load initial segments to start playback
-    let initial_count = 2.min(seg_uris.len());
-    for (i, url) in seg_uris[..initial_count].iter().enumerate() {
-        status.set(format!(
-            "Buffering segment {}/{}…",
-            i + 1,
-            seg_uris.len()
-        ));
-        let data = fetch_bytes(url).await?;
-        append_segment_with_quota_handling(&sb, &data, video).await?;
-        fetched_segments.borrow_mut().mark_fetched(i);
-    }
-
-    // Clear status - playback ready
-    status.set(String::new());
-
-    // Track if we've signaled end of stream
-    let mut end_of_stream_signaled = false;
-
-    // Demand-based streaming loop - runs continuously while video is active
-    loop {
-        let current_time = video.current_time();
-        let video_duration = video.duration();
-        
-        // Check if video element is still valid
-        if !video_duration.is_finite() || video_duration <= 0.0 {
-            // Video might be detached, wait and check again
-            TimeoutFuture::new(BUFFER_CHECK_INTERVAL_MS).await;
-            continue;
-        }
-
-        // Calculate which segments we need around current position
-        let current_segment = time_to_segment_index(current_time, seg_uris.len());
-        let target_buffer_end = current_time + BUFFER_AHEAD_SECONDS;
-        let target_segment = time_to_segment_index(target_buffer_end, seg_uris.len());
-
-        // Check buffer state and fetch needed segments
-        let buffer_ahead = get_buffer_ahead(video);
-        
-        // If buffer is low, fetch segments around current position
-        if buffer_ahead < MIN_BUFFER_AHEAD {
-            // First, clean up old buffer data (but be careful not to remove too much)
-            let remove_before = (current_time - BUFFER_BEHIND_SECONDS).max(0.0);
-            if remove_before > MIN_BUFFER_CLEANUP_THRESHOLD {
-                // Only remove if there's significant data behind to avoid thrashing
-                let _ = safe_remove_buffer(&sb, 0.0, remove_before).await;
-            }
-
-            // Fetch segments from current position forward
-            for seg_idx in current_segment..=target_segment {
-                if seg_idx >= seg_uris.len() {
-                    break;
-                }
-
-                // Always check actual buffer state - segment might have been evicted
-                if is_segment_buffered(video, seg_idx) {
-                    // Segment is already in buffer, mark as fetched and skip
-                    fetched_segments.borrow_mut().mark_fetched(seg_idx);
-                    continue;
-                }
-
-                // Fetch and append the segment
-                let url = &seg_uris[seg_idx];
-                match fetch_bytes(url).await {
-                    Ok(data) => {
-                        if let Err(e) = append_segment_with_quota_handling(&sb, &data, video).await {
-                            // Log error but continue - might recover
-                            log::warn!("Failed to append segment {}: {}", seg_idx, e);
-                        } else {
-                            fetched_segments.borrow_mut().mark_fetched(seg_idx);
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to fetch segment {}: {}", seg_idx, e);
-                    }
-                }
-            }
-        }
-
-        // Check if we should signal end of stream
-        // Only do this when ALL segments have been fetched AND video is near the end
-        // We check near-end first to avoid expensive all_buffered check on every iteration
-        if !end_of_stream_signaled 
-            && current_time > video_duration * 0.9  // Only check when near end (90%+)
-            && fetched_segments.borrow().all_fetched() 
-        {
-            // Verify all segments are actually in the buffer
-            let all_buffered = (0..seg_uris.len()).all(|i| is_segment_buffered(video, i));
-            
-            if all_buffered {
-                // Wait for any pending operations
-                while sb.updating() {
-                    updateend_future(&sb)
-                        .await
-                        .map_err(|e| format!("waiting for final update: {e:?}"))?;
-                }
-                
-                if let Err(e) = ms.end_of_stream() {
-                    log::warn!("end_of_stream failed: {:?}", e);
-                } else {
-                    end_of_stream_signaled = true;
-                }
-            }
-        }
-
-        // Check if video has ended
-        if video.ended() {
-            return Ok(());
-        }
-
-        // Wait before next check
-        TimeoutFuture::new(BUFFER_CHECK_INTERVAL_MS).await;
-    }
-}
-
-/// Safely remove buffer data, handling errors gracefully.
-/// Buffer removal errors are non-fatal - the browser may reject removal for various
-/// reasons (invalid range, buffer not appendable, etc.) but playback can continue.
-async fn safe_remove_buffer(sb: &SourceBuffer, start: f64, end: f64) -> Result<(), String> {
-    // Wait for any pending operations
-    while sb.updating() {
-        updateend_future(sb)
-            .await
-            .map_err(|e| format!("waiting for update before remove: {e:?}"))?;
-    }
-
-    // Try to remove - this might fail if range is invalid or buffer is in wrong state.
-    // This is safe to ignore because:
-    // 1. The buffer will eventually be cleaned up by quota management
-    // 2. Playback continues normally even with extra buffered data
-    // 3. The browser handles memory limits automatically
-    if let Err(e) = sb.remove(start, end) {
-        log::debug!("Buffer removal skipped (non-fatal): {:?} - range [{:.1}s, {:.1}s]", e, start, end);
-        return Ok(());
-    }
-
-    // Wait for remove to complete
-    while sb.updating() {
-        updateend_future(sb)
-            .await
-            .map_err(|e| format!("waiting for remove to complete: {e:?}"))?;
-    }
-
-    Ok(())
 }

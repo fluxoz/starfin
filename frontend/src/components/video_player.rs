@@ -1704,6 +1704,8 @@ async fn fetch_subtitle_tracks(video_id: &str) -> Result<Vec<SubtitleTrack>, Str
 /// `fetch()` request is owned by the browser networking stack and will
 /// complete independently of the WASM component lifecycle, so starting
 /// it with `spawn_local` before unmounting the player is safe.
+/// In the unlikely event the request is lost (e.g. network error), the
+/// server's idle-eviction sweep will clear the cache after 10 minutes.
 async fn clear_video_cache(video_id: &str) {
     let url = format!("/api/videos/{video_id}/cache");
     if let Err(e) = Request::delete(&url).send().await {

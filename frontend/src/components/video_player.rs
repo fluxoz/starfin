@@ -3,6 +3,8 @@ use gloo_timers::callback::Interval;
 use gloo_timers::future::TimeoutFuture;
 use js_sys::Function;
 use serde::Deserialize;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
@@ -915,7 +917,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             drag_time.set(initial_seek_time);
             current_time.set(initial_seek_time);
 
-            let shared_seek_time: std::rc::Rc<std::cell::Cell<f64>> = std::rc::Rc::new(std::cell::Cell::new(initial_seek_time));
+            let shared_seek_time: Rc<Cell<f64>> = Rc::new(Cell::new(initial_seek_time));
             let shared_seek_time_move = shared_seek_time.clone();
             let shared_seek_time_up = shared_seek_time.clone();
 
@@ -929,9 +931,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let hover_time_move = hover_time.clone();
             let hover_position_move = hover_position.clone();
 
-            let closures: std::rc::Rc<
-                std::cell::RefCell<Option<(Closure<dyn Fn(MouseEvent)>, Closure<dyn Fn(MouseEvent)>)>>,
-            > = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let closures: Rc<
+                RefCell<Option<(Closure<dyn Fn(MouseEvent)>, Closure<dyn Fn(MouseEvent)>)>>,
+            > = Rc::new(RefCell::new(None));
             let closures_for_mouseup = closures.clone();
 
             let on_mousemove = Closure::<dyn Fn(MouseEvent)>::new(move |e: MouseEvent| {

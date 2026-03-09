@@ -6,6 +6,7 @@ use rust_embed::RustEmbed;
 use mime_guess::MimeGuess;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use tokio::process::Command;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -37,6 +38,7 @@ struct VideoItem {
 struct AppState {
     library_path: PathBuf,
     cache_dir: PathBuf,
+    video_cache: Arc<RwLock<Vec<VideoItem>>>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -180,10 +182,17 @@ async fn find_video(state: &AppState, id: &str) -> Option<(PathBuf, String)> {
 
 // ── API handlers ─────────────────────────────────────────────────────────────
 
-/// `GET /api/videos` — list all videos with metadata.
+/// `GET /api/videos` — list all videos with metadata (served from cache).
 async fn list_videos(state: web::Data<AppState>) -> impl Responder {
-    let items = scan_library(&state.library_path).await;
+    let items = state.video_cache.read().expect("video cache lock poisoned").clone();
     HttpResponse::Ok().json(serde_json::json!({ "items": items }))
+}
+
+/// `POST /api/scan` — trigger an immediate re-scan of the media library.
+async fn scan_videos(state: web::Data<AppState>) -> impl Responder {
+    let items = scan_library(&state.library_path).await;
+    *state.video_cache.write().expect("video cache lock poisoned") = items;
+    HttpResponse::Ok().json(serde_json::json!({ "status": "ok" }))
 }
 
 /// `GET /api/videos/{id}/thumbnail` — JPEG thumbnail via ffmpeg.
@@ -823,9 +832,29 @@ async fn main() -> std::io::Result<()> {
     }
     std::fs::create_dir_all(&cache_dir)?;
 
+    // Initial library scan at startup.
+    println!("→ Scanning library…");
+    let initial_items = scan_library(&library_path).await;
+    println!("→ Found {} video(s)", initial_items.len());
+    let video_cache: Arc<RwLock<Vec<VideoItem>>> = Arc::new(RwLock::new(initial_items));
+
     let state = web::Data::new(AppState {
         library_path: library_path.clone(),
         cache_dir: cache_dir.clone(),
+        video_cache: Arc::clone(&video_cache),
+    });
+
+    // Background task: re-scan the library every 60 seconds.
+    let bg_library_path = library_path.clone();
+    let bg_cache = Arc::clone(&video_cache);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.tick().await; // skip the immediate tick
+        loop {
+            interval.tick().await;
+            let items = scan_library(&bg_library_path).await;
+            *bg_cache.write().expect("video cache lock poisoned") = items;
+        }
     });
 
     println!("→ Library : {}", library_path.display());
@@ -839,6 +868,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(state.clone())
             .wrap(Logger::default())
             .route("/api/health", web::get().to(|| async { "ok" }))
+            .route("/api/scan", web::post().to(scan_videos))
             .route("/api/videos", web::get().to(list_videos))
             .route("/api/videos/{id}/thumbnail", web::get().to(get_thumbnail))
             .route(

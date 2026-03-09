@@ -7,6 +7,20 @@ struct ElementsResponse {
     items: Vec<Element>,
 }
 
+/// Trigger an immediate re-scan of the media library on the server.
+pub async fn trigger_scan() -> Result<(), String> {
+    let resp = Request::post("/api/scan")
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e:?}"))?;
+
+    if !resp.ok() {
+        return Err(format!("HTTP error: {}", resp.status()));
+    }
+
+    Ok(())
+}
+
 /// Fetch all videos from the API, then apply filtering and sorting locally.
 pub async fn fetch_elements(
     query: &str,

@@ -201,6 +201,29 @@ body{
   align-items: center;
 }
 
+.scan-btn{
+  font-family: inherit;
+  font-size: .7rem;
+  font-weight: 700;
+  letter-spacing: .08em;
+  color: var(--text);
+  background: transparent;
+  border: 1.5px solid var(--text);
+  border-radius: var(--radius);
+  padding: 4px 10px;
+  cursor: pointer;
+  margin-right: 12px;
+  transition: background .15s, color .15s;
+}
+.scan-btn:hover:not(:disabled){
+  background: var(--text);
+  color: var(--bg);
+}
+.scan-btn--scanning,
+.scan-btn:disabled{
+  opacity: .55;
+  cursor: default;
+}
 .theme-toggle{
   position: relative;
   display: inline-block;

@@ -273,18 +273,51 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     return;
                 }
 
-                // Create HLS.js instance with configuration
+                // Create HLS.js instance with configuration optimized for VOD seeking
+                // Based on industry best practices (similar to Jellyfin/Plex approach)
                 let config = js_sys::Object::new();
-                // Enable debug logs in development
+                
+                // Enable debug logs only in development
                 js_sys::Reflect::set(&config, &JsValue::from_str("debug"), &JsValue::from_bool(false)).ok();
-                // Lower the max buffer length to reduce memory usage and improve seeking
+                
+                // Enable web worker for better UI responsiveness during seeking
+                js_sys::Reflect::set(&config, &JsValue::from_str("enableWorker"), &JsValue::from_bool(true)).ok();
+                
+                // Buffer settings optimized for VOD with on-demand transcoding:
+                // - Lower maxBufferLength for faster response when seeking to non-cached segments
+                // - Reasonable maxMaxBufferLength for smooth playback after seek
                 js_sys::Reflect::set(&config, &JsValue::from_str("maxBufferLength"), &JsValue::from_f64(30.0)).ok();
-                // Reduce buffer size to avoid issues with rapid seeking
                 js_sys::Reflect::set(&config, &JsValue::from_str("maxMaxBufferLength"), &JsValue::from_f64(60.0)).ok();
-                // Enable more aggressive buffer cleanup
                 js_sys::Reflect::set(&config, &JsValue::from_str("maxBufferSize"), &JsValue::from_f64(60.0 * 1000.0 * 1000.0)).ok();
-                // Set lower liveSyncDuration to improve seeking responsiveness
-                js_sys::Reflect::set(&config, &JsValue::from_str("liveSyncDurationCount"), &JsValue::from_f64(3.0)).ok();
+                
+                // Back buffer settings - keep some played content for backward seeking
+                // Set to 30 seconds to allow quick backward seeks without re-fetching
+                js_sys::Reflect::set(&config, &JsValue::from_str("backBufferLength"), &JsValue::from_f64(30.0)).ok();
+                
+                // Start position for VOD content (start from beginning)
+                js_sys::Reflect::set(&config, &JsValue::from_str("startPosition"), &JsValue::from_f64(-1.0)).ok();
+                
+                // Seek handling improvements:
+                // - When seeking, flush the buffer and start loading from the new position
+                // - nudgeOffset helps recover from small gaps in the stream
+                js_sys::Reflect::set(&config, &JsValue::from_str("nudgeOffset"), &JsValue::from_f64(0.1)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("nudgeMaxRetry"), &JsValue::from_f64(5.0)).ok();
+                
+                // Fragment loading settings for better seeking:
+                // - Lower timeout for faster failure detection on slow segments
+                // - More retries to handle on-demand transcoding latency
+                js_sys::Reflect::set(&config, &JsValue::from_str("fragLoadingTimeOut"), &JsValue::from_f64(20000.0)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("fragLoadingMaxRetry"), &JsValue::from_f64(4.0)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("fragLoadingRetryDelay"), &JsValue::from_f64(1000.0)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("fragLoadingMaxRetryTimeout"), &JsValue::from_f64(64000.0)).ok();
+                
+                // Level loading settings
+                js_sys::Reflect::set(&config, &JsValue::from_str("levelLoadingTimeOut"), &JsValue::from_f64(10000.0)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("levelLoadingMaxRetry"), &JsValue::from_f64(4.0)).ok();
+                
+                // Manifest loading settings
+                js_sys::Reflect::set(&config, &JsValue::from_str("manifestLoadingTimeOut"), &JsValue::from_f64(10000.0)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("manifestLoadingMaxRetry"), &JsValue::from_f64(2.0)).ok();
 
                 let hls = HlsJs::new_with_config(&config);
                 
@@ -319,11 +352,21 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         .unwrap_or_else(|| "Unknown".to_string());
                     
                     if fatal {
-                        // Try to recover from media errors
+                        // Try to recover from errors that can happen during seeking
+                        // especially with on-demand transcoding where segments may take time
                         if error_type == "mediaError" {
                             log::warn!("Fatal media error detected, attempting recovery: {}", error_details);
                             if let Ok(hls_for_recovery) = hls_js_value.clone().dyn_into::<HlsJs>() {
                                 hls_for_recovery.recover_media_error();
+                            }
+                        } else if error_type == "networkError" {
+                            // Network errors during seeking can occur when segments are still
+                            // being transcoded. HLS.js will retry automatically based on config,
+                            // but for fatal network errors, we try to recover by restarting load.
+                            log::warn!("Fatal network error detected, attempting recovery: {}", error_details);
+                            if let Ok(hls_for_recovery) = hls_js_value.clone().dyn_into::<HlsJs>() {
+                                // Try to restart loading from current position
+                                hls_for_recovery.start_load(-1.0);
                             }
                         } else {
                             error_for_handler.set(Some(format!(
@@ -332,7 +375,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             )));
                         }
                     } else {
-                        // Log non-fatal errors for debugging
+                        // Log non-fatal errors for debugging (these are usually recoverable)
                         log::debug!("Non-fatal HLS error: {} - {}", error_type, error_details);
                     }
                 }) as Box<dyn Fn(JsValue, JsValue)>);

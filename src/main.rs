@@ -238,7 +238,11 @@ async fn get_thumbnail(
 }
 
 /// Segment duration in seconds for on-demand HLS generation.
-const SEGMENT_DURATION: f64 = 6.0;
+/// Using 4 seconds (industry standard: 2-6 seconds) for a good balance between:
+/// - Fast seeking response (shorter segments = less delay when seeking)
+/// - Encoding efficiency (slightly longer segments = better compression)
+/// Jellyfin/Plex typically use 3-6 second segments.
+const SEGMENT_DURATION: f64 = 4.0;
 
 /// `GET /api/videos/{id}/playlist.m3u8`
 ///
@@ -436,8 +440,15 @@ async fn get_segment(
     }
 
     // Transcode just this segment on-demand
-    // Use -ss before -i for fast seeking, then encode just SEGMENT_DURATION seconds
-    // Output as fMP4 segment (compatible with MSE)
+    // Use -ss before -i for fast seeking (input seeking), then encode just SEGMENT_DURATION seconds
+    // Output as fMP4 segment (compatible with MSE/HLS.js)
+    //
+    // Key optimizations for better seeking performance:
+    // 1. Force keyframe at segment start with -force_key_frames expr:gte(t,0)
+    // 2. Set keyint/g to match segment duration for consistent keyframe placement
+    // 3. Use faster preset for quicker segment generation
+    // 4. Disable scene change detection to ensure predictable keyframe placement
+    let keyint = (SEGMENT_DURATION * 30.0) as i32; // Assuming ~30fps, keyframe every segment duration
     let output = Command::new("ffmpeg")
         .current_dir(&hls_dir)
         .stdin(std::process::Stdio::null())  // Don't read from stdin
@@ -451,8 +462,12 @@ async fn get_segment(
             "-pix_fmt", "yuv420p",  // Ensure baseline-compatible pixel format
             "-profile:v", "baseline",
             "-level", "3.1",
-            "-preset", "fast",  // Faster encoding for on-demand
+            "-preset", "veryfast",  // Faster encoding for on-demand transcoding
+            // Keyframe settings for better seeking:
+            "-force_key_frames", "expr:gte(t,0)",  // Force keyframe at segment start
+            "-x264-params", &format!("keyint={}:min-keyint={}:scenecut=0", keyint, keyint),
             "-c:a", "aac",
+            "-b:a", "128k",  // Consistent audio bitrate
             "-f", "mp4",
             "-movflags", "frag_keyframe+empty_moov+default_base_moof",
             &filename,

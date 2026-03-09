@@ -4,6 +4,7 @@
   font-weight: normal;
   font-style: normal;
   font-display: block;
+  unicode-range: U+F05E0, U+F1378, U+F0E95;
 }
 
 :root{
@@ -534,11 +535,10 @@ body{
   justify-content: center;
   flex-shrink: 0;
   font-family: 'SymbolsNerdFontMono', monospace;
-  font-size: 18px;
+  font-size: 20px;
   line-height: 1;
-  width: 1em;
-  height: 1em;
-  transform-origin: 50% 50%;
+  width: 20px;
+  height: 20px;
   box-sizing: border-box;
 }
 .processing-status--processed{
@@ -547,6 +547,8 @@ body{
 .processing-status--processing{
   color: #ff6b35;
   animation: processing-spin 1s linear infinite;
+  transform-origin: 50% 50%;
+  will-change: transform;
 }
 .processing-status--pending{
   color: #555555;

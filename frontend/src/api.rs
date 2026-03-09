@@ -20,6 +20,9 @@ pub struct ThumbProgressData {
     pub current: u32,
     pub total: u32,
     pub active: bool,
+    /// `"quick"` during the initial random-frame pass; `"deep"` during the
+    /// signalstats quality-selection pass.
+    pub phase: String,
 }
 
 /// Fetch all videos from the API, then apply filtering and sorting locally.

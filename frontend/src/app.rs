@@ -25,8 +25,8 @@ pub fn app() -> Html {
     let scanning = use_state(|| false);
     let scan_progress = use_state(|| Option::<(u32, u32)>::None);
 
-    // Thumbnail generation progress state
-    let thumb_progress = use_state(|| Option::<(u32, u32)>::None);
+    // Thumbnail generation progress state: (current, total, phase)
+    let thumb_progress = use_state(|| Option::<(u32, u32, String)>::None);
 
     // Dark mode state
     let dark_mode = use_state(|| false);
@@ -96,7 +96,7 @@ pub fn app() -> Html {
                 spawn_local(async move {
                     if let Ok(data) = api::fetch_thumb_progress().await {
                         if data.active {
-                            thumb_progress.set(Some((data.current, data.total)));
+                            thumb_progress.set(Some((data.current, data.total, data.phase)));
                         } else {
                             thumb_progress.set(None);
                         }
@@ -200,11 +200,15 @@ pub fn app() -> Html {
     };
 
     // Compute progress percentage and label for the thumbnail generation bar.
-    let (thumb_pct, thumb_label) = match *thumb_progress {
-        Some((current, total)) if total > 0 => (
-            (current as f64 / total as f64 * 100.0) as u32,
-            format!("Thumbnails: {} / {}", current, total),
-        ),
+    let (thumb_pct, thumb_label) = match (*thumb_progress).clone() {
+        Some((current, total, ref phase)) if total > 0 => {
+            let label = if phase == "deep" {
+                format!("Quality thumbnails: {} / {}", current, total)
+            } else {
+                format!("Quick thumbnails: {} / {}", current, total)
+            };
+            ((current as f64 / total as f64 * 100.0) as u32, label)
+        }
         Some(_) => (0, "Generating thumbnails…".to_string()),
         None => (0, String::new()),
     };

@@ -48,11 +48,13 @@ const CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(60); // 1 minute
 
 // ── App state ────────────────────────────────────────────────────────────────
 
-/// Tracks the progress of the deep thumbnail generation background job.
+/// Tracks the progress of the thumbnail generation background job.
 struct ThumbProgress {
     current: u32,
     total: u32,
     active: bool,
+    /// Which generation phase is running: `"quick"` or `"deep"`.
+    phase: &'static str,
 }
 
 struct AppState {
@@ -308,87 +310,87 @@ async fn scan_ws(
     Ok(response)
 }
 
-/// `GET /api/videos/{id}/thumbnail` — quick JPEG thumbnail via ffmpeg.
+/// `GET /api/videos/{id}/thumbnail` — serve the cached JPEG thumbnail.
 ///
-/// Seeks to a deterministic pseudo-random position within 20–80% of the video
-/// runtime (based on the video ID) and grabs a single frame.  This is fast
-/// enough to serve on demand.  The background deep-thumbnail worker will later
-/// replace this file with a better frame chosen via signalstats analysis.
+/// Thumbnails are generated entirely in the background by `run_thumb_worker`
+/// (quick random-frame grab first, then upgraded to a signalstats-selected
+/// frame).  If the thumbnail has not yet been generated this returns 404 so
+/// callers can handle the not-ready state gracefully.
 async fn get_thumbnail(
     id: web::Path<String>,
     state: web::Data<AppState>,
 ) -> impl Responder {
-    let (abs_path, _) = match find_video(&state, &id).await {
-        Some(v) => v,
-        None => return HttpResponse::NotFound().body("video not found"),
-    };
-
     let thumb_path = state.cache_dir.join(format!("{}.jpg", *id));
-    if !thumb_path.exists() {
-        let abs_str = match abs_path.to_str() {
-            Some(s) => s.to_owned(),
-            None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
-        };
-        let thumb_str = match thumb_path.to_str() {
-            Some(s) => s.to_owned(),
-            None => return HttpResponse::InternalServerError().body("cache path is not valid UTF-8"),
-        };
-
-        let (duration_secs, _) = probe_video(&abs_path).await;
-        let duration = duration_secs as f64;
-
-        // Derive a deterministic fraction in [0.20, 0.80) from the video ID
-        // so every restart returns the same quick thumbnail for the same file.
-        let id_fraction = Uuid::parse_str(&*id)
-            .ok()
-            .map(|u| u.as_bytes()[0] as f64 / 255.0)
-            .unwrap_or(0.5);
-        let seek_secs = format!("{:.3}", (duration * (0.20 + id_fraction * 0.60)).max(1.0));
-
-        // Single seek + grab one frame — fast, no multi-frame analysis.
-        let status = Command::new("ffmpeg")
-            .stdin(std::process::Stdio::null())
-            .args([
-                "-y",
-                "-ss",
-                &seek_secs,
-                "-i",
-                &abs_str,
-                "-frames:v",
-                "1",
-                "-q:v",
-                "2",
-                "-vf",
-                "scale=640:-1",
-                &thumb_str,
-            ])
-            .status()
-            .await;
-        if status.map(|s| !s.success()).unwrap_or(true) {
-            return HttpResponse::ServiceUnavailable().body("ffmpeg thumbnail failed");
-        }
-    }
-
     match tokio::fs::read(&thumb_path).await {
         Ok(data) => HttpResponse::Ok()
             .content_type("image/jpeg")
             .insert_header((header::CACHE_CONTROL, "public, max-age=86400"))
             .body(data),
-        Err(_) => HttpResponse::NotFound().body("thumbnail not found"),
+        Err(_) => HttpResponse::NotFound().body("thumbnail not ready"),
     }
 }
 
-// ── Deep thumbnail generation (background job) ────────────────────────────────
+// ── Thumbnail background job ──────────────────────────────────────────────────
+
+/// Quick one-shot thumbnail: seeks to a **fresh random** position within
+/// 20–80% of the video runtime and grabs a single frame.  The position is
+/// different every time this function is called so repeated runs will pick
+/// different frames.
+///
+/// ffmpeg stdout **and** stderr are suppressed so no ffmpeg output appears in
+/// the main process.
+async fn generate_quick_thumbnail(id: &str, video_path: &Path, cache_dir: &Path) -> bool {
+    let thumb_path = cache_dir.join(format!("{}.jpg", id));
+    if thumb_path.exists() {
+        return true;
+    }
+
+    let (duration_secs, _) = probe_video(video_path).await;
+    if duration_secs == 0 {
+        return false;
+    }
+    let duration = duration_secs as f64;
+
+    // Pick a fresh random position in [20 %, 80 %) of the runtime.
+    // Uuid::new_v4() uses a CSPRNG, giving a different value every call.
+    let random_byte = Uuid::new_v4().as_bytes()[0];
+    let fraction = random_byte as f64 / 255.0; // maps to [0.0, 1.0]
+    let seek_secs = format!("{:.3}", (duration * (0.20 + fraction * 0.60)).max(1.0));
+
+    let video_str = match video_path.to_str() {
+        Some(s) => s.to_owned(),
+        None => return false,
+    };
+    let thumb_str = match thumb_path.to_str() {
+        Some(s) => s.to_owned(),
+        None => return false,
+    };
+
+    let status = Command::new("ffmpeg")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .args([
+            "-y", "-ss", &seek_secs, "-i", &video_str,
+            "-frames:v", "1", "-q:v", "2", "-vf", "scale=640:-1",
+            &thumb_str,
+        ])
+        .status()
+        .await;
+
+    status.map(|s| s.success()).unwrap_or(false)
+}
 
 /// Two-pass ffmpeg thumbnail that uses `signalstats` to pick the most visually
 /// appealing frame from the 20–80% window of the video:
 ///
-/// Pass 1 — analyse frames at 1 fps/5 s and emit signal statistics to stderr.
+/// Pass 1 — sample frames at 1 fps/5 s and capture signal statistics.
 /// Parse SATAVG (colour saturation) and BRNG (out-of-range pixel ratio) for
 /// each frame.  Prefer frames with high saturation and low BRNG (i.e. neither
 /// overexposed nor underexposed).
 ///
 /// Pass 2 — seek directly to the chosen timestamp and write a single JPEG.
+/// ffmpeg stdout **and** stderr are suppressed in pass 2.
 ///
 /// A side-car marker file `{id}.deep` is created on success so the job is
 /// skipped on subsequent runs.
@@ -446,9 +448,12 @@ async fn generate_deep_thumbnail(id: &str, video_path: &Path, cache_dir: &Path) 
         None => return false,
     };
 
-    // Pass 2: extract the chosen frame.
+    // Pass 2: extract the chosen frame.  Suppress stdout/stderr so no
+    // ffmpeg output appears in the main process.
     let status = Command::new("ffmpeg")
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .args([
             "-y",
             "-ss",
@@ -523,13 +528,25 @@ fn parse_float_field(line: &str, field: &str) -> Option<f64> {
     after[..end].parse().ok()
 }
 
-/// Background worker that processes videos one at a time, replacing the quick
-/// thumbnail with a higher-quality signalstats-derived frame.
+/// Background worker that processes videos one at a time in two sequential
+/// phases.
 ///
-/// Waits for a notification via `trigger`, then scans the library for any
-/// video whose `.deep` marker file is absent, and processes each one
-/// sequentially.  The progress counters in `AppState::thumb_progress` are
-/// updated as work proceeds so the frontend can display a progress bar.
+/// **Phase 1 — quick thumbnails**: for every video whose `.jpg` is absent,
+/// grab a single deterministic random frame within 20–80% of the runtime.
+/// This is fast (one short ffmpeg invocation per file) and gives the UI
+/// something to show immediately.
+///
+/// **Phase 2 — deep thumbnails**: for every video whose `.deep` marker is
+/// absent, run the two-pass signalstats analysis to select and extract the
+/// most visually representative frame, then replace the quick thumbnail with
+/// the better one.
+///
+/// Both phases are triggered by a notification on `trigger` (sent at startup
+/// and after every library re-scan).  Progress counters are written to
+/// `progress` so `GET /api/thumbnails/progress` can drive the frontend bar.
+///
+/// All ffmpeg invocations in this worker suppress their stdout **and** stderr
+/// so no ffmpeg output appears in the main process.
 async fn run_thumb_worker(
     library_path: PathBuf,
     cache_dir: PathBuf,
@@ -539,8 +556,53 @@ async fn run_thumb_worker(
     loop {
         trigger.notified().await;
 
-        // Collect every video that still needs a deep thumbnail.
-        let entries: Vec<_> = WalkDir::new(&library_path)
+        // ── Phase 1: quick thumbnails ─────────────────────────────────────
+
+        let quick_entries: Vec<_> = WalkDir::new(&library_path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file() && is_video(e.path()))
+            .filter(|e| {
+                let abs = e.path();
+                let rel = abs
+                    .strip_prefix(&library_path)
+                    .unwrap_or(abs)
+                    .to_string_lossy();
+                let id = video_id(&rel);
+                !cache_dir.join(format!("{}.jpg", id)).exists()
+            })
+            .collect();
+
+        let quick_total = quick_entries.len() as u32;
+        {
+            let mut p = progress.write().expect("thumb_progress lock poisoned");
+            p.current = 0;
+            p.total = quick_total;
+            p.active = quick_total > 0;
+            p.phase = "quick";
+        }
+
+        for entry in quick_entries {
+            let abs = entry.path().to_path_buf();
+            let rel = abs
+                .strip_prefix(&library_path)
+                .unwrap_or(&abs)
+                .to_string_lossy()
+                .to_string();
+            let id = video_id(&rel);
+
+            generate_quick_thumbnail(&id, &abs, &cache_dir).await;
+
+            let mut p = progress.write().expect("thumb_progress lock poisoned");
+            p.current += 1;
+            if p.current >= p.total {
+                p.active = false;
+            }
+        }
+
+        // ── Phase 2: deep thumbnails ──────────────────────────────────────
+
+        let deep_entries: Vec<_> = WalkDir::new(&library_path)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file() && is_video(e.path()))
@@ -555,15 +617,16 @@ async fn run_thumb_worker(
             })
             .collect();
 
-        let total = entries.len() as u32;
+        let deep_total = deep_entries.len() as u32;
         {
             let mut p = progress.write().expect("thumb_progress lock poisoned");
             p.current = 0;
-            p.total = total;
-            p.active = total > 0;
+            p.total = deep_total;
+            p.active = deep_total > 0;
+            p.phase = "deep";
         }
 
-        for entry in entries {
+        for entry in deep_entries {
             let abs = entry.path().to_path_buf();
             let rel = abs
                 .strip_prefix(&library_path)
@@ -585,15 +648,17 @@ async fn run_thumb_worker(
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `GET /api/thumbnails/progress` — current deep-thumbnail generation progress.
+/// `GET /api/thumbnails/progress` — current thumbnail generation progress.
 ///
-/// Returns `{"current":N,"total":M,"active":bool}`.  The frontend polls this
-/// every few seconds to drive the progress bar on the homepage.
+/// Returns `{"current":N,"total":M,"active":bool,"phase":"quick"|"deep"}`.
+/// The frontend polls this every few seconds to drive the progress bar on the
+/// homepage.
 #[derive(Clone, Serialize)]
 struct ThumbProgressResponse {
     current: u32,
     total: u32,
     active: bool,
+    phase: String,
 }
 
 async fn get_thumb_progress(state: web::Data<AppState>) -> impl Responder {
@@ -602,6 +667,7 @@ async fn get_thumb_progress(state: web::Data<AppState>) -> impl Responder {
         current: p.current,
         total: p.total,
         active: p.active,
+        phase: p.phase.to_owned(),
     })
 }
 
@@ -1256,6 +1322,7 @@ async fn main() -> std::io::Result<()> {
         current: 0,
         total: 0,
         active: false,
+        phase: "quick",
     }));
     let thumb_trigger = Arc::new(tokio::sync::Notify::new());
 

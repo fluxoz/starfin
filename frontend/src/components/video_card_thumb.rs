@@ -25,6 +25,11 @@ struct ThumbnailInfo {
     pub interval: f64,
 }
 
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+struct SpriteStatus {
+    pub ready: bool,
+}
+
 #[derive(Properties, PartialEq)]
 pub struct VideoCardThumbProps {
     pub video_id: String,
@@ -59,12 +64,12 @@ pub fn video_card_thumb(props: &VideoCardThumbProps) -> Html {
     // Whether we are currently loading the sprite (to avoid duplicate fetches).
     let loading = use_state(|| false);
 
-    // Whether loading the sprite failed.
+    // Whether loading the sprite failed or the sprite is simply not available yet.
     let load_failed = use_state(|| false);
 
     let thumbnail_url = format!("/api/videos/{}/thumbnail", props.video_id);
 
-    // ── Fetch sprite on first hover ──────────────────────────────────────────
+    // ── Fetch sprite on first hover (only if sprite is already cached) ───────
     {
         let hovering = hovering.clone();
         let loading = loading.clone();
@@ -83,6 +88,27 @@ pub fn video_card_thumb(props: &VideoCardThumbProps) -> Html {
                     let loading = loading.clone();
                     let load_failed = load_failed.clone();
                     spawn_local(async move {
+                        // First, check if the sprite is already cached on the
+                        // server.  This is a cheap filesystem check that never
+                        // triggers ffmpeg, so it returns almost instantly.
+                        match check_sprite_status(&video_id).await {
+                            Ok(status) if status.ready => { /* sprite available — continue */ }
+                            Ok(_) => {
+                                // Sprite not ready yet.  Mark as failed so we
+                                // don't re-check on every hover.
+                                loading.set(false);
+                                load_failed.set(true);
+                                return;
+                            }
+                            Err(_) => {
+                                // Check itself failed (e.g. network error).
+                                // Don't mark as permanently failed — a future
+                                // hover will retry.
+                                loading.set(false);
+                                return;
+                            }
+                        }
+
                         match fetch_thumbnail_info(&video_id).await {
                             Ok(info) => {
                                 let img = web_sys::HtmlImageElement::new().unwrap();
@@ -242,13 +268,26 @@ pub fn video_card_thumb(props: &VideoCardThumbProps) -> Html {
                 width="320"
                 height="180"
             />
-            if *hovering && !*sprite_loaded && !*load_failed {
-                <div class="card__preview-loading">
-                    <span class="card__preview-spinner" />
-                </div>
-            }
         </div>
     }
+}
+
+/// Check whether the sprite sheet for a video is already cached on the server.
+/// This endpoint never triggers ffmpeg — it is a lightweight filesystem check.
+async fn check_sprite_status(video_id: &str) -> Result<SpriteStatus, String> {
+    let url = format!("/api/videos/{video_id}/thumbnails/sprite-status");
+    let resp = Request::get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("fetch error: {e:?}"))?;
+
+    if !resp.ok() {
+        return Err(format!("HTTP {} for {url}", resp.status()));
+    }
+
+    resp.json()
+        .await
+        .map_err(|e| format!("JSON parse error: {e:?}"))
 }
 
 async fn fetch_thumbnail_info(video_id: &str) -> Result<ThumbnailInfo, String> {

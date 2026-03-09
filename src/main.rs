@@ -293,131 +293,13 @@ async fn scan_ws(
     Ok(response)
 }
 
-// ── Smart thumbnail frame selection ─────────────────────────────────────────
-
-/// Parse the stderr output of an ffmpeg `signalstats` pass and return the
-/// timestamp (seconds) of the highest-scoring frame.
-///
-/// Scoring philosophy:
-/// - Reward brightness near the midpoint (~128): well-lit, not dark/blown-out.
-/// - Penalise very dark frames (YAVG < 40) or overexposed frames (YAVG > 220).
-/// - Reward colourful frames (SATAVG contributes positively).
-/// - Skip the first 5% and last 5% of the video to avoid intros/credits.
-///
-/// Returns `None` if no scoreable frame is found (caller should fall back).
-fn parse_best_frame_from_signalstats(stderr: &str, duration: f64) -> Option<f64> {
-    let skip_start = duration * 0.05;
-    let skip_end = duration * 0.95;
-
-    let mut best_ts: Option<f64> = None;
-    let mut best_score = f64::NEG_INFINITY;
-
-    // Per-frame accumulator — reset once both YAVG and SATAVG are seen.
-    let mut cur_ts: Option<f64> = None;
-    let mut cur_yavg: Option<f64> = None;
-    let mut cur_satavg: Option<f64> = None;
-
-    /// Score a single frame and update the running best if it is an improvement.
-    fn try_score(
-        ts: f64,
-        yavg: f64,
-        satavg: f64,
-        skip_start: f64,
-        skip_end: f64,
-        best_ts: &mut Option<f64>,
-        best_score: &mut f64,
-    ) {
-        if ts < skip_start || ts > skip_end {
-            return;
-        }
-        let brightness_score = if yavg < 40.0 || yavg > 220.0 {
-            -100.0
-        } else {
-            -(yavg - 128.0).abs() / 128.0 * 50.0
-        };
-        let score = brightness_score + satavg * 0.5;
-        if score > *best_score {
-            *best_score = score;
-            *best_ts = Some(ts);
-        }
-    }
-
-    for line in stderr.lines() {
-        let line = line.trim();
-
-        // Timestamp line: `t=5.000000` (may appear among other tokens).
-        if let Some(t_str) = line
-            .split_whitespace()
-            .find_map(|tok| tok.strip_prefix("t="))
-        {
-            if let Ok(t) = t_str.parse::<f64>() {
-                // Starting a new frame — score the previous one first.
-                if let (Some(ts), Some(yavg), Some(satavg)) = (cur_ts, cur_yavg, cur_satavg) {
-                    try_score(ts, yavg, satavg, skip_start, skip_end, &mut best_ts, &mut best_score);
-                }
-                cur_ts = Some(t);
-                cur_yavg = None;
-                cur_satavg = None;
-            }
-        }
-
-        // Key=value metadata style: `lavfi.signalstats.YAVG=128.4`
-        if let Some(val) = line.strip_prefix("lavfi.signalstats.YAVG=") {
-            cur_yavg = val.parse().ok();
-        } else if let Some(val) = line.strip_prefix("lavfi.signalstats.SATAVG=") {
-            cur_satavg = val.parse().ok();
-        }
-
-        // Inline log style: `YAVG:128.4` / `SATAVG:45.2`
-        for tok in line.split_whitespace() {
-            if let Some(val) = tok.strip_prefix("YAVG:") {
-                cur_yavg = val.parse().ok();
-            } else if let Some(val) = tok.strip_prefix("SATAVG:") {
-                cur_satavg = val.parse().ok();
-            }
-        }
-    }
-
-    // Score the final frame if it was never followed by a new timestamp line.
-    if let (Some(ts), Some(yavg), Some(satavg)) = (cur_ts, cur_yavg, cur_satavg) {
-        try_score(ts, yavg, satavg, skip_start, skip_end, &mut best_ts, &mut best_score);
-    }
-
-    best_ts
-}
-
-/// Run ffmpeg with the `signalstats` filter to sample one frame every 5 seconds,
-/// score each frame for brightness and colour, and return the timestamp of the
-/// best-looking frame.
-///
-/// Falls back to 10% of the video duration (minimum 5 s) if ffmpeg fails or
-/// produces no parseable output.
-async fn find_best_frame_timestamp(video_path: &str, duration: f64) -> f64 {
-    let fallback = (duration * 0.10_f64).max(5.0);
-
-    // Sample one frame every 5 seconds — fast because we use `-f null -`.
-    let output = Command::new("ffmpeg")
-        .args([
-            "-i",
-            video_path,
-            "-vf",
-            "fps=1/5,signalstats",
-            "-f",
-            "null",
-            "-",
-        ])
-        .output()
-        .await;
-
-    let Ok(out) = output else {
-        return fallback;
-    };
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    parse_best_frame_from_signalstats(&stderr, duration).unwrap_or(fallback)
-}
-
 /// `GET /api/videos/{id}/thumbnail` — JPEG thumbnail via ffmpeg.
+///
+/// Uses a single ffmpeg pass with the `thumbnail` filter: seeks to 10% of the
+/// video to skip intros, then analyses 80% of the total duration (i.e. from
+/// 10% to 90%) to avoid end-credits, samples one frame every 5 seconds, and
+/// lets the `thumbnail` filter pick the most representative frame from the
+/// first 50 samples (~4 min of content).
 async fn get_thumbnail(
     id: web::Path<String>,
     state: web::Data<AppState>,
@@ -438,24 +320,31 @@ async fn get_thumbnail(
             None => return HttpResponse::InternalServerError().body("cache path is not valid UTF-8"),
         };
 
-        // Probe the video to get its duration, then pick the best-looking frame.
         let (duration_secs, _) = probe_video(&abs_path).await;
-        let best_ts = find_best_frame_timestamp(&abs_str, duration_secs as f64).await;
-        let ts_str = format!("{:.3}", best_ts);
+        let duration = duration_secs as f64;
+        // Skip the first 10% (intro) and analyse the next 80% of the video
+        // (i.e. from 10% to 90%), so end-credits are excluded.
+        // Both values are floored to at least 1 s to handle very short clips.
+        let skip_secs = format!("{:.3}", (duration * 0.10).max(1.0));
+        let analyze_secs = format!("{:.3}", (duration * 0.80).max(1.0));
 
+        // Single-pass: seek → sample 1 fps/5 s → thumbnail filter picks best →
+        // scale → write JPEG.  No separate analysis pass needed.
         let status = Command::new("ffmpeg")
             .args([
                 "-y",
+                "-ss",
+                &skip_secs,
+                "-t",
+                &analyze_secs,
                 "-i",
                 &abs_str,
-                "-ss",
-                &ts_str,
-                "-vframes",
+                "-vf",
+                "fps=1/5,thumbnail=n=50,scale=640:-1",
+                "-frames:v",
                 "1",
                 "-q:v",
                 "2",
-                "-vf",
-                "scale=640:-1",
                 &thumb_str,
             ])
             .status()
@@ -1236,67 +1125,4 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_best_frame_from_signalstats;
 
-    /// Simulate the key=value metadata format emitted by newer ffmpeg builds.
-    #[test]
-    fn test_parse_signalstats_keyvalue_format() {
-        let stderr = "\
-frame=1 fps=0.0 pts=0 t=0.000000 best_effort_timestamp=0
-lavfi.signalstats.YAVG=5.0
-lavfi.signalstats.SATAVG=2.0
-frame=2 fps=0.0 pts=5 t=5.000000 best_effort_timestamp=5
-lavfi.signalstats.YAVG=128.0
-lavfi.signalstats.SATAVG=60.0
-frame=3 fps=0.0 pts=10 t=10.000000 best_effort_timestamp=10
-lavfi.signalstats.YAVG=230.0
-lavfi.signalstats.SATAVG=10.0
-";
-        // Duration 20 s → skip window 1..19 s.  Frame at t=0 is skipped (< 5%),
-        // frame at t=5 should win (bright midpoint + colour), t=10 penalised (>220).
-        let ts = parse_best_frame_from_signalstats(stderr, 20.0);
-        assert_eq!(ts, Some(5.0));
-    }
-
-    /// Simulate the inline log format emitted by some older ffmpeg builds.
-    #[test]
-    fn test_parse_signalstats_inline_format() {
-        let stderr = "\
-frame=1 fps=0.0 pts=5 t=5.000000 YAVG:20.0 SATAVG:5.0
-frame=2 fps=0.0 pts=10 t=10.000000 YAVG:130.0 SATAVG:50.0
-frame=3 fps=0.0 pts=15 t=15.000000 YAVG:125.0 SATAVG:80.0
-";
-        // Duration 40 s → skip window 2..38 s.  All three frames are in range.
-        // t=15 wins: -(125-128)/128*50 + 80*0.5 ≈ 1.17 + 40 = 41.17
-        // t=10: -(130-128)/128*50 + 50*0.5 ≈ -0.78 + 25 = 24.22
-        // t=5: yavg=20 < 40 → brightness=-100, score = -100 + 2.5 = -97.5
-        let ts = parse_best_frame_from_signalstats(stderr, 40.0);
-        assert_eq!(ts, Some(15.0));
-    }
-
-    /// All frames outside the 5%–95% window should be skipped.
-    #[test]
-    fn test_parse_signalstats_skip_boundary_frames() {
-        let stderr = "\
-frame=1 fps=0.0 pts=0 t=0.500000
-lavfi.signalstats.YAVG=128.0
-lavfi.signalstats.SATAVG=60.0
-frame=2 fps=0.0 pts=5 t=9.800000
-lavfi.signalstats.YAVG=128.0
-lavfi.signalstats.SATAVG=60.0
-";
-        // Duration 10 s → valid window is 0.5 s to 9.5 s.
-        // t=0.5 is exactly at 5% boundary, included; t=9.8 is past 95%, excluded.
-        let ts = parse_best_frame_from_signalstats(stderr, 10.0);
-        assert_eq!(ts, Some(0.5));
-    }
-
-    /// Returns None when stderr is empty or contains no parseable frames.
-    #[test]
-    fn test_parse_signalstats_empty_returns_none() {
-        assert_eq!(parse_best_frame_from_signalstats("", 60.0), None);
-        assert_eq!(parse_best_frame_from_signalstats("some random output\n", 60.0), None);
-    }
-}

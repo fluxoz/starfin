@@ -8,7 +8,6 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use uuid::Uuid;
@@ -912,6 +911,7 @@ async fn main() -> std::io::Result<()> {
         library_path: library_path.clone(),
         cache_dir: cache_dir.clone(),
         video_cache: Arc::clone(&video_cache),
+        last_segment_access: RwLock::new(HashMap::new()),
     });
 
     // Background task: re-scan the library every 60 seconds.
@@ -925,7 +925,6 @@ async fn main() -> std::io::Result<()> {
             let items = scan_library(&bg_library_path).await;
             *bg_cache.write().expect("video cache lock poisoned") = items;
         }
-        last_segment_access: RwLock::new(HashMap::new()),
     });
 
     // ── Idle-eviction background task ────────────────────────────────────────

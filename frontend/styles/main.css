@@ -596,6 +596,46 @@ body{
   }
 }
 
+/* ── Hover preview canvas ─────────────────────────────────────────────────── */
+.card__preview-canvas{
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  transition: opacity .25s ease;
+  pointer-events: none;
+}
+.card__preview-canvas--visible{
+  opacity: 1;
+}
+
+.card__preview-loading{
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,.35);
+  pointer-events: none;
+}
+.card__preview-spinner{
+  width: 24px;
+  height: 24px;
+  border: 3px solid rgba(255,255,255,.3);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: card-spin .6s linear infinite;
+}
+@keyframes card-spin{
+  to{ transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce){
+  .card__preview-canvas{ transition: none; }
+  .card__preview-spinner{ animation: none; }
+}
+
 /* ── Watch button variant ────────────────────────────────────────────────── */
 .btn--watch{
   background: var(--accent);

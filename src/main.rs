@@ -993,6 +993,30 @@ async fn get_thumbnail_info(
     HttpResponse::Ok().json(info)
 }
 
+/// `GET /api/videos/{id}/thumbnails/sprite-status` — check if sprite is cached
+///
+/// Returns `{"ready": true}` when the sprite sheet has already been generated
+/// and is available in the cache.  Returns `{"ready": false}` otherwise.
+/// This endpoint never triggers ffmpeg — it is a cheap filesystem check so
+/// the frontend can decide whether to show a hover preview.
+async fn get_sprite_status(
+    id: web::Path<String>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    // Validate that the ID is a well-formed UUID to prevent path-traversal.
+    if Uuid::parse_str(&id).is_err() {
+        return HttpResponse::BadRequest().body("invalid video id");
+    }
+
+    let sprite_path = state
+        .cache_dir
+        .join(format!("{}_thumbs", *id))
+        .join("sprite.jpg");
+
+    let ready = sprite_path.exists();
+    HttpResponse::Ok().json(serde_json::json!({ "ready": ready }))
+}
+
 /// `GET /api/videos/{id}/thumbnails/sprite.jpg` — get thumbnail sprite image
 async fn get_thumbnail_sprite(
     id: web::Path<String>,
@@ -1426,6 +1450,10 @@ async fn main() -> std::io::Result<()> {
             .route(
                 "/api/videos/{id}/thumbnails/info",
                 web::get().to(get_thumbnail_info),
+            )
+            .route(
+                "/api/videos/{id}/thumbnails/sprite-status",
+                web::get().to(get_sprite_status),
             )
             .route(
                 "/api/videos/{id}/thumbnails/sprite.jpg",

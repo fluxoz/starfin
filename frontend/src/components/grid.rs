@@ -1,3 +1,4 @@
+use crate::components::video_card_thumb::VideoCardThumb;
 use crate::models::Element;
 use yew::prelude::*;
 
@@ -33,11 +34,10 @@ pub fn elements_grid(props: &Props) -> Html {
             { for props.items.iter().map(|item| {
                 let item_clone = item.clone();
                 let on_watch = props.on_watch.clone();
-                let thumbnail_url = format!("/api/videos/{}/thumbnail", item.id);
 
                 html! {
                     <article class="card" key={item.id.clone()}>
-                        <div class="card__thumb" style={format!("background-image: url('{thumbnail_url}')")} />
+                        <VideoCardThumb video_id={item.id.clone()} />
 
                         <div class="card__top">
                             <div class="card__title">{ item.title.clone() }</div>

@@ -1213,7 +1213,12 @@ async fn generate_sprite(id: &str, abs_path: &Path, cache_dir: &Path) -> bool {
     let tile_layout = format!("{}x{}", columns, rows);
     let scale = format!("scale={}:{}", THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
 
-    let sprite_path_str = match sprite_path.to_str() {
+    // Write to a temp file first so that `sprite.jpg` only exists once the
+    // file is fully written.  An interrupted or failed ffmpeg run would
+    // otherwise leave a partial `sprite.jpg` that the status check would
+    // mistake for a completed sprite.
+    let tmp_path = sprite_dir.join("sprite.jpg.tmp");
+    let tmp_path_str = match tmp_path.to_str() {
         Some(s) => s.to_owned(),
         None => return false,
     };
@@ -1234,21 +1239,32 @@ async fn generate_sprite(id: &str, abs_path: &Path, cache_dir: &Path) -> bool {
             "1",
             "-q:v",
             "5",
-            &sprite_path_str,
+            &tmp_path_str,
         ])
         .stdout(std::process::Stdio::null())
         .output()
         .await;
 
     match output {
-        Ok(out) if out.status.success() => true,
+        Ok(out) if out.status.success() => {
+            // Atomically promote the temp file to the final path so that
+            // `sprite.jpg` is never visible in a partially-written state.
+            if tokio::fs::rename(&tmp_path, &sprite_path).await.is_ok() {
+                true
+            } else {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                false
+            }
+        }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             eprintln!("ffmpeg sprite generation failed for {id}: {stderr}");
+            let _ = tokio::fs::remove_file(&tmp_path).await;
             false
         }
         Err(e) => {
             eprintln!("failed to execute ffmpeg for sprite {id}: {e}");
+            let _ = tokio::fs::remove_file(&tmp_path).await;
             false
         }
     }

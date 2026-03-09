@@ -445,10 +445,13 @@ async fn get_segment(
     //
     // Key optimizations for better seeking performance:
     // 1. Force keyframe at segment start with -force_key_frames expr:gte(t,0)
-    // 2. Set keyint/g to match segment duration for consistent keyframe placement
+    // 2. Use GOP settings that work across different frame rates
     // 3. Use faster preset for quicker segment generation
     // 4. Disable scene change detection to ensure predictable keyframe placement
-    let keyint = (SEGMENT_DURATION * 30.0) as i32; // Assuming ~30fps, keyframe every segment duration
+    //
+    // Note: We use a time-based expression for keyframes rather than frame count
+    // to be framerate-independent. The -g option with a high value ensures libx264
+    // doesn't insert additional keyframes beyond what we force.
     let output = Command::new("ffmpeg")
         .current_dir(&hls_dir)
         .stdin(std::process::Stdio::null())  // Don't read from stdin
@@ -463,9 +466,13 @@ async fn get_segment(
             "-profile:v", "baseline",
             "-level", "3.1",
             "-preset", "veryfast",  // Faster encoding for on-demand transcoding
-            // Keyframe settings for better seeking:
-            "-force_key_frames", "expr:gte(t,0)",  // Force keyframe at segment start
-            "-x264-params", &format!("keyint={}:min-keyint={}:scenecut=0", keyint, keyint),
+            // Keyframe settings for better seeking (framerate-independent):
+            // Force keyframe at segment start; use time-based expression
+            "-force_key_frames", "expr:gte(t,0)",
+            // Set large GOP to avoid extra keyframes; scenecut=0 disables scene detection
+            "-g", "250",
+            "-keyint_min", "25",
+            "-sc_threshold", "0",
             "-c:a", "aac",
             "-b:a", "128k",  // Consistent audio bitrate
             "-f", "mp4",

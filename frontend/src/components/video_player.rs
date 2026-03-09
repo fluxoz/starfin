@@ -14,6 +14,45 @@ use yew::prelude::*;
 // ── Playback speed options ───────────────────────────────────────────────────
 const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
 
+// ── HLS.js configuration constants ───────────────────────────────────────────
+// These settings are optimized for VOD content with on-demand transcoding.
+// The timeouts and retry values are tuned for the latency introduced by
+// transcoding segments on the fly (similar to Jellyfin/Plex approach).
+
+/// Maximum buffer length in seconds (forward buffer)
+const HLS_MAX_BUFFER_LENGTH: f64 = 30.0;
+/// Maximum maximum buffer length in seconds (absolute cap)
+const HLS_MAX_MAX_BUFFER_LENGTH: f64 = 60.0;
+/// Maximum buffer size in bytes (60 MB)
+const HLS_MAX_BUFFER_SIZE: f64 = 60.0 * 1000.0 * 1000.0;
+/// Back buffer length in seconds (for backward seeking without refetch)
+const HLS_BACK_BUFFER_LENGTH: f64 = 30.0;
+
+/// Fragment loading timeout in milliseconds
+/// Higher than default to accommodate on-demand transcoding latency
+const HLS_FRAG_LOADING_TIMEOUT_MS: f64 = 20000.0;
+/// Maximum retries for fragment loading
+const HLS_FRAG_LOADING_MAX_RETRY: f64 = 4.0;
+/// Delay between fragment loading retries in milliseconds
+const HLS_FRAG_LOADING_RETRY_DELAY_MS: f64 = 1000.0;
+/// Maximum total retry timeout for fragment loading in milliseconds
+const HLS_FRAG_LOADING_MAX_RETRY_TIMEOUT_MS: f64 = 64000.0;
+
+/// Level loading timeout in milliseconds
+const HLS_LEVEL_LOADING_TIMEOUT_MS: f64 = 10000.0;
+/// Maximum retries for level loading
+const HLS_LEVEL_LOADING_MAX_RETRY: f64 = 4.0;
+
+/// Manifest loading timeout in milliseconds
+const HLS_MANIFEST_LOADING_TIMEOUT_MS: f64 = 10000.0;
+/// Maximum retries for manifest loading
+const HLS_MANIFEST_LOADING_MAX_RETRY: f64 = 2.0;
+
+/// Nudge offset in seconds (helps recover from small stream gaps)
+const HLS_NUDGE_OFFSET: f64 = 0.1;
+/// Maximum nudge retry count
+const HLS_NUDGE_MAX_RETRY: f64 = 5.0;
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn format_time(seconds: f64) -> String {
@@ -275,6 +314,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
                 // Create HLS.js instance with configuration optimized for VOD seeking
                 // Based on industry best practices (similar to Jellyfin/Plex approach)
+                // See HLS_* constants at the top of this file for value documentation
                 let config = js_sys::Object::new();
                 
                 // Enable debug logs only in development
@@ -283,41 +323,34 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 // Enable web worker for better UI responsiveness during seeking
                 js_sys::Reflect::set(&config, &JsValue::from_str("enableWorker"), &JsValue::from_bool(true)).ok();
                 
-                // Buffer settings optimized for VOD with on-demand transcoding:
-                // - Lower maxBufferLength for faster response when seeking to non-cached segments
-                // - Reasonable maxMaxBufferLength for smooth playback after seek
-                js_sys::Reflect::set(&config, &JsValue::from_str("maxBufferLength"), &JsValue::from_f64(30.0)).ok();
-                js_sys::Reflect::set(&config, &JsValue::from_str("maxMaxBufferLength"), &JsValue::from_f64(60.0)).ok();
-                js_sys::Reflect::set(&config, &JsValue::from_str("maxBufferSize"), &JsValue::from_f64(60.0 * 1000.0 * 1000.0)).ok();
+                // Buffer settings optimized for VOD with on-demand transcoding
+                js_sys::Reflect::set(&config, &JsValue::from_str("maxBufferLength"), &JsValue::from_f64(HLS_MAX_BUFFER_LENGTH)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("maxMaxBufferLength"), &JsValue::from_f64(HLS_MAX_MAX_BUFFER_LENGTH)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("maxBufferSize"), &JsValue::from_f64(HLS_MAX_BUFFER_SIZE)).ok();
                 
                 // Back buffer settings - keep some played content for backward seeking
-                // Set to 30 seconds to allow quick backward seeks without re-fetching
-                js_sys::Reflect::set(&config, &JsValue::from_str("backBufferLength"), &JsValue::from_f64(30.0)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("backBufferLength"), &JsValue::from_f64(HLS_BACK_BUFFER_LENGTH)).ok();
                 
                 // Start position for VOD content (start from beginning)
                 js_sys::Reflect::set(&config, &JsValue::from_str("startPosition"), &JsValue::from_f64(-1.0)).ok();
                 
-                // Seek handling improvements:
-                // - When seeking, flush the buffer and start loading from the new position
-                // - nudgeOffset helps recover from small gaps in the stream
-                js_sys::Reflect::set(&config, &JsValue::from_str("nudgeOffset"), &JsValue::from_f64(0.1)).ok();
-                js_sys::Reflect::set(&config, &JsValue::from_str("nudgeMaxRetry"), &JsValue::from_f64(5.0)).ok();
+                // Seek handling improvements - nudge settings help recover from small stream gaps
+                js_sys::Reflect::set(&config, &JsValue::from_str("nudgeOffset"), &JsValue::from_f64(HLS_NUDGE_OFFSET)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("nudgeMaxRetry"), &JsValue::from_f64(HLS_NUDGE_MAX_RETRY)).ok();
                 
-                // Fragment loading settings for better seeking:
-                // - Lower timeout for faster failure detection on slow segments
-                // - More retries to handle on-demand transcoding latency
-                js_sys::Reflect::set(&config, &JsValue::from_str("fragLoadingTimeOut"), &JsValue::from_f64(20000.0)).ok();
-                js_sys::Reflect::set(&config, &JsValue::from_str("fragLoadingMaxRetry"), &JsValue::from_f64(4.0)).ok();
-                js_sys::Reflect::set(&config, &JsValue::from_str("fragLoadingRetryDelay"), &JsValue::from_f64(1000.0)).ok();
-                js_sys::Reflect::set(&config, &JsValue::from_str("fragLoadingMaxRetryTimeout"), &JsValue::from_f64(64000.0)).ok();
+                // Fragment loading settings for on-demand transcoding
+                js_sys::Reflect::set(&config, &JsValue::from_str("fragLoadingTimeOut"), &JsValue::from_f64(HLS_FRAG_LOADING_TIMEOUT_MS)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("fragLoadingMaxRetry"), &JsValue::from_f64(HLS_FRAG_LOADING_MAX_RETRY)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("fragLoadingRetryDelay"), &JsValue::from_f64(HLS_FRAG_LOADING_RETRY_DELAY_MS)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("fragLoadingMaxRetryTimeout"), &JsValue::from_f64(HLS_FRAG_LOADING_MAX_RETRY_TIMEOUT_MS)).ok();
                 
                 // Level loading settings
-                js_sys::Reflect::set(&config, &JsValue::from_str("levelLoadingTimeOut"), &JsValue::from_f64(10000.0)).ok();
-                js_sys::Reflect::set(&config, &JsValue::from_str("levelLoadingMaxRetry"), &JsValue::from_f64(4.0)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("levelLoadingTimeOut"), &JsValue::from_f64(HLS_LEVEL_LOADING_TIMEOUT_MS)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("levelLoadingMaxRetry"), &JsValue::from_f64(HLS_LEVEL_LOADING_MAX_RETRY)).ok();
                 
                 // Manifest loading settings
-                js_sys::Reflect::set(&config, &JsValue::from_str("manifestLoadingTimeOut"), &JsValue::from_f64(10000.0)).ok();
-                js_sys::Reflect::set(&config, &JsValue::from_str("manifestLoadingMaxRetry"), &JsValue::from_f64(2.0)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("manifestLoadingTimeOut"), &JsValue::from_f64(HLS_MANIFEST_LOADING_TIMEOUT_MS)).ok();
+                js_sys::Reflect::set(&config, &JsValue::from_str("manifestLoadingMaxRetry"), &JsValue::from_f64(HLS_MANIFEST_LOADING_MAX_RETRY)).ok();
 
                 let hls = HlsJs::new_with_config(&config);
                 

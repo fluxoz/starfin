@@ -6,8 +6,11 @@
     <meta name="color-scheme" content="light dark" />
     <title>Starfin</title>
     <link data-trunk rel="css" href="styles/main.css" />
-    <!-- HLS.js for video streaming -->
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.0/dist/hls.min.js"></script>
+    <!-- Vendored assets – no external CDN requests -->
+    <link data-trunk rel="copy-file" href="vendor/hls.min.js" />
+    <link data-trunk rel="copy-dir"  href="fonts" />
+    <!-- HLS.js for video streaming (vendored) -->
+    <script src="vendor/hls.min.js"></script>
   </head>
   <body>
 	  <p>This is some embedded html!</p>

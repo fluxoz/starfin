@@ -999,8 +999,8 @@ async fn clear_cache(
 
 /// Thumbnail sprite configuration
 const THUMBNAIL_INTERVAL: f64 = 10.0; // Generate thumbnail every 10 seconds
-const THUMBNAIL_WIDTH: u32 = 320;
-const THUMBNAIL_HEIGHT: u32 = 180;
+const THUMBNAIL_WIDTH: u32 = 640;
+const THUMBNAIL_HEIGHT: u32 = 360;
 const THUMBNAILS_PER_ROW: u32 = 10;
 
 /// Response for thumbnail sprite info

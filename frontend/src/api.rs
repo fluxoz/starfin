@@ -7,18 +7,11 @@ struct ElementsResponse {
     items: Vec<Element>,
 }
 
-/// Trigger an immediate re-scan of the media library on the server.
-pub async fn trigger_scan() -> Result<(), String> {
-    let resp = Request::post("/api/scan")
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {e:?}"))?;
-
-    if !resp.ok() {
-        return Err(format!("HTTP error: {}", resp.status()));
-    }
-
-    Ok(())
+/// Progress frame received over the scan WebSocket: `{"current":N,"total":M}`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ScanProgressData {
+    pub current: u32,
+    pub total: u32,
 }
 
 /// Fetch all videos from the API, then apply filtering and sorting locally.

@@ -4,6 +4,8 @@ use crate::components;
 use components::{filters::FiltersBar, grid::ElementsGrid, video_player::VideoPlayer};
 use crate::models::{Element, Filters, SortBy};
 
+use futures::StreamExt;
+use gloo_net::websocket::{futures::WebSocket, Message};
 use gloo_timers::callback::Interval;
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
@@ -19,6 +21,7 @@ pub fn app() -> Html {
     let error = use_state(|| Option::<String>::None);
     let selected = use_state(|| Option::<Element>::None);
     let scanning = use_state(|| false);
+    let scan_progress = use_state(|| Option::<(u32, u32)>::None);
 
     // Dark mode state
     let dark_mode = use_state(|| false);
@@ -118,6 +121,7 @@ pub fn app() -> Html {
         let query = query.clone();
         let filters = filters.clone();
         let sort_by = sort_by.clone();
+        let scan_progress = scan_progress.clone();
         Callback::from(move |_: MouseEvent| {
             if *scanning {
                 return;
@@ -127,18 +131,58 @@ pub fn app() -> Html {
             let query = (*query).clone();
             let filters = (*filters).clone();
             let sort_by = (*sort_by).clone();
+            let scan_progress = scan_progress.clone();
+
             scanning.set(true);
+            scan_progress.set(Some((0, 0)));
+
             spawn_local(async move {
-                let _ = api::trigger_scan().await;
+                // Build the WebSocket URL from the current page's location.
+                let ws_url = {
+                    let location = web_sys::window()
+                        .expect("no window")
+                        .location();
+                    let protocol = location.protocol().unwrap_or_default();
+                    let host = location.host().unwrap_or_default();
+                    let ws_proto = if protocol == "https:" { "wss" } else { "ws" };
+                    format!("{ws_proto}://{host}/api/scan/ws")
+                };
+
+                if let Ok(ws) = WebSocket::open(&ws_url) {
+                    // Only read from the server; split() avoids needing the type to be Unpin.
+                    let (_, mut read) = ws.split();
+                    while let Some(Ok(Message::Text(text))) = read.next().await {
+                        match serde_json::from_str::<api::ScanProgressData>(&text) {
+                            Ok(p) => scan_progress.set(Some((p.current, p.total))),
+                            Err(e) => web_sys::console::warn_1(
+                                &format!("scan_ws: unexpected message: {e}").into(),
+                            ),
+                        }
+                    }
+                    // WebSocket closed = scan complete.
+                }
+
+                // Refresh the media list now that the cache is updated.
                 if let Ok(data) = api::fetch_elements(&query, &filters, sort_by).await {
                     items.set(data);
                 }
+                scan_progress.set(None);
                 scanning.set(false);
             });
         })
     };
 
     let app_class = if *dark_mode { "app dark-mode" } else { "app" };
+
+    // Compute progress percentage and label for the scan progress bar.
+    let (scan_pct, scan_label) = match *scan_progress {
+        Some((current, total)) if total > 0 => (
+            (current as f64 / total as f64 * 100.0) as u32,
+            format!("{} / {} files", current, total),
+        ),
+        Some(_) => (0, "Counting files…".to_string()),
+        None => (0, String::new()),
+    };
 
     html! {
         <>
@@ -163,14 +207,24 @@ pub fn app() -> Html {
                     <div class="topbar__inner">
                         <div class="topbar__left">{ "STARFIN MEDIA SERVER" }</div>
                         <div class="topbar__right">
-                            <button
-                                class={if *scanning { "scan-btn scan-btn--scanning" } else { "scan-btn" }}
-                                onclick={on_scan}
-                                disabled={*scanning}
-                                aria-label="Scan for new media"
-                            >
-                                { if *scanning { "SCANNING…" } else { "SCAN MEDIA" } }
-                            </button>
+                            <div class="scan-area">
+                                <button
+                                    class={if *scanning { "scan-btn scan-btn--scanning" } else { "scan-btn" }}
+                                    onclick={on_scan}
+                                    disabled={*scanning}
+                                    aria-label="Scan for new media"
+                                >
+                                    { if *scanning { "SCANNING…" } else { "SCAN MEDIA" } }
+                                </button>
+                                if *scanning {
+                                    <div class="scan-progress" role="progressbar" aria-label="Scan progress" aria-valuenow={scan_pct.to_string()} aria-valuemin="0" aria-valuemax="100">
+                                        <div class="scan-progress__track">
+                                            <div class="scan-progress__fill" style={format!("width: {}%", scan_pct)} />
+                                        </div>
+                                        <span class="scan-progress__label">{ &scan_label }</span>
+                                    </div>
+                                }
+                            </div>
                             <button 
                                 class="theme-toggle" 
                                 onclick={on_toggle_dark_mode.clone()}
@@ -210,4 +264,3 @@ pub fn app() -> Html {
         </>
     }
 }
-

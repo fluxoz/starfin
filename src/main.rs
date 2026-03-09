@@ -202,11 +202,80 @@ async fn list_videos(state: web::Data<AppState>) -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!({ "items": items }))
 }
 
-/// `POST /api/scan` — trigger an immediate re-scan of the media library.
-async fn scan_videos(state: web::Data<AppState>) -> impl Responder {
-    let items = scan_library(&state.library_path).await;
-    *state.video_cache.write().expect("video cache lock poisoned") = items;
-    HttpResponse::Ok().json(serde_json::json!({ "status": "ok" }))
+/// `GET /api/scan/ws` — WebSocket endpoint that starts an immediate library scan and
+/// streams live progress as JSON text frames: `{"current":N,"total":M}`.
+/// The connection closes once the scan completes and the cache has been updated.
+async fn scan_ws(
+    req: HttpRequest,
+    body: web::Payload,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (response, mut session, _msg_stream) = actix_ws::handle(&req, body)?;
+
+    let library_path = state.library_path.clone();
+    let video_cache = Arc::clone(&state.video_cache);
+
+    actix_web::rt::spawn(async move {
+        // Enumerate all video files up-front so we can report a total.
+        let entries: Vec<_> = WalkDir::new(&library_path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file() && is_video(e.path()))
+            .collect();
+
+        let total = entries.len() as u32;
+
+        // Send the initial frame so the client knows the total immediately.
+        let init_msg = serde_json::json!({"current": 0u32, "total": total}).to_string();
+        if session.text(init_msg).await.is_err() {
+            return; // Client already disconnected.
+        }
+
+        let mut items = Vec::new();
+        for (idx, entry) in entries.into_iter().enumerate() {
+            let abs = entry.path().to_path_buf();
+            let rel = abs
+                .strip_prefix(&library_path)
+                .unwrap_or(&abs)
+                .to_string_lossy()
+                .to_string();
+
+            let fallback_title = abs
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Unknown")
+                .replace(['.', '_', '-'], " ");
+
+            let id = video_id(&rel);
+            let (duration_secs, meta) = probe_video(&abs).await;
+
+            items.push(VideoItem {
+                id,
+                title: meta.title.unwrap_or(fallback_title),
+                description: String::new(),
+                genre: meta.genre.unwrap_or_default(),
+                tags: vec![],
+                rating: 0.0,
+                year: meta.year.unwrap_or(0),
+                duration_secs,
+                director: meta.director.unwrap_or_default(),
+            });
+
+            let current = (idx + 1) as u32;
+            let msg = serde_json::json!({"current": current, "total": total}).to_string();
+            if session.text(msg).await.is_err() {
+                return; // Client disconnected mid-scan.
+            }
+        }
+
+        // Commit the updated library to the shared cache.
+        *video_cache.write().expect("video cache lock poisoned") = items;
+
+        // Close the WebSocket — the client uses this signal to know the scan is done.
+        let _ = session.close(None).await;
+    });
+
+    Ok(response)
 }
 
 /// `GET /api/videos/{id}/thumbnail` — JPEG thumbnail via ffmpeg.
@@ -984,7 +1053,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(state.clone())
             .wrap(Logger::default())
             .route("/api/health", web::get().to(|| async { "ok" }))
-            .route("/api/scan", web::post().to(scan_videos))
+            .route("/api/scan/ws", web::get().to(scan_ws))
             .route("/api/videos", web::get().to(list_videos))
             .route("/api/videos/{id}/thumbnail", web::get().to(get_thumbnail))
             .route(

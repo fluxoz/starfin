@@ -14,6 +14,17 @@ pub struct ScanProgressData {
     pub total: u32,
 }
 
+/// Progress data returned by `GET /api/thumbnails/progress`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ThumbProgressData {
+    pub current: u32,
+    pub total: u32,
+    pub active: bool,
+    /// `"quick"` during the initial random-frame pass; `"deep"` during the
+    /// signalstats quality-selection pass.
+    pub phase: String,
+}
+
 /// Fetch all videos from the API, then apply filtering and sorting locally.
 pub async fn fetch_elements(
     query: &str,
@@ -34,6 +45,22 @@ pub async fn fetch_elements(
         .map_err(|e| format!("Invalid JSON: {e:?}"))?;
 
     Ok(apply_filters(parsed.items, query, sort_by))
+}
+
+/// Fetch the current deep-thumbnail generation progress from the server.
+pub async fn fetch_thumb_progress() -> Result<ThumbProgressData, String> {
+    let resp = Request::get("/api/thumbnails/progress")
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e:?}"))?;
+
+    if !resp.ok() {
+        return Err(format!("HTTP error: {}", resp.status()));
+    }
+
+    resp.json()
+        .await
+        .map_err(|e| format!("Invalid JSON: {e:?}"))
 }
 
 // ── Local filtering & sorting ────────────────────────────────────────────────

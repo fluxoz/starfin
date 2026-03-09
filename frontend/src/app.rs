@@ -4,6 +4,8 @@ use crate::components;
 use components::{filters::FiltersBar, grid::ElementsGrid, video_player::VideoPlayer};
 use crate::models::{Element, Filters, SortBy};
 
+use futures::StreamExt;
+use gloo_net::websocket::{futures::WebSocket, Message};
 use gloo_timers::callback::Interval;
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
@@ -83,28 +85,6 @@ pub fn app() -> Html {
         });
     }
 
-    // Progress polling: while a scan is running, fetch progress every 500 ms.
-    {
-        let scan_progress = scan_progress.clone();
-        use_effect_with(*scanning, move |&is_scanning| {
-            let interval = if is_scanning {
-                let scan_progress = scan_progress.clone();
-                Some(Interval::new(500, move || {
-                    let scan_progress = scan_progress.clone();
-                    spawn_local(async move {
-                        if let Ok(p) = api::fetch_scan_progress().await {
-                            scan_progress.set(Some((p.current, p.total)));
-                        }
-                    });
-                }))
-            } else {
-                scan_progress.set(None);
-                None
-            };
-            move || drop(interval)
-        });
-    }
-
     let on_query_change = {
         let query = query.clone();
         Callback::from(move |v: String| query.set(v))
@@ -141,6 +121,7 @@ pub fn app() -> Html {
         let query = query.clone();
         let filters = filters.clone();
         let sort_by = sort_by.clone();
+        let scan_progress = scan_progress.clone();
         Callback::from(move |_: MouseEvent| {
             if *scanning {
                 return;
@@ -150,12 +131,42 @@ pub fn app() -> Html {
             let query = (*query).clone();
             let filters = (*filters).clone();
             let sort_by = (*sort_by).clone();
+            let scan_progress = scan_progress.clone();
+
             scanning.set(true);
+            scan_progress.set(Some((0, 0)));
+
             spawn_local(async move {
-                let _ = api::trigger_scan().await;
+                // Build the WebSocket URL from the current page's location.
+                let ws_url = {
+                    let location = web_sys::window()
+                        .expect("no window")
+                        .location();
+                    let protocol = location.protocol().unwrap_or_default();
+                    let host = location.host().unwrap_or_default();
+                    let ws_proto = if protocol == "https:" { "wss" } else { "ws" };
+                    format!("{ws_proto}://{host}/api/scan/ws")
+                };
+
+                if let Ok(ws) = WebSocket::open(&ws_url) {
+                    // Only read from the server; split() avoids needing the type to be Unpin.
+                    let (_, mut read) = ws.split();
+                    while let Some(Ok(Message::Text(text))) = read.next().await {
+                        match serde_json::from_str::<api::ScanProgressData>(&text) {
+                            Ok(p) => scan_progress.set(Some((p.current, p.total))),
+                            Err(e) => web_sys::console::warn_1(
+                                &format!("scan_ws: unexpected message: {e}").into(),
+                            ),
+                        }
+                    }
+                    // WebSocket closed = scan complete.
+                }
+
+                // Refresh the media list now that the cache is updated.
                 if let Ok(data) = api::fetch_elements(&query, &filters, sort_by).await {
                     items.set(data);
                 }
+                scan_progress.set(None);
                 scanning.set(false);
             });
         })
@@ -253,4 +264,3 @@ pub fn app() -> Html {
         </>
     }
 }
-

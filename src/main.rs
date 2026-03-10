@@ -388,7 +388,7 @@ async fn detect_hwaccel() -> HwAccel {
 /// ffmpeg availability, and available render devices.
 async fn run_startup_healthchecks(library_path: &Path, cache_dir: &Path) {
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║              STARFIN — STARTUP HEALTHCHECKS                 ║");
+    println!("║            STARFIN — STARTUP HEALTHCHECKS                   ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
 
     // ── 1. Process identity ──────────────────────────────────────────────
@@ -400,18 +400,19 @@ async fn run_startup_healthchecks(library_path: &Path, cache_dir: &Path) {
     // Resolve username from /etc/passwd via reentrant getpwuid_r.
     let username = {
         let mut buf = vec![0u8; 1024];
-        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
         let mut result: *mut libc::passwd = std::ptr::null_mut();
         let rc = unsafe {
             libc::getpwuid_r(
                 uid,
-                &mut pwd,
+                pwd.as_mut_ptr(),
                 buf.as_mut_ptr() as *mut libc::c_char,
                 buf.len(),
                 &mut result,
             )
         };
         if rc == 0 && !result.is_null() {
+            let pwd = unsafe { pwd.assume_init() };
             unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }
                 .to_string_lossy()
                 .into_owned()
@@ -423,18 +424,19 @@ async fn run_startup_healthchecks(library_path: &Path, cache_dir: &Path) {
     // Resolve group name from /etc/group via reentrant getgrgid_r.
     let groupname = {
         let mut buf = vec![0u8; 1024];
-        let mut grp: libc::group = unsafe { std::mem::zeroed() };
+        let mut grp = std::mem::MaybeUninit::<libc::group>::uninit();
         let mut result: *mut libc::group = std::ptr::null_mut();
         let rc = unsafe {
             libc::getgrgid_r(
                 gid,
-                &mut grp,
+                grp.as_mut_ptr(),
                 buf.as_mut_ptr() as *mut libc::c_char,
                 buf.len(),
                 &mut result,
             )
         };
         if rc == 0 && !result.is_null() {
+            let grp = unsafe { grp.assume_init() };
             unsafe { std::ffi::CStr::from_ptr(grp.gr_name) }
                 .to_string_lossy()
                 .into_owned()
@@ -541,6 +543,8 @@ async fn run_startup_healthchecks(library_path: &Path, cache_dir: &Path) {
 /// Check that a directory exists and is readable and writable by the current
 /// process.  Logs a clear pass/fail line for each check.
 fn check_directory_access(label: &str, path: &Path) {
+    // Display the canonical (resolved) path when possible; fall back to the
+    // raw configured path if canonicalization fails (e.g. broken symlink).
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     println!("  {} = {}", label, canonical.display());
 

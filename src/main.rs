@@ -89,123 +89,505 @@ impl HwAccel {
     }
 }
 
-async fn test_hwaccel(hw_name: &str) -> bool {
-    match hw_name {
-        "cuda" | "nvdec" => {
-            let args = vec![
-                "-v", "quiet", "-hide_banner",
-                "-init_hw_device", "cuda=test",
-                "-f", "lavfi", "-i", "nullsrc",
-                "-frames:v", "1",
-                "-f", "null", "-",
-            ];
-            run_ffmpeg_test(&args).await
-        }
-        "vaapi" => {
-            // Hades Canyon priority: AMD Vega M first (stable PCI path), then Intel, then legacy nodes
-            let candidates = [
-                // "/dev/dri/by-path/pci-0000:01:00.0-render", // ← AMD Radeon RX Vega M GH 
-                "/dev/dri/by-path/pci-0000:00:02.0-render", // Intel UHD 630
-                "/dev/dri/renderD129",
-                "/dev/dri/renderD128",
-                "/dev/dri/renderD130",
-                "/dev/dri/renderD131",
-            ];
 
-            for dev in candidates {
-                let device_string = format!("vaapi=va:{}", dev);
-                let args = vec![
-                    "-v", "quiet", "-hide_banner",
-                    "-init_hw_device", device_string.as_str(),
-                    "-f", "lavfi", "-i", "nullsrc",
-                    "-frames:v", "1",
-                    "-f", "null", "-",
-                ];
-                if run_ffmpeg_test(&args).await {
-                    println!("→ VAAPI using {}", dev);
-                    return true;
-                }
-            }
-            false
+/// Run an ffmpeg command and return (success, stderr_output) for diagnostics.
+async fn run_ffmpeg_probe(args: &[&str]) -> (bool, String) {
+    match tokio::process::Command::new("ffmpeg")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+    {
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+            (o.status.success(), stderr)
         }
-        "qsv" => {
-            let args = vec![
-                "-v", "quiet", "-hide_banner",
-                "-init_hw_device", "qsv=test",
-                "-f", "lavfi", "-i", "nullsrc",
-                "-frames:v", "1",
-                "-f", "null", "-",
-            ];
-            run_ffmpeg_test(&args).await
-        }
-        _ => false,
+        Err(e) => (false, format!("failed to spawn ffmpeg: {}", e)),
     }
 }
 
-/// Tiny helper so we don’t duplicate the spawn code
-async fn run_ffmpeg_test(args: &[&str]) -> bool {
-    tokio::process::Command::new("ffmpeg")
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// Discover all accessible render device nodes under /dev/dri, preferring
+/// stable by-path symlinks over raw renderDxxx nodes.
+fn discover_render_devices() -> Vec<PathBuf> {
+    let mut devices = Vec::new();
+
+    // Prefer stable PCI-path symlinks (survive device re-enumeration).
+    let by_path = Path::new("/dev/dri/by-path");
+    if by_path.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(by_path) {
+            let mut links: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+            links.sort_by_key(|e| e.file_name());
+            for entry in links {
+                if entry.file_name().to_string_lossy().contains("render") {
+                    // Resolve the symlink to its canonical path so ffmpeg can open it.
+                    if let Ok(real) = entry.path().canonicalize() {
+                        if std::fs::File::open(&real).is_ok() {
+                            devices.push(real);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fall back to raw renderD* nodes that weren't already found via by-path.
+    let dri = Path::new("/dev/dri");
+    if dri.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(dri) {
+            let mut nodes: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+            nodes.sort_by_key(|e| e.file_name());
+            for entry in nodes {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("renderD") {
+                    let path = entry.path();
+                    if !devices.contains(&path) && std::fs::File::open(&path).is_ok() {
+                        devices.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    devices
 }
 
-/// Probe which GPU encoder is available by attempting a tiny null-transcode
-/// with each backend in priority order. Called once at startup.
+/// Check whether NVIDIA GPU devices are present on the system.
+fn nvidia_devices_present() -> bool {
+    if let Ok(entries) = std::fs::read_dir("/dev") {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("nvidia") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Attempt a real one-frame encode using the given encoder and extra ffmpeg
+/// args.  This catches cases where a generic build advertises an encoder but
+/// the underlying hardware / driver is absent.
+async fn test_encode(encoder: &str, extra_pre_input: &[&str], extra_filter: Option<&str>) -> (bool, String) {
+    let mut args: Vec<&str> = vec!["-hide_banner", "-y"];
+    args.extend_from_slice(extra_pre_input);
+    args.extend_from_slice(&["-f", "lavfi", "-i", "color=black:s=256x256:d=0.04:r=25"]);
+    args.extend_from_slice(&["-frames:v", "1"]);
+    if let Some(vf) = extra_filter {
+        args.extend_from_slice(&["-vf", vf]);
+    }
+    args.extend_from_slice(&["-c:v", encoder, "-f", "null", "-"]);
+    run_ffmpeg_probe(&args).await
+}
+
+/// Extract a concise error reason from ffmpeg stderr output.
+fn extract_ffmpeg_error(stderr: &str) -> String {
+    for line in stderr.lines().rev() {
+        let t = line.trim();
+        if t.contains("Cannot load") || t.contains("No such file")
+            || t.contains("not found") || t.contains("Failed")
+            || t.contains("Error") || t.contains("error")
+            || t.contains("does not support") || t.contains("Unknown")
+            || t.contains("No device") || t.contains("Device setup failed")
+            || t.contains("cannot open") || t.contains("Permission denied")
+        {
+            return t.to_string();
+        }
+    }
+    stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("unknown error")
+        .trim()
+        .to_string()
+}
+
+/// Probe which GPU encoder is available by attempting a real one-frame encode
+/// with each backend in priority order.  Called once at startup.
+///
+/// Because ffmpeg may be compiled generically and report encoders/hwaccels
+/// that are not actually usable on the current hardware, we do NOT trust the
+/// compiled-in list as a gate.  Instead we run a real encode test for every
+/// candidate and only select one that produces a successful exit code.
 async fn detect_hwaccel() -> HwAccel {
-    // Quick filter: only test things that are actually compiled into this Nix build
-    let output = match tokio::process::Command::new("ffmpeg")
+    // ── Informational: log what ffmpeg reports as compiled in ─────────────
+    if let Ok(output) = tokio::process::Command::new("ffmpeg")
         .args(["-hwaccels"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
         .await
     {
-        Ok(output) if output.status.success() => output.stdout,
-        _ => {
-            println!("→ GPU acceleration: CPU (software fallback)");
-            return HwAccel::Software;
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut methods: Vec<&str> = Vec::new();
+            let mut in_list = false;
+            for line in text.lines() {
+                let t = line.trim();
+                if t == "Hardware acceleration methods:" {
+                    in_list = true;
+                    continue;
+                }
+                if in_list && !t.is_empty() && t != "none" {
+                    methods.push(t);
+                }
+            }
+            methods.sort();
+            println!("  Compiled-in hwaccels: {}", methods.join(", "));
+            println!("  (generic build — compiled-in list is NOT trusted; real encode tests follow)");
+        }
+    }
+
+    // ── Informational: log which HW H.264 encoders ffmpeg lists ──────────
+    if let Ok(output) = tokio::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-encoders"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let hw_encoders: Vec<&str> = text
+                .lines()
+                .filter(|l| {
+                    let t = l.trim();
+                    t.contains("h264_nvenc")
+                        || t.contains("h264_vaapi")
+                        || t.contains("h264_qsv")
+                        || t.contains("h264_amf")
+                        || t.contains("h264_videotoolbox")
+                })
+                .map(|l| l.trim())
+                .collect();
+            if hw_encoders.is_empty() {
+                println!("  Listed HW H.264 encoders: (none)");
+            } else {
+                println!("  Listed HW H.264 encoders:");
+                for enc in &hw_encoders {
+                    println!("    {}", enc);
+                }
+            }
+        }
+    }
+
+    println!();
+
+    // ── Pre-flight: discover available hardware ──────────────────────────
+    let has_nvidia = nvidia_devices_present();
+    let render_devices = discover_render_devices();
+
+    if has_nvidia {
+        println!("  Pre-flight: NVIDIA device nodes detected in /dev");
+    } else {
+        println!("  Pre-flight: no NVIDIA device nodes in /dev");
+    }
+    if render_devices.is_empty() {
+        println!("  Pre-flight: no accessible render devices in /dev/dri");
+    } else {
+        println!(
+            "  Pre-flight: {} accessible render device(s): {}",
+            render_devices.len(),
+            render_devices.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        );
+    }
+
+    println!();
+
+    // ── NVIDIA (NVENC via CUDA) ──────────────────────────────────────────
+    {
+        println!("  h264_nvenc (NVIDIA NVENC):");
+        if !has_nvidia {
+            println!("    → skipped (no NVIDIA device nodes)");
+        } else {
+            println!("    Testing real encode with h264_nvenc…");
+            let (ok, stderr) = test_encode(
+                "h264_nvenc",
+                &["-init_hw_device", "cuda=test"],
+                None,
+            ).await;
+            if ok {
+                println!("    ✓ Encode succeeded");
+                println!();
+                println!("  ★ Selected: NVIDIA (NVENC)");
+                println!("    Encoder : h264_nvenc");
+                return HwAccel::Nvidia;
+            } else {
+                let reason = extract_ffmpeg_error(&stderr);
+                println!("    ✗ Encode failed: {}", reason);
+            }
+        }
+    }
+
+    // ── VAAPI (AMD / Intel on Linux) ─────────────────────────────────────
+    {
+        println!("  h264_vaapi (VAAPI):");
+        if render_devices.is_empty() {
+            println!("    → skipped (no accessible render devices)");
+        } else {
+            for dev in &render_devices {
+                let dev_str = dev.display().to_string();
+                println!("    Testing real encode with h264_vaapi on {}…", dev_str);
+                let device_arg = format!("vaapi=va:{}", dev_str);
+                let (ok, stderr) = test_encode(
+                    "h264_vaapi",
+                    &["-init_hw_device", &device_arg],
+                    Some("format=nv12,hwupload"),
+                ).await;
+                if ok {
+                    println!("    ✓ Encode succeeded on {}", dev_str);
+                    println!();
+                    println!("  ★ Selected: AMD/Intel (VAAPI)");
+                    println!("    Encoder : h264_vaapi");
+                    println!("    Device  : {}", dev_str);
+                    return HwAccel::Vaapi;
+                } else {
+                    let reason = extract_ffmpeg_error(&stderr);
+                    println!("    ✗ Failed on {}: {}", dev_str, reason);
+                }
+            }
+        }
+    }
+
+    // ── QSV (Intel Quick Sync) ───────────────────────────────────────────
+    {
+        println!("  h264_qsv (Intel QSV):");
+        if render_devices.is_empty() {
+            println!("    → skipped (no accessible render devices)");
+        } else {
+            println!("    Testing real encode with h264_qsv…");
+            let (ok, stderr) = test_encode(
+                "h264_qsv",
+                &["-init_hw_device", "qsv=test"],
+                None,
+            ).await;
+            if ok {
+                println!("    ✓ Encode succeeded");
+                println!();
+                println!("  ★ Selected: Intel (QSV)");
+                println!("    Encoder : h264_qsv");
+                return HwAccel::Qsv;
+            } else {
+                let reason = extract_ffmpeg_error(&stderr);
+                println!("    ✗ Encode failed: {}", reason);
+            }
+        }
+    }
+
+    println!();
+    println!("  ⚠ No GPU acceleration available — falling back to CPU");
+    println!("    Encoder : libx264");
+    println!("    Transcoding will be significantly slower.");
+    HwAccel::Software
+}
+
+// ── Startup healthchecks ──────────────────────────────────────────────────────
+
+/// Run detailed healthchecks at startup and log results so they are visible in
+/// journalctl.  Checks cover: process identity, directory read/write access,
+/// ffmpeg availability, and available render devices.
+async fn run_startup_healthchecks(library_path: &Path, cache_dir: &Path) {
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║            STARFIN — STARTUP HEALTHCHECKS                   ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+
+    // ── 1. Process identity ──────────────────────────────────────────────
+    println!();
+    println!("── Process identity ────────────────────────────────────────────");
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    // Resolve username from /etc/passwd via reentrant getpwuid_r.
+    let username = {
+        let mut buf = vec![0u8; 1024];
+        let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                pwd.as_mut_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == 0 && !result.is_null() {
+            let pwd = unsafe { pwd.assume_init() };
+            unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            format!("(uid {})", uid)
         }
     };
 
-    let output_str = String::from_utf8_lossy(&output);
-    let mut available: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut in_list = false;
-
-    for line in output_str.lines() {
-        let trimmed = line.trim();
-        if trimmed == "Hardware acceleration methods:" {
-            in_list = true;
-            continue;
+    // Resolve group name from /etc/group via reentrant getgrgid_r.
+    let groupname = {
+        let mut buf = vec![0u8; 1024];
+        let mut grp = std::mem::MaybeUninit::<libc::group>::uninit();
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getgrgid_r(
+                gid,
+                grp.as_mut_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == 0 && !result.is_null() {
+            let grp = unsafe { grp.assume_init() };
+            unsafe { std::ffi::CStr::from_ptr(grp.gr_name) }
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            format!("(gid {})", gid)
         }
-        if in_list && !trimmed.is_empty() && trimmed != "none" {
-            available.insert(trimmed.to_lowercase());
+    };
+
+    println!("  User  : {} (uid={})", username, uid);
+    println!("  Group : {} (gid={})", groupname, gid);
+    println!("  PID   : {}", std::process::id());
+
+    // ── 2. Directory access checks ───────────────────────────────────────
+    println!();
+    println!("── Directory access ───────────────────────────────────────────");
+    check_directory_access("VIDEO_LIBRARY_PATH", library_path);
+    check_directory_access("CACHE_DIR", cache_dir);
+
+    // ── 3. ffmpeg availability ───────────────────────────────────────────
+    println!();
+    println!("── ffmpeg ─────────────────────────────────────────────────────");
+    match tokio::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            let version_str = String::from_utf8_lossy(&output.stdout);
+            // Print only the first line (e.g. "ffmpeg version 6.1 Copyright ...")
+            if let Some(first_line) = version_str.lines().next() {
+                println!("  ✓ {}", first_line);
+            }
+        }
+        Ok(_) => {
+            println!("  ✗ ffmpeg found but returned an error");
+        }
+        Err(e) => {
+            println!("  ✗ ffmpeg not found: {}", e);
+            println!("    Transcoding and thumbnail generation will not work!");
         }
     }
 
-    println!("available (compiled-in): {:?}", available);
+    // ── 4. Render devices ────────────────────────────────────────────────
+    println!();
+    println!("── Render devices (/dev/dri) ────────────────────────────────");
+    let dri_path = Path::new("/dev/dri");
+    if dri_path.exists() {
+        match std::fs::read_dir(dri_path) {
+            Ok(entries) => {
+                let mut found_any = false;
+                let mut devices: Vec<_> = entries
+                    .filter_map(|e| e.ok())
+                    .collect();
+                devices.sort_by_key(|e| e.file_name());
+                for entry in &devices {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with("render") || name_str.starts_with("card") {
+                        let accessible = std::fs::File::open(entry.path()).is_ok();
+                        let status = if accessible { "✓ accessible" } else { "✗ not accessible" };
+                        println!("  {} : {}", name_str, status);
+                        found_any = true;
+                    }
+                }
+                if !found_any {
+                    println!("  (no render/card devices found)");
+                }
+            }
+            Err(e) => println!("  ✗ Cannot read /dev/dri: {}", e),
+        }
 
-    // Priority order + real runtime test (succeeds ONLY if hardware + driver + libs are usable)
-    let candidates: &[(&str, HwAccel)] = &[
-        ("cuda", HwAccel::Nvidia),
-        ("nvdec", HwAccel::Nvidia),
-        ("vaapi", HwAccel::Vaapi),
-        ("qsv", HwAccel::Qsv),
-    ];
+        // Also check by-path symlinks for stable device identification
+        let by_path = dri_path.join("by-path");
+        if by_path.exists() {
+            println!();
+            println!("  Stable paths (/dev/dri/by-path):");
+            if let Ok(entries) = std::fs::read_dir(&by_path) {
+                let mut links: Vec<_> = entries
+                    .filter_map(|e| e.ok())
+                    .collect();
+                links.sort_by_key(|e| e.file_name());
+                for entry in &links {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.contains("render") {
+                        let target = std::fs::read_link(entry.path())
+                            .map(|t| t.display().to_string())
+                            .unwrap_or_else(|_| "?".into());
+                        println!("    {} → {}", name_str, target);
+                    }
+                }
+            }
+        }
+    } else {
+        println!("  (no /dev/dri directory — no GPU devices detected)");
+    }
 
-    for (hw_name, variant) in candidates {
-        if available.contains(*hw_name) && test_hwaccel(hw_name).await {
-            println!("→ GPU acceleration: {} ({})", variant.label(), hw_name);
-            return variant.clone();
+    println!();
+    println!("── Hardware acceleration probe ─────────────────────────────────");
+}
+
+/// Check that a directory exists and is readable and writable by the current
+/// process.  Logs a clear pass/fail line for each check.
+fn check_directory_access(label: &str, path: &Path) {
+    // Display the canonical (resolved) path when possible; fall back to the
+    // raw configured path if canonicalization fails (e.g. broken symlink).
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    println!("  {} = {}", label, canonical.display());
+
+    // Existence
+    if !path.exists() {
+        println!("    ✗ Directory does not exist");
+        return;
+    }
+    println!("    ✓ Exists");
+
+    // Metadata (readability)
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            if meta.is_dir() {
+                println!("    ✓ Is a directory");
+            } else {
+                println!("    ✗ Path exists but is NOT a directory");
+                return;
+            }
+        }
+        Err(e) => {
+            println!("    ✗ Cannot read metadata: {}", e);
+            return;
         }
     }
 
-    println!("→ GPU acceleration: CPU (software fallback)");
-    HwAccel::Software
+    // Read check (can we list contents?)
+    match std::fs::read_dir(path) {
+        Ok(_) => println!("    ✓ Readable (can list contents)"),
+        Err(e) => println!("    ✗ Not readable: {}", e),
+    }
+
+    // Write check (try creating and removing a temp file)
+    let probe = path.join(format!(".starfin_healthcheck_probe_{}", std::process::id()));
+    match std::fs::write(&probe, b"healthcheck") {
+        Ok(_) => {
+            println!("    ✓ Writable");
+            let _ = std::fs::remove_file(&probe);
+        }
+        Err(e) => {
+            println!("    ✗ Not writable: {}", e);
+        }
+    }
 }
 
 // ── Embedded frontend assets ─────────────────────────────────────────────────
@@ -1921,14 +2303,17 @@ async fn main() -> std::io::Result<()> {
     }
     std::fs::create_dir_all(&cache_dir)?;
 
+    // ── Startup healthchecks (logged for journalctl) ─────────────────────
+    run_startup_healthchecks(&library_path, &cache_dir).await;
+    let hwaccel = detect_hwaccel().await;
+    println!();
+    println!("════════════════════════════════════════════════════════════════");
+
     // Initial library scan at startup.
     println!("→ Scanning library…");
     let initial_items = scan_library(&library_path).await;
     println!("→ Found {} video(s)", initial_items.len());
     let video_cache: Arc<RwLock<Vec<VideoItem>>> = Arc::new(RwLock::new(initial_items));
-
-    println!("→ Detecting GPU hardware acceleration…");
-    let hwaccel = detect_hwaccel().await;
 
     let thumb_progress = Arc::new(RwLock::new(ThumbProgress {
         current: 0,

@@ -75,52 +75,131 @@ impl HwAccel {
     /// needed for broad HLS player support.
     fn encoder_quality_args(&self) -> &'static [&'static str] {
         match self {
-            HwAccel::Nvidia        => &["-preset", "p4", "-tune", "ll"],
-            HwAccel::Vaapi         => &["-vf", "format=nv12|vaapi,hwupload", "-profile:v", "66"],
-            HwAccel::Qsv           => &["-preset", "veryfast"],
-            HwAccel::VideoToolbox  => &["-realtime", "true"],
-            HwAccel::Amf           => &["-quality", "speed"],
-            HwAccel::Software      => &["-preset", "veryfast",
+            HwAccel::Nvidia        => &["-preset", "p7", "-tune", "hq", "-temporal-aq", "1", "-spatial-aq", "1", "-rc", "constqp", "-qp", "18"],
+            HwAccel::Vaapi         => &["-vf", "format=nv12|vaapi,hwupload", "-profile:v", "high", "-qp", "18"],
+            HwAccel::Qsv           => &["-preset", "veryslow", "-global_quality", "18"],
+            HwAccel::VideoToolbox  => &["-qp", "18", "-profile:v", "high"],
+            HwAccel::Amf           => &["-quality", "quality", "-rc", "cqp", "-qp", "18"],
+            HwAccel::Software      => &["-preset", "veryslow",
+                                        "-crf", "18",
                                         "-pix_fmt", "yuv420p",
-                                        "-profile:v", "baseline",
-                                        "-level", "3.1"],
+                                        "-profile:v", "high",
+                                        "-level", "4.2"],
         }
     }
+}
+
+async fn test_hwaccel(hw_name: &str) -> bool {
+    match hw_name {
+        "cuda" | "nvdec" => {
+            let args = vec![
+                "-v", "quiet", "-hide_banner",
+                "-init_hw_device", "cuda=test",
+                "-f", "lavfi", "-i", "nullsrc",
+                "-frames:v", "1",
+                "-f", "null", "-",
+            ];
+            run_ffmpeg_test(&args).await
+        }
+        "vaapi" => {
+            // Hades Canyon priority: AMD Vega M first (stable PCI path), then Intel, then legacy nodes
+            let candidates = [
+                "/dev/dri/by-path/pci-0000:01:00.0-render", // ← AMD Radeon RX Vega M GH (your working one)
+                "/dev/dri/by-path/pci-0000:00:02.0-render", // Intel UHD 630
+                "/dev/dri/renderD129",
+                "/dev/dri/renderD128",
+                "/dev/dri/renderD130",
+                "/dev/dri/renderD131",
+            ];
+
+            for dev in candidates {
+                let device_string = format!("vaapi=va:{}", dev);
+                let args = vec![
+                    "-v", "quiet", "-hide_banner",
+                    "-init_hw_device", device_string.as_str(),
+                    "-f", "lavfi", "-i", "nullsrc",
+                    "-frames:v", "1",
+                    "-f", "null", "-",
+                ];
+                if run_ffmpeg_test(&args).await {
+                    println!("→ VAAPI using {}", dev);
+                    return true;
+                }
+            }
+            false
+        }
+        "qsv" => {
+            let args = vec![
+                "-v", "quiet", "-hide_banner",
+                "-init_hw_device", "qsv=test",
+                "-f", "lavfi", "-i", "nullsrc",
+                "-frames:v", "1",
+                "-f", "null", "-",
+            ];
+            run_ffmpeg_test(&args).await
+        }
+        _ => false,
+    }
+}
+
+/// Tiny helper so we don’t duplicate the spawn code
+async fn run_ffmpeg_test(args: &[&str]) -> bool {
+    tokio::process::Command::new("ffmpeg")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Probe which GPU encoder is available by attempting a tiny null-transcode
 /// with each backend in priority order. Called once at startup.
 async fn detect_hwaccel() -> HwAccel {
-    let candidates: &[(&str, &[&str], HwAccel)] = &[
-        ("h264_nvenc",        &["-hwaccel", "cuda"],        HwAccel::Nvidia),
-        ("h264_vaapi",        &["-hwaccel", "vaapi",
-                                "-hwaccel_device", "/dev/dri/renderD128"], HwAccel::Vaapi),
-        ("h264_qsv",          &["-hwaccel", "qsv"],         HwAccel::Qsv),
-        ("h264_videotoolbox", &["-hwaccel", "videotoolbox"],HwAccel::VideoToolbox),
-        ("h264_amf",          &["-hwaccel", "d3d11va"],     HwAccel::Amf),
+    // Quick filter: only test things that are actually compiled into this Nix build
+    let output = match tokio::process::Command::new("ffmpeg")
+        .args(["-hwaccels"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => output.stdout,
+        _ => {
+            println!("→ GPU acceleration: CPU (software fallback)");
+            return HwAccel::Software;
+        }
+    };
+
+    let output_str = String::from_utf8_lossy(&output);
+    let mut available: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut in_list = false;
+
+    for line in output_str.lines() {
+        let trimmed = line.trim();
+        if trimmed == "Hardware acceleration methods:" {
+            in_list = true;
+            continue;
+        }
+        if in_list && !trimmed.is_empty() && trimmed != "none" {
+            available.insert(trimmed.to_lowercase());
+        }
+    }
+
+    println!("available (compiled-in): {:?}", available);
+
+    // Priority order + real runtime test (succeeds ONLY if hardware + driver + libs are usable)
+    let candidates: &[(&str, HwAccel)] = &[
+        ("cuda", HwAccel::Nvidia),
+        ("nvdec", HwAccel::Nvidia),
+        ("vaapi", HwAccel::Vaapi),
+        ("qsv", HwAccel::Qsv),
     ];
 
-    for (encoder, hwaccel_args, variant) in candidates {
-        let mut args: Vec<&str> = Vec::new();
-        args.extend_from_slice(hwaccel_args);
-        args.extend_from_slice(&[
-            "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
-            "-c:v", encoder,
-            "-f", "null", "-",
-        ]);
-
-        let ok = tokio::process::Command::new("ffmpeg")
-            .args(&args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .stdin(std::process::Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false);
-
-        if ok {
-            println!("→ GPU acceleration: {} ({})", variant.label(), encoder);
+    for (hw_name, variant) in candidates {
+        if available.contains(*hw_name) && test_hwaccel(hw_name).await {
+            println!("→ GPU acceleration: {} ({})", variant.label(), hw_name);
             return variant.clone();
         }
     }

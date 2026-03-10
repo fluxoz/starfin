@@ -1,5 +1,5 @@
 [package]
-name = "starfin-backend"
+name = "starfin"
 version = "0.1.0"
 edition = "2024"
 

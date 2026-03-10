@@ -156,7 +156,7 @@
         description = "Self-hosted media server with hardware-accelerated transcoding and a WebAssembly frontend";
         homepage = "https://github.com/fluxoz/starfin";
         license = licenses.mit;
-        mainProgram = "starfin-backend";
+        mainProgram = "starfin";
       };
     };
 

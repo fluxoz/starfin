@@ -29,40 +29,68 @@
     # ── Phase 1: compile the Yew frontend crate to WebAssembly ───────────────
     #
     # Produces a single `starfin_frontend.wasm` file; wasm-bindgen runs next.
+    #
+    # NOTE: the default cargoBuildHook substitutes @rustcTargetSpec@ at
+    # evaluation time (always the host platform).  Setting CARGO_BUILD_TARGET
+    # as an env var does NOT override that substitution, so we must supply our
+    # own buildPhase to pass --target wasm32-unknown-unknown explicitly.
+    # The cargoSetupHook (added by buildRustPackage) still runs and wires up
+    # the offline vendor directory from importCargoLock before our buildPhase.
     starfinFrontendWasm = rustPlatform.buildRustPackage {
       pname = "starfin-frontend-wasm";
       inherit version;
       src = ./frontend;
       cargoLock.lockFile = ./frontend/Cargo.lock;
 
-      # Target the wasm32 bare-metal tier.
-      CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
+      # Override buildPhase to target wasm32-unknown-unknown explicitly.
+      buildPhase = ''
+        runHook preBuild
+        cargo build --release --target wasm32-unknown-unknown --offline
+        runHook postBuild
+      '';
 
-      # No runnable tests for a WASM library crate.
+      # No runnable tests for a WASM crate.
       doCheck = false;
 
       installPhase = ''
         runHook preInstall
         mkdir -p $out
-        ls -lah
-        pwd
-        ls target/release -lah
         cp target/wasm32-unknown-unknown/release/starfin_frontend.wasm $out/
         runHook postInstall
       '';
     };
 
+    # ── wasm-bindgen-cli at the exact version used by the frontend ────────────
+    #
+    # wasm-bindgen-cli must match the wasm-bindgen crate version used in the
+    # frontend (currently 0.2.114).  The nixos-25.11 pin only ships up to
+    # 0.2.108, so we build the CLI from crates.io here.
+    wasmBindgenCli =
+      let
+        wasmBindgenSrc = pkgs.fetchCrate {
+          pname = "wasm-bindgen-cli";
+          version = "0.2.114";
+          hash = "sha256-xrCym+rFY6EUQFWyWl6OPA+LtftpUAE5pIaElAIVqW0=";
+        };
+      in
+      pkgs.buildWasmBindgenCli {
+        src = wasmBindgenSrc;
+        cargoDeps = rustPlatform.fetchCargoVendor {
+          src = wasmBindgenSrc;
+          inherit (wasmBindgenSrc) pname version;
+          hash = "sha256-Z8+dUXPQq7S+Q7DWNr2Y9d8GMuEdSnq00quUR0wDNPM=";
+        };
+      };
+
     # ── Phase 2: run wasm-bindgen and assemble the static frontend dist ───────
     #
     # Produces the `dist/` directory consumed by rust-embed in phase 3.
-    # NOTE: wasm-bindgen-cli must be compatible with the wasm-bindgen version
-    # declared in frontend/Cargo.lock (currently 0.2.x).
     starfinFrontendDist = pkgs.stdenv.mkDerivation {
       pname = "starfin-frontend-dist";
       inherit version;
       src = ./frontend;
 
-      nativeBuildInputs = [ pkgs.wasm-bindgen-cli ];
+      nativeBuildInputs = [ wasmBindgenCli ];
 
       buildPhase = ''
         runHook preBuild

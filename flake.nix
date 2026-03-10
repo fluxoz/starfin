@@ -28,7 +28,7 @@
 
     # ── Phase 1: compile the Yew frontend crate to WebAssembly ───────────────
     #
-    # Produces a single `starfin_frontend.wasm` file; wasm-bindgen runs next.
+    # Produces a single `starfin-frontend.wasm` file; wasm-bindgen runs next.
     #
     # NOTE: the default cargoBuildHook substitutes @rustcTargetSpec@ at
     # evaluation time (always the host platform).  Setting CARGO_BUILD_TARGET
@@ -52,10 +52,12 @@
       # No runnable tests for a WASM crate.
       doCheck = false;
 
+      # The frontend crate is a binary (src/main.rs), so cargo preserves
+      # hyphens in the output filename: starfin-frontend.wasm (not underscores).
       installPhase = ''
         runHook preInstall
         mkdir -p $out
-        cp target/wasm32-unknown-unknown/release/starfin_frontend.wasm $out/
+        cp target/wasm32-unknown-unknown/release/starfin-frontend.wasm $out/
         runHook postInstall
       '';
     };
@@ -98,7 +100,7 @@
           --target web \
           --no-typescript \
           --out-dir dist \
-          ${starfinFrontendWasm}/starfin_frontend.wasm
+          ${starfinFrontendWasm}/starfin-frontend.wasm
         runHook postBuild
       '';
 

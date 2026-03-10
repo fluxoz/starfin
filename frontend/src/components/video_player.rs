@@ -14,6 +14,9 @@ use yew::prelude::*;
 // ── Playback speed options ───────────────────────────────────────────────────
 const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
 
+// ── Controls auto-hide timeout (milliseconds of inactivity) ─────────────────
+const CONTROL_HIDE_TIMEOUT_MS: f64 = 5000.0;
+
 // ── HLS.js configuration constants ───────────────────────────────────────────
 // These settings are optimized for VOD content with on-demand transcoding.
 // The timeouts and retry values are tuned for the latency introduced by
@@ -190,6 +193,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // UI visibility state
     let controls_visible = use_state(|| true);
     let last_mouse_move = use_state(|| js_sys::Date::now());
+    let mouse_inside = use_state(|| false);
     let settings_open = use_state(|| false);
     let speed_menu_open = use_state(|| false);
     let volume_slider_visible = use_state(|| false);
@@ -531,6 +535,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     {
         let controls_visible = controls_visible.clone();
         let last_mouse_move = last_mouse_move.clone();
+        let mouse_inside = mouse_inside.clone();
         let is_playing = is_playing.clone();
         let settings_open = settings_open.clone();
 
@@ -539,13 +544,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             move |_| {
                 let controls_visible = controls_visible.clone();
                 let last_mouse_move = last_mouse_move.clone();
+                let mouse_inside = mouse_inside.clone();
                 let is_playing = is_playing.clone();
                 let settings_open = settings_open.clone();
 
                 let interval = Interval::new(1000, move || {
-                    if *is_playing && !*settings_open {
+                    if *is_playing && !*settings_open && !*mouse_inside {
                         let now = js_sys::Date::now();
-                        if now - *last_mouse_move > 3000.0 {
+                        if now - *last_mouse_move > CONTROL_HIDE_TIMEOUT_MS {
                             controls_visible.set(false);
                         }
                     }
@@ -817,20 +823,19 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let on_mouse_move = {
         let controls_visible = controls_visible.clone();
         let last_mouse_move = last_mouse_move.clone();
+        let mouse_inside = mouse_inside.clone();
         Callback::from(move |_: MouseEvent| {
             controls_visible.set(true);
             last_mouse_move.set(js_sys::Date::now());
+            mouse_inside.set(true);
         })
     };
 
-    // Mouse leave handler
+    // Mouse leave handler — keep controls visible; the inactivity timer handles hiding
     let on_mouse_leave = {
-        let is_playing = is_playing.clone();
-        let controls_visible = controls_visible.clone();
+        let mouse_inside = mouse_inside.clone();
         Callback::from(move |_: MouseEvent| {
-            if *is_playing {
-                controls_visible.set(false);
-            }
+            mouse_inside.set(false);
         })
     };
 

@@ -1408,12 +1408,12 @@ async fn get_sprite_status(
 /// `GET /api/videos/{id}/processing-status` — processing status for a video.
 ///
 /// Returns one of three states:
-/// - `{"status":"processed"}` — both deep thumbnail (`.deep` marker) and sprite
-///   sheet (`_thumbs/sprite.jpg`) are present for the video
-/// - `{"status":"processing"}` — a background worker is actively processing
-///   this specific video right now (thumbnail or sprite)
+/// - `{"status":"processed"}` — all three operations are complete: quick thumbnail
+///   (`.jpg`), deep thumbnail (`.deep` marker), and sprite sheet (`_thumbs/sprite.jpg`)
+/// - `{"status":"processing"}` — the thumb or sprite background worker is actively
+///   working on this specific video right now
 /// - `{"status":"pending"}`   — not fully processed and no worker is currently
-///   on this video
+///   working on this specific video
 ///
 /// This is a cheap filesystem + lock-read check; it never triggers ffmpeg.
 async fn get_processing_status(
@@ -1424,15 +1424,17 @@ async fn get_processing_status(
         return HttpResponse::BadRequest().body("invalid video id");
     }
 
+    let quick_marker = state.cache_dir.join(format!("{}.jpg", *id));
     let deep_marker = state.cache_dir.join(format!("{}.deep", *id));
     let sprite_path = state
         .cache_dir
         .join(format!("{}_thumbs", *id))
         .join("sprite.jpg");
 
-    let status = if deep_marker.exists() && sprite_path.exists() {
+    let status = if quick_marker.exists() && deep_marker.exists() && sprite_path.exists() {
         "processed"
     } else {
+        // "processing" only when THIS video is the one a worker is actively working on.
         let thumb_on_this = state
             .thumb_progress
             .read()
@@ -1443,6 +1445,7 @@ async fn get_processing_status(
             .read()
             .map(|p| p.current_id.as_deref() == Some(id.as_str()))
             .unwrap_or(false);
+
         if thumb_on_this || sprite_on_this {
             "processing"
         } else {

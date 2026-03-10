@@ -33,6 +33,10 @@ struct SpriteStatus {
 #[derive(Properties, PartialEq)]
 pub struct VideoCardThumbProps {
     pub video_id: String,
+    /// Bumps whenever a background worker finishes a video or a batch.
+    /// Used for cache-busting thumbnails and retrying sprite loads.
+    #[prop_or_default]
+    pub processing_version: u32,
 }
 
 /// Holds the loaded sprite data so it can be reused across hover sessions.
@@ -67,7 +71,35 @@ pub fn video_card_thumb(props: &VideoCardThumbProps) -> Html {
     // Whether loading the sprite failed or the sprite is simply not available yet.
     let load_failed = use_state(|| false);
 
-    let thumbnail_url = format!("/api/videos/{}/thumbnail", props.video_id);
+    // Cache-bust the thumbnail URL when processing_version changes so the
+    // browser re-fetches the image after a new thumbnail has been generated.
+    let thumbnail_url = format!(
+        "/api/videos/{}/thumbnail?v={}",
+        props.video_id, props.processing_version
+    );
+
+    // ── Reset sprite failure flag when processing_version bumps ─────────
+    // This allows the sprite to be retried after the background worker has
+    // generated it.
+    {
+        let load_failed = load_failed.clone();
+        let sprite_loaded = sprite_loaded.clone();
+        let sprite_data = sprite_data.clone();
+        use_effect_with(
+            props.processing_version,
+            move |_version| {
+                // Only reset if the sprite wasn't already loaded — if it was,
+                // there is nothing to retry.
+                if !*sprite_loaded {
+                    load_failed.set(false);
+                    // Also clear cached sprite data so the next hover attempt
+                    // re-checks the server.
+                    sprite_data.set(None);
+                }
+                || ()
+            },
+        );
+    }
 
     // ── Fetch sprite on first hover (only if sprite is already cached) ───────
     {

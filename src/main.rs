@@ -975,8 +975,8 @@ async fn get_thumb_progress(state: web::Data<AppState>) -> impl Responder {
 /// Each frame is a JSON text message:
 /// ```json
 /// {
-///   "thumb":  { "current": N, "total": M, "active": bool, "phase": "quick" },
-///   "sprite": { "current": N, "total": M, "active": bool }
+///   "thumb":  { "current": N, "total": M, "active": bool, "phase": "quick", "current_id": "uuid"|null },
+///   "sprite": { "current": N, "total": M, "active": bool, "current_id": "uuid"|null }
 /// }
 /// ```
 async fn progress_ws(
@@ -994,18 +994,18 @@ async fn progress_ws(
         loop {
             ticker.tick().await;
 
-            let (tc, tt, ta, tph) = {
+            let (tc, tt, ta, tph, tid) = {
                 let p = thumb_progress.read().expect("thumb_progress lock poisoned");
-                (p.current, p.total, p.active, p.phase)
+                (p.current, p.total, p.active, p.phase, p.current_id.clone())
             };
-            let (sc, st, sa) = {
+            let (sc, st, sa, sid) = {
                 let p = sprite_progress.read().expect("sprite_progress lock poisoned");
-                (p.current, p.total, p.active)
+                (p.current, p.total, p.active, p.current_id.clone())
             };
 
             let msg = serde_json::json!({
-                "thumb":  { "current": tc, "total": tt, "active": ta, "phase": tph },
-                "sprite": { "current": sc, "total": st, "active": sa }
+                "thumb":  { "current": tc, "total": tt, "active": ta, "phase": tph, "current_id": tid },
+                "sprite": { "current": sc, "total": st, "active": sa, "current_id": sid }
             })
             .to_string();
 

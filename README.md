@@ -96,6 +96,160 @@ PORT=8080 BIND_ADDR=0.0.0.0 VIDEO_LIBRARY_PATH=/media/videos CACHE_DIR=/var/cach
 
 ---
 
+## Nix / NixOS
+
+Starfin ships a [Nix flake](https://nixos.wiki/wiki/Flakes) that exposes a pre-built package and a NixOS module for running Starfin as a managed `systemd` service.
+
+### Quick start with `nix run`
+
+The fastest way to try Starfin without installing anything:
+
+```bash
+nix run github:fluxoz/starfin
+```
+
+With custom settings:
+
+```bash
+VIDEO_LIBRARY_PATH=/mnt/videos BIND_ADDR=0.0.0.0 nix run github:fluxoz/starfin
+```
+
+### Adding Starfin to your flake
+
+Add Starfin as an input in your `flake.nix`:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    starfin.url  = "github:fluxoz/starfin";
+  };
+  ...
+}
+```
+
+> **Tip:** Pin to a specific commit for reproducibility:
+> ```nix
+> starfin.url = "github:fluxoz/starfin/<commit-sha>";
+> ```
+
+### Using the NixOS module
+
+The flake exports a NixOS module at `nixosModules.default`. Add it to your `nixosConfigurations` and enable the service:
+
+#### Minimal configuration
+
+```nix
+{
+  inputs.starfin.url = "github:fluxoz/starfin";
+
+  outputs = { nixpkgs, starfin, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        starfin.nixosModules.default
+        {
+          services.starfin = {
+            enable            = true;
+            videoLibraryPath  = "/mnt/videos";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+This starts Starfin on `http://127.0.0.1:8089` as the `starfin` system user with the cache stored in `/var/cache/starfin`.
+
+#### Full configuration example
+
+```nix
+services.starfin = {
+  enable           = true;
+  videoLibraryPath = "/mnt/videos";
+  cacheDir         = "/var/cache/starfin";
+
+  # Expose on all interfaces instead of loopback only
+  bindAddr         = "0.0.0.0";
+  port             = 8089;
+
+  # Open the firewall automatically for the configured port
+  openFirewall     = true;
+
+  # Run under a custom user/group that already has read access to /mnt/videos
+  user             = "media";
+  group            = "media";
+
+  # Pass additional environment variables to the process
+  extraEnvironment = {
+    RUST_LOG = "info";
+  };
+};
+```
+
+### Module options reference
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enable` | `bool` | `false` | Enable the Starfin service |
+| `package` | `package` | flake default | The `starfin` package to use |
+| `port` | `port` | `8089` | TCP port Starfin listens on |
+| `bindAddr` | `str` | `"127.0.0.1"` | Address to bind (`"0.0.0.0"` for all interfaces) |
+| `videoLibraryPath` | `path` | *(required)* | Directory scanned for video files |
+| `cacheDir` | `path` | `"/var/cache/starfin"` | Directory for HLS segments and thumbnail cache |
+| `openFirewall` | `bool` | `false` | Open the configured `port` in the NixOS firewall |
+| `user` | `str` | `"starfin"` | System user that runs the service |
+| `group` | `str` | `"starfin"` | System group that runs the service |
+| `extraEnvironment` | `attrs` | `{}` | Extra environment variables passed to the process |
+
+### Using the package directly
+
+You can install the Starfin binary without the NixOS module — for example, in `configuration.nix`:
+
+```nix
+environment.systemPackages = [
+  inputs.starfin.packages.${pkgs.system}.default
+];
+```
+
+Or add it to a devShell in your own flake:
+
+```nix
+devShells.default = pkgs.mkShell {
+  buildInputs = [ inputs.starfin.packages.${pkgs.system}.default ];
+};
+```
+
+### Reverse proxy with nginx
+
+To expose Starfin publicly with TLS, keep the service on loopback and let nginx proxy it:
+
+```nix
+services.starfin = {
+  enable           = true;
+  videoLibraryPath = "/mnt/videos";
+  bindAddr         = "127.0.0.1";  # keep internal; nginx handles public traffic
+  port             = 8089;
+};
+
+services.nginx = {
+  enable = true;
+  virtualHosts."starfin.example.com" = {
+    enableACME = true;
+    forceSSL   = true;
+    locations."/" = {
+      proxyPass       = "http://127.0.0.1:8089";
+      proxyWebsockets = true;  # required for real-time scan/progress updates
+    };
+  };
+};
+```
+
+> **Note:** `proxyWebsockets = true` is required because Starfin uses WebSockets for real-time library-scan and thumbnail-generation progress updates.
+
+---
+
 ## Usage
 
 1. Set `VIDEO_LIBRARY_PATH` to your video directory (or place videos in `./test_videos`).

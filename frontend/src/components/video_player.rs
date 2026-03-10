@@ -16,6 +16,9 @@ const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3
 
 // ── Controls auto-hide timeout (milliseconds of inactivity) ─────────────────
 const CONTROL_HIDE_TIMEOUT_MS: f64 = 5000.0;
+/// Pixel distance from the top or bottom edge of the player within which the
+/// controls/header are considered "near" and should not be hidden.
+const CONTROLS_VICINITY_PX: f64 = 80.0;
 
 // ── HLS.js configuration constants ───────────────────────────────────────────
 // These settings are optimized for VOD content with on-demand transcoding.
@@ -194,6 +197,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let controls_visible = use_state(|| true);
     let last_mouse_move = use_state(|| js_sys::Date::now());
     let mouse_inside = use_state(|| false);
+    let is_near_controls = use_state(|| false);
     let settings_open = use_state(|| false);
     let speed_menu_open = use_state(|| false);
     let volume_slider_visible = use_state(|| false);
@@ -536,6 +540,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let controls_visible = controls_visible.clone();
         let last_mouse_move = last_mouse_move.clone();
         let mouse_inside = mouse_inside.clone();
+        let is_near_controls = is_near_controls.clone();
         let is_playing = is_playing.clone();
         let settings_open = settings_open.clone();
 
@@ -545,11 +550,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 let controls_visible = controls_visible.clone();
                 let last_mouse_move = last_mouse_move.clone();
                 let mouse_inside = mouse_inside.clone();
+                let is_near_controls = is_near_controls.clone();
                 let is_playing = is_playing.clone();
                 let settings_open = settings_open.clone();
 
                 let interval = Interval::new(1000, move || {
-                    if *is_playing && !*settings_open && !*mouse_inside {
+                    if *is_playing && !*settings_open && !*mouse_inside && !*is_near_controls {
                         let now = js_sys::Date::now();
                         if now - *last_mouse_move > CONTROL_HIDE_TIMEOUT_MS {
                             controls_visible.set(false);
@@ -819,23 +825,39 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
-    // Mouse move handler for showing controls
+    // Mouse move handler — show controls and update vicinity flag
     let on_mouse_move = {
         let controls_visible = controls_visible.clone();
         let last_mouse_move = last_mouse_move.clone();
         let mouse_inside = mouse_inside.clone();
-        Callback::from(move |_: MouseEvent| {
+        let is_near_controls = is_near_controls.clone();
+        let container_ref = container_ref.clone();
+        Callback::from(move |e: MouseEvent| {
             controls_visible.set(true);
             last_mouse_move.set(js_sys::Date::now());
             mouse_inside.set(true);
+
+            // Update vicinity: keep controls visible if mouse is within
+            // CONTROLS_VICINITY_PX of the top (header) or bottom (controls bar).
+            if let Some(el) = container_ref.cast::<web_sys::HtmlElement>() {
+                let rect = el.get_bounding_client_rect();
+                let mouse_y = e.client_y() as f64;
+                let dist_from_bottom = (rect.bottom() - mouse_y).max(0.0);
+                let dist_from_top = (mouse_y - rect.top()).max(0.0);
+                let near = dist_from_bottom < CONTROLS_VICINITY_PX
+                    || dist_from_top < CONTROLS_VICINITY_PX;
+                is_near_controls.set(near);
+            }
         })
     };
 
-    // Mouse leave handler — keep controls visible; the inactivity timer handles hiding
+    // Mouse leave handler — clear both inside and vicinity flags
     let on_mouse_leave = {
         let mouse_inside = mouse_inside.clone();
+        let is_near_controls = is_near_controls.clone();
         Callback::from(move |_: MouseEvent| {
             mouse_inside.set(false);
+            is_near_controls.set(false);
         })
     };
 

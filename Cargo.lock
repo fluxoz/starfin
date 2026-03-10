@@ -2150,6 +2150,7 @@ dependencies = [
  "actix-web",
  "actix-web-lab",
  "actix-ws",
+ "libc",
  "mime_guess",
  "reqwest",
  "rust-embed",

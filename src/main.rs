@@ -241,6 +241,10 @@ const CACHE_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60); // 10 minutes
 /// How often the background sweep task wakes up to evict idle caches.
 const CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(60); // 1 minute
 
+/// How long after the last segment request before playback is considered
+/// inactive and background workers are allowed to resume.
+const PLAYBACK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ── App state ────────────────────────────────────────────────────────────────
 
 /// Tracks the progress of the thumbnail generation background job.
@@ -280,6 +284,9 @@ struct AppState {
     sprite_trigger: Arc<tokio::sync::Notify>,
     /// Detected hardware acceleration backend (detected once at startup).
     hwaccel: HwAccel,
+    /// Broadcasts playback state (`true` = playing, `false` = idle) to all
+    /// background workers so they can pause while a video is being streamed.
+    playback_tx: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -555,7 +562,12 @@ async fn get_thumbnail(
 ///
 /// ffmpeg stdout **and** stderr are suppressed so no ffmpeg output appears in
 /// the main process.
-async fn generate_quick_thumbnail(id: &str, video_path: &Path, cache_dir: &Path) -> bool {
+async fn generate_quick_thumbnail(
+    id: &str,
+    video_path: &Path,
+    cache_dir: &Path,
+    kill: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
     let thumb_path = cache_dir.join(format!("{}.jpg", id));
     if thumb_path.exists() {
         return true;
@@ -582,7 +594,7 @@ async fn generate_quick_thumbnail(id: &str, video_path: &Path, cache_dir: &Path)
         None => return false,
     };
 
-    let status = Command::new("ffmpeg")
+    let Ok(mut child) = Command::new("ffmpeg")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -592,10 +604,19 @@ async fn generate_quick_thumbnail(id: &str, video_path: &Path, cache_dir: &Path)
             "-frames:v", "1", "-q:v", "2",
             &thumb_str,
         ])
-        .status()
-        .await;
+        .spawn()
+    else {
+        return false;
+    };
 
-    status.map(|s| s.success()).unwrap_or(false)
+    tokio::select! {
+        result = child.wait() => result.map(|s| s.success()).unwrap_or(false),
+        _ = async { let _ = kill.wait_for(|&v| v).await; } => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            false
+        }
+    }
 }
 
 /// Two-pass ffmpeg thumbnail that uses `signalstats` to pick the most visually
@@ -611,7 +632,12 @@ async fn generate_quick_thumbnail(id: &str, video_path: &Path, cache_dir: &Path)
 ///
 /// A side-car marker file `{id}.deep` is created on success so the job is
 /// skipped on subsequent runs.
-async fn generate_deep_thumbnail(id: &str, video_path: &Path, cache_dir: &Path) -> bool {
+async fn generate_deep_thumbnail(
+    id: &str,
+    video_path: &Path,
+    cache_dir: &Path,
+    kill: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
     let deep_marker = cache_dir.join(format!("{}.deep", id));
     if deep_marker.exists() {
         return true;
@@ -632,8 +658,10 @@ async fn generate_deep_thumbnail(id: &str, video_path: &Path, cache_dir: &Path) 
     };
 
     // Pass 1: run signalstats on one frame every 5 seconds within the window.
-    let analysis = Command::new("ffmpeg")
+    let Ok(mut child) = Command::new("ffmpeg")
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .args([
             "-hwaccel",
             "auto",
@@ -649,13 +677,36 @@ async fn generate_deep_thumbnail(id: &str, video_path: &Path, cache_dir: &Path) 
             "null",
             "-",
         ])
-        .output()
-        .await;
+        .spawn()
+    else {
+        return false;
+    };
+
+    // Drain stderr concurrently to prevent the pipe buffer from filling and
+    // blocking ffmpeg before it exits (avoids a potential deadlock).
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf).await;
+        buf
+    });
 
     let default_time = start + length * 0.5;
-    let best_time = match analysis {
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
+    let wait_result = tokio::select! {
+        result = child.wait() => result,
+        _ = async { let _ = kill.wait_for(|&v| v).await; } => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            stderr_task.abort();
+            return false;
+        }
+    };
+
+    let stderr_bytes = stderr_task.await.unwrap_or_default();
+    let best_time = match wait_result {
+        Ok(_) => {
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
             find_best_frame_time(&stderr, default_time)
         }
         Err(_) => default_time,
@@ -669,7 +720,7 @@ async fn generate_deep_thumbnail(id: &str, video_path: &Path, cache_dir: &Path) 
 
     // Pass 2: extract the chosen frame.  Suppress stdout/stderr so no
     // ffmpeg output appears in the main process.
-    let status = Command::new("ffmpeg")
+    let Ok(mut child) = Command::new("ffmpeg")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -687,10 +738,21 @@ async fn generate_deep_thumbnail(id: &str, video_path: &Path, cache_dir: &Path) 
             "2",
             &thumb_str,
         ])
-        .status()
-        .await;
+        .spawn()
+    else {
+        return false;
+    };
 
-    if status.map(|s| s.success()).unwrap_or(false) {
+    let success = tokio::select! {
+        result = child.wait() => result.map(|s| s.success()).unwrap_or(false),
+        _ = async { let _ = kill.wait_for(|&v| v).await; } => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            false
+        }
+    };
+
+    if success {
         let _ = tokio::fs::write(&deep_marker, b"").await;
         true
     } else {
@@ -771,6 +833,7 @@ async fn run_thumb_worker(
     cache_dir: PathBuf,
     progress: Arc<RwLock<ThumbProgress>>,
     trigger: Arc<tokio::sync::Notify>,
+    mut playback_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
         trigger.notified().await;
@@ -800,6 +863,11 @@ async fn run_thumb_worker(
         }
 
         for entry in quick_entries {
+            // Pause between items while a video is being streamed.
+            while *playback_rx.borrow() {
+                let _ = playback_rx.changed().await;
+            }
+
             let abs = entry.path().to_path_buf();
             let rel = abs
                 .strip_prefix(&library_path)
@@ -812,7 +880,7 @@ async fn run_thumb_worker(
                 let mut p = progress.write().expect("thumb_progress lock poisoned");
                 p.current_id = Some(id.clone());
             }
-            generate_quick_thumbnail(&id, &abs, &cache_dir).await;
+            generate_quick_thumbnail(&id, &abs, &cache_dir, &mut playback_rx).await;
 
             let mut p = progress.write().expect("thumb_progress lock poisoned");
             p.current_id = None;
@@ -847,6 +915,11 @@ async fn run_thumb_worker(
         }
 
         for entry in deep_entries {
+            // Pause between items while a video is being streamed.
+            while *playback_rx.borrow() {
+                let _ = playback_rx.changed().await;
+            }
+
             let abs = entry.path().to_path_buf();
             let rel = abs
                 .strip_prefix(&library_path)
@@ -859,7 +932,7 @@ async fn run_thumb_worker(
                 let mut p = progress.write().expect("thumb_progress lock poisoned");
                 p.current_id = Some(id.clone());
             }
-            generate_deep_thumbnail(&id, &abs, &cache_dir).await;
+            generate_deep_thumbnail(&id, &abs, &cache_dir, &mut playback_rx).await;
 
             let mut p = progress.write().expect("thumb_progress lock poisoned");
             p.current_id = None;
@@ -1051,6 +1124,10 @@ async fn get_segment(
             .expect("last_segment_access lock poisoned");
         map.insert(id.clone(), Instant::now());
     }
+    // Signal to background workers that playback is in progress.
+    state.playback_tx.send_if_modified(|v| {
+        if *v { false } else { *v = true; true }
+    });
 
     // If segment exists, serve it immediately from cache
     if let Ok(data) = tokio::fs::read(&seg_path).await {
@@ -1397,8 +1474,18 @@ async fn get_thumbnail_sprite(
             .body(data);
     }
 
+    // Refuse to start generation while any video is being streamed.
+    // The background worker will generate this sprite once playback ends.
+    let mut kill_rx = state.playback_tx.subscribe();
+    if *kill_rx.borrow() {
+        return HttpResponse::ServiceUnavailable()
+            .body("sprite generation paused during playback");
+    }
+
     // Generate the sprite using the shared helper (creates dir, runs ffmpeg).
-    if generate_sprite(&id, &abs_path, &state.cache_dir).await {
+    // Pass the playback receiver so an in-flight ffmpeg process is killed the
+    // moment a segment is served for any video.
+    if generate_sprite(&id, &abs_path, &state.cache_dir, &mut kill_rx).await {
         match tokio::fs::read(&sprite_path).await {
             Ok(data) => HttpResponse::Ok()
                 .content_type("image/jpeg")
@@ -1408,7 +1495,7 @@ async fn get_thumbnail_sprite(
                 .body(format!("failed to read sprite: {e}")),
         }
     } else {
-        HttpResponse::ServiceUnavailable().body("sprite generation failed")
+        HttpResponse::ServiceUnavailable().body("sprite generation failed or was interrupted by playback")
     }
 }
 
@@ -1417,7 +1504,12 @@ async fn get_thumbnail_sprite(
 /// Creates `{cache_dir}/{id}_thumbs/sprite.jpg` by running `ffmpeg` with the
 /// tile filter.  Returns `true` on success, `false` on any error.  Skips
 /// generation if the file already exists.
-async fn generate_sprite(id: &str, abs_path: &Path, cache_dir: &Path) -> bool {
+async fn generate_sprite(
+    id: &str,
+    abs_path: &Path,
+    cache_dir: &Path,
+    kill: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
     let sprite_dir = cache_dir.join(format!("{}_thumbs", id));
     let sprite_path = sprite_dir.join("sprite.jpg");
 
@@ -1462,8 +1554,10 @@ async fn generate_sprite(id: &str, abs_path: &Path, cache_dir: &Path) -> bool {
         None => return false,
     };
 
-    let output = Command::new("ffmpeg")
+    let Ok(child) = Command::new("ffmpeg")
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .args([
             "-y",
             "-nostdin",
@@ -1482,9 +1576,34 @@ async fn generate_sprite(id: &str, abs_path: &Path, cache_dir: &Path) -> bool {
             "5",
             &tmp_path_str,
         ])
-        .stdout(std::process::Stdio::null())
-        .output()
-        .await;
+        .spawn()
+    else {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return false;
+    };
+
+    // Save the PID before wait_with_output() moves the Child handle so we can
+    // still send SIGKILL if the playback kill signal fires.
+    let child_pid = child.id();
+
+    let output = tokio::select! {
+        result = child.wait_with_output() => result,
+        _ = async { let _ = kill.wait_for(|&v| v).await; } => {
+            // child was moved into wait_with_output; kill by saved PID
+            #[cfg(unix)]
+            if let Some(pid) = child_pid {
+                // SAFETY: pid is a valid child process PID obtained from
+                // Child::id() before the Child was moved. The process is still
+                // alive (wait_with_output is still pending) when this fires.
+                // Ignoring the return value is intentional: if the process
+                // already exited between the select firing and this call,
+                // kill returns ESRCH, which is harmless.
+                let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            }
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return false;
+        }
+    };
 
     match output {
         Ok(out) if out.status.success() => {
@@ -1521,6 +1640,7 @@ async fn run_sprite_worker(
     cache_dir: PathBuf,
     progress: Arc<RwLock<SpriteProgress>>,
     trigger: Arc<tokio::sync::Notify>,
+    mut playback_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
         trigger.notified().await;
@@ -1550,6 +1670,11 @@ async fn run_sprite_worker(
         }
 
         for entry in entries {
+            // Pause between items while a video is being streamed.
+            while *playback_rx.borrow() {
+                let _ = playback_rx.changed().await;
+            }
+
             let abs = entry.path().to_path_buf();
             let rel = abs
                 .strip_prefix(&library_path)
@@ -1562,7 +1687,7 @@ async fn run_sprite_worker(
                 let mut p = progress.write().expect("sprite_progress lock poisoned");
                 p.current_id = Some(id.clone());
             }
-            generate_sprite(&id, &abs, &cache_dir).await;
+            generate_sprite(&id, &abs, &cache_dir, &mut playback_rx).await;
 
             let mut p = progress.write().expect("sprite_progress lock poisoned");
             p.current_id = None;
@@ -1819,6 +1944,9 @@ async fn main() -> std::io::Result<()> {
     }));
     let sprite_trigger = Arc::new(tokio::sync::Notify::new());
 
+    let (playback_tx, playback_rx) = tokio::sync::watch::channel(false);
+    let playback_tx = Arc::new(playback_tx);
+
     let state = web::Data::new(AppState {
         library_path: library_path.clone(),
         cache_dir: cache_dir.clone(),
@@ -1829,6 +1957,7 @@ async fn main() -> std::io::Result<()> {
         sprite_progress: Arc::clone(&sprite_progress),
         sprite_trigger: Arc::clone(&sprite_trigger),
         hwaccel,
+        playback_tx: Arc::clone(&playback_tx),
     });
 
     // Background task: re-scan the library every 60 seconds.
@@ -1854,8 +1983,9 @@ async fn main() -> std::io::Result<()> {
         let worker_cache = cache_dir.clone();
         let worker_progress = Arc::clone(&thumb_progress);
         let worker_trigger = Arc::clone(&thumb_trigger);
+        let worker_playback_rx = playback_rx.clone();
         tokio::spawn(async move {
-            run_thumb_worker(worker_library, worker_cache, worker_progress, worker_trigger).await;
+            run_thumb_worker(worker_library, worker_cache, worker_progress, worker_trigger, worker_playback_rx).await;
         });
         // Kick off the first batch immediately after startup.
         thumb_trigger.notify_one();
@@ -1868,11 +1998,50 @@ async fn main() -> std::io::Result<()> {
         let worker_cache = cache_dir.clone();
         let worker_progress = Arc::clone(&sprite_progress);
         let worker_trigger = Arc::clone(&sprite_trigger);
+        let worker_playback_rx = playback_rx.clone();
         tokio::spawn(async move {
-            run_sprite_worker(worker_library, worker_cache, worker_progress, worker_trigger).await;
+            run_sprite_worker(worker_library, worker_cache, worker_progress, worker_trigger, worker_playback_rx).await;
         });
         // Kick off the first batch immediately after startup.
         sprite_trigger.notify_one();
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── Playback monitor ─────────────────────────────────────────────────────
+    // Every 2 seconds, check whether any video has had a recent segment
+    // request.  When playback stops, the watch channel immediately wakes any
+    // background workers that were blocked, and they are re-triggered so
+    // processing resumes without waiting for the next 60-second library scan.
+    {
+        let monitor_state = state.clone();
+        let monitor_tx = Arc::clone(&playback_tx);
+        let monitor_thumb_trigger = Arc::clone(&thumb_trigger);
+        let monitor_sprite_trigger = Arc::clone(&sprite_trigger);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                interval.tick().await;
+                let is_playing = {
+                    let map = monitor_state
+                        .last_segment_access
+                        .read()
+                        .expect("last_segment_access lock poisoned");
+                    map.values().any(|t| t.elapsed() < PLAYBACK_IDLE_TIMEOUT)
+                };
+                // Only send when the value actually changes to avoid
+                // spuriously waking workers.
+                let changed = monitor_tx.send_if_modified(|v| {
+                    if *v == is_playing { false } else { *v = is_playing; true }
+                });
+                // When transitioning from playing → idle, re-trigger workers
+                // so they resume immediately without waiting for the next
+                // scheduled library scan.
+                if changed && !is_playing {
+                    monitor_thumb_trigger.notify_one();
+                    monitor_sprite_trigger.notify_one();
+                }
+            }
+        });
     }
     // ─────────────────────────────────────────────────────────────────────────
 

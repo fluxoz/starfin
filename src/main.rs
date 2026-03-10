@@ -62,7 +62,7 @@ impl HwAccel {
         match self {
             HwAccel::Nvidia => &["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"],
             HwAccel::Vaapi  => &["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi",
-                                  "-hwaccel_device", "/dev/dri/renderD128"],
+                                  "-hwaccel_device", "/dev/dri/renderD129"],
             HwAccel::Qsv          => &["-hwaccel", "qsv"],
             HwAccel::VideoToolbox => &["-hwaccel", "videotoolbox"],
             HwAccel::Amf          => &["-hwaccel", "d3d11va"],
@@ -76,7 +76,7 @@ impl HwAccel {
     fn encoder_quality_args(&self) -> &'static [&'static str] {
         match self {
             HwAccel::Nvidia        => &["-preset", "p7", "-tune", "hq", "-temporal-aq", "1", "-spatial-aq", "1", "-rc", "constqp", "-qp", "18"],
-            HwAccel::Vaapi         => &["-vf", "format=nv12|vaapi,hwupload", "-profile:v", "high", "-qp", "18"],
+            HwAccel::Vaapi         => &["-profile:v", "high", "-qp", "18"],
             HwAccel::Qsv           => &["-preset", "veryslow", "-global_quality", "18"],
             HwAccel::VideoToolbox  => &["-qp", "18", "-profile:v", "high"],
             HwAccel::Amf           => &["-quality", "quality", "-rc", "cqp", "-qp", "18"],
@@ -104,7 +104,7 @@ async fn test_hwaccel(hw_name: &str) -> bool {
         "vaapi" => {
             // Hades Canyon priority: AMD Vega M first (stable PCI path), then Intel, then legacy nodes
             let candidates = [
-                "/dev/dri/by-path/pci-0000:01:00.0-render", // ← AMD Radeon RX Vega M GH (your working one)
+                // "/dev/dri/by-path/pci-0000:01:00.0-render", // ← AMD Radeon RX Vega M GH 
                 "/dev/dri/by-path/pci-0000:00:02.0-render", // Intel UHD 630
                 "/dev/dri/renderD129",
                 "/dev/dri/renderD128",

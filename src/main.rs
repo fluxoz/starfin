@@ -1333,10 +1333,10 @@ async fn get_sprite_status(
 /// Returns one of three states:
 /// - `{"status":"processed"}` — both deep thumbnail (`.deep` marker) and sprite
 ///   sheet (`_thumbs/sprite.jpg`) are present for the video
-/// - `{"status":"processing"}` — a background worker is actively processing
-///   this specific video right now (thumbnail or sprite)
-/// - `{"status":"pending"}`   — not fully processed and no worker is currently
-///   on this video
+/// - `{"status":"processing"}` — the video still needs thumbnails or sprites
+///   and the corresponding background worker is currently active
+/// - `{"status":"pending"}`   — not fully processed and no background worker
+///   is currently running for the outstanding work
 ///
 /// This is a cheap filesystem + lock-read check; it never triggers ffmpeg.
 async fn get_processing_status(
@@ -1356,17 +1356,21 @@ async fn get_processing_status(
     let status = if deep_marker.exists() && sprite_path.exists() {
         "processed"
     } else {
-        let thumb_on_this = state
+        let needs_thumb = !deep_marker.exists();
+        let needs_sprite = !sprite_path.exists();
+
+        let thumb_worker_active = state
             .thumb_progress
             .read()
-            .map(|p| p.current_id.as_deref() == Some(id.as_str()))
+            .map(|p| p.active)
             .unwrap_or(false);
-        let sprite_on_this = state
+        let sprite_worker_active = state
             .sprite_progress
             .read()
-            .map(|p| p.current_id.as_deref() == Some(id.as_str()))
+            .map(|p| p.active)
             .unwrap_or(false);
-        if thumb_on_this || sprite_on_this {
+
+        if (needs_thumb && thumb_worker_active) || (needs_sprite && sprite_worker_active) {
             "processing"
         } else {
             "pending"

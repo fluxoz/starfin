@@ -87,6 +87,15 @@
     # ── Phase 2: run wasm-bindgen and assemble the static frontend dist ───────
     #
     # Produces the `dist/` directory consumed by rust-embed in phase 3.
+    #
+    # The source index.html uses Trunk-specific `data-trunk` directives that
+    # browsers do not understand.  We transform it here so that the embedded
+    # copy is valid, standalone HTML:
+    #   • <link data-trunk rel="css" …>  →  <link rel="stylesheet" …>
+    #   • <link data-trunk rel="copy-dir" …> lines are removed (assets are
+    #     already copied to $out by the explicit cp commands below)
+    #   • A <script type="module"> that initialises the Yew WASM app is
+    #     injected just before </head>
     starfinFrontendDist = pkgs.stdenv.mkDerivation {
       pname = "starfin-frontend-dist";
       inherit version;
@@ -111,7 +120,13 @@
         cp -r styles/. $out/styles/
         cp -r vendor/. $out/vendor/
         cp -r fonts/.  $out/fonts/
-        cp index.html  $out/
+        # Transform index.html: replace data-trunk directives with standard
+        # HTML and inject the WASM module initialisation script.
+        sed \
+          -e 's|<link data-trunk rel="css" href="\([^"]*\)" />|<link rel="stylesheet" href="\1" />|g' \
+          -e '/data-trunk rel="copy-dir"/d' \
+          -e "s|</head>|<script type=\"module\">import init from '/starfin_frontend.js'; init();</script>\n</head>|" \
+          index.html > "$out/index.html"
         runHook postInstall
       '';
     };

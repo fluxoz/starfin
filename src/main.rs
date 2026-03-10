@@ -1474,10 +1474,18 @@ async fn get_thumbnail_sprite(
             .body(data);
     }
 
+    // Refuse to start generation while any video is being streamed.
+    // The background worker will generate this sprite once playback ends.
+    let mut kill_rx = state.playback_tx.subscribe();
+    if *kill_rx.borrow() {
+        return HttpResponse::ServiceUnavailable()
+            .body("sprite generation paused during playback");
+    }
+
     // Generate the sprite using the shared helper (creates dir, runs ffmpeg).
-    // This is a user-initiated request so no kill signal is needed.
-    let (_kill_tx, mut never_kill_rx) = tokio::sync::watch::channel(false);
-    if generate_sprite(&id, &abs_path, &state.cache_dir, &mut never_kill_rx).await {
+    // Pass the playback receiver so an in-flight ffmpeg process is killed the
+    // moment a segment is served for any video.
+    if generate_sprite(&id, &abs_path, &state.cache_dir, &mut kill_rx).await {
         match tokio::fs::read(&sprite_path).await {
             Ok(data) => HttpResponse::Ok()
                 .content_type("image/jpeg")
@@ -1487,7 +1495,7 @@ async fn get_thumbnail_sprite(
                 .body(format!("failed to read sprite: {e}")),
         }
     } else {
-        HttpResponse::ServiceUnavailable().body("sprite generation failed")
+        HttpResponse::ServiceUnavailable().body("sprite generation failed or was interrupted by playback")
     }
 }
 

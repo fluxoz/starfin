@@ -172,6 +172,9 @@ pub fn app() -> Html {
                     let mut prev_thumb_active = false;
                     let mut prev_sprite_active = false;
                     let mut version: u32 = 0;
+                    // Skip the first message to avoid a spurious version bump
+                    // when prev_* values transition from their initial defaults.
+                    let mut initialized = false;
 
                     while let Some(Ok(Message::Text(text))) = read.next().await {
                         if let Ok(update) = serde_json::from_str::<api::ProgressUpdate>(&text) {
@@ -202,16 +205,22 @@ pub fn app() -> Html {
                             sprite_current_id.set(new_sprite_id.clone());
 
                             // ── Bump processing_version on meaningful transitions
-                            let thumb_id_changed = new_thumb_id != prev_thumb_id;
-                            let sprite_id_changed = new_sprite_id != prev_sprite_id;
-                            let thumb_went_inactive = prev_thumb_active && !update.thumb.active;
-                            let sprite_went_inactive = prev_sprite_active && !update.sprite.active;
+                            // Skip the very first WS message to avoid a spurious
+                            // bump when prev_* values are their initial defaults.
+                            if !initialized {
+                                initialized = true;
+                            } else {
+                                let thumb_id_changed = new_thumb_id != prev_thumb_id;
+                                let sprite_id_changed = new_sprite_id != prev_sprite_id;
+                                let thumb_went_inactive = prev_thumb_active && !update.thumb.active;
+                                let sprite_went_inactive = prev_sprite_active && !update.sprite.active;
 
-                            if thumb_id_changed || sprite_id_changed
-                                || thumb_went_inactive || sprite_went_inactive
-                            {
-                                version += 1;
-                                processing_version.set(version);
+                                if thumb_id_changed || sprite_id_changed
+                                    || thumb_went_inactive || sprite_went_inactive
+                                {
+                                    version += 1;
+                                    processing_version.set(version);
+                                }
                             }
 
                             prev_thumb_id = new_thumb_id;

@@ -125,7 +125,7 @@
         sed \
           -e 's|<link data-trunk rel="css" href="\([^"]*\)" />|<link rel="stylesheet" href="\1" />|g' \
           -e '/data-trunk rel="copy-dir"/d' \
-          -e "s|</head>|<script type=\"module\">import init from '/starfin_frontend.js'; init();</script>\n</head>|" \
+          -e "s|</head>|<script type=\"module\">import init from '/starfin-frontend.js'; init();</script>\n</head>|" \
           index.html > "$out/index.html"
         runHook postInstall
       '';

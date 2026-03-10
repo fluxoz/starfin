@@ -197,6 +197,17 @@ body{
 
 .topbar__left{
   flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.topbar__renderer{
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  opacity: .65;
+  text-transform: none;
 }
 
 .topbar__center{

@@ -35,6 +35,22 @@ pub fn app() -> Html {
     // Scroll-to-top button visibility state
     let show_scroll_top = use_state(|| false);
 
+    // Hardware acceleration renderer name
+    let hwaccel_label = use_state(|| Option::<String>::None);
+
+    // Fetch the renderer name once on mount.
+    {
+        let hwaccel_label = hwaccel_label.clone();
+        use_effect_with((), move |_| {
+            spawn_local(async move {
+                if let Ok(info) = api::fetch_hwaccel().await {
+                    hwaccel_label.set(Some(info.label));
+                }
+            });
+            || ()
+        });
+    }
+
     // Listen for scroll events on the window to toggle the back-to-top button.
     {
         let show_scroll_top = show_scroll_top.clone();
@@ -310,7 +326,12 @@ pub fn app() -> Html {
 
                 <header class="topbar">
                     <div class="topbar__inner">
-                        <div class="topbar__left">{ "STARFIN MEDIA SERVER" }</div>
+                        <div class="topbar__left">
+                            { "STARFIN MEDIA SERVER" }
+                            if let Some(label) = (*hwaccel_label).clone() {
+                                <span class="topbar__renderer">{ label }</span>
+                            }
+                        </div>
                         <div class="topbar__right">
                             <div class="scan-area">
                                 <button

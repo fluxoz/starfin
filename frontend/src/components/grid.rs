@@ -8,6 +8,15 @@ use yew::prelude::*;
 pub struct Props {
     pub items: Vec<Element>,
     pub on_watch: Callback<Element>,
+    /// The video ID the thumbnail worker is currently processing (from WS).
+    #[prop_or_default]
+    pub thumb_current_id: Option<String>,
+    /// The video ID the sprite worker is currently processing (from WS).
+    #[prop_or_default]
+    pub sprite_current_id: Option<String>,
+    /// Bumps whenever a background worker finishes a video or a batch.
+    #[prop_or_default]
+    pub processing_version: u32,
 }
 
 fn format_duration(secs: u32) -> String {
@@ -45,11 +54,19 @@ pub fn elements_grid(props: &Props) -> Html {
 
                 html! {
                     <article class="card" key={item.id.clone()}>
-                        <VideoCardThumb video_id={item.id.clone()} />
+                        <VideoCardThumb
+                            video_id={item.id.clone()}
+                            processing_version={props.processing_version}
+                        />
 
                         <div class="card__top">
                             <div class="card__title">{ item.title.clone() }</div>
-                            <ProcessingStatus video_id={item.id.clone()} />
+                            <ProcessingStatus
+                                video_id={item.id.clone()}
+                                thumb_current_id={props.thumb_current_id.clone()}
+                                sprite_current_id={props.sprite_current_id.clone()}
+                                processing_version={props.processing_version}
+                            />
                         </div>
 
                         <div class="card__meta">

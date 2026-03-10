@@ -1,5 +1,6 @@
 use gloo_net::http::Request;
 use serde::Deserialize;
+use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -10,6 +11,15 @@ struct ProcessingStatusResponse {
 #[derive(Properties, PartialEq)]
 pub struct Props {
     pub video_id: String,
+    /// The video ID the thumbnail worker is currently processing (from WS).
+    #[prop_or_default]
+    pub thumb_current_id: Option<String>,
+    /// The video ID the sprite worker is currently processing (from WS).
+    #[prop_or_default]
+    pub sprite_current_id: Option<String>,
+    /// Bumps whenever a background worker finishes a video or a batch.
+    #[prop_or_default]
+    pub processing_version: u32,
 }
 
 /// SVG path data for the nf-md-sync_circle icon (U+F1378), extracted from the
@@ -21,22 +31,35 @@ const SYNC_CIRCLE_PATH: &str = "M0 614Q0 335 137.0 99.5Q274 -136 509.5 -273.0Q74
 /// - nf-md-check_circle `\u{f05e0}` (green)   — fully processed: deep thumbnail and sprite both complete
 /// - nf-md-sync_circle SVG path (orange)       — a background worker is currently active (spins CCW once/s)
 /// - nf-md-circle_double `\u{f0e95}` (grey)   — awaiting processing (no worker currently running)
+///
+/// The component fetches the authoritative status from the server on mount and
+/// whenever `processing_version` changes (indicating a worker just finished a
+/// video).  Between re-fetches, the WS-provided `current_id` fields give an
+/// immediate "processing" indicator for the video currently being worked on.
 #[function_component(ProcessingStatus)]
 pub fn processing_status(props: &Props) -> Html {
-    let status: UseStateHandle<Option<String>> = use_state(|| None);
+    let fetched_status: UseStateHandle<Option<String>> = use_state(|| None);
 
+    // Determine if this specific video is actively being processed right now.
+    let is_processing =
+        props.thumb_current_id.as_deref() == Some(props.video_id.as_str())
+        || props.sprite_current_id.as_deref() == Some(props.video_id.as_str());
+
+    // Fetch the authoritative processing status from the server on mount
+    // and whenever processing_version bumps (a video just finished).
     {
-        let status = status.clone();
+        let fetched_status = fetched_status.clone();
         let video_id = props.video_id.clone();
-        use_effect_with(video_id, move |video_id| {
+        let version = props.processing_version;
+        use_effect_with((video_id, version), move |(video_id, _version)| {
             let video_id = video_id.clone();
-            let status = status.clone();
-            wasm_bindgen_futures::spawn_local(async move {
+            let fetched_status = fetched_status.clone();
+            spawn_local(async move {
                 let url = format!("/api/videos/{video_id}/processing-status");
                 if let Ok(resp) = Request::get(&url).send().await {
                     if resp.ok() {
                         if let Ok(data) = resp.json::<ProcessingStatusResponse>().await {
-                            status.set(Some(data.status));
+                            fetched_status.set(Some(data.status));
                         }
                     }
                 }
@@ -45,7 +68,15 @@ pub fn processing_status(props: &Props) -> Html {
         });
     }
 
-    match status.as_deref() {
+    // If the WS says this video is actively being worked on right now,
+    // show the "processing" badge immediately regardless of the last fetch.
+    let display_status = if is_processing {
+        Some("processing")
+    } else {
+        fetched_status.as_deref()
+    };
+
+    match display_status {
         Some("processed") => html! {
             <span
                 class="processing-status processing-status--processed"

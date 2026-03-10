@@ -85,11 +85,12 @@ The server starts at **`http://127.0.0.1:8089`** by default.
 | Environment Variable | Default | Description |
 |---|---|---|
 | `PORT` | `8089` | Port the server listens on |
+| `BIND_ADDR` | `127.0.0.1` | IP address the server binds to. Set to `0.0.0.0` to expose to the network |
 | `VIDEO_LIBRARY_PATH` | `./test_videos` | Path to your video library directory |
 
 **Example:**
 ```bash
-PORT=8080 VIDEO_LIBRARY_PATH=/media/videos cargo run --release
+PORT=8080 BIND_ADDR=0.0.0.0 VIDEO_LIBRARY_PATH=/media/videos cargo run --release
 ```
 
 ---

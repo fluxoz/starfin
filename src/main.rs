@@ -241,6 +241,10 @@ const CACHE_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60); // 10 minutes
 /// How often the background sweep task wakes up to evict idle caches.
 const CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(60); // 1 minute
 
+/// How long after the last segment request before playback is considered
+/// inactive and background workers are allowed to resume.
+const PLAYBACK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ── App state ────────────────────────────────────────────────────────────────
 
 /// Tracks the progress of the thumbnail generation background job.
@@ -280,6 +284,9 @@ struct AppState {
     sprite_trigger: Arc<tokio::sync::Notify>,
     /// Detected hardware acceleration backend (detected once at startup).
     hwaccel: HwAccel,
+    /// Broadcasts playback state (`true` = playing, `false` = idle) to all
+    /// background workers so they can pause while a video is being streamed.
+    playback_tx: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -771,6 +778,7 @@ async fn run_thumb_worker(
     cache_dir: PathBuf,
     progress: Arc<RwLock<ThumbProgress>>,
     trigger: Arc<tokio::sync::Notify>,
+    mut playback_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
         trigger.notified().await;
@@ -800,6 +808,11 @@ async fn run_thumb_worker(
         }
 
         for entry in quick_entries {
+            // Pause between items while a video is being streamed.
+            while *playback_rx.borrow() {
+                let _ = playback_rx.changed().await;
+            }
+
             let abs = entry.path().to_path_buf();
             let rel = abs
                 .strip_prefix(&library_path)
@@ -847,6 +860,11 @@ async fn run_thumb_worker(
         }
 
         for entry in deep_entries {
+            // Pause between items while a video is being streamed.
+            while *playback_rx.borrow() {
+                let _ = playback_rx.changed().await;
+            }
+
             let abs = entry.path().to_path_buf();
             let rel = abs
                 .strip_prefix(&library_path)
@@ -1051,6 +1069,10 @@ async fn get_segment(
             .expect("last_segment_access lock poisoned");
         map.insert(id.clone(), Instant::now());
     }
+    // Signal to background workers that playback is in progress.
+    state.playback_tx.send_if_modified(|v| {
+        if *v { false } else { *v = true; true }
+    });
 
     // If segment exists, serve it immediately from cache
     if let Ok(data) = tokio::fs::read(&seg_path).await {
@@ -1521,6 +1543,7 @@ async fn run_sprite_worker(
     cache_dir: PathBuf,
     progress: Arc<RwLock<SpriteProgress>>,
     trigger: Arc<tokio::sync::Notify>,
+    mut playback_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
         trigger.notified().await;
@@ -1550,6 +1573,11 @@ async fn run_sprite_worker(
         }
 
         for entry in entries {
+            // Pause between items while a video is being streamed.
+            while *playback_rx.borrow() {
+                let _ = playback_rx.changed().await;
+            }
+
             let abs = entry.path().to_path_buf();
             let rel = abs
                 .strip_prefix(&library_path)
@@ -1819,6 +1847,9 @@ async fn main() -> std::io::Result<()> {
     }));
     let sprite_trigger = Arc::new(tokio::sync::Notify::new());
 
+    let (playback_tx, playback_rx) = tokio::sync::watch::channel(false);
+    let playback_tx = Arc::new(playback_tx);
+
     let state = web::Data::new(AppState {
         library_path: library_path.clone(),
         cache_dir: cache_dir.clone(),
@@ -1829,6 +1860,7 @@ async fn main() -> std::io::Result<()> {
         sprite_progress: Arc::clone(&sprite_progress),
         sprite_trigger: Arc::clone(&sprite_trigger),
         hwaccel,
+        playback_tx: Arc::clone(&playback_tx),
     });
 
     // Background task: re-scan the library every 60 seconds.
@@ -1854,8 +1886,9 @@ async fn main() -> std::io::Result<()> {
         let worker_cache = cache_dir.clone();
         let worker_progress = Arc::clone(&thumb_progress);
         let worker_trigger = Arc::clone(&thumb_trigger);
+        let worker_playback_rx = playback_rx.clone();
         tokio::spawn(async move {
-            run_thumb_worker(worker_library, worker_cache, worker_progress, worker_trigger).await;
+            run_thumb_worker(worker_library, worker_cache, worker_progress, worker_trigger, worker_playback_rx).await;
         });
         // Kick off the first batch immediately after startup.
         thumb_trigger.notify_one();
@@ -1868,11 +1901,41 @@ async fn main() -> std::io::Result<()> {
         let worker_cache = cache_dir.clone();
         let worker_progress = Arc::clone(&sprite_progress);
         let worker_trigger = Arc::clone(&sprite_trigger);
+        let worker_playback_rx = playback_rx.clone();
         tokio::spawn(async move {
-            run_sprite_worker(worker_library, worker_cache, worker_progress, worker_trigger).await;
+            run_sprite_worker(worker_library, worker_cache, worker_progress, worker_trigger, worker_playback_rx).await;
         });
         // Kick off the first batch immediately after startup.
         sprite_trigger.notify_one();
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── Playback monitor ─────────────────────────────────────────────────────
+    // Every 2 seconds, check whether any video has had a recent segment
+    // request.  When the state changes, the watch channel immediately wakes
+    // any waiting background workers so they can pause or resume without
+    // polling.
+    {
+        let monitor_state = state.clone();
+        let monitor_tx = Arc::clone(&playback_tx);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                interval.tick().await;
+                let is_playing = {
+                    let map = monitor_state
+                        .last_segment_access
+                        .read()
+                        .expect("last_segment_access lock poisoned");
+                    map.values().any(|t| t.elapsed() < PLAYBACK_IDLE_TIMEOUT)
+                };
+                // Only send when the value actually changes to avoid
+                // spuriously waking workers.
+                monitor_tx.send_if_modified(|v| {
+                    if *v == is_playing { false } else { *v = is_playing; true }
+                });
+            }
+        });
     }
     // ─────────────────────────────────────────────────────────────────────────
 

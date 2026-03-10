@@ -167,7 +167,8 @@ async fn detect_hwaccel() -> HwAccel {
     {
         Ok(output) if output.status.success() => output.stdout,
         _ => {
-            println!("→ GPU acceleration: CPU (software fallback)");
+            println!("  ✗ Could not query ffmpeg for hardware acceleration methods");
+            println!("  → Falling back to CPU (software)");
             return HwAccel::Software;
         }
     };
@@ -187,7 +188,9 @@ async fn detect_hwaccel() -> HwAccel {
         }
     }
 
-    println!("available (compiled-in): {:?}", available);
+    let mut sorted_available: Vec<&String> = available.iter().collect();
+    sorted_available.sort();
+    println!("  Compiled-in hwaccels: {:?}", sorted_available);
 
     // Priority order + real runtime test (succeeds ONLY if hardware + driver + libs are usable)
     let candidates: &[(&str, HwAccel)] = &[
@@ -198,14 +201,210 @@ async fn detect_hwaccel() -> HwAccel {
     ];
 
     for (hw_name, variant) in candidates {
-        if available.contains(*hw_name) && test_hwaccel(hw_name).await {
-            println!("→ GPU acceleration: {} ({})", variant.label(), hw_name);
+        if !available.contains(*hw_name) {
+            println!("  {} : skipped (not compiled in)", hw_name);
+            continue;
+        }
+        print!("  {} : testing runtime… ", hw_name);
+        if test_hwaccel(hw_name).await {
+            println!("✓ works");
+            println!();
+            println!("  ★ Selected: {} (via {})", variant.label(), hw_name);
+            println!("    Encoder : {}", variant.encoder());
             return variant.clone();
+        } else {
+            println!("✗ not usable (driver/device issue)");
         }
     }
 
-    println!("→ GPU acceleration: CPU (software fallback)");
+    println!();
+    println!("  ⚠ No GPU acceleration available — falling back to CPU");
+    println!("    Encoder : libx264");
+    println!("    Transcoding will be significantly slower.");
     HwAccel::Software
+}
+
+// ── Startup healthchecks ──────────────────────────────────────────────────────
+
+/// Run detailed healthchecks at startup and log results so they are visible in
+/// journalctl.  Checks cover: process identity, directory read/write access,
+/// ffmpeg availability, and available render devices.
+async fn run_startup_healthchecks(library_path: &Path, cache_dir: &Path) {
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║              STARFIN — STARTUP HEALTHCHECKS                 ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+
+    // ── 1. Process identity ──────────────────────────────────────────────
+    println!();
+    println!("── Process identity ────────────────────────────────────────────");
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    // Resolve username from /etc/passwd via libc.
+    let username = unsafe {
+        let pw = libc::getpwuid(uid);
+        if pw.is_null() {
+            format!("(uid {})", uid)
+        } else {
+            std::ffi::CStr::from_ptr((*pw).pw_name)
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+
+    // Resolve group name from /etc/group via libc.
+    let groupname = unsafe {
+        let gr = libc::getgrgid(gid);
+        if gr.is_null() {
+            format!("(gid {})", gid)
+        } else {
+            std::ffi::CStr::from_ptr((*gr).gr_name)
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+
+    println!("  User  : {} (uid={})", username, uid);
+    println!("  Group : {} (gid={})", groupname, gid);
+    println!("  PID   : {}", std::process::id());
+
+    // ── 2. Directory access checks ───────────────────────────────────────
+    println!();
+    println!("── Directory access ───────────────────────────────────────────");
+    check_directory_access("VIDEO_LIBRARY_PATH", library_path);
+    check_directory_access("CACHE_DIR", cache_dir);
+
+    // ── 3. ffmpeg availability ───────────────────────────────────────────
+    println!();
+    println!("── ffmpeg ─────────────────────────────────────────────────────");
+    match tokio::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            let version_str = String::from_utf8_lossy(&output.stdout);
+            // Print only the first line (e.g. "ffmpeg version 6.1 Copyright ...")
+            if let Some(first_line) = version_str.lines().next() {
+                println!("  ✓ {}", first_line);
+            }
+        }
+        Ok(_) => {
+            println!("  ✗ ffmpeg found but returned an error");
+        }
+        Err(e) => {
+            println!("  ✗ ffmpeg not found: {}", e);
+            println!("    Transcoding and thumbnail generation will not work!");
+        }
+    }
+
+    // ── 4. Render devices ────────────────────────────────────────────────
+    println!();
+    println!("── Render devices (/dev/dri) ────────────────────────────────");
+    let dri_path = Path::new("/dev/dri");
+    if dri_path.exists() {
+        match std::fs::read_dir(dri_path) {
+            Ok(entries) => {
+                let mut found_any = false;
+                let mut devices: Vec<_> = entries
+                    .filter_map(|e| e.ok())
+                    .collect();
+                devices.sort_by_key(|e| e.file_name());
+                for entry in &devices {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with("render") || name_str.starts_with("card") {
+                        let accessible = std::fs::File::open(entry.path()).is_ok();
+                        let status = if accessible { "✓ accessible" } else { "✗ not accessible" };
+                        println!("  {} : {}", name_str, status);
+                        found_any = true;
+                    }
+                }
+                if !found_any {
+                    println!("  (no render/card devices found)");
+                }
+            }
+            Err(e) => println!("  ✗ Cannot read /dev/dri: {}", e),
+        }
+
+        // Also check by-path symlinks for stable device identification
+        let by_path = dri_path.join("by-path");
+        if by_path.exists() {
+            println!();
+            println!("  Stable paths (/dev/dri/by-path):");
+            if let Ok(entries) = std::fs::read_dir(&by_path) {
+                let mut links: Vec<_> = entries
+                    .filter_map(|e| e.ok())
+                    .collect();
+                links.sort_by_key(|e| e.file_name());
+                for entry in &links {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.contains("render") {
+                        let target = std::fs::read_link(entry.path())
+                            .map(|t| t.display().to_string())
+                            .unwrap_or_else(|_| "?".into());
+                        println!("    {} → {}", name_str, target);
+                    }
+                }
+            }
+        }
+    } else {
+        println!("  (no /dev/dri directory — no GPU devices detected)");
+    }
+
+    println!();
+    println!("── Hardware acceleration probe ─────────────────────────────────");
+}
+
+/// Check that a directory exists and is readable and writable by the current
+/// process.  Logs a clear pass/fail line for each check.
+fn check_directory_access(label: &str, path: &Path) {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    println!("  {} = {}", label, canonical.display());
+
+    // Existence
+    if !path.exists() {
+        println!("    ✗ Directory does not exist");
+        return;
+    }
+    println!("    ✓ Exists");
+
+    // Metadata (readability)
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            if meta.is_dir() {
+                println!("    ✓ Is a directory");
+            } else {
+                println!("    ✗ Path exists but is NOT a directory");
+                return;
+            }
+        }
+        Err(e) => {
+            println!("    ✗ Cannot read metadata: {}", e);
+            return;
+        }
+    }
+
+    // Read check (can we list contents?)
+    match std::fs::read_dir(path) {
+        Ok(_) => println!("    ✓ Readable (can list contents)"),
+        Err(e) => println!("    ✗ Not readable: {}", e),
+    }
+
+    // Write check (try creating and removing a temp file)
+    let probe = path.join(".starfin_healthcheck_probe");
+    match std::fs::write(&probe, b"healthcheck") {
+        Ok(_) => {
+            println!("    ✓ Writable");
+            let _ = std::fs::remove_file(&probe);
+        }
+        Err(e) => {
+            println!("    ✗ Not writable: {}", e);
+        }
+    }
 }
 
 // ── Embedded frontend assets ─────────────────────────────────────────────────
@@ -1921,14 +2120,17 @@ async fn main() -> std::io::Result<()> {
     }
     std::fs::create_dir_all(&cache_dir)?;
 
+    // ── Startup healthchecks (logged for journalctl) ─────────────────────
+    run_startup_healthchecks(&library_path, &cache_dir).await;
+    let hwaccel = detect_hwaccel().await;
+    println!();
+    println!("════════════════════════════════════════════════════════════════");
+
     // Initial library scan at startup.
     println!("→ Scanning library…");
     let initial_items = scan_library(&library_path).await;
     println!("→ Found {} video(s)", initial_items.len());
     let video_cache: Arc<RwLock<Vec<VideoItem>>> = Arc::new(RwLock::new(initial_items));
-
-    println!("→ Detecting GPU hardware acceleration…");
-    let hwaccel = detect_hwaccel().await;
 
     let thumb_progress = Arc::new(RwLock::new(ThumbProgress {
         current: 0,

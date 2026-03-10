@@ -1111,7 +1111,8 @@ async fn get_segment(
     //   (without this, each segment's PTS would start from 0 instead of
     //    the correct position in the stream timeline)
     // - `-f mpegts` for self-contained MPEG Transport Stream output
-    // - `-force_key_frames expr:gte(t,0)` to ensure segment starts with a keyframe
+    // - `-force_key_frames 0` to ensure the very first frame is a keyframe
+    // - `-bf 0` to disable B-frames (see below)
     let ts_offset = format!("{:.3}", start_time);
     let mut cmd = Command::new("ffmpeg");
     cmd.current_dir(&hls_dir)
@@ -1133,8 +1134,29 @@ async fn get_segment(
     cmd.args(["-c:v", state.hwaccel.encoder()]);
     cmd.args(state.hwaccel.encoder_quality_args());
 
+    // Disable B-frames.  B-frames require DTS/PTS reordering which makes the
+    // first decodable frame in an MPEG-TS segment *not* the first stored
+    // packet.  When HLS.js seeks and the browser appends a segment to a
+    // SourceBuffer for independent decoding, this mismatch causes
+    // "avcodec_send_packet error: End of file" decode failures.  Disabling
+    // B-frames ensures DTS == PTS order and each segment is independently
+    // decodable from its very first packet.
+    cmd.args(["-bf", "0"]);
+
+    // For NVENC, promote forced keyframes to true IDR frames.  Without this
+    // flag NVENC may emit a closed-GOP I-frame instead of an IDR, which
+    // does not flush the decoder's reference picture buffer and can leave
+    // the browser unable to decode the segment in isolation.
+    if state.hwaccel == HwAccel::Nvidia {
+        cmd.args(["-forced-idr", "1"]);
+    }
+
     cmd.args([
-        "-force_key_frames", "expr:gte(t,0)",
+        // Force a keyframe at encoding timestamp 0 (the first frame of this
+        // segment).  Using "0" rather than "expr:gte(t,0)" is intentional:
+        // the expression gte(t,0) is always true and would make *every* frame
+        // a keyframe, which is extremely inefficient with hardware encoders.
+        "-force_key_frames", "0",
         "-c:a", "aac",
         "-b:a", "128k",
         "-output_ts_offset", &ts_offset,

@@ -76,7 +76,7 @@ impl HwAccel {
     fn encoder_quality_args(&self) -> &'static [&'static str] {
         match self {
             HwAccel::Nvidia        => &["-preset", "p7", "-tune", "hq", "-temporal-aq", "1", "-spatial-aq", "1", "-rc", "constqp", "-qp", "18"],
-            HwAccel::Vaapi         => &["-vf", "format=nv12|vaapi,hwupload", "-profile:v", "high", "-qp", "18"],
+            HwAccel::Vaapi         => &["-profile:v", "high", "-qp", "18"],
             HwAccel::Qsv           => &["-preset", "veryslow", "-global_quality", "18"],
             HwAccel::VideoToolbox  => &["-qp", "18", "-profile:v", "high"],
             HwAccel::Amf           => &["-quality", "quality", "-rc", "cqp", "-qp", "18"],

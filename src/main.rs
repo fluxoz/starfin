@@ -1331,12 +1331,12 @@ async fn get_sprite_status(
 /// `GET /api/videos/{id}/processing-status` — processing status for a video.
 ///
 /// Returns one of three states:
-/// - `{"status":"processed"}` — both deep thumbnail (`.deep` marker) and sprite
-///   sheet (`_thumbs/sprite.jpg`) are present for the video
-/// - `{"status":"processing"}` — the video still needs thumbnails or sprites
-///   and the corresponding background worker is currently active
-/// - `{"status":"pending"}`   — not fully processed and no background worker
-///   is currently running for the outstanding work
+/// - `{"status":"processed"}` — all three operations are complete: quick thumbnail
+///   (`.jpg`), deep thumbnail (`.deep` marker), and sprite sheet (`_thumbs/sprite.jpg`)
+/// - `{"status":"processing"}` — one or more operations are incomplete and the
+///   corresponding background worker is currently active
+/// - `{"status":"pending"}`   — one or more operations are incomplete but no
+///   background worker is currently running for the outstanding work
 ///
 /// This is a cheap filesystem + lock-read check; it never triggers ffmpeg.
 async fn get_processing_status(
@@ -1347,16 +1347,19 @@ async fn get_processing_status(
         return HttpResponse::BadRequest().body("invalid video id");
     }
 
+    let quick_marker = state.cache_dir.join(format!("{}.jpg", *id));
     let deep_marker = state.cache_dir.join(format!("{}.deep", *id));
     let sprite_path = state
         .cache_dir
         .join(format!("{}_thumbs", *id))
         .join("sprite.jpg");
 
-    let status = if deep_marker.exists() && sprite_path.exists() {
+    let status = if quick_marker.exists() && deep_marker.exists() && sprite_path.exists() {
         "processed"
     } else {
-        let needs_thumb = !deep_marker.exists();
+        // needs_thumb covers both quick and deep phases, which are both handled
+        // by the thumb background worker.
+        let needs_thumb = !quick_marker.exists() || !deep_marker.exists();
         let needs_sprite = !sprite_path.exists();
 
         let thumb_worker_active = state

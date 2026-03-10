@@ -1784,7 +1784,9 @@ async fn main() -> std::io::Result<()> {
         std::env::var("VIDEO_LIBRARY_PATH").unwrap_or_else(|_| "./test_videos".into()),
     );
 
-    let cache_dir = PathBuf::new().join("starfin_cache");
+    let cache_dir = PathBuf::from(
+        std::env::var("CACHE_DIR").unwrap_or_else(|_| "./starfin_cache".into()),
+    );
 
     if !library_path.exists() {
         std::fs::create_dir_all(&library_path)?;

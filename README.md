@@ -87,10 +87,11 @@ The server starts at **`http://127.0.0.1:8089`** by default.
 | `PORT` | `8089` | Port the server listens on |
 | `BIND_ADDR` | `127.0.0.1` | IP address the server binds to. Set to `0.0.0.0` to expose to the network |
 | `VIDEO_LIBRARY_PATH` | `./test_videos` | Path to your video library directory |
+| `CACHE_DIR` | `./starfin_cache` | Directory used to store thumbnails and sprite sheet cache |
 
 **Example:**
 ```bash
-PORT=8080 BIND_ADDR=0.0.0.0 VIDEO_LIBRARY_PATH=/media/videos cargo run --release
+PORT=8080 BIND_ADDR=0.0.0.0 VIDEO_LIBRARY_PATH=/media/videos CACHE_DIR=/var/cache/starfin cargo run --release
 ```
 
 ---

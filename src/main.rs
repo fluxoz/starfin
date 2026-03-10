@@ -1333,10 +1333,10 @@ async fn get_sprite_status(
 /// Returns one of three states:
 /// - `{"status":"processed"}` — all three operations are complete: quick thumbnail
 ///   (`.jpg`), deep thumbnail (`.deep` marker), and sprite sheet (`_thumbs/sprite.jpg`)
-/// - `{"status":"processing"}` — one or more operations are incomplete and the
-///   corresponding background worker is currently active
-/// - `{"status":"pending"}`   — one or more operations are incomplete but no
-///   background worker is currently running for the outstanding work
+/// - `{"status":"processing"}` — the thumb or sprite background worker is actively
+///   working on this specific video right now
+/// - `{"status":"pending"}`   — not fully processed and no worker is currently
+///   working on this specific video
 ///
 /// This is a cheap filesystem + lock-read check; it never triggers ffmpeg.
 async fn get_processing_status(
@@ -1357,23 +1357,19 @@ async fn get_processing_status(
     let status = if quick_marker.exists() && deep_marker.exists() && sprite_path.exists() {
         "processed"
     } else {
-        // needs_thumb covers both quick and deep phases, which are both handled
-        // by the thumb background worker.
-        let needs_thumb = !quick_marker.exists() || !deep_marker.exists();
-        let needs_sprite = !sprite_path.exists();
-
-        let thumb_worker_active = state
+        // "processing" only when THIS video is the one a worker is actively working on.
+        let thumb_on_this = state
             .thumb_progress
             .read()
-            .map(|p| p.active)
+            .map(|p| p.current_id.as_deref() == Some(id.as_str()))
             .unwrap_or(false);
-        let sprite_worker_active = state
+        let sprite_on_this = state
             .sprite_progress
             .read()
-            .map(|p| p.active)
+            .map(|p| p.current_id.as_deref() == Some(id.as_str()))
             .unwrap_or(false);
 
-        if (needs_thumb && thumb_worker_active) || (needs_sprite && sprite_worker_active) {
+        if thumb_on_this || sprite_on_this {
             "processing"
         } else {
             "pending"

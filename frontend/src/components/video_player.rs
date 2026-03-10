@@ -193,6 +193,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // UI visibility state
     let controls_visible = use_state(|| true);
     let last_mouse_move = use_state(|| js_sys::Date::now());
+    let mouse_inside = use_state(|| false);
     let settings_open = use_state(|| false);
     let speed_menu_open = use_state(|| false);
     let volume_slider_visible = use_state(|| false);
@@ -534,6 +535,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     {
         let controls_visible = controls_visible.clone();
         let last_mouse_move = last_mouse_move.clone();
+        let mouse_inside = mouse_inside.clone();
         let is_playing = is_playing.clone();
         let settings_open = settings_open.clone();
 
@@ -542,11 +544,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             move |_| {
                 let controls_visible = controls_visible.clone();
                 let last_mouse_move = last_mouse_move.clone();
+                let mouse_inside = mouse_inside.clone();
                 let is_playing = is_playing.clone();
                 let settings_open = settings_open.clone();
 
                 let interval = Interval::new(1000, move || {
-                    if *is_playing && !*settings_open {
+                    if *is_playing && !*settings_open && !*mouse_inside {
                         let now = js_sys::Date::now();
                         if now - *last_mouse_move > CONTROL_HIDE_TIMEOUT_MS {
                             controls_visible.set(false);
@@ -820,18 +823,19 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let on_mouse_move = {
         let controls_visible = controls_visible.clone();
         let last_mouse_move = last_mouse_move.clone();
+        let mouse_inside = mouse_inside.clone();
         Callback::from(move |_: MouseEvent| {
             controls_visible.set(true);
             last_mouse_move.set(js_sys::Date::now());
+            mouse_inside.set(true);
         })
     };
 
-    // Mouse leave handler
+    // Mouse leave handler — keep controls visible; the inactivity timer handles hiding
     let on_mouse_leave = {
-        let last_mouse_move = last_mouse_move.clone();
+        let mouse_inside = mouse_inside.clone();
         Callback::from(move |_: MouseEvent| {
-            // Backdate last_mouse_move so the interval hides controls within ~1 s
-            last_mouse_move.set(js_sys::Date::now() - (CONTROL_HIDE_TIMEOUT_MS - 1000.0));
+            mouse_inside.set(false);
         })
     };
 

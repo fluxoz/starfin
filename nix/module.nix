@@ -136,6 +136,8 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
 
+      path = [ pkgs.ffmpeg ];
+
       environment = {
         PORT = toString cfg.port;
         BIND_ADDR = cfg.bindAddr;

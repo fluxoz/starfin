@@ -44,6 +44,9 @@
       installPhase = ''
         runHook preInstall
         mkdir -p $out
+        ls -lah
+        pwd
+        ls target/release -lah
         cp target/wasm32-unknown-unknown/release/starfin_frontend.wasm $out/
         runHook postInstall
       '';

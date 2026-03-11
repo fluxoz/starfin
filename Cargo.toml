@@ -1,0 +1,23 @@
+[package]
+name = "starfin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2"
+actix-cors = "0.7"
+actix-session = { version = "0.10", features = ["cookie-session"] }
+actix-web = "4"
+actix-web-lab = "0.24"
+actix-ws = "0.4.0"
+mime_guess = "2.0.5"
+reqwest = "0.13.2"
+rust-embed = "8.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "fs", "sync"] }
+toml = "0.8"
+url = "2.5"
+urlencoding = "2.1"
+uuid = { version = "1.18.1", features = ["serde", "v4", "v5"] }
+walkdir = "2"

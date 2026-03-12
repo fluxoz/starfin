@@ -81,6 +81,16 @@ in
       description = "Open the firewall for the configured `port`.";
     };
 
+    passwordProtection = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Enable password protection.  When enabled, a password modal gates
+        access to the library.  The hashed password is stored in the cache
+        directory (`PASSWORD_PROTECTION` environment variable).
+      '';
+    };
+
     user = mkOption {
       type = types.str;
       default = "starfin";
@@ -143,7 +153,9 @@ in
         BIND_ADDR = cfg.bindAddr;
         VIDEO_LIBRARY_PATH = toString cfg.videoLibraryPath;
         CACHE_DIR = toString cfg.cacheDir;
-      } // cfg.extraEnvironment;
+      } // (lib.optionalAttrs cfg.passwordProtection {
+        PASSWORD_PROTECTION = "true";
+      }) // cfg.extraEnvironment;
 
       serviceConfig = {
         ExecStart = getExe cfg.package;

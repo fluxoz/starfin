@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::process::Command;
 use uuid::Uuid;
 use walkdir::WalkDir;
-use sha2::{Sha256, Digest};
+use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash::{SaltString, rand_core::OsRng}};
 
 // ── Hardware acceleration ─────────────────────────────────────────────────────
 
@@ -2253,11 +2253,25 @@ async fn get_subtitle(
 
 // ── Password protection ──────────────────────────────────────────────────────
 
-/// Hash a password with SHA-256.
-fn hash_password(password: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(password.as_bytes());
-    hex::encode(hasher.finalize())
+/// Hash a password with Argon2id (salted, memory-hard).
+fn hash_password(password: &str) -> Result<String, String> {
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+    argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| format!("hashing error: {e}"))
+}
+
+/// Verify a password against a stored Argon2 hash.
+fn verify_password(password: &str, hash: &str) -> bool {
+    let parsed = match argon2::PasswordHash::new(hash) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
 }
 
 /// Generate a random session token.
@@ -2336,7 +2350,15 @@ async fn set_password(
         }));
     }
 
-    let hashed = hash_password(&body.password);
+    let hashed = match hash_password(&body.password) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("password hashing failed: {e}");
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Failed to hash password"
+            }));
+        }
+    };
     if let Err(e) = std::fs::write(&state.password_hash_path, &hashed) {
         eprintln!("failed to write password hash: {e}");
         return HttpResponse::InternalServerError().json(serde_json::json!({
@@ -2387,8 +2409,7 @@ async fn login(
         }
     };
 
-    let provided_hash = hash_password(&body.password);
-    if provided_hash != stored_hash {
+    if !verify_password(&body.password, &stored_hash) {
         return HttpResponse::Unauthorized().json(serde_json::json!({
             "error": "Incorrect password"
         }));

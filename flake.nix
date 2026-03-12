@@ -94,6 +94,8 @@
     #   • <link data-trunk rel="css" …>  →  <link rel="stylesheet" …>
     #   • <link data-trunk rel="copy-dir" …> lines are removed (assets are
     #     already copied to $out by the explicit cp commands below)
+    #   • <link data-trunk rel="copy-file" …> lines are removed (files are
+    #     already copied to $out by the explicit cp commands below)
     #   • A <script type="module"> that initialises the Yew WASM app is
     #     injected just before </head>
     starfinFrontendDist = pkgs.stdenv.mkDerivation {
@@ -120,11 +122,13 @@
         cp -r styles/. $out/styles/
         cp -r vendor/. $out/vendor/
         cp -r fonts/.  $out/fonts/
+        cp favicon.svg $out/favicon.svg
         # Transform index.html: replace data-trunk directives with standard
         # HTML and inject the WASM module initialisation script.
         sed \
           -e 's|<link data-trunk rel="css" href="\([^"]*\)" />|<link rel="stylesheet" href="\1" />|g' \
           -e '/data-trunk rel="copy-dir"/d' \
+          -e '/data-trunk rel="copy-file"/d' \
           -e "s|</head>|<script type=\"module\">import init from '/starfin-frontend.js'; init();</script>\n</head>|" \
           index.html > "$out/index.html"
         runHook postInstall

@@ -391,7 +391,7 @@ async fn detect_hwaccel() -> HwAccel {
 /// ffmpeg availability, and available render devices.
 async fn run_startup_healthchecks(library_path: &Path, cache_dir: &Path) {
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║            STARFIN — STARTUP HEALTHCHECKS                   ║");
+    println!("║            STARFIN —  STARTUP HEALTHCHECKS                   ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
 
     // ── 1. Process identity ──────────────────────────────────────────────

@@ -1363,3 +1363,127 @@ body{
   background: var(--text);
   color: var(--bg);
 }
+
+/* ── Password protection modal ──────────────────────────────────────────── */
+
+.pw-backdrop{
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,.35);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+}
+
+.pw-modal{
+  background: var(--bg, #c8bfb0);
+  border: 2px solid rgba(0,0,0,.3);
+  border-radius: var(--radius, 2px);
+  padding: 48px 40px 40px;
+  width: 360px;
+  max-width: 90vw;
+  text-align: center;
+  font-family: 'Courier New', 'Courier', monospace;
+  box-shadow: 0 8px 32px rgba(0,0,0,.4);
+}
+
+.pw-modal__logo{
+  font-size: 28px;
+  font-weight: 900;
+  letter-spacing: 6px;
+  color: var(--accent, #ff4500);
+  margin-bottom: 24px;
+}
+
+.pw-modal__title{
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--text, #1a1a1a);
+  margin-bottom: 6px;
+}
+
+.pw-modal__subtitle{
+  font-size: 11px;
+  color: var(--muted, #4a4a4a);
+  margin-bottom: 24px;
+}
+
+.pw-modal__form{
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.pw-modal__input{
+  font-family: inherit;
+  font-size: 13px;
+  padding: 10px 12px;
+  background: rgba(0,0,0,.06);
+  border: 1.5px solid rgba(0,0,0,.2);
+  border-radius: var(--radius, 2px);
+  color: var(--text, #1a1a1a);
+  outline: none;
+  transition: border-color .15s;
+}
+
+.pw-modal__input:focus{
+  border-color: var(--accent, #ff4500);
+}
+
+.pw-modal__input::placeholder{
+  color: var(--muted, #4a4a4a);
+  opacity: .6;
+}
+
+.pw-modal__error{
+  font-size: 11px;
+  color: var(--danger, #cc0000);
+  font-weight: 600;
+  letter-spacing: .04em;
+}
+
+.pw-modal__btn{
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  padding: 10px 20px;
+  background: var(--accent, #ff4500);
+  color: white;
+  border: none;
+  border-radius: var(--radius, 2px);
+  cursor: pointer;
+  transition: opacity .15s;
+  margin-top: 4px;
+}
+
+.pw-modal__btn:hover:not(:disabled){
+  opacity: .85;
+}
+
+.pw-modal__btn:disabled{
+  opacity: .5;
+  cursor: not-allowed;
+}
+
+/* Dark mode overrides for the password modal */
+.app.dark-mode .pw-modal{
+  background: #2a2a2a;
+  border-color: rgba(255,255,255,.2);
+}
+
+.app.dark-mode .pw-modal__input{
+  background: rgba(255,255,255,.08);
+  border-color: rgba(255,255,255,.2);
+  color: var(--text);
+}
+
+.app.dark-mode .pw-modal__input::placeholder{
+  color: var(--muted);
+}

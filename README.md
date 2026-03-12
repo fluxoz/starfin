@@ -88,6 +88,7 @@ The server starts at **`http://127.0.0.1:8089`** by default.
 | `BIND_ADDR` | `127.0.0.1` | IP address the server binds to. Set to `0.0.0.0` to expose to the network |
 | `VIDEO_LIBRARY_PATH` | `./test_videos` | Path to your video library directory |
 | `CACHE_DIR` | `./starfin_cache` | Directory used to store thumbnails and sprite sheet cache |
+| `PASSWORD_PROTECTION` | *(unset)* | Set to `true` to enable password protection. A login modal will gate access to the library |
 
 **Example:**
 ```bash

@@ -1,7 +1,12 @@
 use crate::api;
 use crate::components;
 
-use components::{filters::FiltersBar, grid::ElementsGrid, video_player::VideoPlayer};
+use components::{
+    filters::FiltersBar,
+    grid::ElementsGrid,
+    password_modal::PasswordModal,
+    video_player::VideoPlayer,
+};
 use crate::models::{Element, SortBy};
 
 use futures::StreamExt;
@@ -11,8 +16,89 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
+/// Tracks the authentication state of the application.
+#[derive(Clone, PartialEq)]
+enum AuthState {
+    /// Still loading the auth status from the server.
+    Loading,
+    /// Password protection is not enabled — proceed normally.
+    Disabled,
+    /// Password protection is on but no password has been set yet.
+    NeedsSetup,
+    /// Password protection is on and the user needs to enter it.
+    Locked,
+    /// The user has been authenticated.
+    Authenticated,
+}
+
 #[function_component(App)]
 pub fn app() -> Html {
+    let auth_state = use_state(|| AuthState::Loading);
+
+    // Check auth status on mount.
+    {
+        let auth_state = auth_state.clone();
+        use_effect_with((), move |_| {
+            spawn_local(async move {
+                match api::fetch_auth_status().await {
+                    Ok(status) => {
+                        if !status.password_protection {
+                            auth_state.set(AuthState::Disabled);
+                        } else if status.authenticated {
+                            auth_state.set(AuthState::Authenticated);
+                        } else if !status.password_set {
+                            auth_state.set(AuthState::NeedsSetup);
+                        } else {
+                            auth_state.set(AuthState::Locked);
+                        }
+                    }
+                    Err(_) => {
+                        // If we can't reach the auth endpoint, assume no protection.
+                        auth_state.set(AuthState::Disabled);
+                    }
+                }
+            });
+            || ()
+        });
+    }
+
+    let on_authenticated = {
+        let auth_state = auth_state.clone();
+        Callback::from(move |_| auth_state.set(AuthState::Authenticated))
+    };
+
+    // Show the password modal when locked or needs setup.
+    match &*auth_state {
+        AuthState::Loading => {
+            return html! {
+                <div class="pw-backdrop">
+                    <div class="pw-modal">
+                        <div class="pw-modal__logo">{ "STARFIN" }</div>
+                        <div class="pw-modal__subtitle">{ "Loading…" }</div>
+                    </div>
+                </div>
+            };
+        }
+        AuthState::NeedsSetup => {
+            return html! {
+                <PasswordModal password_set={false} on_authenticated={on_authenticated} />
+            };
+        }
+        AuthState::Locked => {
+            return html! {
+                <PasswordModal password_set={true} on_authenticated={on_authenticated} />
+            };
+        }
+        AuthState::Disabled | AuthState::Authenticated => {
+            // Continue to render the main app below.
+        }
+    }
+
+    html! { <AppInner /> }
+}
+
+#[function_component(AppInner)]
+fn app_inner() -> Html {
     let query = use_state(|| "".to_string());
     let sort_by = use_state(|| SortBy::DateAddedNewest);
 

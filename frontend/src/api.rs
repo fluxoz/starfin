@@ -49,6 +49,83 @@ pub struct HwAccelInfo {
     pub encoder: String,
 }
 
+// ── Authentication API ───────────────────────────────────────────────────────
+
+/// Response from `GET /api/auth/status`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct AuthStatus {
+    pub password_protection: bool,
+    pub password_set: bool,
+    pub authenticated: bool,
+}
+
+/// Fetch the current authentication status.
+pub async fn fetch_auth_status() -> Result<AuthStatus, String> {
+    let resp = Request::get("/api/auth/status")
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e:?}"))?;
+
+    if !resp.ok() {
+        return Err(format!("HTTP error: {}", resp.status()));
+    }
+
+    resp.json()
+        .await
+        .map_err(|e| format!("Invalid JSON: {e:?}"))
+}
+
+/// Set the initial password (when none is set yet).
+pub async fn set_password(password: &str, confirm: &str) -> Result<(), String> {
+    let body = serde_json::json!({
+        "password": password,
+        "confirm": confirm,
+    });
+
+    let resp = Request::post("/api/auth/set-password")
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .map_err(|e| format!("Request error: {e:?}"))?
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e:?}"))?;
+
+    if !resp.ok() {
+        #[derive(Deserialize)]
+        struct ErrResp { error: String }
+        if let Ok(err) = resp.json::<ErrResp>().await {
+            return Err(err.error);
+        }
+        return Err(format!("HTTP error: {}", resp.status()));
+    }
+
+    Ok(())
+}
+
+/// Login with a password.
+pub async fn login(password: &str) -> Result<(), String> {
+    let body = serde_json::json!({ "password": password });
+
+    let resp = Request::post("/api/auth/login")
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .map_err(|e| format!("Request error: {e:?}"))?
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e:?}"))?;
+
+    if !resp.ok() {
+        #[derive(Deserialize)]
+        struct ErrResp { error: String }
+        if let Ok(err) = resp.json::<ErrResp>().await {
+            return Err(err.error);
+        }
+        return Err(format!("HTTP error: {}", resp.status()));
+    }
+
+    Ok(())
+}
+
 /// Fetch the detected hardware acceleration backend from `/api/hwaccel`.
 pub async fn fetch_hwaccel() -> Result<HwAccelInfo, String> {
     let resp = Request::get("/api/hwaccel")

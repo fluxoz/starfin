@@ -1,17 +1,20 @@
 use actix_web::{
-    App, HttpRequest, HttpResponse, HttpServer, Responder,
-    http::header, middleware::Logger, web,
+    App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
+    body::MessageBody,
+    dev::{ServiceRequest, ServiceResponse},
+    http::header, middleware::{self, Logger, Next}, web,
 };
 use rust_embed::RustEmbed;
 use mime_guess::MimeGuess;
-use serde::Serialize;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::process::Command;
 use uuid::Uuid;
 use walkdir::WalkDir;
+use sha2::{Sha256, Digest};
 
 // ── Hardware acceleration ─────────────────────────────────────────────────────
 
@@ -669,6 +672,12 @@ struct AppState {
     /// Broadcasts playback state (`true` = playing, `false` = idle) to all
     /// background workers so they can pause while a video is being streamed.
     playback_tx: Arc<tokio::sync::watch::Sender<bool>>,
+    /// Whether password protection is enabled.
+    password_protection: bool,
+    /// Path to the `.hash` file inside the cache directory.
+    password_hash_path: PathBuf,
+    /// In-memory set of valid session tokens.
+    auth_tokens: Arc<RwLock<HashSet<String>>>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -2242,6 +2251,209 @@ async fn get_subtitle(
     }
 }
 
+// ── Password protection ──────────────────────────────────────────────────────
+
+/// Hash a password with SHA-256.
+fn hash_password(password: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Generate a random session token.
+fn generate_token() -> String {
+    format!("{}{}", Uuid::new_v4().as_simple(), Uuid::new_v4().as_simple())
+}
+
+/// Extract the session token from the `starfin_token` cookie.
+fn extract_token(req: &HttpRequest) -> Option<String> {
+    req.cookie("starfin_token").map(|c| c.value().to_string())
+}
+
+/// Check whether the request carries a valid session token.
+fn is_authenticated(req: &HttpRequest, state: &AppState) -> bool {
+    if !state.password_protection {
+        return true;
+    }
+    if let Some(token) = extract_token(req) {
+        let tokens = state.auth_tokens.read().expect("auth_tokens lock poisoned");
+        tokens.contains(&token)
+    } else {
+        false
+    }
+}
+
+/// `GET /api/auth/status` — returns whether password protection is enabled,
+/// whether a password has been set, and whether the current request is
+/// authenticated.
+#[derive(Serialize)]
+struct AuthStatusResponse {
+    password_protection: bool,
+    password_set: bool,
+    authenticated: bool,
+}
+
+async fn auth_status(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
+    let password_set = state.password_hash_path.exists();
+    let authenticated = is_authenticated(&req, &state);
+    HttpResponse::Ok().json(AuthStatusResponse {
+        password_protection: state.password_protection,
+        password_set,
+        authenticated,
+    })
+}
+
+/// `POST /api/auth/set-password` — set the initial password (only allowed when
+/// no password has been set yet).
+#[derive(Deserialize)]
+struct SetPasswordRequest {
+    password: String,
+    confirm: String,
+}
+
+async fn set_password(
+    body: web::Json<SetPasswordRequest>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    if !state.password_protection {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Password protection is not enabled"
+        }));
+    }
+    if state.password_hash_path.exists() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Password is already set"
+        }));
+    }
+    if body.password.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Password cannot be empty"
+        }));
+    }
+    if body.password != body.confirm {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Passwords do not match"
+        }));
+    }
+
+    let hashed = hash_password(&body.password);
+    if let Err(e) = std::fs::write(&state.password_hash_path, &hashed) {
+        eprintln!("failed to write password hash: {e}");
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": "Failed to save password"
+        }));
+    }
+
+    // Auto-login after setting password.
+    let token = generate_token();
+    {
+        let mut tokens = state.auth_tokens.write().expect("auth_tokens lock poisoned");
+        tokens.insert(token.clone());
+    }
+
+    HttpResponse::Ok()
+        .cookie(
+            actix_web::cookie::Cookie::build("starfin_token", &token)
+                .path("/")
+                .http_only(true)
+                .same_site(actix_web::cookie::SameSite::Lax)
+                .finish(),
+        )
+        .json(serde_json::json!({ "ok": true }))
+}
+
+/// `POST /api/auth/login` — authenticate with the password.
+#[derive(Deserialize)]
+struct LoginRequest {
+    password: String,
+}
+
+async fn login(
+    body: web::Json<LoginRequest>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    if !state.password_protection {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Password protection is not enabled"
+        }));
+    }
+
+    let stored_hash = match std::fs::read_to_string(&state.password_hash_path) {
+        Ok(h) => h.trim().to_string(),
+        Err(_) => {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "No password has been set"
+            }));
+        }
+    };
+
+    let provided_hash = hash_password(&body.password);
+    if provided_hash != stored_hash {
+        return HttpResponse::Unauthorized().json(serde_json::json!({
+            "error": "Incorrect password"
+        }));
+    }
+
+    let token = generate_token();
+    {
+        let mut tokens = state.auth_tokens.write().expect("auth_tokens lock poisoned");
+        tokens.insert(token.clone());
+    }
+
+    HttpResponse::Ok()
+        .cookie(
+            actix_web::cookie::Cookie::build("starfin_token", &token)
+                .path("/")
+                .http_only(true)
+                .same_site(actix_web::cookie::SameSite::Lax)
+                .finish(),
+        )
+        .json(serde_json::json!({ "ok": true }))
+}
+
+/// Middleware: returns `401 Unauthorized` for unauthenticated requests to
+/// protected API routes when password protection is enabled.
+async fn auth_middleware(
+    req: ServiceRequest,
+    next: Next<impl MessageBody + 'static>,
+) -> Result<ServiceResponse<impl MessageBody + 'static>, Error> {
+    let path = req.path().to_string();
+
+    // Auth endpoints and static frontend assets are always accessible.
+    let is_exempt = path.starts_with("/api/auth/")
+        || path == "/api/health"
+        || !path.starts_with("/api/");
+
+    if is_exempt {
+        return next.call(req).await.map(|res| res.map_into_left_body());
+    }
+
+    let state = req
+        .app_data::<web::Data<AppState>>()
+        .expect("AppState not configured");
+
+    if !state.password_protection {
+        return next.call(req).await.map(|res| res.map_into_left_body());
+    }
+
+    // Check for a valid session token in the cookie.
+    let authenticated = req
+        .cookie("starfin_token")
+        .map(|c| {
+            let tokens = state.auth_tokens.read().expect("auth_tokens lock poisoned");
+            tokens.contains(c.value())
+        })
+        .unwrap_or(false);
+
+    if authenticated {
+        return next.call(req).await.map(|res| res.map_into_left_body());
+    }
+
+    let response = HttpResponse::Unauthorized()
+        .json(serde_json::json!({ "error": "Authentication required" }));
+    Ok(req.into_response(response).map_into_right_body())
+}
+
 // ── Static asset serving ─────────────────────────────────────────────────────
 
 fn content_type(path: &str) -> header::HeaderValue {
@@ -2335,6 +2547,24 @@ async fn main() -> std::io::Result<()> {
     let (playback_tx, playback_rx) = tokio::sync::watch::channel(false);
     let playback_tx = Arc::new(playback_tx);
 
+    // ── Password protection ──────────────────────────────────────────────
+    let password_protection = std::env::var("PASSWORD_PROTECTION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false);
+    let password_hash_path = cache_dir.join(".hash");
+    let auth_tokens: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+
+    if password_protection {
+        println!("→ Password protection: ENABLED");
+        if password_hash_path.exists() {
+            println!("  ✓ Password hash found at {}", password_hash_path.display());
+        } else {
+            println!("  ⚠ No password set — first visitor will be prompted to create one");
+        }
+    } else {
+        println!("→ Password protection: disabled");
+    }
+
     let state = web::Data::new(AppState {
         library_path: library_path.clone(),
         cache_dir: cache_dir.clone(),
@@ -2346,6 +2576,9 @@ async fn main() -> std::io::Result<()> {
         sprite_trigger: Arc::clone(&sprite_trigger),
         hwaccel,
         playback_tx: Arc::clone(&playback_tx),
+        password_protection,
+        password_hash_path,
+        auth_tokens,
     });
 
     // Background task: re-scan the library every 60 seconds.
@@ -2489,6 +2722,12 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(state.clone())
             .wrap(Logger::default())
+            .wrap(middleware::from_fn(auth_middleware))
+            // ── Auth routes (always accessible) ──────────────────────────
+            .route("/api/auth/status", web::get().to(auth_status))
+            .route("/api/auth/set-password", web::post().to(set_password))
+            .route("/api/auth/login", web::post().to(login))
+            // ── Protected API routes ─────────────────────────────────────
             .route("/api/health", web::get().to(|| async { "ok" }))
             .route("/api/hwaccel", web::get().to(get_hwaccel))
             .route("/api/scan/ws", web::get().to(scan_ws))

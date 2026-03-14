@@ -1665,7 +1665,8 @@ async fn transcode_segment(
             let (max_width, crf, preset) = match quality {
                 Quality::Medium => ("1280", "26", "fast"),
                 Quality::Low    => ("854",  "30", "faster"),
-                Quality::High   => unreachable!(),
+                // Safety: this arm only executes for Medium | Low (see outer match).
+                Quality::High   => unreachable!("Quality::High is handled by the outer match arm"),
             };
             let scale_filter = format!("scale=min(iw\\,{}):-2", max_width);
 

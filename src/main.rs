@@ -93,6 +93,64 @@ impl HwAccel {
 }
 
 
+// ── Stream quality ────────────────────────────────────────────────────────────
+
+/// Quality level for on-demand video transcoding.
+///
+/// - `High`   – full source resolution, high-quality hardware-accelerated
+///              encode (current default behaviour).
+/// - `Medium` – software encode, scaled to at most 1280 px wide (≈ 720 p for
+///              16:9 content), CRF 26.  Suitable for moderate-speed connections
+///              and mid-range client hardware.
+/// - `Low`    – software encode, scaled to at most 854 px wide (≈ 480 p for
+///              16:9 content), CRF 30.  Ideal for low-power / low-bandwidth
+///              devices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Quality {
+    #[default]
+    High,
+    Medium,
+    Low,
+}
+
+impl Quality {
+    /// URL-safe ASCII token used in query strings and cache-directory names.
+    fn as_str(self) -> &'static str {
+        match self {
+            Quality::High   => "high",
+            Quality::Medium => "medium",
+            Quality::Low    => "low",
+        }
+    }
+
+    /// Human-readable display label shown in the player UI.
+    fn label(self) -> &'static str {
+        match self {
+            Quality::High   => "High",
+            Quality::Medium => "Medium",
+            Quality::Low    => "Low",
+        }
+    }
+}
+
+/// Query-string struct used by the playlist and segment endpoints so that
+/// `?quality=medium` is deserialized into a `Quality` value automatically.
+#[derive(Default, Deserialize)]
+struct QualityQuery {
+    #[serde(default)]
+    quality: Quality,
+}
+
+/// `GET /api/quality-options` – list the available quality levels.
+async fn get_quality_options() -> impl Responder {
+    HttpResponse::Ok().json(serde_json::json!([
+        { "value": "high",   "label": Quality::High.label() },
+        { "value": "medium", "label": Quality::Medium.label() },
+        { "value": "low",    "label": Quality::Low.label() },
+    ]))
+}
+
 /// Run an ffmpeg command and return (success, stderr_output) for diagnostics.
 async fn run_ffmpeg_probe(args: &[&str]) -> (bool, String) {
     match tokio::process::Command::new("ffmpeg")
@@ -1504,6 +1562,9 @@ const PRECACHE_SEGMENTS: usize = 20;
 
 /// Transcode a single MPEG-TS segment for a video using ffmpeg.
 ///
+/// Segments are stored in a quality-specific subdirectory so that multiple
+/// quality levels can be cached independently.
+///
 /// Writes to a temporary file first, then atomically renames to the final
 /// location to prevent readers from seeing partially-written segments.
 async fn transcode_segment(
@@ -1511,6 +1572,7 @@ async fn transcode_segment(
     hls_dir: &Path,
     seg_index: usize,
     hwaccel: &HwAccel,
+    quality: Quality,
 ) -> Result<(), String> {
     let filename = format!("seg_{:05}.ts", seg_index);
     let seg_path = hls_dir.join(&filename);
@@ -1530,51 +1592,106 @@ async fn transcode_segment(
     cmd.current_dir(hls_dir)
        .stdin(std::process::Stdio::null());
 
-    // Prepend GPU decode args before the input
-    for arg in hwaccel.hwaccel_decode_args() {
-        cmd.arg(arg);
+    match quality {
+        Quality::High => {
+            // High quality: hardware-accelerated decode + encode at full source
+            // resolution, identical to the previous single-quality behaviour.
+
+            // Prepend GPU decode args before the input.
+            for arg in hwaccel.hwaccel_decode_args() {
+                cmd.arg(arg);
+            }
+
+            cmd.args([
+                "-y", "-nostdin",
+                "-ss", &format!("{:.3}", start_time),
+                "-i", abs_path,
+                "-t", &format!("{:.3}", SEGMENT_DURATION),
+            ]);
+
+            // GPU encoder + quality preset.
+            cmd.args(["-c:v", hwaccel.encoder()]);
+            cmd.args(hwaccel.encoder_quality_args());
+
+            // Disable B-frames.  B-frames require DTS/PTS reordering which makes
+            // the first decodable frame in an MPEG-TS segment *not* the first
+            // stored packet.  When HLS.js seeks and the browser appends a segment
+            // to a SourceBuffer for independent decoding, this mismatch causes
+            // "avcodec_send_packet error: End of file" decode failures.  Disabling
+            // B-frames ensures DTS == PTS order and each segment is independently
+            // decodable from its very first packet.
+            cmd.args(["-bf", "0"]);
+
+            // For NVENC, promote forced keyframes to true IDR frames.  Without this
+            // flag NVENC may emit a closed-GOP I-frame instead of an IDR, which
+            // does not flush the decoder's reference picture buffer and can leave
+            // the browser unable to decode the segment in isolation.
+            if *hwaccel == HwAccel::Nvidia {
+                cmd.args(["-forced-idr", "1"]);
+            }
+
+            cmd.args([
+                // Force a keyframe at encoding timestamp 0 (the first frame of this
+                // segment).  Using "0" rather than "expr:gte(t,0)" is intentional:
+                // the expression gte(t,0) is always true and would make *every*
+                // frame a keyframe, which is extremely inefficient with hardware
+                // encoders.
+                "-force_key_frames", "0",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-output_ts_offset", &ts_offset,
+                "-f", "mpegts",
+                &tmp_filename,
+            ]);
+        }
+
+        Quality::Medium | Quality::Low => {
+            // Medium / Low quality: software decode + libx264 encode with
+            // resolution scaling.  Hardware acceleration is intentionally skipped
+            // here to keep the filter pipeline simple and universally compatible
+            // across all platforms.
+            //
+            // Resolution targets (width-based, height auto, always even):
+            //   Medium – max 1280 px wide  ≈ 720 p for 16:9 content,  CRF 26
+            //   Low    – max  854 px wide  ≈ 480 p for 16:9 content,  CRF 30
+            //
+            // The `min(iw\,MAX)` expression in the scale filter is ffmpeg filter
+            // syntax where `\,` is an escaped comma inside an option value.  When
+            // the process is spawned directly (no shell), the backslash is passed
+            // verbatim to ffmpeg's filter parser, which interprets `\,` as a
+            // literal comma inside the function call.  The `-2` height token
+            // auto-calculates height while keeping it divisible by 2.
+
+            let (max_width, crf, preset) = match quality {
+                Quality::Medium => ("1280", "26", "fast"),
+                Quality::Low    => ("854",  "30", "faster"),
+                // Safety: this arm only executes for Medium | Low (see outer match).
+                Quality::High   => unreachable!("Quality::High is handled by the outer match arm"),
+            };
+            let scale_filter = format!("scale=min(iw\\,{}):-2", max_width);
+
+            cmd.args([
+                "-y", "-nostdin",
+                "-ss", &format!("{:.3}", start_time),
+                "-i", abs_path,
+                "-t", &format!("{:.3}", SEGMENT_DURATION),
+                "-c:v", "libx264",
+                "-preset", preset,
+                "-crf", crf,
+                "-vf", &scale_filter,
+                "-pix_fmt", "yuv420p",
+                "-profile:v", "high",
+                "-level", "4.1",
+                "-bf", "0",
+                "-force_key_frames", "0",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-output_ts_offset", &ts_offset,
+                "-f", "mpegts",
+                &tmp_filename,
+            ]);
+        }
     }
-
-    cmd.args([
-        "-y", "-nostdin",
-        "-ss", &format!("{:.3}", start_time),
-        "-i", abs_path,
-        "-t", &format!("{:.3}", SEGMENT_DURATION),
-    ]);
-
-    // GPU encoder
-    cmd.args(["-c:v", hwaccel.encoder()]);
-    cmd.args(hwaccel.encoder_quality_args());
-
-    // Disable B-frames.  B-frames require DTS/PTS reordering which makes the
-    // first decodable frame in an MPEG-TS segment *not* the first stored
-    // packet.  When HLS.js seeks and the browser appends a segment to a
-    // SourceBuffer for independent decoding, this mismatch causes
-    // "avcodec_send_packet error: End of file" decode failures.  Disabling
-    // B-frames ensures DTS == PTS order and each segment is independently
-    // decodable from its very first packet.
-    cmd.args(["-bf", "0"]);
-
-    // For NVENC, promote forced keyframes to true IDR frames.  Without this
-    // flag NVENC may emit a closed-GOP I-frame instead of an IDR, which
-    // does not flush the decoder's reference picture buffer and can leave
-    // the browser unable to decode the segment in isolation.
-    if *hwaccel == HwAccel::Nvidia {
-        cmd.args(["-forced-idr", "1"]);
-    }
-
-    cmd.args([
-        // Force a keyframe at encoding timestamp 0 (the first frame of this
-        // segment).  Using "0" rather than "expr:gte(t,0)" is intentional:
-        // the expression gte(t,0) is always true and would make *every* frame
-        // a keyframe, which is extremely inefficient with hardware encoders.
-        "-force_key_frames", "0",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-output_ts_offset", &ts_offset,
-        "-f", "mpegts",
-        &tmp_filename,
-    ]);
 
     match cmd.output().await {
         Ok(out) if out.status.success() => {
@@ -1594,9 +1711,9 @@ async fn transcode_segment(
     }
 }
 
-/// Remove cached segments beyond the pre-cache range from a video's cache
-/// directory.  Segments with index < [`PRECACHE_SEGMENTS`] are preserved so
-/// that playback can always begin instantly.
+/// Remove cached segments beyond the pre-cache range from a quality-specific
+/// segment directory.  Segments with index < [`PRECACHE_SEGMENTS`] are
+/// preserved so that playback can always begin instantly.
 async fn remove_non_precached_segments(cache_dir: &Path) -> std::io::Result<()> {
     let mut entries = match tokio::fs::read_dir(cache_dir).await {
         Ok(e) => e,
@@ -1627,9 +1744,26 @@ async fn remove_non_precached_segments(cache_dir: &Path) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Remove non-pre-cached segments from **all** quality subdirectories of a
+/// video's cache folder (`{cache_dir}/{video_id}/{quality}/`).
+async fn remove_non_precached_segments_all_qualities(video_cache_dir: &Path) {
+    for quality_name in [Quality::High.as_str(), Quality::Medium.as_str(), Quality::Low.as_str()] {
+        let q_dir = video_cache_dir.join(quality_name);
+        if q_dir.exists() {
+            if let Err(e) = remove_non_precached_segments(&q_dir).await {
+                eprintln!("cache eviction error in {}: {e}", q_dir.display());
+            }
+        }
+    }
+}
+
 /// `GET /api/videos/{id}/playlist.m3u8`
 ///
 /// Generates an HLS VOD playlist using MPEG-TS segments.
+///
+/// Accepts an optional `?quality=high|medium|low` query parameter (default:
+/// `high`).  Segment URLs embed the same quality token so that HLS.js fetches
+/// segments at the correct quality level.
 ///
 /// This follows the Jellyfin/Plex approach:
 /// - MPEG-TS segment format (self-contained, no init segment required)
@@ -1637,8 +1771,11 @@ async fn remove_non_precached_segments(cache_dir: &Path) -> std::io::Result<()> 
 /// - Segments are transcoded on-demand when first requested
 async fn get_playlist(
     id: web::Path<String>,
+    query: web::Query<QualityQuery>,
     state: web::Data<AppState>,
 ) -> impl Responder {
+    let quality = query.quality;
+
     let (abs_path, _) = match find_video(&state, &id).await {
         Some(v) => v,
         None => return HttpResponse::NotFound().body("video not found"),
@@ -1651,7 +1788,8 @@ async fn get_playlist(
             .body("Could not determine video duration. Ensure ffprobe is installed and the video file is valid.");
     }
 
-    let hls_dir = state.cache_dir.join(id.as_str());
+    // Segments are stored in a quality-specific subdirectory.
+    let hls_dir = state.cache_dir.join(id.as_str()).join(quality.as_str());
     if let Err(e) = tokio::fs::create_dir_all(&hls_dir).await {
         return HttpResponse::InternalServerError()
             .body(format!("cache dir error: {e}"));
@@ -1682,9 +1820,11 @@ async fn get_playlist(
         };
 
         playlist.push_str(&format!("#EXTINF:{:.3},\n", seg_duration));
+        // Embed the quality token in every segment URL so that HLS.js requests
+        // each segment at the correct quality level.
         playlist.push_str(&format!(
-            "/api/videos/{}/segments/seg_{:05}.ts\n",
-            id, i
+            "/api/videos/{}/segments/seg_{:05}.ts?quality={}\n",
+            id, i, quality.as_str()
         ));
     }
 
@@ -1698,15 +1838,22 @@ async fn get_playlist(
 
 /// `GET /api/videos/{id}/segments/{filename}` — serve an MPEG-TS segment on-demand.
 ///
+/// Accepts an optional `?quality=high|medium|low` query parameter (default:
+/// `high`).  Segments are stored in and served from a quality-specific
+/// subdirectory so that different quality caches never interfere with each
+/// other.
+///
 /// Segments are transcoded on-demand if they don't exist in the cache.
 /// Uses MPEG-TS format (like Jellyfin) for self-contained segments with
 /// embedded codec info and PTS timestamps, avoiding the fMP4
 /// baseMediaDecodeTime issues that cause playback freezes.
 async fn get_segment(
     params: web::Path<(String, String)>,
+    query: web::Query<QualityQuery>,
     state: web::Data<AppState>,
 ) -> impl Responder {
     let (id, filename) = params.into_inner();
+    let quality = query.quality;
 
     // Reject path traversal and unexpected extensions.
     if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
@@ -1716,7 +1863,8 @@ async fn get_segment(
         return HttpResponse::BadRequest().body("invalid segment type");
     }
 
-    let hls_dir = state.cache_dir.join(&id);
+    // Segments are stored in a quality-specific subdirectory.
+    let hls_dir = state.cache_dir.join(&id).join(quality.as_str());
     let seg_path = hls_dir.join(&filename);
 
     // Record that this video was actively streamed right now so the
@@ -1779,7 +1927,7 @@ async fn get_segment(
     }
 
     // Transcode the segment on-demand (reuses the shared helper).
-    match transcode_segment(&abs_str, &hls_dir, seg_index, &state.hwaccel).await {
+    match transcode_segment(&abs_str, &hls_dir, seg_index, &state.hwaccel, quality).await {
         Ok(()) => {
             match tokio::fs::read(&seg_path).await {
                 Ok(data) => HttpResponse::Ok()
@@ -1813,10 +1961,11 @@ async fn get_hwaccel(state: web::Data<AppState>) -> impl Responder {
 
 /// `DELETE /api/videos/{id}/cache` — clear cached segments for a video.
 ///
-/// Removes non-pre-cached segments from `cache_dir/{id}/`.  The first
-/// [`PRECACHE_SEGMENTS`] segments are preserved so that future playback can
-/// begin instantly.  Called by the frontend when the user navigates away
-/// from the player so that disk space is reclaimed immediately.
+/// Removes non-pre-cached segments from all quality subdirectories of
+/// `cache_dir/{id}/`.  The first [`PRECACHE_SEGMENTS`] segments are preserved
+/// so that future playback can begin instantly.  Called by the frontend when
+/// the user navigates away from the player so that disk space is reclaimed
+/// immediately.
 async fn clear_cache(
     id: web::Path<String>,
     state: web::Data<AppState>,
@@ -1828,22 +1977,19 @@ async fn clear_cache(
         return HttpResponse::BadRequest().body("invalid video id");
     }
 
-    let cache_subdir = state.cache_dir.join(&id);
+    let video_cache_dir = state.cache_dir.join(&id);
 
-    match remove_non_precached_segments(&cache_subdir).await {
-        Ok(_) => {
-            // Also cancel idle-eviction tracking so a stale entry doesn't
-            // trigger a redundant removal on the next sweep.
-            state
-                .last_segment_access
-                .write()
-                .expect("last_segment_access lock poisoned")
-                .remove(&id);
-            HttpResponse::NoContent().finish()
-        }
-        Err(e) => HttpResponse::InternalServerError()
-            .body(format!("failed to clear cache: {e}")),
-    }
+    remove_non_precached_segments_all_qualities(&video_cache_dir).await;
+
+    // Also cancel idle-eviction tracking so a stale entry doesn't
+    // trigger a redundant removal on the next sweep.
+    state
+        .last_segment_access
+        .write()
+        .expect("last_segment_access lock poisoned")
+        .remove(&id);
+
+    HttpResponse::NoContent().finish()
 }
 
 // ── Thumbnail sprite generation ──────────────────────────────────────────────
@@ -1956,9 +2102,12 @@ async fn get_processing_status(
     // Check whether the pre-cached segments exist.  We only check for
     // seg_00000.ts as a lightweight proxy — if the pre-cache worker
     // finished, all PRECACHE_SEGMENTS files will be present.
+    // Segments are now stored in quality-specific subdirectories; the
+    // precache worker always operates on the `high` quality level.
     let precache_marker = state
         .cache_dir
         .join(id.as_str())
+        .join(Quality::High.as_str())
         .join("seg_00000.ts");
 
     let all_done = quick_marker.exists()
@@ -2270,8 +2419,9 @@ async fn run_precache_worker(
             .collect();
 
         // Partition into already-cached and needs-work.  A video counts as
-        // "done" when seg_00000.ts already exists (the first segment is the
-        // cheapest proxy for "pre-cache finished").
+        // "done" when seg_00000.ts already exists in the high-quality
+        // subdirectory (the first segment is the cheapest proxy for
+        // "pre-cache finished").
         let (done, pending): (Vec<_>, Vec<_>) = entries.into_iter().partition(|e| {
             let abs = e.path();
             let rel = abs
@@ -2279,7 +2429,8 @@ async fn run_precache_worker(
                 .unwrap_or(abs)
                 .to_string_lossy();
             let id = video_id(&rel);
-            let hls_dir = cache_dir.join(&id);
+            // Precache always uses the High quality subdirectory.
+            let hls_dir = cache_dir.join(&id).join(Quality::High.as_str());
             // Quick check: if the first segment exists the batch ran before.
             hls_dir.join("seg_00000.ts").exists()
         });
@@ -2304,7 +2455,8 @@ async fn run_precache_worker(
                 .to_string_lossy()
                 .to_string();
             let id = video_id(&rel);
-            let hls_dir = cache_dir.join(&id);
+            // Precache always uses the High quality subdirectory.
+            let hls_dir = cache_dir.join(&id).join(Quality::High.as_str());
 
             {
                 let mut p = progress.write().expect("precache_progress lock poisoned");
@@ -2362,7 +2514,7 @@ async fn run_precache_worker(
                     let _ = playback_rx.changed().await;
                 }
 
-                if let Err(e) = transcode_segment(&abs_str, &hls_dir, i, &hwaccel).await {
+                if let Err(e) = transcode_segment(&abs_str, &hls_dir, i, &hwaccel, Quality::High).await {
                     eprintln!("precache: {e}");
                     break; // Stop for this video on error.
                 }
@@ -3043,15 +3195,9 @@ async fn main() -> std::io::Result<()> {
                 };
 
                 for id in idle_ids {
-                    let cache_subdir = sweep_state.cache_dir.join(&id);
-                    match remove_non_precached_segments(&cache_subdir).await {
-                        Ok(_) => {
-                            println!("→ Cache evicted (idle): {id}");
-                        }
-                        Err(e) => {
-                            eprintln!("cache eviction error for {id}: {e}");
-                        }
-                    }
+                    let video_cache_dir = sweep_state.cache_dir.join(&id);
+                    remove_non_precached_segments_all_qualities(&video_cache_dir).await;
+                    println!("→ Cache evicted (idle): {id}");
                     sweep_state
                         .last_segment_access
                         .write()
@@ -3081,6 +3227,7 @@ async fn main() -> std::io::Result<()> {
             // ── Protected API routes ─────────────────────────────────────
             .route("/api/health", web::get().to(|| async { "ok" }))
             .route("/api/hwaccel", web::get().to(get_hwaccel))
+            .route("/api/quality-options", web::get().to(get_quality_options))
             .route("/api/scan/ws", web::get().to(scan_ws))
             .route("/api/progress/ws", web::get().to(progress_ws))
             .route("/api/thumbnails/progress", web::get().to(get_thumb_progress))

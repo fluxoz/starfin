@@ -14,6 +14,16 @@ use yew::prelude::*;
 // ── Playback speed options ───────────────────────────────────────────────────
 const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
 
+// ── Stream quality options ────────────────────────────────────────────────────
+/// (url-token, display-label) pairs for the quality selector.
+const QUALITY_OPTIONS: [(&str, &str); 3] = [
+    ("high",   "High"),
+    ("medium", "Medium (720p)"),
+    ("low",    "Low (480p)"),
+];
+/// localStorage key used to persist the selected quality across sessions.
+const QUALITY_STORAGE_KEY: &str = "starfin_quality";
+
 // ── Controls auto-hide timeout (milliseconds of inactivity) ─────────────────
 const CONTROL_HIDE_TIMEOUT_MS: f64 = 5000.0;
 /// Pixel distance from the top or bottom edge of the player within which the
@@ -199,6 +209,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let is_near_controls = use_mut_ref(|| false);
     let settings_open = use_state(|| false);
     let speed_menu_open = use_state(|| false);
+    let quality_menu_open = use_state(|| false);
     let volume_slider_visible = use_state(|| false);
 
     // Fullscreen state
@@ -206,6 +217,22 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
     // Playback speed
     let playback_speed = use_state(|| 1.0_f64);
+
+    // Stream quality — initialised from localStorage so the preference
+    // persists across sessions.  Defaults to "high" if nothing is stored.
+    let initial_quality = window()
+        .and_then(|w| w.local_storage().ok())
+        .flatten()
+        .and_then(|s| s.get_item(QUALITY_STORAGE_KEY).ok())
+        .flatten()
+        .filter(|q| QUALITY_OPTIONS.iter().any(|(v, _)| v == q))
+        .unwrap_or_else(|| "high".to_string());
+    let selected_quality = use_state(|| initial_quality);
+
+    // Stores the video position to resume at when quality is changed
+    // mid-playback.  Updated by `on_quality_select` before triggering a
+    // re-initialisation of HLS.
+    let resume_position = use_mut_ref(|| 0.0_f64);
 
     // Thumbnail sprite info
     let thumbnail_info = use_state(|| Option::<ThumbnailInfo>::None);
@@ -228,22 +255,41 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let active_subtitle = use_state(|| Option::<u32>::None); // index of active subtitle, None = off
     let captions_menu_open = use_state(|| false);
 
-    // HLS.js instance storage
-    let hls_instance = use_state(|| Option::<JsValue>::None);
+    // HLS.js instance storage.
+    //
+    // We use `use_mut_ref` (Rc<RefCell<…>>) rather than `use_state` here
+    // because the HLS instance is set *asynchronously* inside a `spawn_local`
+    // block (after a 50 ms delay).  In Yew 0.21, `use_state` clones a new
+    // `Rc<R>` on every state update, so a handle captured in a cleanup closure
+    // before the async write completes will always read the *initial* `None`
+    // value — meaning `hls.destroy()` is never called and stale HLS instances
+    // accumulate, each still loading segments at the old quality level.
+    //
+    // `use_mut_ref` wraps a single `Rc<RefCell<T>>` that is shared by all
+    // clones, so any write made by the async task is immediately visible to
+    // the cleanup closure captured earlier.
+    let hls_instance = use_mut_ref(|| Option::<JsValue>::None);
 
-    // Initialize HLS.js player
+    // Initialize HLS.js player (and re-initialise when video ID or quality changes).
     {
         let video_ref = video_ref.clone();
-        let video_id = props.video_id.clone();
         let status = status.clone();
         let error = error.clone();
         let thumbnail_info = thumbnail_info.clone();
         let thumbnail_image = thumbnail_image.clone();
         let subtitle_tracks = subtitle_tracks.clone();
         let hls_instance = hls_instance.clone();
+        let selected_quality = selected_quality.clone();
+        let resume_position = resume_position.clone();
 
-        use_effect_with(props.video_id.clone(), move |_| {
-            // Fetch thumbnail info and load sprite
+        use_effect_with(
+            (props.video_id.clone(), (*selected_quality).clone()),
+            move |(video_id, quality)| {
+            let video_id = video_id.clone();
+            let quality = quality.clone();
+
+            // Fetch thumbnail info and load sprite (only on first load per video,
+            // but harmless to re-fetch on quality change).
             let thumbnail_info_clone = thumbnail_info.clone();
             let thumbnail_image_clone = thumbnail_image.clone();
             let video_id_clone = video_id.clone();
@@ -278,12 +324,17 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 }
             });
 
+            // Read the resume position captured by `on_quality_select`, then
+            // reset the ref to 0 so future initialisation starts from the
+            // beginning by default.
+            let start_pos = *resume_position.borrow();
+            *resume_position.borrow_mut() = 0.0;
+
             // Initialize HLS.js
             let video_ref_clone = video_ref.clone();
             let status_clone = status.clone();
             let error_clone = error.clone();
             let hls_instance_clone = hls_instance.clone();
-            let video_id_for_hls = video_id.clone();
 
             spawn_local(async move {
                 // Give time for video element to be created
@@ -297,7 +348,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     }
                 };
 
-                let playlist_url = format!("/api/videos/{}/playlist.m3u8", video_id_for_hls);
+                // Embed the selected quality in the playlist URL so the server
+                // returns segment URLs for the correct quality level.
+                let playlist_url = format!(
+                    "/api/videos/{}/playlist.m3u8?quality={}",
+                    video_id, quality
+                );
 
                 // Check if the browser has native HLS support (Safari)
                 if !video
@@ -307,6 +363,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     // Safari: use native HLS
                     video.set_src(&playlist_url);
                     status_clone.set(String::new());
+                    if start_pos > 0.0 {
+                        video.set_current_time(start_pos);
+                    }
                     let _ = video.play();
                     return;
                 }
@@ -338,8 +397,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 // Back buffer settings - keep some played content for backward seeking
                 js_sys::Reflect::set(&config, &JsValue::from_str("backBufferLength"), &JsValue::from_f64(HLS_BACK_BUFFER_LENGTH)).ok();
                 
-                // Start position for VOD content (start from beginning)
-                js_sys::Reflect::set(&config, &JsValue::from_str("startPosition"), &JsValue::from_f64(-1.0)).ok();
+                // Start position: -1 means "from the beginning" for a fresh load;
+                // a positive value resumes at the position captured before a
+                // quality-switch reinitialisation.
+                let start_position = if start_pos > 0.0 { start_pos } else { -1.0 };
+                js_sys::Reflect::set(&config, &JsValue::from_str("startPosition"), &JsValue::from_f64(start_position)).ok();
                 
                 // Seek handling improvements - nudge settings help recover from small stream gaps
                 js_sys::Reflect::set(&config, &JsValue::from_str("nudgeOffset"), &JsValue::from_f64(HLS_NUDGE_OFFSET)).ok();
@@ -427,16 +489,20 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 hls.attach_media(&video);
                 hls.load_source(&playlist_url);
                 
-                // Store HLS instance for cleanup
-                hls_instance_clone.set(Some(hls.into()));
+                // Store HLS instance so the cleanup closure can destroy it.
+                // Using borrow_mut() on the shared Rc<RefCell<…>> ensures the
+                // write is visible to any clone of the ref, even those captured
+                // in closures before this async block ran.
+                *hls_instance_clone.borrow_mut() = Some(hls.into());
             });
 
-            // Cleanup function
+            // Cleanup function: called by Yew when the dep tuple changes (quality
+            // or video ID changes) or when the component unmounts.  We .take() the
+            // stored instance so it can never be double-destroyed.
             let hls_instance_for_cleanup = hls_instance.clone();
             move || {
-                // Destroy HLS instance on component unmount
-                if let Some(hls_val) = &*hls_instance_for_cleanup {
-                    if let Ok(hls) = hls_val.clone().dyn_into::<HlsJs>() {
+                if let Some(hls_val) = hls_instance_for_cleanup.borrow_mut().take() {
+                    if let Ok(hls) = hls_val.dyn_into::<HlsJs>() {
                         hls.destroy();
                     }
                 }
@@ -541,18 +607,20 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let is_near_controls = is_near_controls.clone();
         let is_playing = is_playing.clone();
         let settings_open = settings_open.clone();
+        let quality_menu_open = quality_menu_open.clone();
 
         use_effect_with(
-            ((*is_playing).clone(), (*settings_open).clone()),
+            ((*is_playing).clone(), (*settings_open).clone(), (*quality_menu_open).clone()),
             move |_| {
                 let controls_visible = controls_visible.clone();
                 let last_mouse_move = last_mouse_move.clone();
                 let is_near_controls = is_near_controls.clone();
                 let is_playing = is_playing.clone();
                 let settings_open = settings_open.clone();
+                let quality_menu_open = quality_menu_open.clone();
 
                 let interval = Interval::new(1000, move || {
-                    if *is_playing && !*settings_open && !*is_near_controls.borrow() {
+                    if *is_playing && !*settings_open && !*quality_menu_open && !*is_near_controls.borrow() {
                         let now = js_sys::Date::now();
                         if now - *last_mouse_move.borrow() > CONTROL_HIDE_TIMEOUT_MS {
                             controls_visible.set(false);
@@ -920,10 +988,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let on_speed_toggle = {
         let speed_menu_open = speed_menu_open.clone();
         let settings_open = settings_open.clone();
+        let quality_menu_open = quality_menu_open.clone();
         Callback::from(move |e: MouseEvent| {
             e.stop_propagation();
             speed_menu_open.set(!*speed_menu_open);
             settings_open.set(false);
+            quality_menu_open.set(false);
         })
     };
 
@@ -945,10 +1015,49 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let on_settings_toggle = {
         let settings_open = settings_open.clone();
         let speed_menu_open = speed_menu_open.clone();
+        let quality_menu_open = quality_menu_open.clone();
         Callback::from(move |e: MouseEvent| {
             e.stop_propagation();
             settings_open.set(!*settings_open);
             speed_menu_open.set(false);
+            quality_menu_open.set(false);
+        })
+    };
+
+    // Quality menu toggle
+    let on_quality_toggle = {
+        let quality_menu_open = quality_menu_open.clone();
+        let settings_open = settings_open.clone();
+        let speed_menu_open = speed_menu_open.clone();
+        Callback::from(move |e: MouseEvent| {
+            e.stop_propagation();
+            quality_menu_open.set(!*quality_menu_open);
+            settings_open.set(false);
+            speed_menu_open.set(false);
+        })
+    };
+
+    // Quality selection — saves preference to localStorage and reinitialises
+    // HLS at the new quality level, resuming from the current playback position.
+    let on_quality_select = {
+        let selected_quality = selected_quality.clone();
+        let quality_menu_open = quality_menu_open.clone();
+        let video_ref = video_ref.clone();
+        let resume_position = resume_position.clone();
+        Callback::from(move |quality: String| {
+            // Capture the current position before tearing down the old stream.
+            if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
+                *resume_position.borrow_mut() = video.current_time();
+            }
+            quality_menu_open.set(false);
+            // Persist preference.
+            if let Some(storage) = window()
+                .and_then(|w| w.local_storage().ok())
+                .flatten()
+            {
+                let _ = storage.set_item(QUALITY_STORAGE_KEY, &quality);
+            }
+            selected_quality.set(quality);
         })
     };
 
@@ -956,9 +1065,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let on_container_click = {
         let settings_open = settings_open.clone();
         let speed_menu_open = speed_menu_open.clone();
+        let quality_menu_open = quality_menu_open.clone();
         Callback::from(move |_: MouseEvent| {
             settings_open.set(false);
             speed_menu_open.set(false);
+            quality_menu_open.set(false);
         })
     };
 
@@ -1281,11 +1392,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let captions_menu_open = captions_menu_open.clone();
         let settings_open = settings_open.clone();
         let speed_menu_open = speed_menu_open.clone();
+        let quality_menu_open = quality_menu_open.clone();
         Callback::from(move |e: MouseEvent| {
             e.stop_propagation();
             captions_menu_open.set(!*captions_menu_open);
             settings_open.set(false);
             speed_menu_open.set(false);
+            quality_menu_open.set(false);
         })
     };
 
@@ -1593,6 +1706,40 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
                         </div>
 
+                        // Quality selector
+                        <div class="player-quality">
+                            <button
+                                class="player-controls__btn player-controls__btn--text"
+                                onclick={on_quality_toggle}
+                                title="Stream quality"
+                            >
+                                { QUALITY_OPTIONS.iter()
+                                    .find(|(v, _)| *v == selected_quality.as_str())
+                                    .map(|(_, label)| *label)
+                                    .unwrap_or("High") }
+                            </button>
+                            if *quality_menu_open {
+                                <div class="player-quality__menu">
+                                    { for QUALITY_OPTIONS.iter().map(|(value, label)| {
+                                        let on_select = on_quality_select.clone();
+                                        let is_active = selected_quality.as_str() == *value;
+                                        let value_str = value.to_string();
+                                        html! {
+                                            <button
+                                                class={if is_active { "player-quality__option player-quality__option--active" } else { "player-quality__option" }}
+                                                onclick={Callback::from(move |e: MouseEvent| {
+                                                    e.stop_propagation();
+                                                    on_select.emit(value_str.clone());
+                                                })}
+                                            >
+                                                { *label }
+                                            </button>
+                                        }
+                                    })}
+                                </div>
+                            }
+                        </div>
+
                         // Captions button (only show if subtitles available)
                         if !subtitle_tracks.is_empty() {
                             <div class="player-captions">
@@ -1654,7 +1801,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 <div class="player-settings__menu">
                                     <div class="player-settings__item">
                                         <span>{ "Quality" }</span>
-                                        <span class="player-settings__value">{ "Auto" }</span>
+                                        <span class="player-settings__value">
+                                            { QUALITY_OPTIONS.iter()
+                                                .find(|(v, _)| *v == selected_quality.as_str())
+                                                .map(|(_, label)| *label)
+                                                .unwrap_or("High") }
+                                        </span>
                                     </div>
                                     <div class="player-settings__item">
                                         <span>{ "Speed" }</span>

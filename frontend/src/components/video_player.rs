@@ -195,8 +195,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
     // UI visibility state
     let controls_visible = use_state(|| true);
-    let last_mouse_move = use_state(|| js_sys::Date::now());
-    let is_near_controls = use_state(|| false);
+    let last_mouse_move = use_mut_ref(|| js_sys::Date::now());
+    let is_near_controls = use_mut_ref(|| false);
     let settings_open = use_state(|| false);
     let speed_menu_open = use_state(|| false);
     let volume_slider_visible = use_state(|| false);
@@ -552,9 +552,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 let settings_open = settings_open.clone();
 
                 let interval = Interval::new(1000, move || {
-                    if *is_playing && !*settings_open && !*is_near_controls {
+                    if *is_playing && !*settings_open && !*is_near_controls.borrow() {
                         let now = js_sys::Date::now();
-                        if now - *last_mouse_move > CONTROL_HIDE_TIMEOUT_MS {
+                        if now - *last_mouse_move.borrow() > CONTROL_HIDE_TIMEOUT_MS {
                             controls_visible.set(false);
                         }
                     }
@@ -830,7 +830,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let container_ref = container_ref.clone();
         Callback::from(move |e: MouseEvent| {
             controls_visible.set(true);
-            last_mouse_move.set(js_sys::Date::now());
+            *last_mouse_move.borrow_mut() = js_sys::Date::now();
 
             // Update vicinity: keep controls visible if mouse is within
             // CONTROLS_VICINITY_PX of the top (header) or bottom (controls bar).
@@ -841,7 +841,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 let dist_from_top = (mouse_y - rect.top()).max(0.0);
                 let near = dist_from_bottom < CONTROLS_VICINITY_PX
                     || dist_from_top < CONTROLS_VICINITY_PX;
-                is_near_controls.set(near);
+                *is_near_controls.borrow_mut() = near;
             }
         })
     };
@@ -850,7 +850,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let on_mouse_leave = {
         let is_near_controls = is_near_controls.clone();
         Callback::from(move |_: MouseEvent| {
-            is_near_controls.set(false);
+            *is_near_controls.borrow_mut() = false;
         })
     };
 

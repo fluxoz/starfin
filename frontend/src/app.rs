@@ -102,6 +102,12 @@ fn app_inner() -> Html {
     let query = use_state(|| "".to_string());
     let sort_by = use_state(|| SortBy::DateAddedNewest);
 
+    // Mutable refs that always hold the *current* query and sort order so that
+    // the auto-refresh interval (which is set up only once on mount) can read
+    // the latest values without capturing stale UseStateHandle Rc pointers.
+    let query_ref = use_mut_ref(|| "".to_string());
+    let sort_by_ref = use_mut_ref(|| SortBy::DateAddedNewest);
+
     let items = use_state(|| Vec::<Element>::new());
     let loading = use_state(|| false);
     let error = use_state(|| Option::<String>::None);
@@ -180,10 +186,14 @@ fn app_inner() -> Html {
         });
     }
 
-    // Fetch on load and whenever query/sort changes
+    // Fetch on load and whenever query/sort changes.
+    // Also keeps query_ref / sort_by_ref in sync so the auto-refresh interval
+    // can read the current filter values.
     {
         let query = query.clone();
         let sort_by = sort_by.clone();
+        let query_ref = query_ref.clone();
+        let sort_by_ref = sort_by_ref.clone();
 
         let items = items.clone();
         let loading = loading.clone();
@@ -192,6 +202,10 @@ fn app_inner() -> Html {
         use_effect_with(((*query).clone(), (*sort_by).clone()), move |_| {
             let query = (*query).clone();
             let sort_by = (*sort_by).clone();
+
+            // Keep refs current so the interval can read the latest values.
+            *query_ref.borrow_mut() = query.clone();
+            *sort_by_ref.borrow_mut() = sort_by.clone();
 
             loading.set(true);
             error.set(None);
@@ -210,8 +224,8 @@ fn app_inner() -> Html {
 
     // Auto-refresh: re-fetch the video list every 60 seconds.
     {
-        let query = query.clone();
-        let sort_by = sort_by.clone();
+        let query_ref = query_ref.clone();
+        let sort_by_ref = sort_by_ref.clone();
         let items = items.clone();
         let scanning = scanning.clone();
 
@@ -221,8 +235,22 @@ fn app_inner() -> Html {
                 if *scanning {
                     return;
                 }
-                let query = (*query).clone();
-                let sort_by = (*sort_by).clone();
+                // Read the current filter values from the shared refs.
+                // These are always up-to-date because the fetch effect above
+                // writes to them on every query/sort change.  Using plain
+                // UseStateHandle clones here would capture the Rc from mount
+                // time and always see the initial empty-string query, which
+                // is what caused the visible "reset" every 60 seconds.
+                let query = query_ref.borrow().clone();
+                let sort_by = *sort_by_ref.borrow();
+
+                // If the user has an active search or a non-default sort,
+                // skip the background refresh so their filtered results are
+                // not disturbed.
+                if !query.is_empty() || sort_by != SortBy::DateAddedNewest {
+                    return;
+                }
+
                 let items = items.clone();
                 spawn_local(async move {
                     if let Ok(data) = api::fetch_elements(&query, sort_by).await {

@@ -196,7 +196,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // UI visibility state
     let controls_visible = use_state(|| true);
     let last_mouse_move = use_state(|| js_sys::Date::now());
-    let mouse_inside = use_state(|| false);
     let is_near_controls = use_state(|| false);
     let settings_open = use_state(|| false);
     let speed_menu_open = use_state(|| false);
@@ -539,7 +538,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     {
         let controls_visible = controls_visible.clone();
         let last_mouse_move = last_mouse_move.clone();
-        let mouse_inside = mouse_inside.clone();
         let is_near_controls = is_near_controls.clone();
         let is_playing = is_playing.clone();
         let settings_open = settings_open.clone();
@@ -549,13 +547,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             move |_| {
                 let controls_visible = controls_visible.clone();
                 let last_mouse_move = last_mouse_move.clone();
-                let mouse_inside = mouse_inside.clone();
                 let is_near_controls = is_near_controls.clone();
                 let is_playing = is_playing.clone();
                 let settings_open = settings_open.clone();
 
                 let interval = Interval::new(1000, move || {
-                    if *is_playing && !*settings_open && !*mouse_inside && !*is_near_controls {
+                    if *is_playing && !*settings_open && !*is_near_controls {
                         let now = js_sys::Date::now();
                         if now - *last_mouse_move > CONTROL_HIDE_TIMEOUT_MS {
                             controls_visible.set(false);
@@ -829,13 +826,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let on_mouse_move = {
         let controls_visible = controls_visible.clone();
         let last_mouse_move = last_mouse_move.clone();
-        let mouse_inside = mouse_inside.clone();
         let is_near_controls = is_near_controls.clone();
         let container_ref = container_ref.clone();
         Callback::from(move |e: MouseEvent| {
             controls_visible.set(true);
             last_mouse_move.set(js_sys::Date::now());
-            mouse_inside.set(true);
 
             // Update vicinity: keep controls visible if mouse is within
             // CONTROLS_VICINITY_PX of the top (header) or bottom (controls bar).
@@ -851,12 +846,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
-    // Mouse leave handler — clear both inside and vicinity flags
+    // Mouse leave handler — clear vicinity flag
     let on_mouse_leave = {
-        let mouse_inside = mouse_inside.clone();
         let is_near_controls = is_near_controls.clone();
         Callback::from(move |_: MouseEvent| {
-            mouse_inside.set(false);
             is_near_controls.set(false);
         })
     };

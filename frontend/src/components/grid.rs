@@ -17,9 +17,6 @@ pub struct Props {
     /// The video ID the pre-cache worker is currently processing (from WS).
     #[prop_or_default]
     pub precache_current_id: Option<String>,
-    /// Bumps whenever a background worker finishes a video or a batch.
-    #[prop_or_default]
-    pub processing_version: u32,
 }
 
 #[derive(Properties, PartialEq)]
@@ -35,9 +32,6 @@ struct CardProps {
     /// Whether the pre-cache worker is currently processing this video.
     #[prop_or_default]
     pub is_precache_processing: bool,
-    /// Bumps whenever a background worker finishes a video or a batch.
-    #[prop_or_default]
-    pub processing_version: u32,
 }
 
 fn format_duration(secs: u32) -> String {
@@ -62,11 +56,35 @@ fn video_card(props: &CardProps) -> Html {
     let item_clone = item.clone();
     let on_watch = props.on_watch.clone();
 
+    // Per-card version that bumps only when THIS card's video transitions from
+    // actively-processing to idle.  Passed to VideoCardThumb (thumbnail URL
+    // cache-bust) and ProcessingStatus (status re-fetch), so neither component
+    // reacts to processing events for other videos.
+    let local_version = use_state(|| 0_u32);
+    let prev_processing = use_mut_ref(|| false);
+
+    {
+        let local_version = local_version.clone();
+        let prev_processing = prev_processing.clone();
+        use_effect_with(
+            (props.is_thumb_processing, props.is_sprite_processing, props.is_precache_processing),
+            move |(is_thumb, is_sprite, is_precache)| {
+                let is_now = *is_thumb || *is_sprite || *is_precache;
+                let was = *prev_processing.borrow();
+                if was && !is_now {
+                    local_version.set(*local_version + 1);
+                }
+                *prev_processing.borrow_mut() = is_now;
+                || ()
+            },
+        );
+    }
+
     html! {
         <article class="card">
             <VideoCardThumb
                 video_id={item.id.clone()}
-                processing_version={props.processing_version}
+                processing_version={*local_version}
             />
 
             <div class="card__top">
@@ -76,7 +94,7 @@ fn video_card(props: &CardProps) -> Html {
                     is_thumb_processing={props.is_thumb_processing}
                     is_sprite_processing={props.is_sprite_processing}
                     is_precache_processing={props.is_precache_processing}
-                    processing_version={props.processing_version}
+                    processing_version={*local_version}
                 />
             </div>
 
@@ -145,7 +163,6 @@ pub fn elements_grid(props: &Props) -> Html {
                         is_thumb_processing={is_thumb_processing}
                         is_sprite_processing={is_sprite_processing}
                         is_precache_processing={is_precache_processing}
-                        processing_version={props.processing_version}
                     />
                 }
             }) }

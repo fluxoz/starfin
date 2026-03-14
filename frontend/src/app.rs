@@ -133,12 +133,6 @@ fn app_inner() -> Html {
     // The video ID currently being pre-cached (from WS).
     let precache_current_id = use_state(|| Option::<String>::None);
 
-    // Monotonically increasing version counter; bumps whenever a background
-    // worker's `current_id` changes or a batch transitions active → inactive.
-    // Child components use this to know when to re-fetch per-video state
-    // (processing badges, thumbnails, sprite availability).
-    let processing_version = use_state(|| 0_u32);
-
     // Dark mode state — default to the system's prefers-color-scheme setting
     let dark_mode = use_state(|| {
         web_sys::window()
@@ -278,7 +272,6 @@ fn app_inner() -> Html {
         let thumb_current_id = thumb_current_id.clone();
         let sprite_current_id = sprite_current_id.clone();
         let precache_current_id = precache_current_id.clone();
-        let processing_version = processing_version.clone();
         use_effect_with((), move |_| {
             spawn_local(async move {
                 let ws_url = {
@@ -292,18 +285,6 @@ fn app_inner() -> Html {
                 };
                 if let Ok(ws) = WebSocket::open(&ws_url) {
                     let (_, mut read) = ws.split();
-
-                    // Local tracking for detecting transitions across WS frames.
-                    let mut prev_thumb_id: Option<String> = None;
-                    let mut prev_sprite_id: Option<String> = None;
-                    let mut prev_precache_id: Option<String> = None;
-                    let mut prev_thumb_active = false;
-                    let mut prev_sprite_active = false;
-                    let mut prev_precache_active = false;
-                    let mut version: u32 = 0;
-                    // Skip the first message to avoid a spurious version bump
-                    // when prev_* values transition from their initial defaults.
-                    let mut initialized = false;
 
                     while let Some(Ok(Message::Text(text))) = read.next().await {
                         if let Ok(update) = serde_json::from_str::<api::ProgressUpdate>(&text) {
@@ -335,41 +316,9 @@ fn app_inner() -> Html {
                             }
 
                             // ── Per-video processing IDs ────────────────────
-                            let new_thumb_id = update.thumb.current_id.clone();
-                            let new_sprite_id = update.sprite.current_id.clone();
-                            let new_precache_id = update.precache.current_id.clone();
-
-                            thumb_current_id.set(new_thumb_id.clone());
-                            sprite_current_id.set(new_sprite_id.clone());
-                            precache_current_id.set(new_precache_id.clone());
-
-                            // ── Bump processing_version on meaningful transitions
-                            // Skip the very first WS message to avoid a spurious
-                            // bump when prev_* values are their initial defaults.
-                            if !initialized {
-                                initialized = true;
-                            } else {
-                                let thumb_id_changed = new_thumb_id != prev_thumb_id;
-                                let sprite_id_changed = new_sprite_id != prev_sprite_id;
-                                let precache_id_changed = new_precache_id != prev_precache_id;
-                                let thumb_went_inactive = prev_thumb_active && !update.thumb.active;
-                                let sprite_went_inactive = prev_sprite_active && !update.sprite.active;
-                                let precache_went_inactive = prev_precache_active && !update.precache.active;
-
-                                if thumb_id_changed || sprite_id_changed || precache_id_changed
-                                    || thumb_went_inactive || sprite_went_inactive || precache_went_inactive
-                                {
-                                    version += 1;
-                                    processing_version.set(version);
-                                }
-                            }
-
-                            prev_thumb_id = new_thumb_id;
-                            prev_sprite_id = new_sprite_id;
-                            prev_precache_id = new_precache_id;
-                            prev_thumb_active = update.thumb.active;
-                            prev_sprite_active = update.sprite.active;
-                            prev_precache_active = update.precache.active;
+                            thumb_current_id.set(update.thumb.current_id.clone());
+                            sprite_current_id.set(update.sprite.current_id.clone());
+                            precache_current_id.set(update.precache.current_id.clone());
                         }
                     }
                     // WebSocket closed (server restart, etc.) — silently stop updating.
@@ -677,7 +626,6 @@ fn app_inner() -> Html {
                         thumb_current_id={(*thumb_current_id).clone()}
                         sprite_current_id={(*sprite_current_id).clone()}
                         precache_current_id={(*precache_current_id).clone()}
-                        processing_version={*processing_version}
                     />
                 }
             </main>

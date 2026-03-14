@@ -2590,9 +2590,7 @@ async fn main() -> std::io::Result<()> {
     println!("════════════════════════════════════════════════════════════════");
 
     // Load any previously-persisted video index so the server starts with
-    // known media immediately.  The first WebSocket scan (triggered by the
-    // frontend on page load) will refresh and re-persist the list in the
-    // background without blocking startup or the initial page load.
+    // known media immediately.
     let initial_items = load_video_cache(&cache_dir);
     if !initial_items.is_empty() {
         println!("→ Loaded {} video(s) from persisted index", initial_items.len());
@@ -2653,6 +2651,24 @@ async fn main() -> std::io::Result<()> {
         auth_tokens,
     });
 
+    // One-time background scan at startup to refresh the index immediately.
+    // The persisted cache is pre-loaded above so clients see known media
+    // instantly; this scan updates with any new/removed files.
+    {
+        let startup_library = library_path.clone();
+        let startup_cache_dir = cache_dir.clone();
+        let startup_cache = Arc::clone(&video_cache);
+        let startup_thumb_trigger = Arc::clone(&thumb_trigger);
+        let startup_sprite_trigger = Arc::clone(&sprite_trigger);
+        tokio::spawn(async move {
+            let items = scan_library(&startup_library).await;
+            save_video_cache(&items, &startup_cache_dir);
+            *startup_cache.write().expect("video cache lock poisoned") = items;
+            startup_thumb_trigger.notify_one();
+            startup_sprite_trigger.notify_one();
+        });
+    }
+
     // Background task: re-scan the library every 60 seconds.
     let bg_library_path = library_path.clone();
     let bg_cache_dir = cache_dir.clone();
@@ -2661,7 +2677,7 @@ async fn main() -> std::io::Result<()> {
     let bg_sprite_trigger = Arc::clone(&sprite_trigger);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        interval.tick().await; // skip the immediate tick
+        interval.tick().await; // skip the immediate first tick (covered by startup scan)
         loop {
             interval.tick().await;
             let items = scan_library(&bg_library_path).await;

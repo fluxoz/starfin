@@ -322,86 +322,6 @@ fn app_inner() -> Html {
         });
     }
 
-    // Auto-trigger a library scan on startup so the server's initial (non-blocking)
-    // background scan streams live progress to the UI the moment the page loads.
-    {
-        let scanning = scanning.clone();
-        let items = items.clone();
-        let query = query.clone();
-        let sort_by = sort_by.clone();
-        let scan_progress = scan_progress.clone();
-        use_effect_with((), move |_| {
-            let scanning = scanning.clone();
-            let items = items.clone();
-            let query = (*query).clone();
-            let sort_by = (*sort_by).clone();
-            let scan_progress = scan_progress.clone();
-
-            scanning.set(true);
-            scan_progress.set(Some((0, 0)));
-
-            spawn_local(async move {
-                let ws_url = {
-                    let location = web_sys::window()
-                        .expect("no window")
-                        .location();
-                    let protocol = location.protocol().unwrap_or_default();
-                    let host = location.host().unwrap_or_default();
-                    let ws_proto = if protocol == "https:" { "wss" } else { "ws" };
-                    format!("{ws_proto}://{host}/api/scan/ws")
-                };
-
-                if let Ok(ws) = WebSocket::open(&ws_url) {
-                    let (_, mut read) = ws.split();
-
-                    // Start from whatever the cache loaded (may be empty on first run).
-                    let mut accumulated: Vec<crate::models::Element> = (*items).clone();
-
-                    while let Some(Ok(Message::Text(text))) = read.next().await {
-                        match serde_json::from_str::<api::ScanProgressData>(&text) {
-                            Ok(p) => {
-                                scan_progress.set(Some((p.current, p.total)));
-                                // Stream the new item into the grid immediately.
-                                if let Some(new_item) = p.item {
-                                    // Deduplicate: the item may already be in the cache.
-                                    if let Some(pos) = accumulated.iter().position(|e| e.id == new_item.id) {
-                                        // Update in-place in case metadata changed.
-                                        accumulated[pos] = new_item;
-                                    } else {
-                                        accumulated.push(new_item);
-                                    }
-                                    items.set(api::apply_filters(
-                                        &accumulated,
-                                        &query,
-                                        sort_by,
-                                    ));
-                                }
-                            }
-                            Err(e) => web_sys::console::warn_1(
-                                &format!("startup scan: failed to parse progress message: {e}").into(),
-                            ),
-                        }
-                    }
-                    // WebSocket closed = scan complete.
-                } else {
-                    web_sys::console::warn_1(
-                        &"startup scan: could not open WebSocket connection to /api/scan/ws".into(),
-                    );
-                }
-
-                // Final refresh to ensure the displayed list matches the server's
-                // authoritative sorted/filtered view (catches any race conditions).
-                if let Ok(data) = api::fetch_elements(&query, sort_by).await {
-                    items.set(data);
-                }
-                scan_progress.set(None);
-                scanning.set(false);
-            });
-
-            || ()
-        });
-    }
-
     let on_query_change = {
         let query = query.clone();
         Callback::from(move |v: String| query.set(v))
@@ -468,11 +388,30 @@ fn app_inner() -> Html {
                 };
 
                 if let Ok(ws) = WebSocket::open(&ws_url) {
-                    // Only read from the server; split() avoids needing the type to be Unpin.
                     let (_, mut read) = ws.split();
+
+                    // Start from what is currently displayed so existing cards
+                    // are preserved while newly-scanned ones stream in.
+                    let mut accumulated: Vec<crate::models::Element> = (*items).clone();
+
                     while let Some(Ok(Message::Text(text))) = read.next().await {
                         match serde_json::from_str::<api::ScanProgressData>(&text) {
-                            Ok(p) => scan_progress.set(Some((p.current, p.total))),
+                            Ok(p) => {
+                                scan_progress.set(Some((p.current, p.total)));
+                                // Stream the new item into the grid immediately.
+                                if let Some(new_item) = p.item {
+                                    if let Some(pos) = accumulated.iter().position(|e| e.id == new_item.id) {
+                                        accumulated[pos] = new_item;
+                                    } else {
+                                        accumulated.push(new_item);
+                                    }
+                                    items.set(api::apply_filters(
+                                        &accumulated,
+                                        &query,
+                                        sort_by,
+                                    ));
+                                }
+                            }
                             Err(e) => web_sys::console::warn_1(
                                 &format!("scan_ws: unexpected message: {e}").into(),
                             ),
@@ -481,7 +420,7 @@ fn app_inner() -> Html {
                     // WebSocket closed = scan complete.
                 }
 
-                // Refresh the media list now that the cache is updated.
+                // Final authoritative refresh once the scan is fully committed.
                 if let Ok(data) = api::fetch_elements(&query, sort_by).await {
                     items.set(data);
                 }

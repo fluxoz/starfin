@@ -607,8 +607,6 @@ fn app_inner() -> Html {
 
                 if *loading {
                     <div class="notice notice--loading">{ "Loading…" }</div>
-                } else if *scanning && items.is_empty() {
-                    <div class="notice notice--loading">{ "Scanning library…" }</div>
                 } else {
                     <ElementsGrid
                         items={(*items).clone()}

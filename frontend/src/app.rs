@@ -133,12 +133,25 @@ fn app_inner() -> Html {
     // The video ID currently being pre-cached (from WS).
     let precache_current_id = use_state(|| Option::<String>::None);
 
-    // Dark mode state — default to the system's prefers-color-scheme setting
+    // localStorage key used to persist the user's theme preference.
+    const THEME_STORAGE_KEY: &str = "starfin_theme";
+
+    // Dark mode state — use a saved user preference from localStorage if present,
+    // otherwise fall back to the system's prefers-color-scheme setting.
     let dark_mode = use_state(|| {
-        web_sys::window()
-            .and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok().flatten())
-            .map(|mql| mql.matches())
-            .unwrap_or(false)
+        let saved = web_sys::window()
+            .and_then(|w| w.local_storage().ok())
+            .flatten()
+            .and_then(|s| s.get_item(THEME_STORAGE_KEY).ok())
+            .flatten();
+        match saved.as_deref() {
+            Some("dark")  => true,
+            Some("light") => false,
+            _ => web_sys::window()
+                .and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok().flatten())
+                .map(|mql| mql.matches())
+                .unwrap_or(false),
+        }
     });
 
     // Scroll-to-top button visibility state
@@ -350,7 +363,17 @@ fn app_inner() -> Html {
 
     let on_toggle_dark_mode = {
         let dark_mode = dark_mode.clone();
-        Callback::from(move |_| dark_mode.set(!*dark_mode))
+        Callback::from(move |_| {
+            let new_value = !*dark_mode;
+            // Persist the user's explicit choice to localStorage.
+            if let Some(storage) = web_sys::window()
+                .and_then(|w| w.local_storage().ok())
+                .flatten()
+            {
+                let _ = storage.set_item(THEME_STORAGE_KEY, if new_value { "dark" } else { "light" });
+            }
+            dark_mode.set(new_value);
+        })
     };
 
     let on_scroll_top = Callback::from(move |_: MouseEvent| {

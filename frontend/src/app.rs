@@ -502,7 +502,12 @@ fn app_inner() -> Html {
                 <aside class="sidebar">
                     <div class="sidebar__logo">{ "STARFIN" }</div>
                     <div class="sidebar__text">{ "MEDIA COLLECTION" }</div>
-                    <div class="sidebar__arrow">{ "↗" }</div>
+                    <div class="sidebar__arrow">
+                        <svg class="sidebar__arrow-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-hidden="true">
+                            <line x1="5" y1="19" x2="19" y2="5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+                            <polyline points="9 5 19 5 19 15" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+                        </svg>
+                    </div>
                 </aside>
 
                 // Video player overlay — rendered on top of the library when a video is selected.

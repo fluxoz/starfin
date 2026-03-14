@@ -117,22 +117,32 @@ body{
     flex-direction: row !important;
     height: auto !important;
     position: static !important;
-    padding: 10px 20px !important;
+    padding: 6px 16px !important;
     justify-content: space-between;
+    align-items: center;
   }
   
   .sidebar__text{
     writing-mode: horizontal-tb !important;
     text-orientation: initial !important;
     margin: 0 !important;
+    font-size: 11px !important;
   }
   
   .sidebar__logo{
+    writing-mode: horizontal-tb !important;
+    text-orientation: initial !important;
     margin-bottom: 0 !important;
+    font-size: 14px !important;
   }
   
   .sidebar__arrow{
     margin-top: 0 !important;
+  }
+  
+  .sidebar__arrow-svg{
+    width: 18px !important;
+    height: 18px !important;
   }
 }
 
@@ -172,9 +182,17 @@ body{
 
 .sidebar__arrow{
   color: white;
-  font-size: 32px;
-  font-weight: 900;
   margin-top: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sidebar__arrow-svg{
+  width: 28px;
+  height: 28px;
+  display: block;
+  flex-shrink: 0;
 }
 
 .topbar{

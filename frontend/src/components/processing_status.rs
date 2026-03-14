@@ -11,15 +11,15 @@ struct ProcessingStatusResponse {
 #[derive(Properties, PartialEq)]
 pub struct Props {
     pub video_id: String,
-    /// The video ID the thumbnail worker is currently processing (from WS).
+    /// Whether the thumbnail worker is currently processing this video.
     #[prop_or_default]
-    pub thumb_current_id: Option<String>,
-    /// The video ID the sprite worker is currently processing (from WS).
+    pub is_thumb_processing: bool,
+    /// Whether the sprite worker is currently processing this video.
     #[prop_or_default]
-    pub sprite_current_id: Option<String>,
-    /// The video ID the pre-cache worker is currently processing (from WS).
+    pub is_sprite_processing: bool,
+    /// Whether the pre-cache worker is currently processing this video.
     #[prop_or_default]
-    pub precache_current_id: Option<String>,
+    pub is_precache_processing: bool,
     /// Bumps whenever a background worker finishes a video or a batch.
     #[prop_or_default]
     pub processing_version: u32,
@@ -45,9 +45,7 @@ pub fn processing_status(props: &Props) -> Html {
 
     // Determine if this specific video is actively being processed right now.
     let is_processing =
-        props.thumb_current_id.as_deref() == Some(props.video_id.as_str())
-        || props.sprite_current_id.as_deref() == Some(props.video_id.as_str())
-        || props.precache_current_id.as_deref() == Some(props.video_id.as_str());
+        props.is_thumb_processing || props.is_sprite_processing || props.is_precache_processing;
 
     // Fetch the authoritative processing status from the server on mount
     // and whenever processing_version bumps (a video just finished).

@@ -253,6 +253,32 @@ body{
   opacity: .55;
   cursor: default;
 }
+.random-btn{
+  font-family: inherit;
+  font-size: .85rem;
+  font-weight: 700;
+  color: var(--text);
+  background: transparent;
+  border: 1.5px solid var(--text);
+  border-radius: 50%;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  margin-right: 10px;
+  transition: background .15s, color .15s;
+  flex-shrink: 0;
+}
+.random-btn:hover:not(:disabled){
+  background: var(--text);
+  color: var(--bg);
+}
+.random-btn:disabled{
+  opacity: .35;
+  cursor: default;
+}
 .scan-progress{
   display: flex;
   flex-direction: column;

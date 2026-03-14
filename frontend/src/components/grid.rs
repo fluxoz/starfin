@@ -17,9 +17,21 @@ pub struct Props {
     /// The video ID the pre-cache worker is currently processing (from WS).
     #[prop_or_default]
     pub precache_current_id: Option<String>,
-    /// Bumps whenever a background worker finishes a video or a batch.
+}
+
+#[derive(Properties, PartialEq)]
+struct CardProps {
+    pub item: Element,
+    pub on_watch: Callback<Element>,
+    /// Whether the thumbnail worker is currently processing this video.
     #[prop_or_default]
-    pub processing_version: u32,
+    pub is_thumb_processing: bool,
+    /// Whether the sprite worker is currently processing this video.
+    #[prop_or_default]
+    pub is_sprite_processing: bool,
+    /// Whether the pre-cache worker is currently processing this video.
+    #[prop_or_default]
+    pub is_precache_processing: bool,
 }
 
 fn format_duration(secs: u32) -> String {
@@ -38,6 +50,90 @@ fn format_date(timestamp: u64) -> Option<String> {
         .map(|dt| dt.format("%b %d, %Y").to_string())
 }
 
+#[function_component(VideoCard)]
+fn video_card(props: &CardProps) -> Html {
+    let item = &props.item;
+    let item_clone = item.clone();
+    let on_watch = props.on_watch.clone();
+
+    // Per-card version that bumps only when THIS card's video transitions from
+    // actively-processing to idle.  Passed to VideoCardThumb (thumbnail URL
+    // cache-bust) and ProcessingStatus (status re-fetch), so neither component
+    // reacts to processing events for other videos.
+    let local_version = use_state(|| 0_u32);
+    let prev_processing = use_mut_ref(|| false);
+
+    {
+        let local_version = local_version.clone();
+        let prev_processing = prev_processing.clone();
+        use_effect_with(
+            (props.is_thumb_processing, props.is_sprite_processing, props.is_precache_processing),
+            move |(is_thumb, is_sprite, is_precache)| {
+                let is_now = *is_thumb || *is_sprite || *is_precache;
+                let was = *prev_processing.borrow();
+                if was && !is_now {
+                    local_version.set(*local_version + 1);
+                }
+                *prev_processing.borrow_mut() = is_now;
+                || ()
+            },
+        );
+    }
+
+    html! {
+        <article class="card">
+            <VideoCardThumb
+                video_id={item.id.clone()}
+                processing_version={*local_version}
+            />
+
+            <div class="card__top">
+                <div class="card__title">{ item.title.clone() }</div>
+                <ProcessingStatus
+                    video_id={item.id.clone()}
+                    is_thumb_processing={props.is_thumb_processing}
+                    is_sprite_processing={props.is_sprite_processing}
+                    is_precache_processing={props.is_precache_processing}
+                    processing_version={*local_version}
+                />
+            </div>
+
+            <div class="card__meta">
+                if item.duration_secs > 0 {
+                    <span class="card__meta-item card__meta-item--highlight">{ format_duration(item.duration_secs) }</span>
+                }
+                if item.year > 0 {
+                    if item.duration_secs > 0 {
+                        <span class="card__meta-sep">{ "·" }</span>
+                    }
+                    <span class="card__meta-item">{ item.year }</span>
+                }
+                if let Some(date_str) = format_date(item.date_added) {
+                    if item.duration_secs > 0 || item.year > 0 {
+                        <span class="card__meta-sep">{ "·" }</span>
+                    }
+                    <span class="card__meta-item">{ format!("Added {}", date_str) }</span>
+                }
+            </div>
+
+            <div class="card__footer">
+                if item.rating > 0.0 {
+                    <div class="muted">{ format!("★ {:.1}", item.rating) }</div>
+                } else {
+                    <div />
+                }
+                <button
+                    class="btn btn--watch"
+                    type="button"
+                    onclick={Callback::from(move |_| on_watch.emit(item_clone.clone()))}
+                >
+                    { "▶ Watch" }
+                </button>
+            </div>
+        </article>
+    }
+}
+
 #[function_component(ElementsGrid)]
 pub fn elements_grid(props: &Props) -> Html {
     if props.items.is_empty() {
@@ -52,60 +148,22 @@ pub fn elements_grid(props: &Props) -> Html {
     html! {
         <section class="grid" aria-label="Videos grid">
             { for props.items.iter().map(|item| {
-                let item_clone = item.clone();
-                let on_watch = props.on_watch.clone();
+                let is_thumb_processing =
+                    props.thumb_current_id.as_deref() == Some(item.id.as_str());
+                let is_sprite_processing =
+                    props.sprite_current_id.as_deref() == Some(item.id.as_str());
+                let is_precache_processing =
+                    props.precache_current_id.as_deref() == Some(item.id.as_str());
 
                 html! {
-                    <article class="card" key={item.id.clone()}>
-                        <VideoCardThumb
-                            video_id={item.id.clone()}
-                            processing_version={props.processing_version}
-                        />
-
-                        <div class="card__top">
-                            <div class="card__title">{ item.title.clone() }</div>
-                            <ProcessingStatus
-                                video_id={item.id.clone()}
-                                thumb_current_id={props.thumb_current_id.clone()}
-                                sprite_current_id={props.sprite_current_id.clone()}
-                                precache_current_id={props.precache_current_id.clone()}
-                                processing_version={props.processing_version}
-                            />
-                        </div>
-
-                        <div class="card__meta">
-                            if item.duration_secs > 0 {
-                                <span class="card__meta-item card__meta-item--highlight">{ format_duration(item.duration_secs) }</span>
-                            }
-                            if item.year > 0 {
-                                if item.duration_secs > 0 {
-                                    <span class="card__meta-sep">{ "·" }</span>
-                                }
-                                <span class="card__meta-item">{ item.year }</span>
-                            }
-                            if let Some(date_str) = format_date(item.date_added) {
-                                if item.duration_secs > 0 || item.year > 0 {
-                                    <span class="card__meta-sep">{ "·" }</span>
-                                }
-                                <span class="card__meta-item">{ format!("Added {}", date_str) }</span>
-                            }
-                        </div>
-
-                        <div class="card__footer">
-                            if item.rating > 0.0 {
-                                <div class="muted">{ format!("★ {:.1}", item.rating) }</div>
-                            } else {
-                                <div />
-                            }
-                            <button
-                                class="btn btn--watch"
-                                type="button"
-                                onclick={Callback::from(move |_| on_watch.emit(item_clone.clone()))}
-                            >
-                                { "▶ Watch" }
-                            </button>
-                        </div>
-                    </article>
+                    <VideoCard
+                        key={item.id.clone()}
+                        item={item.clone()}
+                        on_watch={props.on_watch.clone()}
+                        is_thumb_processing={is_thumb_processing}
+                        is_sprite_processing={is_sprite_processing}
+                        is_precache_processing={is_precache_processing}
+                    />
                 }
             }) }
         </section>

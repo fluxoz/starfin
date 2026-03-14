@@ -1575,3 +1575,13 @@ body{
 .app.dark-mode .pw-modal__input::placeholder{
   color: var(--muted);
 }
+
+/* Prevent iOS/Safari from auto-zooming when input fields are focused.
+   The browser only triggers the zoom when font-size < 16px, so we
+   override the size on mobile viewports.  Manual pinch-zoom is
+   unaffected by this rule. */
+@media (max-width: 768px){
+  .input, .select, .pw-modal__input{
+    font-size: 16px;
+  }
+}

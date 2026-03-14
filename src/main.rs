@@ -602,7 +602,7 @@ struct Assets;
 // ── Models ───────────────────────────────────────────────────────────────────
 
 /// Matches the `Element` struct used by the frontend.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct VideoItem {
     id: String,
     title: String,
@@ -791,6 +791,44 @@ async fn probe_video(path: &Path) -> (u32, FfprobeMeta) {
 
 // ── Library scanning ─────────────────────────────────────────────────────────
 
+/// Path of the persisted video-index file inside `cache_dir`.
+fn video_index_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join(".video_index.json")
+}
+
+/// Persist the current in-memory video list to disk so it can be restored
+/// on the next startup without waiting for a full re-scan.
+fn save_video_cache(items: &[VideoItem], cache_dir: &Path) {
+    let path = video_index_path(cache_dir);
+    match serde_json::to_string(items) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                eprintln!("⚠ Could not save video index: {e}");
+            }
+        }
+        Err(e) => eprintln!("⚠ Could not serialize video index: {e}"),
+    }
+}
+
+/// Load a previously-persisted video list from disk.
+/// Returns an empty `Vec` if the file does not exist or cannot be parsed.
+fn load_video_cache(cache_dir: &Path) -> Vec<VideoItem> {
+    let path = video_index_path(cache_dir);
+    if !path.exists() {
+        return Vec::new();
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
+            eprintln!("⚠ Could not parse video index: {e}");
+            Vec::new()
+        }),
+        Err(e) => {
+            eprintln!("⚠ Could not read video index: {e}");
+            Vec::new()
+        }
+    }
+}
+
 async fn scan_library(library_path: &Path) -> Vec<VideoItem> {
     let entries: Vec<_> = WalkDir::new(library_path)
         .into_iter()
@@ -874,6 +912,7 @@ async fn scan_ws(
     let (response, mut session, _msg_stream) = actix_ws::handle(&req, body)?;
 
     let library_path = state.library_path.clone();
+    let cache_dir = state.cache_dir.clone();
     let video_cache = Arc::clone(&state.video_cache);
     let thumb_trigger = Arc::clone(&state.thumb_trigger);
     let sprite_trigger = Arc::clone(&state.sprite_trigger);
@@ -927,13 +966,21 @@ async fn scan_ws(
             });
 
             let current = (idx + 1) as u32;
-            let msg = serde_json::json!({"current": current, "total": total}).to_string();
+            // Include the newly-scanned item so the frontend can stream
+            // cards into the grid as each file is discovered.
+            let msg = serde_json::json!({
+                "current": current,
+                "total": total,
+                "item": items.last().unwrap(),
+            })
+            .to_string();
             if session.text(msg).await.is_err() {
                 return; // Client disconnected mid-scan.
             }
         }
 
-        // Commit the updated library to the shared cache.
+        // Commit the updated library to the shared cache and persist to disk.
+        save_video_cache(&items, &cache_dir);
         *video_cache.write().expect("video cache lock poisoned") = items;
 
         // Re-trigger deep thumbnail generation for any newly discovered videos.
@@ -2775,10 +2822,12 @@ async fn main() -> std::io::Result<()> {
     println!();
     println!("════════════════════════════════════════════════════════════════");
 
-    // Initial library scan at startup.
-    println!("→ Scanning library…");
-    let initial_items = scan_library(&library_path).await;
-    println!("→ Found {} video(s)", initial_items.len());
+    // Load any previously-persisted video index so the server starts with
+    // known media immediately.
+    let initial_items = load_video_cache(&cache_dir);
+    if !initial_items.is_empty() {
+        println!("→ Loaded {} video(s) from persisted index", initial_items.len());
+    }
     let video_cache: Arc<RwLock<Vec<VideoItem>>> = Arc::new(RwLock::new(initial_items));
 
     let thumb_progress = Arc::new(RwLock::new(ThumbProgress {
@@ -2845,18 +2894,38 @@ async fn main() -> std::io::Result<()> {
         auth_tokens,
     });
 
+    // One-time background scan at startup to refresh the index immediately.
+    // The persisted cache is pre-loaded above so clients see known media
+    // instantly; this scan updates with any new/removed files.
+    {
+        let startup_library = library_path.clone();
+        let startup_cache_dir = cache_dir.clone();
+        let startup_cache = Arc::clone(&video_cache);
+        let startup_thumb_trigger = Arc::clone(&thumb_trigger);
+        let startup_sprite_trigger = Arc::clone(&sprite_trigger);
+        tokio::spawn(async move {
+            let items = scan_library(&startup_library).await;
+            save_video_cache(&items, &startup_cache_dir);
+            *startup_cache.write().expect("video cache lock poisoned") = items;
+            startup_thumb_trigger.notify_one();
+            startup_sprite_trigger.notify_one();
+        });
+    }
+
     // Background task: re-scan the library every 60 seconds.
     let bg_library_path = library_path.clone();
+    let bg_cache_dir = cache_dir.clone();
     let bg_cache = Arc::clone(&video_cache);
     let bg_thumb_trigger = Arc::clone(&thumb_trigger);
     let bg_sprite_trigger = Arc::clone(&sprite_trigger);
     let bg_precache_trigger = Arc::clone(&precache_trigger);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        interval.tick().await; // skip the immediate tick
+        interval.tick().await; // skip the immediate first tick (covered by startup scan)
         loop {
             interval.tick().await;
             let items = scan_library(&bg_library_path).await;
+            save_video_cache(&items, &bg_cache_dir);
             *bg_cache.write().expect("video cache lock poisoned") = items;
             bg_thumb_trigger.notify_one();
             bg_sprite_trigger.notify_one();

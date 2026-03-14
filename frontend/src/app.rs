@@ -458,11 +458,30 @@ fn app_inner() -> Html {
                 };
 
                 if let Ok(ws) = WebSocket::open(&ws_url) {
-                    // Only read from the server; split() avoids needing the type to be Unpin.
                     let (_, mut read) = ws.split();
+
+                    // Start from what is currently displayed so existing cards
+                    // are preserved while newly-scanned ones stream in.
+                    let mut accumulated: Vec<crate::models::Element> = (*items).clone();
+
                     while let Some(Ok(Message::Text(text))) = read.next().await {
                         match serde_json::from_str::<api::ScanProgressData>(&text) {
-                            Ok(p) => scan_progress.set(Some((p.current, p.total))),
+                            Ok(p) => {
+                                scan_progress.set(Some((p.current, p.total)));
+                                // Stream the new item into the grid immediately.
+                                if let Some(new_item) = p.item {
+                                    if let Some(pos) = accumulated.iter().position(|e| e.id == new_item.id) {
+                                        accumulated[pos] = new_item;
+                                    } else {
+                                        accumulated.push(new_item);
+                                    }
+                                    items.set(api::apply_filters(
+                                        &accumulated,
+                                        &query,
+                                        sort_by,
+                                    ));
+                                }
+                            }
                             Err(e) => web_sys::console::warn_1(
                                 &format!("scan_ws: unexpected message: {e}").into(),
                             ),
@@ -471,7 +490,7 @@ fn app_inner() -> Html {
                     // WebSocket closed = scan complete.
                 }
 
-                // Refresh the media list now that the cache is updated.
+                // Final authoritative refresh once the scan is fully committed.
                 if let Ok(data) = api::fetch_elements(&query, sort_by).await {
                     items.set(data);
                 }

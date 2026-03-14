@@ -356,6 +356,19 @@ fn app_inner() -> Html {
         }
     });
 
+    let on_random = {
+        let items = items.clone();
+        let selected = selected.clone();
+        Callback::from(move |_: MouseEvent| {
+            let list = (*items).clone();
+            if list.is_empty() {
+                return;
+            }
+            let idx = (js_sys::Math::random() * list.len() as f64) as usize;
+            selected.set(Some(list[idx].clone()));
+        })
+    };
+
     let on_scan = {
         let scanning = scanning.clone();
         let items = items.clone();
@@ -477,6 +490,14 @@ fn app_inner() -> Html {
                             }
                         </div>
                         <div class="topbar__right">
+                            <button
+                                class="random-btn"
+                                onclick={on_random}
+                                disabled={(*items).is_empty()}
+                                aria-label="Play a random media file"
+                            >
+                                { "?" }
+                            </button>
                             <div class="scan-area">
                                 <button
                                     class={if *scanning { "scan-btn scan-btn--scanning" } else { "scan-btn" }}

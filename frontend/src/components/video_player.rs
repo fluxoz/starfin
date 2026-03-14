@@ -255,8 +255,20 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let active_subtitle = use_state(|| Option::<u32>::None); // index of active subtitle, None = off
     let captions_menu_open = use_state(|| false);
 
-    // HLS.js instance storage
-    let hls_instance = use_state(|| Option::<JsValue>::None);
+    // HLS.js instance storage.
+    //
+    // We use `use_mut_ref` (Rc<RefCell<…>>) rather than `use_state` here
+    // because the HLS instance is set *asynchronously* inside a `spawn_local`
+    // block (after a 50 ms delay).  In Yew 0.21, `use_state` clones a new
+    // `Rc<R>` on every state update, so a handle captured in a cleanup closure
+    // before the async write completes will always read the *initial* `None`
+    // value — meaning `hls.destroy()` is never called and stale HLS instances
+    // accumulate, each still loading segments at the old quality level.
+    //
+    // `use_mut_ref` wraps a single `Rc<RefCell<T>>` that is shared by all
+    // clones, so any write made by the async task is immediately visible to
+    // the cleanup closure captured earlier.
+    let hls_instance = use_mut_ref(|| Option::<JsValue>::None);
 
     // Initialize HLS.js player (and re-initialise when video ID or quality changes).
     {
@@ -477,16 +489,20 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 hls.attach_media(&video);
                 hls.load_source(&playlist_url);
                 
-                // Store HLS instance for cleanup
-                hls_instance_clone.set(Some(hls.into()));
+                // Store HLS instance so the cleanup closure can destroy it.
+                // Using borrow_mut() on the shared Rc<RefCell<…>> ensures the
+                // write is visible to any clone of the ref, even those captured
+                // in closures before this async block ran.
+                *hls_instance_clone.borrow_mut() = Some(hls.into());
             });
 
-            // Cleanup function
+            // Cleanup function: called by Yew when the dep tuple changes (quality
+            // or video ID changes) or when the component unmounts.  We .take() the
+            // stored instance so it can never be double-destroyed.
             let hls_instance_for_cleanup = hls_instance.clone();
             move || {
-                // Destroy HLS instance on component unmount
-                if let Some(hls_val) = &*hls_instance_for_cleanup {
-                    if let Ok(hls) = hls_val.clone().dyn_into::<HlsJs>() {
+                if let Some(hls_val) = hls_instance_for_cleanup.borrow_mut().take() {
+                    if let Ok(hls) = hls_val.dyn_into::<HlsJs>() {
                         hls.destroy();
                     }
                 }

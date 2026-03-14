@@ -1427,9 +1427,6 @@ body{
   border-radius: var(--radius);
   background: var(--bg);
   color: var(--text);
-  font-size: 20px;
-  letter-spacing: 10px;
-  font-weight: 900;
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -1439,6 +1436,13 @@ body{
   pointer-events: none;
   transform: translateY(12px);
   transition: opacity .25s ease, transform .25s ease, background .15s, color .15s;
+}
+
+.scroll-top-btn svg{
+  width: 20px;
+  height: 20px;
+  display: block;
+  flex-shrink: 0;
 }
 
 .scroll-top-btn--visible{

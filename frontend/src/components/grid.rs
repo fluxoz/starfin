@@ -14,6 +14,9 @@ pub struct Props {
     /// The video ID the sprite worker is currently processing (from WS).
     #[prop_or_default]
     pub sprite_current_id: Option<String>,
+    /// The video ID the pre-cache worker is currently processing (from WS).
+    #[prop_or_default]
+    pub precache_current_id: Option<String>,
     /// Bumps whenever a background worker finishes a video or a batch.
     #[prop_or_default]
     pub processing_version: u32,
@@ -65,6 +68,7 @@ pub fn elements_grid(props: &Props) -> Html {
                                 video_id={item.id.clone()}
                                 thumb_current_id={props.thumb_current_id.clone()}
                                 sprite_current_id={props.sprite_current_id.clone()}
+                                precache_current_id={props.precache_current_id.clone()}
                                 processing_version={props.processing_version}
                             />
                         </div>

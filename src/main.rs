@@ -652,6 +652,15 @@ struct SpriteProgress {
     current_id: Option<String>,
 }
 
+/// Tracks the progress of the segment pre-caching background job.
+struct PrecacheProgress {
+    current: u32,
+    total: u32,
+    active: bool,
+    /// The video ID currently being pre-cached, or `None` when idle.
+    current_id: Option<String>,
+}
+
 struct AppState {
     library_path: PathBuf,
     cache_dir: PathBuf,
@@ -667,6 +676,8 @@ struct AppState {
     sprite_progress: Arc<RwLock<SpriteProgress>>,
     /// Notified to (re-)start the sprite generation batch.
     sprite_trigger: Arc<tokio::sync::Notify>,
+    /// Progress counters for the background segment pre-caching worker.
+    precache_progress: Arc<RwLock<PrecacheProgress>>,
     /// Notified to (re-)start the segment pre-caching batch.
     precache_trigger: Arc<tokio::sync::Notify>,
     /// Detected hardware acceleration backend (detected once at startup).
@@ -1367,13 +1378,15 @@ async fn get_thumb_progress(state: web::Data<AppState>) -> impl Responder {
 }
 
 /// `GET /api/progress/ws` — persistent WebSocket that streams live progress
-/// updates from the thumbnail and sprite background workers at 500 ms intervals.
+/// updates from the thumbnail, sprite, and pre-cache background workers at
+/// 500 ms intervals.
 ///
 /// Each frame is a JSON text message:
 /// ```json
 /// {
-///   "thumb":  { "current": N, "total": M, "active": bool, "phase": "quick", "current_id": "uuid"|null },
-///   "sprite": { "current": N, "total": M, "active": bool, "current_id": "uuid"|null }
+///   "thumb":    { "current": N, "total": M, "active": bool, "phase": "quick", "current_id": "uuid"|null },
+///   "sprite":   { "current": N, "total": M, "active": bool, "current_id": "uuid"|null },
+///   "precache": { "current": N, "total": M, "active": bool, "current_id": "uuid"|null }
 /// }
 /// ```
 async fn progress_ws(
@@ -1385,6 +1398,7 @@ async fn progress_ws(
 
     let thumb_progress = Arc::clone(&state.thumb_progress);
     let sprite_progress = Arc::clone(&state.sprite_progress);
+    let precache_progress = Arc::clone(&state.precache_progress);
 
     actix_web::rt::spawn(async move {
         let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(500));
@@ -1399,10 +1413,15 @@ async fn progress_ws(
                 let p = sprite_progress.read().expect("sprite_progress lock poisoned");
                 (p.current, p.total, p.active, p.current_id.clone())
             };
+            let (pc, pt, pa, pid) = {
+                let p = precache_progress.read().expect("precache_progress lock poisoned");
+                (p.current, p.total, p.active, p.current_id.clone())
+            };
 
             let msg = serde_json::json!({
-                "thumb":  { "current": tc, "total": tt, "active": ta, "phase": tph, "current_id": tid },
-                "sprite": { "current": sc, "total": st, "active": sa, "current_id": sid }
+                "thumb":    { "current": tc, "total": tt, "active": ta, "phase": tph, "current_id": tid },
+                "sprite":   { "current": sc, "total": st, "active": sa, "current_id": sid },
+                "precache": { "current": pc, "total": pt, "active": pa, "current_id": pid }
             })
             .to_string();
 
@@ -1852,10 +1871,11 @@ async fn get_sprite_status(
 /// `GET /api/videos/{id}/processing-status` — processing status for a video.
 ///
 /// Returns one of three states:
-/// - `{"status":"processed"}` — all three operations are complete: quick thumbnail
-///   (`.jpg`), deep thumbnail (`.deep` marker), and sprite sheet (`_thumbs/sprite.jpg`)
-/// - `{"status":"processing"}` — the thumb or sprite background worker is actively
-///   working on this specific video right now
+/// - `{"status":"processed"}` — all operations complete: quick thumbnail
+///   (`.jpg`), deep thumbnail (`.deep` marker), sprite sheet (`_thumbs/sprite.jpg`),
+///   and segment pre-cache (first [`PRECACHE_SEGMENTS`] `.ts` files)
+/// - `{"status":"processing"}` — a background worker is actively working on
+///   this specific video right now
 /// - `{"status":"pending"}`   — not fully processed and no worker is currently
 ///   working on this specific video
 ///
@@ -1875,7 +1895,20 @@ async fn get_processing_status(
         .join(format!("{}_thumbs", *id))
         .join("sprite.jpg");
 
-    let status = if quick_marker.exists() && deep_marker.exists() && sprite_path.exists() {
+    // Check whether the pre-cached segments exist.  We only check for
+    // seg_00000.ts as a lightweight proxy — if the pre-cache worker
+    // finished, all PRECACHE_SEGMENTS files will be present.
+    let precache_marker = state
+        .cache_dir
+        .join(id.as_str())
+        .join("seg_00000.ts");
+
+    let all_done = quick_marker.exists()
+        && deep_marker.exists()
+        && sprite_path.exists()
+        && precache_marker.exists();
+
+    let status = if all_done {
         "processed"
     } else {
         // "processing" only when THIS video is the one a worker is actively working on.
@@ -1889,8 +1922,13 @@ async fn get_processing_status(
             .read()
             .map(|p| p.current_id.as_deref() == Some(id.as_str()))
             .unwrap_or(false);
+        let precache_on_this = state
+            .precache_progress
+            .read()
+            .map(|p| p.current_id.as_deref() == Some(id.as_str()))
+            .unwrap_or(false);
 
-        if thumb_on_this || sprite_on_this {
+        if thumb_on_this || sprite_on_this || precache_on_this {
             "processing"
         } else {
             "pending"
@@ -2154,11 +2192,13 @@ async fn run_sprite_worker(
 /// Mirrors `run_thumb_worker` / `run_sprite_worker`: waits for a notification
 /// on `trigger`, walks the library, skips videos whose first
 /// [`PRECACHE_SEGMENTS`] segments already exist in the cache, and transcodes
-/// the missing ones.  Pauses while playback is active.
+/// the missing ones.  Pauses while playback is active.  Progress counters are
+/// written to `progress` so the WS can drive a frontend progress bar.
 async fn run_precache_worker(
     library_path: PathBuf,
     cache_dir: PathBuf,
     hwaccel: HwAccel,
+    progress: Arc<RwLock<PrecacheProgress>>,
     trigger: Arc<tokio::sync::Notify>,
     mut playback_rx: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -2171,7 +2211,29 @@ async fn run_precache_worker(
             .filter(|e| e.file_type().is_file() && is_video(e.path()))
             .collect();
 
-        for entry in entries {
+        // Partition into already-cached and needs-work.  A video counts as
+        // "done" when seg_00000.ts already exists (the first segment is the
+        // cheapest proxy for "pre-cache finished").
+        let (done, pending): (Vec<_>, Vec<_>) = entries.into_iter().partition(|e| {
+            let abs = e.path();
+            let rel = abs
+                .strip_prefix(&library_path)
+                .unwrap_or(abs)
+                .to_string_lossy();
+            let id = video_id(&rel);
+            let hls_dir = cache_dir.join(&id);
+            // Quick check: if the first segment exists the batch ran before.
+            hls_dir.join("seg_00000.ts").exists()
+        });
+
+        {
+            let mut p = progress.write().expect("precache_progress lock poisoned");
+            p.current = done.len() as u32;
+            p.total = (done.len() + pending.len()) as u32;
+            p.active = !pending.is_empty();
+        }
+
+        for entry in pending {
             // Pause while a video is being streamed.
             while *playback_rx.borrow() {
                 let _ = playback_rx.changed().await;
@@ -2186,9 +2248,18 @@ async fn run_precache_worker(
             let id = video_id(&rel);
             let hls_dir = cache_dir.join(&id);
 
+            {
+                let mut p = progress.write().expect("precache_progress lock poisoned");
+                p.current_id = Some(id.clone());
+            }
+
             // Determine how many segments to pre-cache (capped by video duration).
             let (duration_secs, _) = probe_video(&abs).await;
             if duration_secs == 0 {
+                let mut p = progress.write().expect("precache_progress lock poisoned");
+                p.current_id = None;
+                p.current += 1;
+                if p.current >= p.total { p.active = false; }
                 continue;
             }
             let total_segments = (duration_secs as f64 / SEGMENT_DURATION).ceil() as usize;
@@ -2199,21 +2270,41 @@ async fn run_precache_worker(
                 .filter(|i| !hls_dir.join(format!("seg_{:05}.ts", i)).exists())
                 .collect();
             if missing.is_empty() {
+                let mut p = progress.write().expect("precache_progress lock poisoned");
+                p.current_id = None;
+                p.current += 1;
+                if p.current >= p.total { p.active = false; }
                 continue;
             }
 
             // Resolve the source path once for all segments of this video.
             let resolved_path = match abs.canonicalize() {
                 Ok(p) => p,
-                Err(_) => continue,
+                Err(_) => {
+                    let mut p = progress.write().expect("precache_progress lock poisoned");
+                    p.current_id = None;
+                    p.current += 1;
+                    if p.current >= p.total { p.active = false; }
+                    continue;
+                }
             };
             let abs_str = match resolved_path.to_str() {
                 Some(s) => s.to_owned(),
-                None => continue,
+                None => {
+                    let mut p = progress.write().expect("precache_progress lock poisoned");
+                    p.current_id = None;
+                    p.current += 1;
+                    if p.current >= p.total { p.active = false; }
+                    continue;
+                }
             };
 
             if let Err(e) = tokio::fs::create_dir_all(&hls_dir).await {
                 eprintln!("precache: cache dir error for {id}: {e}");
+                let mut p = progress.write().expect("precache_progress lock poisoned");
+                p.current_id = None;
+                p.current += 1;
+                if p.current >= p.total { p.active = false; }
                 continue;
             }
 
@@ -2232,6 +2323,13 @@ async fn run_precache_worker(
                     eprintln!("precache: {e}");
                     break; // Stop for this video on error.
                 }
+            }
+
+            let mut p = progress.write().expect("precache_progress lock poisoned");
+            p.current_id = None;
+            p.current += 1;
+            if p.current >= p.total {
+                p.active = false;
             }
         }
     }
@@ -2710,6 +2808,12 @@ async fn main() -> std::io::Result<()> {
     let sprite_trigger = Arc::new(tokio::sync::Notify::new());
     let precache_trigger = Arc::new(tokio::sync::Notify::new());
     let precache_hwaccel = hwaccel.clone();
+    let precache_progress = Arc::new(RwLock::new(PrecacheProgress {
+        current: 0,
+        total: 0,
+        active: false,
+        current_id: None,
+    }));
 
     let (playback_tx, playback_rx) = tokio::sync::watch::channel(false);
     let playback_tx = Arc::new(playback_tx);
@@ -2741,6 +2845,7 @@ async fn main() -> std::io::Result<()> {
         thumb_trigger: Arc::clone(&thumb_trigger),
         sprite_progress: Arc::clone(&sprite_progress),
         sprite_trigger: Arc::clone(&sprite_trigger),
+        precache_progress: Arc::clone(&precache_progress),
         precache_trigger: Arc::clone(&precache_trigger),
         hwaccel,
         playback_tx: Arc::clone(&playback_tx),
@@ -2802,10 +2907,11 @@ async fn main() -> std::io::Result<()> {
     {
         let worker_library = library_path.clone();
         let worker_cache = cache_dir.clone();
+        let worker_progress = Arc::clone(&precache_progress);
         let worker_trigger = Arc::clone(&precache_trigger);
         let worker_playback_rx = playback_rx.clone();
         tokio::spawn(async move {
-            run_precache_worker(worker_library, worker_cache, precache_hwaccel, worker_trigger, worker_playback_rx).await;
+            run_precache_worker(worker_library, worker_cache, precache_hwaccel, worker_progress, worker_trigger, worker_playback_rx).await;
         });
         // Kick off the first batch immediately after startup.
         precache_trigger.notify_one();

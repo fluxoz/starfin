@@ -35,11 +35,22 @@ pub struct SpriteProgressMsg {
     pub current_id: Option<String>,
 }
 
+/// Pre-cache progress received over the `/api/progress/ws` WebSocket.
+#[derive(Clone, Debug, Deserialize)]
+pub struct PrecacheProgressMsg {
+    pub current: u32,
+    pub total: u32,
+    pub active: bool,
+    /// The video ID currently being pre-cached, if any.
+    pub current_id: Option<String>,
+}
+
 /// Combined progress update sent by `GET /api/progress/ws` every 500 ms.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ProgressUpdate {
     pub thumb: ThumbProgressMsg,
     pub sprite: SpriteProgressMsg,
+    pub precache: PrecacheProgressMsg,
 }
 
 /// Hardware acceleration info returned by `GET /api/hwaccel`.

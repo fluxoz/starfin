@@ -115,11 +115,17 @@ fn app_inner() -> Html {
     // Sprite generation progress state: (current, total)
     let sprite_progress = use_state(|| Option::<(u32, u32)>::None);
 
+    // Pre-cache progress state: (current, total)
+    let precache_progress = use_state(|| Option::<(u32, u32)>::None);
+
     // The video ID currently being processed by the thumbnail worker (from WS).
     let thumb_current_id = use_state(|| Option::<String>::None);
 
     // The video ID currently being processed by the sprite worker (from WS).
     let sprite_current_id = use_state(|| Option::<String>::None);
+
+    // The video ID currently being pre-cached (from WS).
+    let precache_current_id = use_state(|| Option::<String>::None);
 
     // Monotonically increasing version counter; bumps whenever a background
     // worker's `current_id` changes or a batch transitions active → inactive.
@@ -231,12 +237,14 @@ fn app_inner() -> Html {
     }
 
     // Connect to /api/progress/ws on mount and keep it open.
-    // This streams live thumb + sprite progress updates without polling.
+    // This streams live thumb + sprite + precache progress updates without polling.
     {
         let thumb_progress = thumb_progress.clone();
         let sprite_progress = sprite_progress.clone();
+        let precache_progress = precache_progress.clone();
         let thumb_current_id = thumb_current_id.clone();
         let sprite_current_id = sprite_current_id.clone();
+        let precache_current_id = precache_current_id.clone();
         let processing_version = processing_version.clone();
         use_effect_with((), move |_| {
             spawn_local(async move {
@@ -255,8 +263,10 @@ fn app_inner() -> Html {
                     // Local tracking for detecting transitions across WS frames.
                     let mut prev_thumb_id: Option<String> = None;
                     let mut prev_sprite_id: Option<String> = None;
+                    let mut prev_precache_id: Option<String> = None;
                     let mut prev_thumb_active = false;
                     let mut prev_sprite_active = false;
+                    let mut prev_precache_active = false;
                     let mut version: u32 = 0;
                     // Skip the first message to avoid a spurious version bump
                     // when prev_* values transition from their initial defaults.
@@ -282,13 +292,23 @@ fn app_inner() -> Html {
                             } else {
                                 sprite_progress.set(None);
                             }
+                            if update.precache.active {
+                                precache_progress.set(Some((
+                                    update.precache.current,
+                                    update.precache.total,
+                                )));
+                            } else {
+                                precache_progress.set(None);
+                            }
 
                             // ── Per-video processing IDs ────────────────────
                             let new_thumb_id = update.thumb.current_id.clone();
                             let new_sprite_id = update.sprite.current_id.clone();
+                            let new_precache_id = update.precache.current_id.clone();
 
                             thumb_current_id.set(new_thumb_id.clone());
                             sprite_current_id.set(new_sprite_id.clone());
+                            precache_current_id.set(new_precache_id.clone());
 
                             // ── Bump processing_version on meaningful transitions
                             // Skip the very first WS message to avoid a spurious
@@ -298,11 +318,13 @@ fn app_inner() -> Html {
                             } else {
                                 let thumb_id_changed = new_thumb_id != prev_thumb_id;
                                 let sprite_id_changed = new_sprite_id != prev_sprite_id;
+                                let precache_id_changed = new_precache_id != prev_precache_id;
                                 let thumb_went_inactive = prev_thumb_active && !update.thumb.active;
                                 let sprite_went_inactive = prev_sprite_active && !update.sprite.active;
+                                let precache_went_inactive = prev_precache_active && !update.precache.active;
 
-                                if thumb_id_changed || sprite_id_changed
-                                    || thumb_went_inactive || sprite_went_inactive
+                                if thumb_id_changed || sprite_id_changed || precache_id_changed
+                                    || thumb_went_inactive || sprite_went_inactive || precache_went_inactive
                                 {
                                     version += 1;
                                     processing_version.set(version);
@@ -311,8 +333,10 @@ fn app_inner() -> Html {
 
                             prev_thumb_id = new_thumb_id;
                             prev_sprite_id = new_sprite_id;
+                            prev_precache_id = new_precache_id;
                             prev_thumb_active = update.thumb.active;
                             prev_sprite_active = update.sprite.active;
+                            prev_precache_active = update.precache.active;
                         }
                     }
                     // WebSocket closed (server restart, etc.) — silently stop updating.
@@ -447,7 +471,17 @@ fn app_inner() -> Html {
         None => (0, String::new()),
     };
 
-    let any_bg_active = thumb_progress.is_some() || sprite_progress.is_some() || *scanning;
+    // Compute progress percentage and label for the segment pre-cache bar.
+    let (precache_pct, precache_label) = match *precache_progress {
+        Some((current, total)) if total > 0 => (
+            (current as f64 / total as f64 * 100.0) as u32,
+            format!("Pre-cache: {} / {}", current, total),
+        ),
+        Some(_) => (0, "Pre-caching segments…".to_string()),
+        None => (0, String::new()),
+    };
+
+    let any_bg_active = thumb_progress.is_some() || sprite_progress.is_some() || precache_progress.is_some() || *scanning;
 
     html! {
         <>
@@ -536,6 +570,15 @@ fn app_inner() -> Html {
                                 <span class="process-row__count">{ &sprite_label }</span>
                             </div>
                         }
+                        if precache_progress.is_some() {
+                            <div class="process-row">
+                                <span class="process-row__label">{ "Pre-cache" }</span>
+                                <div class="process-row__bar-wrap">
+                                    <div class="process-row__bar-fill" style={format!("width: {}%", precache_pct)} />
+                                </div>
+                                <span class="process-row__count">{ &precache_label }</span>
+                            </div>
+                        }
                     </div>
                 }
 
@@ -555,6 +598,7 @@ fn app_inner() -> Html {
                         on_watch={on_watch}
                         thumb_current_id={(*thumb_current_id).clone()}
                         sprite_current_id={(*sprite_current_id).clone()}
+                        precache_current_id={(*precache_current_id).clone()}
                         processing_version={*processing_version}
                     />
                 }

@@ -667,6 +667,8 @@ struct AppState {
     sprite_progress: Arc<RwLock<SpriteProgress>>,
     /// Notified to (re-)start the sprite generation batch.
     sprite_trigger: Arc<tokio::sync::Notify>,
+    /// Notified to (re-)start the segment pre-caching batch.
+    precache_trigger: Arc<tokio::sync::Notify>,
     /// Detected hardware acceleration backend (detected once at startup).
     hwaccel: HwAccel,
     /// Broadcasts playback state (`true` = playing, `false` = idle) to all
@@ -853,6 +855,7 @@ async fn scan_ws(
     let video_cache = Arc::clone(&state.video_cache);
     let thumb_trigger = Arc::clone(&state.thumb_trigger);
     let sprite_trigger = Arc::clone(&state.sprite_trigger);
+    let precache_trigger = Arc::clone(&state.precache_trigger);
 
     actix_web::rt::spawn(async move {
         // Enumerate all video files up-front so we can report a total.
@@ -916,6 +919,9 @@ async fn scan_ws(
 
         // Re-trigger sprite generation for any newly discovered videos.
         sprite_trigger.notify_one();
+
+        // Re-trigger segment pre-caching for any newly discovered videos.
+        precache_trigger.notify_one();
 
         // Close the WebSocket — the client uses this signal to know the scan is done.
         let _ = session.close(None).await;
@@ -1414,6 +1420,136 @@ async fn progress_ws(
 /// Jellyfin/Plex default to 6 second segments.
 const SEGMENT_DURATION: f64 = 6.0;
 
+/// Number of segments at the start of each video to pre-cache so that
+/// playback can begin immediately without waiting for on-demand transcoding.
+/// At 6 seconds per segment, 20 segments ≈ 2 minutes of video.
+const PRECACHE_SEGMENTS: usize = 20;
+
+/// Transcode a single MPEG-TS segment for a video using ffmpeg.
+///
+/// Writes to a temporary file first, then atomically renames to the final
+/// location to prevent readers from seeing partially-written segments.
+async fn transcode_segment(
+    abs_path: &str,
+    hls_dir: &Path,
+    seg_index: usize,
+    hwaccel: &HwAccel,
+) -> Result<(), String> {
+    let filename = format!("seg_{:05}.ts", seg_index);
+    let seg_path = hls_dir.join(&filename);
+
+    // Already exists (another caller may have created it concurrently).
+    if seg_path.exists() {
+        return Ok(());
+    }
+
+    let start_time = seg_index as f64 * SEGMENT_DURATION;
+    debug_assert!(start_time >= 0.0 && start_time.is_finite());
+
+    let ts_offset = format!("{:.3}", start_time);
+    let tmp_filename = format!(".seg_{:05}.ts.tmp", seg_index);
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.current_dir(hls_dir)
+       .stdin(std::process::Stdio::null());
+
+    // Prepend GPU decode args before the input
+    for arg in hwaccel.hwaccel_decode_args() {
+        cmd.arg(arg);
+    }
+
+    cmd.args([
+        "-y", "-nostdin",
+        "-ss", &format!("{:.3}", start_time),
+        "-i", abs_path,
+        "-t", &format!("{:.3}", SEGMENT_DURATION),
+    ]);
+
+    // GPU encoder
+    cmd.args(["-c:v", hwaccel.encoder()]);
+    cmd.args(hwaccel.encoder_quality_args());
+
+    // Disable B-frames.  B-frames require DTS/PTS reordering which makes the
+    // first decodable frame in an MPEG-TS segment *not* the first stored
+    // packet.  When HLS.js seeks and the browser appends a segment to a
+    // SourceBuffer for independent decoding, this mismatch causes
+    // "avcodec_send_packet error: End of file" decode failures.  Disabling
+    // B-frames ensures DTS == PTS order and each segment is independently
+    // decodable from its very first packet.
+    cmd.args(["-bf", "0"]);
+
+    // For NVENC, promote forced keyframes to true IDR frames.  Without this
+    // flag NVENC may emit a closed-GOP I-frame instead of an IDR, which
+    // does not flush the decoder's reference picture buffer and can leave
+    // the browser unable to decode the segment in isolation.
+    if *hwaccel == HwAccel::Nvidia {
+        cmd.args(["-forced-idr", "1"]);
+    }
+
+    cmd.args([
+        // Force a keyframe at encoding timestamp 0 (the first frame of this
+        // segment).  Using "0" rather than "expr:gte(t,0)" is intentional:
+        // the expression gte(t,0) is always true and would make *every* frame
+        // a keyframe, which is extremely inefficient with hardware encoders.
+        "-force_key_frames", "0",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-output_ts_offset", &ts_offset,
+        "-f", "mpegts",
+        &tmp_filename,
+    ]);
+
+    match cmd.output().await {
+        Ok(out) if out.status.success() => {
+            tokio::fs::rename(hls_dir.join(&tmp_filename), &seg_path)
+                .await
+                .map_err(|e| format!("failed to rename segment {seg_index}: {e}"))
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let _ = tokio::fs::remove_file(hls_dir.join(&tmp_filename)).await;
+            Err(format!("ffmpeg segment {seg_index} failed: {stderr}"))
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_file(hls_dir.join(&tmp_filename)).await;
+            Err(format!("failed to execute ffmpeg for segment {seg_index}: {e}"))
+        }
+    }
+}
+
+/// Remove cached segments beyond the pre-cache range from a video's cache
+/// directory.  Segments with index < [`PRECACHE_SEGMENTS`] are preserved so
+/// that playback can always begin instantly.
+async fn remove_non_precached_segments(cache_dir: &Path) -> std::io::Result<()> {
+    let mut entries = match tokio::fs::read_dir(cache_dir).await {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Parse segment index from "seg_XXXXX.ts"
+        if let Some(idx) = name_str
+            .strip_prefix("seg_")
+            .and_then(|s| s.strip_suffix(".ts"))
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            if idx >= PRECACHE_SEGMENTS {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+        // Also clean up any temp files left by the transcoding helper.
+        else if name_str.starts_with(".seg_") && name_str.ends_with(".tmp") {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+
+    Ok(())
+}
+
 /// `GET /api/videos/{id}/playlist.m3u8`
 ///
 /// Generates an HLS VOD playlist using MPEG-TS segments.
@@ -1559,84 +1695,15 @@ async fn get_segment(
         None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
     };
 
-    // Calculate segment time range
-    // start_time is always non-negative (seg_index * SEGMENT_DURATION, both >= 0)
-    let start_time = seg_index as f64 * SEGMENT_DURATION;
-    debug_assert!(start_time >= 0.0 && start_time.is_finite());
-
     // Create cache directory if needed
     if let Err(e) = tokio::fs::create_dir_all(&hls_dir).await {
         return HttpResponse::InternalServerError()
             .body(format!("cache dir error: {e}"));
     }
 
-    // Transcode just this segment on-demand using MPEG-TS output format.
-    //
-    // This follows the Jellyfin approach (using ffmpeg's HLS/MPEG-TS muxer):
-    // - `-ss` before `-i` for fast input seeking to the segment start
-    // - `-t` to limit output to one segment duration
-    // - `-output_ts_offset` to set correct absolute PTS timestamps
-    //   (without this, each segment's PTS would start from 0 instead of
-    //    the correct position in the stream timeline)
-    // - `-f mpegts` for self-contained MPEG Transport Stream output
-    // - `-force_key_frames 0` to ensure the very first frame is a keyframe
-    // - `-bf 0` to disable B-frames (see below)
-    let ts_offset = format!("{:.3}", start_time);
-    let mut cmd = Command::new("ffmpeg");
-    cmd.current_dir(&hls_dir)
-       .stdin(std::process::Stdio::null());
-
-    // Prepend GPU decode args before the input
-    for arg in state.hwaccel.hwaccel_decode_args() {
-        cmd.arg(arg);
-    }
-
-    cmd.args([
-        "-y", "-nostdin",
-        "-ss", &format!("{:.3}", start_time),
-        "-i", &abs_str,
-        "-t", &format!("{:.3}", SEGMENT_DURATION),
-    ]);
-
-    // GPU encoder
-    cmd.args(["-c:v", state.hwaccel.encoder()]);
-    cmd.args(state.hwaccel.encoder_quality_args());
-
-    // Disable B-frames.  B-frames require DTS/PTS reordering which makes the
-    // first decodable frame in an MPEG-TS segment *not* the first stored
-    // packet.  When HLS.js seeks and the browser appends a segment to a
-    // SourceBuffer for independent decoding, this mismatch causes
-    // "avcodec_send_packet error: End of file" decode failures.  Disabling
-    // B-frames ensures DTS == PTS order and each segment is independently
-    // decodable from its very first packet.
-    cmd.args(["-bf", "0"]);
-
-    // For NVENC, promote forced keyframes to true IDR frames.  Without this
-    // flag NVENC may emit a closed-GOP I-frame instead of an IDR, which
-    // does not flush the decoder's reference picture buffer and can leave
-    // the browser unable to decode the segment in isolation.
-    if state.hwaccel == HwAccel::Nvidia {
-        cmd.args(["-forced-idr", "1"]);
-    }
-
-    cmd.args([
-        // Force a keyframe at encoding timestamp 0 (the first frame of this
-        // segment).  Using "0" rather than "expr:gte(t,0)" is intentional:
-        // the expression gte(t,0) is always true and would make *every* frame
-        // a keyframe, which is extremely inefficient with hardware encoders.
-        "-force_key_frames", "0",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-output_ts_offset", &ts_offset,
-        "-f", "mpegts",
-        &filename,
-    ]);
-
-    let output = cmd.output().await;
-
-    match output {
-        Ok(out) if out.status.success() => {
-            // Segment generated successfully, serve it
+    // Transcode the segment on-demand (reuses the shared helper).
+    match transcode_segment(&abs_str, &hls_dir, seg_index, &state.hwaccel).await {
+        Ok(()) => {
             match tokio::fs::read(&seg_path).await {
                 Ok(data) => HttpResponse::Ok()
                     .content_type("video/mp2t")
@@ -1649,16 +1716,10 @@ async fn get_segment(
                     .body(format!("failed to read generated segment: {e}")),
             }
         }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            eprintln!("ffmpeg segment {} failed: {}", seg_index, stderr);
+        Err(msg) => {
+            eprintln!("{msg}");
             HttpResponse::ServiceUnavailable()
-                .body(format!("segment {} transcoding failed", seg_index))
-        }
-        Err(e) => {
-            eprintln!("failed to execute ffmpeg for segment {}: {}", seg_index, e);
-            HttpResponse::ServiceUnavailable()
-                .body(format!("failed to execute ffmpeg: {e}"))
+                .body(format!("segment {seg_index} transcoding failed"))
         }
     }
 }
@@ -1675,9 +1736,10 @@ async fn get_hwaccel(state: web::Data<AppState>) -> impl Responder {
 
 /// `DELETE /api/videos/{id}/cache` — clear cached segments for a video.
 ///
-/// Removes the directory `cache_dir/{id}/` which holds transcoded MPEG-TS
-/// segments.  Called by the frontend when the user navigates away from the
-/// player so that disk space is reclaimed immediately.
+/// Removes non-pre-cached segments from `cache_dir/{id}/`.  The first
+/// [`PRECACHE_SEGMENTS`] segments are preserved so that future playback can
+/// begin instantly.  Called by the frontend when the user navigates away
+/// from the player so that disk space is reclaimed immediately.
 async fn clear_cache(
     id: web::Path<String>,
     state: web::Data<AppState>,
@@ -1691,19 +1753,10 @@ async fn clear_cache(
 
     let cache_subdir = state.cache_dir.join(&id);
 
-    match tokio::fs::remove_dir_all(&cache_subdir).await {
+    match remove_non_precached_segments(&cache_subdir).await {
         Ok(_) => {
             // Also cancel idle-eviction tracking so a stale entry doesn't
             // trigger a redundant removal on the next sweep.
-            state
-                .last_segment_access
-                .write()
-                .expect("last_segment_access lock poisoned")
-                .remove(&id);
-            HttpResponse::NoContent().finish()
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Nothing cached – that's fine, treat as success.
             state
                 .last_segment_access
                 .write()
@@ -2088,6 +2141,97 @@ async fn run_sprite_worker(
             p.current += 1;
             if p.current >= p.total {
                 p.active = false;
+            }
+        }
+    }
+}
+
+// ── Segment pre-caching ──────────────────────────────────────────────────────
+
+/// Background worker that proactively transcodes the first few minutes of
+/// every video so that playback can begin instantly.
+///
+/// Mirrors `run_thumb_worker` / `run_sprite_worker`: waits for a notification
+/// on `trigger`, walks the library, skips videos whose first
+/// [`PRECACHE_SEGMENTS`] segments already exist in the cache, and transcodes
+/// the missing ones.  Pauses while playback is active.
+async fn run_precache_worker(
+    library_path: PathBuf,
+    cache_dir: PathBuf,
+    hwaccel: HwAccel,
+    trigger: Arc<tokio::sync::Notify>,
+    mut playback_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        trigger.notified().await;
+
+        let entries: Vec<_> = WalkDir::new(&library_path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file() && is_video(e.path()))
+            .collect();
+
+        for entry in entries {
+            // Pause while a video is being streamed.
+            while *playback_rx.borrow() {
+                let _ = playback_rx.changed().await;
+            }
+
+            let abs = entry.path().to_path_buf();
+            let rel = abs
+                .strip_prefix(&library_path)
+                .unwrap_or(&abs)
+                .to_string_lossy()
+                .to_string();
+            let id = video_id(&rel);
+            let hls_dir = cache_dir.join(&id);
+
+            // Determine how many segments to pre-cache (capped by video duration).
+            let (duration_secs, _) = probe_video(&abs).await;
+            if duration_secs == 0 {
+                continue;
+            }
+            let total_segments = (duration_secs as f64 / SEGMENT_DURATION).ceil() as usize;
+            let segments_to_cache = PRECACHE_SEGMENTS.min(total_segments);
+
+            // Collect only the segments that are missing.
+            let missing: Vec<usize> = (0..segments_to_cache)
+                .filter(|i| !hls_dir.join(format!("seg_{:05}.ts", i)).exists())
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+
+            // Resolve the source path once for all segments of this video.
+            let resolved_path = match abs.canonicalize() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let abs_str = match resolved_path.to_str() {
+                Some(s) => s.to_owned(),
+                None => continue,
+            };
+
+            if let Err(e) = tokio::fs::create_dir_all(&hls_dir).await {
+                eprintln!("precache: cache dir error for {id}: {e}");
+                continue;
+            }
+
+            println!(
+                "→ Pre-caching {} segment(s) for {id} ({segments_to_cache} total)",
+                missing.len()
+            );
+
+            for i in missing {
+                // Re-check playback between individual segments.
+                while *playback_rx.borrow() {
+                    let _ = playback_rx.changed().await;
+                }
+
+                if let Err(e) = transcode_segment(&abs_str, &hls_dir, i, &hwaccel).await {
+                    eprintln!("precache: {e}");
+                    break; // Stop for this video on error.
+                }
             }
         }
     }
@@ -2564,6 +2708,8 @@ async fn main() -> std::io::Result<()> {
         current_id: None,
     }));
     let sprite_trigger = Arc::new(tokio::sync::Notify::new());
+    let precache_trigger = Arc::new(tokio::sync::Notify::new());
+    let precache_hwaccel = hwaccel.clone();
 
     let (playback_tx, playback_rx) = tokio::sync::watch::channel(false);
     let playback_tx = Arc::new(playback_tx);
@@ -2595,6 +2741,7 @@ async fn main() -> std::io::Result<()> {
         thumb_trigger: Arc::clone(&thumb_trigger),
         sprite_progress: Arc::clone(&sprite_progress),
         sprite_trigger: Arc::clone(&sprite_trigger),
+        precache_trigger: Arc::clone(&precache_trigger),
         hwaccel,
         playback_tx: Arc::clone(&playback_tx),
         password_protection,
@@ -2607,6 +2754,7 @@ async fn main() -> std::io::Result<()> {
     let bg_cache = Arc::clone(&video_cache);
     let bg_thumb_trigger = Arc::clone(&thumb_trigger);
     let bg_sprite_trigger = Arc::clone(&sprite_trigger);
+    let bg_precache_trigger = Arc::clone(&precache_trigger);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         interval.tick().await; // skip the immediate tick
@@ -2616,6 +2764,7 @@ async fn main() -> std::io::Result<()> {
             *bg_cache.write().expect("video cache lock poisoned") = items;
             bg_thumb_trigger.notify_one();
             bg_sprite_trigger.notify_one();
+            bg_precache_trigger.notify_one();
         }
     });
 
@@ -2649,6 +2798,20 @@ async fn main() -> std::io::Result<()> {
     }
     // ─────────────────────────────────────────────────────────────────────────
 
+    // ── Segment pre-cache background worker ──────────────────────────────────
+    {
+        let worker_library = library_path.clone();
+        let worker_cache = cache_dir.clone();
+        let worker_trigger = Arc::clone(&precache_trigger);
+        let worker_playback_rx = playback_rx.clone();
+        tokio::spawn(async move {
+            run_precache_worker(worker_library, worker_cache, precache_hwaccel, worker_trigger, worker_playback_rx).await;
+        });
+        // Kick off the first batch immediately after startup.
+        precache_trigger.notify_one();
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     // ── Playback monitor ─────────────────────────────────────────────────────
     // Every 2 seconds, check whether any video has had a recent segment
     // request.  When playback stops, the watch channel immediately wakes any
@@ -2659,6 +2822,7 @@ async fn main() -> std::io::Result<()> {
         let monitor_tx = Arc::clone(&playback_tx);
         let monitor_thumb_trigger = Arc::clone(&thumb_trigger);
         let monitor_sprite_trigger = Arc::clone(&sprite_trigger);
+        let monitor_precache_trigger = Arc::clone(&precache_trigger);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(2));
             loop {
@@ -2681,6 +2845,7 @@ async fn main() -> std::io::Result<()> {
                 if changed && !is_playing {
                     monitor_thumb_trigger.notify_one();
                     monitor_sprite_trigger.notify_one();
+                    monitor_precache_trigger.notify_one();
                 }
             }
         });
@@ -2713,11 +2878,10 @@ async fn main() -> std::io::Result<()> {
 
                 for id in idle_ids {
                     let cache_subdir = sweep_state.cache_dir.join(&id);
-                    match tokio::fs::remove_dir_all(&cache_subdir).await {
+                    match remove_non_precached_segments(&cache_subdir).await {
                         Ok(_) => {
                             println!("→ Cache evicted (idle): {id}");
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => {
                             eprintln!("cache eviction error for {id}: {e}");
                         }

@@ -661,6 +661,17 @@ struct PrecacheProgress {
     current_id: Option<String>,
 }
 
+impl PrecacheProgress {
+    /// Mark the current video as finished and advance the counter.
+    fn advance(&mut self) {
+        self.current_id = None;
+        self.current += 1;
+        if self.current >= self.total {
+            self.active = false;
+        }
+    }
+}
+
 struct AppState {
     library_path: PathBuf,
     cache_dir: PathBuf,
@@ -2256,10 +2267,7 @@ async fn run_precache_worker(
             // Determine how many segments to pre-cache (capped by video duration).
             let (duration_secs, _) = probe_video(&abs).await;
             if duration_secs == 0 {
-                let mut p = progress.write().expect("precache_progress lock poisoned");
-                p.current_id = None;
-                p.current += 1;
-                if p.current >= p.total { p.active = false; }
+                progress.write().expect("precache_progress lock poisoned").advance();
                 continue;
             }
             let total_segments = (duration_secs as f64 / SEGMENT_DURATION).ceil() as usize;
@@ -2270,10 +2278,7 @@ async fn run_precache_worker(
                 .filter(|i| !hls_dir.join(format!("seg_{:05}.ts", i)).exists())
                 .collect();
             if missing.is_empty() {
-                let mut p = progress.write().expect("precache_progress lock poisoned");
-                p.current_id = None;
-                p.current += 1;
-                if p.current >= p.total { p.active = false; }
+                progress.write().expect("precache_progress lock poisoned").advance();
                 continue;
             }
 
@@ -2281,30 +2286,21 @@ async fn run_precache_worker(
             let resolved_path = match abs.canonicalize() {
                 Ok(p) => p,
                 Err(_) => {
-                    let mut p = progress.write().expect("precache_progress lock poisoned");
-                    p.current_id = None;
-                    p.current += 1;
-                    if p.current >= p.total { p.active = false; }
+                    progress.write().expect("precache_progress lock poisoned").advance();
                     continue;
                 }
             };
             let abs_str = match resolved_path.to_str() {
                 Some(s) => s.to_owned(),
                 None => {
-                    let mut p = progress.write().expect("precache_progress lock poisoned");
-                    p.current_id = None;
-                    p.current += 1;
-                    if p.current >= p.total { p.active = false; }
+                    progress.write().expect("precache_progress lock poisoned").advance();
                     continue;
                 }
             };
 
             if let Err(e) = tokio::fs::create_dir_all(&hls_dir).await {
                 eprintln!("precache: cache dir error for {id}: {e}");
-                let mut p = progress.write().expect("precache_progress lock poisoned");
-                p.current_id = None;
-                p.current += 1;
-                if p.current >= p.total { p.active = false; }
+                progress.write().expect("precache_progress lock poisoned").advance();
                 continue;
             }
 
@@ -2325,12 +2321,7 @@ async fn run_precache_worker(
                 }
             }
 
-            let mut p = progress.write().expect("precache_progress lock poisoned");
-            p.current_id = None;
-            p.current += 1;
-            if p.current >= p.total {
-                p.active = false;
-            }
+            progress.write().expect("precache_progress lock poisoned").advance();
         }
     }
 }

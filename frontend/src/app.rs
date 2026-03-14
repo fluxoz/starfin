@@ -475,7 +475,7 @@ fn app_inner() -> Html {
     let (precache_pct, precache_label) = match *precache_progress {
         Some((current, total)) if total > 0 => (
             (current as f64 / total as f64 * 100.0) as u32,
-            format!("Pre-cache: {} / {}", current, total),
+            format!("Segments: {} / {}", current, total),
         ),
         Some(_) => (0, "Pre-caching segments…".to_string()),
         None => (0, String::new()),

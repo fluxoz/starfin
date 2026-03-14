@@ -659,7 +659,9 @@ fn app_inner() -> Html {
                     onclick={on_scroll_top}
                     aria-label="Scroll to top"
                 >
-                    { "▲" }
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                        <path d="M4 12l8-8 8 8-1.41 1.41L13 7.83V20h-2V7.83l-5.59 5.58L4 12z"/>
+                    </svg>
                 </button>
         </>
     }

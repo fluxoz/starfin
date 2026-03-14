@@ -127,8 +127,13 @@ fn app_inner() -> Html {
     // (processing badges, thumbnails, sprite availability).
     let processing_version = use_state(|| 0_u32);
 
-    // Dark mode state
-    let dark_mode = use_state(|| false);
+    // Dark mode state — default to the system's prefers-color-scheme setting
+    let dark_mode = use_state(|| {
+        web_sys::window()
+            .and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok().flatten())
+            .map(|mql| mql.matches())
+            .unwrap_or(false)
+    });
 
     // Scroll-to-top button visibility state
     let show_scroll_top = use_state(|| false);

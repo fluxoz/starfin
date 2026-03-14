@@ -117,22 +117,28 @@ body{
     flex-direction: row !important;
     height: auto !important;
     position: static !important;
-    padding: 10px 20px !important;
+    padding: 6px 16px !important;
     justify-content: space-between;
+    align-items: center;
   }
   
   .sidebar__text{
     writing-mode: horizontal-tb !important;
     text-orientation: initial !important;
     margin: 0 !important;
+    font-size: 11px !important;
   }
   
   .sidebar__logo{
+    writing-mode: horizontal-tb !important;
+    text-orientation: initial !important;
     margin-bottom: 0 !important;
+    font-size: 14px !important;
   }
   
   .sidebar__arrow{
     margin-top: 0 !important;
+    font-size: 18px !important;
   }
 }
 

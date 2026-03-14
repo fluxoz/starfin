@@ -2542,11 +2542,10 @@ async fn main() -> std::io::Result<()> {
     println!();
     println!("════════════════════════════════════════════════════════════════");
 
-    // Initial library scan at startup.
-    println!("→ Scanning library…");
-    let initial_items = scan_library(&library_path).await;
-    println!("→ Found {} video(s)", initial_items.len());
-    let video_cache: Arc<RwLock<Vec<VideoItem>>> = Arc::new(RwLock::new(initial_items));
+    // Start with an empty cache; the initial scan runs in the background so the
+    // server is immediately ready to accept connections.  The frontend will
+    // connect to /api/scan/ws on first load and stream live scan progress.
+    let video_cache: Arc<RwLock<Vec<VideoItem>>> = Arc::new(RwLock::new(Vec::new()));
 
     let thumb_progress = Arc::new(RwLock::new(ThumbProgress {
         current: 0,

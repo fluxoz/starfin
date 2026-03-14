@@ -322,6 +322,64 @@ fn app_inner() -> Html {
         });
     }
 
+    // Auto-trigger a library scan on startup so the server's initial (non-blocking)
+    // background scan streams live progress to the UI the moment the page loads.
+    {
+        let scanning = scanning.clone();
+        let items = items.clone();
+        let query = query.clone();
+        let sort_by = sort_by.clone();
+        let scan_progress = scan_progress.clone();
+        use_effect_with((), move |_| {
+            let scanning = scanning.clone();
+            let items = items.clone();
+            let query = (*query).clone();
+            let sort_by = (*sort_by).clone();
+            let scan_progress = scan_progress.clone();
+
+            scanning.set(true);
+            scan_progress.set(Some((0, 0)));
+
+            spawn_local(async move {
+                let ws_url = {
+                    let location = web_sys::window()
+                        .expect("no window")
+                        .location();
+                    let protocol = location.protocol().unwrap_or_default();
+                    let host = location.host().unwrap_or_default();
+                    let ws_proto = if protocol == "https:" { "wss" } else { "ws" };
+                    format!("{ws_proto}://{host}/api/scan/ws")
+                };
+
+                if let Ok(ws) = WebSocket::open(&ws_url) {
+                    let (_, mut read) = ws.split();
+                    while let Some(Ok(Message::Text(text))) = read.next().await {
+                        match serde_json::from_str::<api::ScanProgressData>(&text) {
+                            Ok(p) => scan_progress.set(Some((p.current, p.total))),
+                            Err(e) => web_sys::console::warn_1(
+                                &format!("startup scan: failed to parse progress message: {e}").into(),
+                            ),
+                        }
+                    }
+                    // WebSocket closed = scan complete.
+                } else {
+                    web_sys::console::warn_1(
+                        &"startup scan: could not open WebSocket connection to /api/scan/ws".into(),
+                    );
+                }
+
+                // Refresh the media list now that the cache has been populated.
+                if let Ok(data) = api::fetch_elements(&query, sort_by).await {
+                    items.set(data);
+                }
+                scan_progress.set(None);
+                scanning.set(false);
+            });
+
+            || ()
+        });
+    }
+
     let on_query_change = {
         let query = query.clone();
         Callback::from(move |v: String| query.set(v))
@@ -549,6 +607,8 @@ fn app_inner() -> Html {
 
                 if *loading {
                     <div class="notice notice--loading">{ "Loading…" }</div>
+                } else if *scanning && items.is_empty() {
+                    <div class="notice notice--loading">{ "Scanning library…" }</div>
                 } else {
                     <ElementsGrid
                         items={(*items).clone()}

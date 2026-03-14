@@ -941,7 +941,14 @@ async fn scan_ws(
             });
 
             let current = (idx + 1) as u32;
-            let msg = serde_json::json!({"current": current, "total": total}).to_string();
+            // Include the newly-scanned item so the frontend can stream
+            // cards into the grid as each file is discovered.
+            let msg = serde_json::json!({
+                "current": current,
+                "total": total,
+                "item": items.last().unwrap(),
+            })
+            .to_string();
             if session.text(msg).await.is_err() {
                 return; // Client disconnected mid-scan.
             }

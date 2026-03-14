@@ -353,9 +353,30 @@ fn app_inner() -> Html {
 
                 if let Ok(ws) = WebSocket::open(&ws_url) {
                     let (_, mut read) = ws.split();
+
+                    // Start from whatever the cache loaded (may be empty on first run).
+                    let mut accumulated: Vec<crate::models::Element> = (*items).clone();
+
                     while let Some(Ok(Message::Text(text))) = read.next().await {
                         match serde_json::from_str::<api::ScanProgressData>(&text) {
-                            Ok(p) => scan_progress.set(Some((p.current, p.total))),
+                            Ok(p) => {
+                                scan_progress.set(Some((p.current, p.total)));
+                                // Stream the new item into the grid immediately.
+                                if let Some(new_item) = p.item {
+                                    // Deduplicate: the item may already be in the cache.
+                                    if let Some(pos) = accumulated.iter().position(|e| e.id == new_item.id) {
+                                        // Update in-place in case metadata changed.
+                                        accumulated[pos] = new_item;
+                                    } else {
+                                        accumulated.push(new_item);
+                                    }
+                                    items.set(api::apply_filters(
+                                        &accumulated,
+                                        &query,
+                                        sort_by,
+                                    ));
+                                }
+                            }
                             Err(e) => web_sys::console::warn_1(
                                 &format!("startup scan: failed to parse progress message: {e}").into(),
                             ),
@@ -368,7 +389,8 @@ fn app_inner() -> Html {
                     );
                 }
 
-                // Refresh the media list now that the cache has been populated.
+                // Final refresh to ensure the displayed list matches the server's
+                // authoritative sorted/filtered view (catches any race conditions).
                 if let Ok(data) = api::fetch_elements(&query, sort_by).await {
                     items.set(data);
                 }

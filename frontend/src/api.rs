@@ -7,11 +7,14 @@ struct ElementsResponse {
     items: Vec<Element>,
 }
 
-/// Progress frame received over the scan WebSocket: `{"current":N,"total":M}`.
+/// Progress frame received over the scan WebSocket.
+/// Each message after the initial `{"current":0,"total":N}` frame also carries
+/// the newly-scanned `item` so the frontend can stream cards into the grid.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ScanProgressData {
     pub current: u32,
     pub total: u32,
+    pub item: Option<Element>,
 }
 
 /// Thumbnail progress received over the `/api/progress/ws` WebSocket.
@@ -161,32 +164,37 @@ pub async fn fetch_elements(
         .await
         .map_err(|e| format!("Invalid JSON: {e:?}"))?;
 
-    Ok(apply_filters(parsed.items, query, sort_by))
+    Ok(apply_filters(&parsed.items, query, sort_by))
 }
 
 // ── Local filtering & sorting ────────────────────────────────────────────────
 
-fn apply_filters(
-    mut data: Vec<Element>,
+pub fn apply_filters(
+    data: &[Element],
     query: &str,
     sort_by: SortBy,
 ) -> Vec<Element> {
     let q = query.trim().to_lowercase();
-    if !q.is_empty() {
-        data.retain(|e| {
-            e.title.to_lowercase().contains(&q)
-                || e.description.to_lowercase().contains(&q)
-                || e.genre.to_lowercase().contains(&q)
-                || e.director.to_lowercase().contains(&q)
-                || e.tags.iter().any(|t| t.to_lowercase().contains(&q))
-        });
-    }
+    let mut result: Vec<Element> = if q.is_empty() {
+        data.to_vec()
+    } else {
+        data.iter()
+            .filter(|e| {
+                e.title.to_lowercase().contains(&q)
+                    || e.description.to_lowercase().contains(&q)
+                    || e.genre.to_lowercase().contains(&q)
+                    || e.director.to_lowercase().contains(&q)
+                    || e.tags.iter().any(|t| t.to_lowercase().contains(&q))
+            })
+            .cloned()
+            .collect()
+    };
 
     match sort_by {
-        SortBy::DateAddedNewest => data.sort_by(|a, b| b.date_added.cmp(&a.date_added)),
-        SortBy::DateAddedOldest => data.sort_by(|a, b| a.date_added.cmp(&b.date_added)),
-        SortBy::NameAsc => data.sort_by(|a, b| a.title.cmp(&b.title)),
+        SortBy::DateAddedNewest => result.sort_by(|a, b| b.date_added.cmp(&a.date_added)),
+        SortBy::DateAddedOldest => result.sort_by(|a, b| a.date_added.cmp(&b.date_added)),
+        SortBy::NameAsc => result.sort_by(|a, b| a.title.cmp(&b.title)),
     }
 
-    data
+    result
 }

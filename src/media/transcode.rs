@@ -69,7 +69,7 @@ pub async fn transcode_segment(
 }
 
 /// Quality level for on-demand video transcoding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Quality {
     #[default]

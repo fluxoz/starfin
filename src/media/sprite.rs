@@ -97,8 +97,9 @@ pub fn generate_sprite_sheet(
             (*ptr).skip_idct =
                 ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONKEY;
             // Multi-threaded decoding (frame + slice).
-            (*ptr).thread_count = 0; // 0 = auto-detect core count
-            (*ptr).thread_type = 3; // FF_THREAD_FRAME | FF_THREAD_SLICE
+            (*ptr).thread_count = 0; // 0 = auto-detect optimal thread count
+            (*ptr).thread_type =
+                ffmpeg_next::ffi::FF_THREAD_FRAME | ffmpeg_next::ffi::FF_THREAD_SLICE;
         }
 
         match decoder_ctx.decoder().video() {

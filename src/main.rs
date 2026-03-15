@@ -1761,9 +1761,13 @@ async fn get_thumbnail_sprite(
 }
 
 /// Generates the thumbnail sprite sheet for a video using in-process
-/// ffmpeg-next decoding and the `image` crate for compositing.
+/// keyframe-only decoding via `ffmpeg-next`.
 ///
 /// Creates `{cache_dir}/{id}_thumbs/sprite.jpg`.  Returns `true` on success.
+///
+/// Always runs to completion — the outer worker loop suspends *between*
+/// tasks while playback is active, which is the correct granularity for
+/// deferring to playback without risking zombie `spawn_blocking` threads.
 async fn generate_sprite(
     id: &str,
     abs_path: &Path,
@@ -1814,7 +1818,9 @@ async fn run_sprite_worker(
     mut playback_rx: tokio::sync::watch::Receiver<bool>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    let concurrency = worker_concurrency();
+    // Sprite generation uses multi-threaded keyframe-only decoding internally,
+    // so running one video at a time maximises throughput without CPU contention.
+    let concurrency = 1_usize;
     loop {
         // Fast exit if shutdown was already signaled before we block.
         if *shutdown_rx.borrow() {

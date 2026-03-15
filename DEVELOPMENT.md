@@ -13,20 +13,25 @@ If you are not using Nix, you need the following installed:
 - **FFmpeg development libraries** — `libavcodec-dev`, `libavformat-dev`, `libavfilter-dev`, `libswscale-dev`, `libswresample-dev`, `libavutil-dev`
 - **FFmpeg CLI** — still used for GPU-accelerated encode tests at startup and subtitle format conversion
 - **pkg-config** — used by `ffmpeg-next` to locate FFmpeg libraries
-- **clang** — used by `ffmpeg-sys-next` for C bindings generation
+- **clang** and **libclang** — used by `ffmpeg-sys-next` for C bindings generation via `bindgen`. The `LIBCLANG_PATH` environment variable must point to the directory containing `libclang.so`.
 - **OpenSSL development libraries** — `libssl-dev`
 
 On Debian/Ubuntu:
 ```bash
 sudo apt install libavcodec-dev libavformat-dev libavfilter-dev \
   libswscale-dev libswresample-dev libavutil-dev libavdevice-dev \
-  ffmpeg pkg-config clang libssl-dev
+  ffmpeg pkg-config clang libclang-dev libssl-dev
 ```
 
 On Fedora:
 ```bash
-sudo dnf install ffmpeg-devel clang pkg-config openssl-devel
+sudo dnf install ffmpeg-devel clang clang-devel pkg-config openssl-devel
 ```
+
+> **Note:** If `bindgen` fails with "Unable to find libclang", set `LIBCLANG_PATH` to the directory containing `libclang.so`:
+> ```bash
+> export LIBCLANG_PATH=/usr/lib/llvm-18/lib  # adjust for your LLVM version
+> ```
 
 ## Entering the Development Environment
 

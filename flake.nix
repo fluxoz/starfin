@@ -153,6 +153,9 @@
       nativeBuildInputs = with pkgs; [ pkg-config clang ];
       buildInputs = with pkgs; [ ffmpeg openssl ];
 
+      # bindgen (used by ffmpeg-sys-next) needs libclang.so at build time.
+      LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+
       # Populate frontend/dist/ so rust-embed can embed the assets.
       preBuild = ''
         mkdir -p frontend/dist
@@ -183,6 +186,13 @@
 
     # ── Development shell ─────────────────────────────────────────────────────
     devShells.${system}.default = mkShell {
+      # pkg-config and clang must be in nativeBuildInputs so their setup hooks
+      # fire and wire PKG_CONFIG_PATH from the entries in buildInputs.
+      nativeBuildInputs = [
+        pkg-config
+        clang
+      ];
+
       buildInputs = [
         # rust toolchain
         rustWithWasm
@@ -197,13 +207,16 @@
         tmux
         trunk
         wasm-pack
-        # ffmpeg libraries (for ffmpeg-next linking) + CLI (for HW encode tests)
+        # ffmpeg: .dev output exposes libavutil.pc etc. for ffmpeg-sys-next,
+        # the main output provides the CLI binary for HW encode tests.
         ffmpeg
-        pkg-config
-        clang
+        ffmpeg.dev
+        openssl
       ];
 
-      # Add critical environment variables for linking
+      # bindgen (used by ffmpeg-sys-next) needs libclang.so at build time.
+      LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
+
       shellHook = ''
         export SHELL=/run/current-system/sw/bin/bash
       '';

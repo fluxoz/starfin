@@ -922,8 +922,14 @@ async fn run_thumb_worker(
             if join_set.is_empty() {
                 break;
             }
-            // Collect the next completed task.
-            if let Some(Ok((id, _ok))) = join_set.join_next().await {
+            // Collect the next completed task.  Use select! so a shutdown
+            // signal wakes us immediately rather than waiting for the
+            // in-flight spawn_blocking to finish.
+            let next = tokio::select! {
+                r = join_set.join_next() => r,
+                _ = shutdown_rx.changed() => { return; }
+            };
+            if let Some(Ok((id, _ok))) = next {
                 let mut p = progress.write();
                 p.current_ids.remove(&id);
                 p.current += 1;
@@ -999,8 +1005,14 @@ async fn run_thumb_worker(
             if join_set.is_empty() {
                 break;
             }
-            // Collect the next completed task.
-            if let Some(Ok((id, _ok))) = join_set.join_next().await {
+            // Collect the next completed task.  Use select! so a shutdown
+            // signal wakes us immediately rather than waiting for the
+            // in-flight spawn_blocking to finish.
+            let next = tokio::select! {
+                r = join_set.join_next() => r,
+                _ = shutdown_rx.changed() => { return; }
+            };
+            if let Some(Ok((id, _ok))) = next {
                 let mut p = progress.write();
                 p.current_ids.remove(&id);
                 p.current += 1;
@@ -1828,8 +1840,14 @@ async fn run_sprite_worker(
             if join_set.is_empty() {
                 break;
             }
-            // Collect the next completed task.
-            if let Some(Ok((id, _ok))) = join_set.join_next().await {
+            // Collect the next completed task.  Use select! so a shutdown
+            // signal wakes us immediately rather than waiting for the
+            // in-flight spawn_blocking to finish.
+            let next = tokio::select! {
+                r = join_set.join_next() => r,
+                _ = shutdown_rx.changed() => { return; }
+            };
+            if let Some(Ok((id, _ok))) = next {
                 let mut p = progress.write();
                 p.current_ids.remove(&id);
                 p.current += 1;
@@ -2039,7 +2057,14 @@ async fn run_precache_worker(
                     }
                 };
 
-                if let Err(e) = transcode_segment(&abs_str, &hls_dir, i, &hwaccel, Quality::High).await {
+                // Run the transcode inside a select! so a shutdown signal
+                // wakes us immediately rather than waiting for the full
+                // in-process ffmpeg encode to finish.
+                let transcode_result = tokio::select! {
+                    r = transcode_segment(&abs_str, &hls_dir, i, &hwaccel, Quality::High) => r,
+                    _ = shutdown_rx.changed() => { return; }
+                };
+                if let Err(e) = transcode_result {
                     error!(video_id = %id, segment = i, error = %e, "precache: segment transcode failed");
                     break; // Stop for this video on error.
                 }
@@ -2852,6 +2877,22 @@ async fn main() -> std::io::Result<()> {
         semaphore_signal.close();
         // Stop accepting new HTTP requests and drain in-flight ones.
         server_handle.stop(true).await;
+    });
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── Force-exit watchdog ───────────────────────────────────────────────────
+    // spawn_blocking threads (in-process ffmpeg transcodes) cannot be cancelled
+    // mid-execution; they keep the tokio runtime alive until they finish.  This
+    // watchdog waits for the shutdown signal, gives the runtime a brief grace
+    // period to drain naturally, then calls process::exit(0) to guarantee a
+    // timely exit regardless of how long any running transcode takes.
+    let mut watchdog_shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        // Wait until the shutdown signal fires.
+        let _ = watchdog_shutdown_rx.wait_for(|&v| v).await;
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        info!("shutdown grace period elapsed, forcing exit");
+        std::process::exit(0);
     });
     // ─────────────────────────────────────────────────────────────────────────
 

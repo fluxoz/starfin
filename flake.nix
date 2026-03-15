@@ -126,7 +126,7 @@
         # Transform index.html: replace data-trunk directives with standard
         # HTML and inject the WASM module initialisation script.
         sed \
-          -e 's|<link data-trunk rel="css" href="\([^"]*\)" />|<link rel="stylesheet" href="\1" />|g' \
+          -e 's|<link data-trunk rel="css" href="\([^\"]*\)" />|<link rel="stylesheet" href="\1" />|g' \
           -e '/data-trunk rel="copy-dir"/d' \
           -e '/data-trunk rel="copy-file"/d' \
           -e "s|</head>|<script type=\"module\">import init from '/starfin-frontend.js'; init();</script>\n</head>|" \
@@ -139,12 +139,12 @@
     #
     # ffmpeg-sys-next 7.1.3's build.rs unconditionally includes
     # <libavcodec/avfft.h>, but FFmpeg ≥ 7.0 removed that header.  NixOS 25.11
-    # defaults to FFmpeg 8.0.  We wrap ffmpeg.dev to add a stub avfft.h so the
-    # build script's search_include() finds it via pkg-config include paths
-    # instead of falling back to the non-existent /usr/include/.
+    # defaults to FFmpeg 8.0.  We wrap ffmpeg.dev to add a stub avfft.h so
+    # ffmpeg-sys-next's build script finds it immediately via FFMPEG_INCLUDE_DIR
+    # (checked before pkg-config / /usr/include fallback).
     #
-    # The .pc files are rewritten so pkg-config reports our patched include
-    # tree, which is where the build script looks for header existence.
+    # The .pc files are also rewritten so pkg-config reports our patched include
+    # tree as a belt-and-suspenders fallback.
     ffmpegDev = pkgs.runCommand "ffmpeg-dev-compat" {} ''
       # Mirror ffmpeg.dev with symlinks (directories are real, files are links)
       cp -rs --no-preserve=mode ${pkgs.ffmpeg.dev} $out
@@ -183,6 +183,13 @@
 
       nativeBuildInputs = with pkgs; [ pkg-config clang ];
       buildInputs = with pkgs; [ ffmpeg openssl ] ++ [ ffmpegDev ];
+
+      # Tell ffmpeg-sys-next's build.rs exactly where to find FFmpeg headers.
+      # This is checked first (before pkg-config /usr/include fallback) and
+      # prevents the build script from resolving to the non-existent
+      # /usr/include/libavcodec/avfft.h path that causes the bindgen failure.
+      FFMPEG_INCLUDE_DIR = "${ffmpegDev}/include";
+      FFMPEG_LIB_DIR = "${pkgs.ffmpeg.lib}/lib";
 
       # bindgen (used by ffmpeg-sys-next) needs libclang.so at build time.
       LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
@@ -250,6 +257,10 @@
         ffmpegDev
         openssl
       ];
+
+      # Tell ffmpeg-sys-next's build.rs exactly where to find FFmpeg headers.
+      FFMPEG_INCLUDE_DIR = "${ffmpegDev}/include";
+      FFMPEG_LIB_DIR = "${pkgs.ffmpeg.lib}/lib";
 
       # bindgen (used by ffmpeg-sys-next) needs libclang.so at build time.
       LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";

@@ -327,6 +327,11 @@ struct AppState {
     precache_trigger: Arc<tokio::sync::Notify>,
     /// Detected hardware acceleration backend (detected once at startup).
     hwaccel: HwAccel,
+    /// Semaphore limiting the number of concurrent segment transcode operations.
+    /// Shared between the on-demand segment endpoint and the pre-cache worker.
+    /// The limit is set at startup from `TRANSCODE_CONCURRENCY` (default:
+    /// available CPU parallelism).
+    transcode_semaphore: Arc<tokio::sync::Semaphore>,
     /// Broadcasts playback state (`true` = playing, `false` = idle) to all
     /// background workers so they can pause while a video is being streamed.
     playback_tx: Arc<tokio::sync::watch::Sender<bool>>,
@@ -1311,6 +1316,26 @@ async fn get_segment(
             }
         }
     } else {
+        // We own the transcode job — acquire a permit to bound concurrent
+        // transcode operations before starting.  The permit is released
+        // automatically when `_permit` is dropped.
+        let _permit = match state.transcode_semaphore.acquire().await {
+            Ok(p) => p,
+            Err(e) => {
+                error!(error = %e, "transcode semaphore closed during request — server may be shutting down");
+                // Broadcast failure to any subscribers waiting on this key.
+                let tx = state
+                    .segment_inflight
+                    .lock()
+                    .expect("Failed to acquire segment_inflight lock (poisoned) while removing failed transcode job")
+                    .remove(&inflight_key);
+                if let Some(tx) = tx {
+                    let _ = tx.send(Some(Err(format!("semaphore closed"))));
+                }
+                return HttpResponse::InternalServerError().body("transcode unavailable");
+            }
+        };
+
         // We own the transcode job.
         let result = transcode_segment(&abs_str, &hls_dir, seg_index, &state.hwaccel, quality).await;
 
@@ -1353,6 +1378,17 @@ async fn get_segment(
 }
 
 // ── Cache management ─────────────────────────────────────────────────────────
+
+/// `GET /api/debug/transcode` — transcode semaphore diagnostics.
+///
+/// Returns the number of currently available transcode permits so that
+/// operators can observe concurrency headroom under load.
+async fn get_transcode_debug(state: web::Data<AppState>) -> impl Responder {
+    let available = state.transcode_semaphore.available_permits();
+    HttpResponse::Ok().json(serde_json::json!({
+        "available_permits": available,
+    }))
+}
 
 /// `GET /api/hwaccel` — returns the detected hardware acceleration backend.
 async fn get_hwaccel(state: web::Data<AppState>) -> impl Responder {
@@ -1740,6 +1776,7 @@ async fn run_precache_worker(
     progress: Arc<RwLock<PrecacheProgress>>,
     trigger: Arc<tokio::sync::Notify>,
     mut playback_rx: tokio::sync::watch::Receiver<bool>,
+    semaphore: Arc<tokio::sync::Semaphore>,
 ) {
     loop {
         trigger.notified().await;
@@ -1886,6 +1923,16 @@ async fn run_precache_worker(
                 while *playback_rx.borrow() {
                     let _ = playback_rx.changed().await;
                 }
+
+                // Acquire a transcode permit to bound concurrent operations.
+                // The permit is released when `_permit` is dropped at loop end.
+                let _permit = match semaphore.acquire().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!(error = %e, "precache: transcode semaphore closed — worker terminating");
+                        break;
+                    }
+                };
 
                 if let Err(e) = transcode_segment(&abs_str, &hls_dir, i, &hwaccel, Quality::High).await {
                     error!(video_id = %id, segment = i, error = %e, "precache: segment transcode failed");
@@ -2347,6 +2394,24 @@ async fn main() -> std::io::Result<()> {
     let (playback_tx, playback_rx) = tokio::sync::watch::channel(false);
     let playback_tx = Arc::new(playback_tx);
 
+    // ── Transcode concurrency semaphore ──────────────────────────────────
+    // Limits the number of simultaneous segment transcode operations so that
+    // the system is not overloaded.  Defaults to the number of available CPU
+    // threads; override with the TRANSCODE_CONCURRENCY environment variable.
+    let transcode_concurrency = std::env::var("TRANSCODE_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok().filter(|&n| n > 0))
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                // Fall back to 4 if the OS cannot report parallelism — a
+                // reasonable minimum that avoids saturating most systems while
+                // still allowing meaningful concurrent load.
+                .unwrap_or(4)
+        });
+    info!(limit = transcode_concurrency, "max concurrent transcodes (set TRANSCODE_CONCURRENCY to override)");
+    let transcode_semaphore = Arc::new(tokio::sync::Semaphore::new(transcode_concurrency));
+
     // ── Password protection ──────────────────────────────────────────────
     let password_protection = std::env::var("PASSWORD_PROTECTION")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
@@ -2378,6 +2443,7 @@ async fn main() -> std::io::Result<()> {
         precache_progress: Arc::clone(&precache_progress),
         precache_trigger: Arc::clone(&precache_trigger),
         hwaccel,
+        transcode_semaphore: Arc::clone(&transcode_semaphore),
         playback_tx: Arc::clone(&playback_tx),
         password_protection,
         password_hash_path,
@@ -2465,8 +2531,9 @@ async fn main() -> std::io::Result<()> {
         let worker_progress = Arc::clone(&precache_progress);
         let worker_trigger = Arc::clone(&precache_trigger);
         let worker_playback_rx = playback_rx.clone();
+        let worker_semaphore = Arc::clone(&transcode_semaphore);
         tokio::spawn(async move {
-            run_precache_worker(worker_library, worker_cache, precache_hwaccel, worker_progress, worker_trigger, worker_playback_rx).await;
+            run_precache_worker(worker_library, worker_cache, precache_hwaccel, worker_progress, worker_trigger, worker_playback_rx, worker_semaphore).await;
         });
         // Kick off the first batch immediately after startup.
         precache_trigger.notify_one();
@@ -2568,6 +2635,7 @@ async fn main() -> std::io::Result<()> {
             .route("/api/auth/login", web::post().to(login))
             // ── Protected API routes ─────────────────────────────────────
             .route("/api/health", web::get().to(|| async { "ok" }))
+            .route("/api/debug/transcode", web::get().to(get_transcode_debug))
             .route("/api/hwaccel", web::get().to(get_hwaccel))
             .route("/api/quality-options", web::get().to(get_quality_options))
             .route("/api/scan/ws", web::get().to(scan_ws))

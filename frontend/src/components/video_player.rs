@@ -21,12 +21,13 @@ const SEGMENT_DURATION_F: f64 = 6.0;
 const PRECACHE_SEGMENTS_F: f64 = 20.0;
 const SPARSE_CACHE_STRIDE_F: f64 = 3.0;
 
-/// Snaps a seek time (in seconds) down to the nearest pre-cached seek anchor.
+/// Snaps a seek time (in seconds) **down** to the nearest pre-cached seek anchor.
 ///
-/// Within the dense pre-cache window (`PRECACHE_SEGMENTS_F * SEGMENT_DURATION_F`
-/// seconds) every segment is cached so no snapping is needed.  Beyond that
-/// window, only every `SPARSE_CACHE_STRIDE_F`-th segment is cached, so we
-/// round down to the nearest anchor boundary.
+/// Use this for **forward** seeks.  Within the dense pre-cache window
+/// (`PRECACHE_SEGMENTS_F * SEGMENT_DURATION_F` seconds) every segment is
+/// cached so no snapping is needed.  Beyond that window, only every
+/// `SPARSE_CACHE_STRIDE_F`-th segment is cached, so we round down to the
+/// nearest anchor boundary.
 fn snap_to_seek_anchor(time: f64) -> f64 {
     if time <= 0.0 {
         return 0.0;
@@ -37,13 +38,46 @@ fn snap_to_seek_anchor(time: f64) -> f64 {
         return time;
     }
     // Beyond the dense window — snap down to the nearest sparse anchor.
-    // `(seg_index / stride) * stride` always lands on a cached index: either
-    // inside the dense window (all indices < PRECACHE_SEGMENTS are cached) or
-    // on a stride multiple (which is a sparse anchor).
     let seg_index = (time / SEGMENT_DURATION_F).floor() as usize;
     let stride = SPARSE_CACHE_STRIDE_F as usize;
     let anchor_index = (seg_index / stride) * stride;
     anchor_index as f64 * SEGMENT_DURATION_F
+}
+
+/// Snaps a seek time (in seconds) to the nearest pre-cached seek anchor for a
+/// **backward** seek.
+///
+/// Unlike `snap_to_seek_anchor` (which always snaps DOWN / further back),
+/// this function first tries to snap **up** to the nearest anchor that is
+/// ≥ `time` yet strictly less than `current_time`, minimising how far the
+/// player overshoots the intended target.  Falls back to snapping down when
+/// the upward candidate would reach or exceed `current_time` (i.e. there is
+/// no anchor between the target and the current position).
+///
+/// Within the dense window every segment is cached so no snapping is needed.
+fn snap_to_seek_anchor_back(time: f64, current_time: f64) -> f64 {
+    if time <= 0.0 {
+        return 0.0;
+    }
+    let dense_window = PRECACHE_SEGMENTS_F * SEGMENT_DURATION_F; // 120 seconds
+    if time < dense_window {
+        return time;
+    }
+    let stride = SPARSE_CACHE_STRIDE_F as usize;
+    let seg_index = (time / SEGMENT_DURATION_F) as usize;
+    let anchor_down_idx = (seg_index / stride) * stride;
+    let anchor_up_idx = anchor_down_idx + stride;
+
+    let time_down = anchor_down_idx as f64 * SEGMENT_DURATION_F;
+    let time_up = anchor_up_idx as f64 * SEGMENT_DURATION_F;
+
+    // Prefer the closer (upward) anchor only when it still falls strictly
+    // behind the current playback position — otherwise fall back to down.
+    if time_up < current_time && (time_up - time) <= (time - time_down) {
+        time_up
+    } else {
+        time_down
+    }
 }
 
 // ── Stream quality options ────────────────────────────────────────────────────
@@ -717,7 +751,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     "ArrowLeft" => {
                         e.prevent_default();
                         let skip = if e.shift_key() { 10.0 } else { 5.0 };
-                        video.set_current_time(snap_to_seek_anchor((video.current_time() - skip).max(0.0)));
+                        let current = video.current_time();
+                        video.set_current_time(snap_to_seek_anchor_back((current - skip).max(0.0), current));
                         skip_indicator.set(Some(("backward".to_string(), 25.0)));
                         let skip_indicator_clone = skip_indicator.clone();
                         spawn_local(async move {
@@ -727,7 +762,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     }
                     "j" | "J" => {
                         e.prevent_default();
-                        video.set_current_time(snap_to_seek_anchor((video.current_time() - 10.0).max(0.0)));
+                        let current = video.current_time();
+                        video.set_current_time(snap_to_seek_anchor_back((current - 10.0).max(0.0), current));
                         skip_indicator.set(Some(("backward".to_string(), 25.0)));
                         let skip_indicator_clone = skip_indicator.clone();
                         spawn_local(async move {
@@ -1192,6 +1228,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
             let seek_ratio = (click_x / width).clamp(0.0, 1.0);
             let initial_seek_time = seek_ratio * video_duration;
+            // Capture the video's position at drag-start so the mouseup closure
+            // can determine seek direction for direction-aware anchor snapping.
+            let drag_start_time = video.current_time();
 
             is_dragging.set(true);
             drag_time.set(initial_seek_time);
@@ -1239,7 +1278,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 let seek_time = shared_seek_time_up.get();
 
                 if let Some(video) = video_ref_up.cast::<HtmlVideoElement>() {
-                    video.set_current_time(snap_to_seek_anchor(seek_time));
+                    let snapped = if seek_time < drag_start_time {
+                        snap_to_seek_anchor_back(seek_time, drag_start_time)
+                    } else {
+                        snap_to_seek_anchor(seek_time)
+                    };
+                    video.set_current_time(snapped);
                 }
 
                 if let Some((mousemove_closure, mouseup_closure)) =
@@ -1285,11 +1329,17 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             }
             if let Some(progress_el) = progress_ref.cast::<web_sys::HtmlElement>() {
                 if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
+                    let current = video.current_time();
                     let video_duration = video.duration();
                     if let Some((seek_time, _)) =
                         calculate_seek_time(&e, &progress_el, video_duration)
                     {
-                        video.set_current_time(snap_to_seek_anchor(seek_time));
+                        let snapped = if seek_time < current {
+                            snap_to_seek_anchor_back(seek_time, current)
+                        } else {
+                            snap_to_seek_anchor(seek_time)
+                        };
+                        video.set_current_time(snapped);
                     }
                 }
             }
@@ -1334,7 +1384,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
                     if relative_x < width / 3.0 {
                         // Left third - seek backward 10 seconds
-                        video.set_current_time(snap_to_seek_anchor((video.current_time() - 10.0).max(0.0)));
+                        let current = video.current_time();
+                        video.set_current_time(snap_to_seek_anchor_back((current - 10.0).max(0.0), current));
                         skip_indicator.set(Some(("backward".to_string(), 25.0)));
                         let skip_indicator_clone = skip_indicator.clone();
                         spawn_local(async move {

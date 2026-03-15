@@ -804,39 +804,38 @@ async fn run_thumb_worker(
         }
 
         let mut join_set: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
-        let mut iter = quick_entries.into_iter();
+        let mut iter = quick_entries.into_iter().peekable();
         loop {
-            // Fill up to `concurrency` slots, honouring the playback pause.
-            while join_set.len() < concurrency {
-                while *playback_rx.borrow() {
-                    let _ = playback_rx.changed().await;
+            // Pause while a video is being streamed.  In-flight tasks abort via
+            // their cloned kill receiver; their results are collected below.
+            while *playback_rx.borrow() {
+                let _ = playback_rx.changed().await;
+            }
+            // Fill empty slots up to the concurrency limit.
+            while join_set.len() < concurrency && iter.peek().is_some() {
+                let entry = iter.next().unwrap();
+                let abs = entry.path().to_path_buf();
+                let rel = abs
+                    .strip_prefix(&library_path)
+                    .unwrap_or(&abs)
+                    .to_string_lossy()
+                    .to_string();
+                let id = video_id(&rel);
+                {
+                    let mut p = progress.write().expect("thumb_progress lock poisoned");
+                    p.current_ids.insert(id.clone());
                 }
-                match iter.next() {
-                    None => break,
-                    Some(entry) => {
-                        let abs = entry.path().to_path_buf();
-                        let rel = abs
-                            .strip_prefix(&library_path)
-                            .unwrap_or(&abs)
-                            .to_string_lossy()
-                            .to_string();
-                        let id = video_id(&rel);
-                        {
-                            let mut p = progress.write().expect("thumb_progress lock poisoned");
-                            p.current_ids.insert(id.clone());
-                        }
-                        let cache_dir = cache_dir.clone();
-                        let mut kill = playback_rx.clone();
-                        join_set.spawn(async move {
-                            let ok = generate_quick_thumbnail(&id, &abs, &cache_dir, &mut kill).await;
-                            (id, ok)
-                        });
-                    }
-                }
+                let cache_dir = cache_dir.clone();
+                let mut kill = playback_rx.clone();
+                join_set.spawn(async move {
+                    let ok = generate_quick_thumbnail(&id, &abs, &cache_dir, &mut kill).await;
+                    (id, ok)
+                });
             }
             if join_set.is_empty() {
                 break;
             }
+            // Collect the next completed task.
             if let Some(Ok((id, _ok))) = join_set.join_next().await {
                 let mut p = progress.write().expect("thumb_progress lock poisoned");
                 p.current_ids.remove(&id);
@@ -872,39 +871,38 @@ async fn run_thumb_worker(
         }
 
         let mut join_set: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
-        let mut iter = deep_entries.into_iter();
+        let mut iter = deep_entries.into_iter().peekable();
         loop {
-            // Fill up to `concurrency` slots, honouring the playback pause.
-            while join_set.len() < concurrency {
-                while *playback_rx.borrow() {
-                    let _ = playback_rx.changed().await;
+            // Pause while a video is being streamed.  In-flight tasks abort via
+            // their cloned kill receiver; their results are collected below.
+            while *playback_rx.borrow() {
+                let _ = playback_rx.changed().await;
+            }
+            // Fill empty slots up to the concurrency limit.
+            while join_set.len() < concurrency && iter.peek().is_some() {
+                let entry = iter.next().unwrap();
+                let abs = entry.path().to_path_buf();
+                let rel = abs
+                    .strip_prefix(&library_path)
+                    .unwrap_or(&abs)
+                    .to_string_lossy()
+                    .to_string();
+                let id = video_id(&rel);
+                {
+                    let mut p = progress.write().expect("thumb_progress lock poisoned");
+                    p.current_ids.insert(id.clone());
                 }
-                match iter.next() {
-                    None => break,
-                    Some(entry) => {
-                        let abs = entry.path().to_path_buf();
-                        let rel = abs
-                            .strip_prefix(&library_path)
-                            .unwrap_or(&abs)
-                            .to_string_lossy()
-                            .to_string();
-                        let id = video_id(&rel);
-                        {
-                            let mut p = progress.write().expect("thumb_progress lock poisoned");
-                            p.current_ids.insert(id.clone());
-                        }
-                        let cache_dir = cache_dir.clone();
-                        let mut kill = playback_rx.clone();
-                        join_set.spawn(async move {
-                            let ok = generate_deep_thumbnail(&id, &abs, &cache_dir, &mut kill).await;
-                            (id, ok)
-                        });
-                    }
-                }
+                let cache_dir = cache_dir.clone();
+                let mut kill = playback_rx.clone();
+                join_set.spawn(async move {
+                    let ok = generate_deep_thumbnail(&id, &abs, &cache_dir, &mut kill).await;
+                    (id, ok)
+                });
             }
             if join_set.is_empty() {
                 break;
             }
+            // Collect the next completed task.
             if let Some(Ok((id, _ok))) = join_set.join_next().await {
                 let mut p = progress.write().expect("thumb_progress lock poisoned");
                 p.current_ids.remove(&id);
@@ -1606,39 +1604,38 @@ async fn run_sprite_worker(
         }
 
         let mut join_set: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
-        let mut iter = entries.into_iter();
+        let mut iter = entries.into_iter().peekable();
         loop {
-            // Fill up to `concurrency` slots, honouring the playback pause.
-            while join_set.len() < concurrency {
-                while *playback_rx.borrow() {
-                    let _ = playback_rx.changed().await;
+            // Pause while a video is being streamed.  In-flight tasks abort via
+            // their cloned kill receiver; their results are collected below.
+            while *playback_rx.borrow() {
+                let _ = playback_rx.changed().await;
+            }
+            // Fill empty slots up to the concurrency limit.
+            while join_set.len() < concurrency && iter.peek().is_some() {
+                let entry = iter.next().unwrap();
+                let abs = entry.path().to_path_buf();
+                let rel = abs
+                    .strip_prefix(&library_path)
+                    .unwrap_or(&abs)
+                    .to_string_lossy()
+                    .to_string();
+                let id = video_id(&rel);
+                {
+                    let mut p = progress.write().expect("sprite_progress lock poisoned");
+                    p.current_ids.insert(id.clone());
                 }
-                match iter.next() {
-                    None => break,
-                    Some(entry) => {
-                        let abs = entry.path().to_path_buf();
-                        let rel = abs
-                            .strip_prefix(&library_path)
-                            .unwrap_or(&abs)
-                            .to_string_lossy()
-                            .to_string();
-                        let id = video_id(&rel);
-                        {
-                            let mut p = progress.write().expect("sprite_progress lock poisoned");
-                            p.current_ids.insert(id.clone());
-                        }
-                        let cache_dir = cache_dir.clone();
-                        let mut kill = playback_rx.clone();
-                        join_set.spawn(async move {
-                            let ok = generate_sprite(&id, &abs, &cache_dir, &mut kill).await;
-                            (id, ok)
-                        });
-                    }
-                }
+                let cache_dir = cache_dir.clone();
+                let mut kill = playback_rx.clone();
+                join_set.spawn(async move {
+                    let ok = generate_sprite(&id, &abs, &cache_dir, &mut kill).await;
+                    (id, ok)
+                });
             }
             if join_set.is_empty() {
                 break;
             }
+            // Collect the next completed task.
             if let Some(Ok((id, _ok))) = join_set.join_next().await {
                 let mut p = progress.write().expect("sprite_progress lock poisoned");
                 p.current_ids.remove(&id);

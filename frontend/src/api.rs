@@ -25,7 +25,8 @@ pub struct ThumbProgressMsg {
     pub active: bool,
     pub phase: String,
     /// The video IDs currently being thumbnailed (may be multiple when running
-    /// in parallel).
+    /// in parallel).  Defaults to an empty list so that messages from an older
+    /// backend that omits this field still deserialize successfully.
     #[serde(default)]
     pub current_ids: Vec<String>,
 }
@@ -37,7 +38,8 @@ pub struct SpriteProgressMsg {
     pub total: u32,
     pub active: bool,
     /// The video IDs currently getting sprite sheets (may be multiple when
-    /// running in parallel).
+    /// running in parallel).  Defaults to an empty list so that messages from
+    /// an older backend that omits this field still deserialize successfully.
     #[serde(default)]
     pub current_ids: Vec<String>,
 }

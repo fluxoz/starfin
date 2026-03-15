@@ -390,6 +390,11 @@ async fn probe_video(path: &Path) -> (u32, FfprobeMeta) {
 
 // ── Library scanning ─────────────────────────────────────────────────────────
 
+/// Maximum number of `probe_video` calls that run concurrently during a library
+/// scan.  Keeping this bounded avoids thrashing the disk and the blocking
+/// thread-pool when a library has thousands of files.
+const SCAN_CONCURRENCY: usize = 8;
+
 /// Path of the persisted video-index file inside `cache_dir`.
 fn video_index_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(".video_index.json")
@@ -435,7 +440,9 @@ async fn scan_library(library_path: &Path) -> Vec<VideoItem> {
         .filter(|e| e.file_type().is_file() && is_video(e.path()))
         .collect();
 
-    let mut items = Vec::new();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(SCAN_CONCURRENCY));
+    let mut tasks: tokio::task::JoinSet<VideoItem> = tokio::task::JoinSet::new();
+
     for entry in entries {
         let abs = entry.path().to_path_buf();
         let rel = abs
@@ -452,20 +459,32 @@ async fn scan_library(library_path: &Path) -> Vec<VideoItem> {
             .replace(['.', '_', '-'], " ");
 
         let id = video_id(&rel);
-        let (duration_secs, meta) = probe_video(&abs).await;
+        let sem = Arc::clone(&semaphore);
 
-        items.push(VideoItem {
-            id,
-            title: meta.title.unwrap_or(fallback_title),
-            description: String::new(),
-            genre: meta.genre.unwrap_or_default(),
-            tags: vec![],
-            rating: 0.0,
-            year: meta.year.unwrap_or(0),
-            duration_secs,
-            director: meta.director.unwrap_or_default(),
-            date_added: file_date_added(&abs),
+        tasks.spawn(async move {
+            let _permit = sem.acquire().await.expect("semaphore closed");
+            let (duration_secs, meta) = probe_video(&abs).await;
+            VideoItem {
+                id,
+                title: meta.title.unwrap_or(fallback_title),
+                description: String::new(),
+                genre: meta.genre.unwrap_or_default(),
+                tags: vec![],
+                rating: 0.0,
+                year: meta.year.unwrap_or(0),
+                duration_secs,
+                director: meta.director.unwrap_or_default(),
+                date_added: file_date_added(&abs),
+            }
         });
+    }
+
+    let mut items = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(item) => items.push(item),
+            Err(e) => eprintln!("⚠ probe task panicked during library scan: {e}"),
+        }
     }
     items
 }
@@ -534,7 +553,11 @@ async fn scan_ws(
         }
 
         let mut items = Vec::new();
-        for (idx, entry) in entries.into_iter().enumerate() {
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(SCAN_CONCURRENCY));
+        let mut tasks: tokio::task::JoinSet<VideoItem> = tokio::task::JoinSet::new();
+
+        for entry in entries {
             let abs = entry.path().to_path_buf();
             let rel = abs
                 .strip_prefix(&library_path)
@@ -549,30 +572,45 @@ async fn scan_ws(
                 .replace(['.', '_', '-'], " ");
 
             let id = video_id(&rel);
-            let (duration_secs, meta) = probe_video(&abs).await;
+            let sem = Arc::clone(&semaphore);
 
-            items.push(VideoItem {
-                id,
-                title: meta.title.unwrap_or(fallback_title),
-                description: String::new(),
-                genre: meta.genre.unwrap_or_default(),
-                tags: vec![],
-                rating: 0.0,
-                year: meta.year.unwrap_or(0),
-                duration_secs,
-                director: meta.director.unwrap_or_default(),
-                date_added: file_date_added(&abs),
+            tasks.spawn(async move {
+                let _permit = sem.acquire().await.expect("semaphore closed");
+                let (duration_secs, meta) = probe_video(&abs).await;
+                VideoItem {
+                    id,
+                    title: meta.title.unwrap_or(fallback_title),
+                    description: String::new(),
+                    genre: meta.genre.unwrap_or_default(),
+                    tags: vec![],
+                    rating: 0.0,
+                    year: meta.year.unwrap_or(0),
+                    duration_secs,
+                    director: meta.director.unwrap_or_default(),
+                    date_added: file_date_added(&abs),
+                }
             });
+        }
 
-            let current = (idx + 1) as u32;
+        let mut current = 0u32;
+        while let Some(result) = tasks.join_next().await {
+            let item = match result {
+                Ok(item) => item,
+                Err(e) => {
+                    eprintln!("⚠ probe task panicked during scan_ws: {e}");
+                    continue;
+                }
+            };
+            current += 1;
             // Include the newly-scanned item so the frontend can stream
             // cards into the grid as each file is discovered.
             let msg = serde_json::json!({
                 "current": current,
                 "total": total,
-                "item": items.last().unwrap(),
+                "item": &item,
             })
             .to_string();
+            items.push(item);
             if session.text(msg).await.is_err() {
                 return; // Client disconnected mid-scan.
             }

@@ -401,6 +401,11 @@ async fn probe_video(path: &Path) -> (u32, FfprobeMeta) {
 
 // ── Library scanning ─────────────────────────────────────────────────────────
 
+/// Maximum number of `probe_video` calls that run concurrently during a library
+/// scan.  Keeping this bounded avoids thrashing the disk and the blocking
+/// thread-pool when a library has thousands of files.
+const SCAN_CONCURRENCY: usize = 8;
+
 /// Path of the persisted video-index file inside `cache_dir`.
 fn video_index_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(".video_index.json")
@@ -466,8 +471,11 @@ async fn scan_library(library_path: &Path) -> (Vec<VideoItem>, VideoPathIndex) {
         .filter(|e| e.file_type().is_file() && is_video(e.path()))
         .collect();
 
-    let mut items = Vec::new();
-    let mut index = HashMap::new();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(SCAN_CONCURRENCY));
+    // Each task returns the VideoItem plus its (abs, rel) paths for the index.
+    let mut tasks: tokio::task::JoinSet<(VideoItem, PathBuf, String)> =
+        tokio::task::JoinSet::new();
+
     for entry in entries {
         let abs = entry.path().to_path_buf();
         let rel = abs
@@ -484,21 +492,37 @@ async fn scan_library(library_path: &Path) -> (Vec<VideoItem>, VideoPathIndex) {
             .replace(['.', '_', '-'], " ");
 
         let id = video_id(&rel);
-        let (duration_secs, meta) = probe_video(&abs).await;
+        let sem = Arc::clone(&semaphore);
 
-        index.insert(id.clone(), (abs.clone(), rel.clone()));
-        items.push(VideoItem {
-            id,
-            title: meta.title.unwrap_or(fallback_title),
-            description: String::new(),
-            genre: meta.genre.unwrap_or_default(),
-            tags: vec![],
-            rating: 0.0,
-            year: meta.year.unwrap_or(0),
-            duration_secs,
-            director: meta.director.unwrap_or_default(),
-            date_added: file_date_added(&abs),
+        tasks.spawn(async move {
+            let _permit = sem.acquire().await.expect("semaphore closed");
+            let (duration_secs, meta) = probe_video(&abs).await;
+            let item = VideoItem {
+                id,
+                title: meta.title.unwrap_or(fallback_title),
+                description: String::new(),
+                genre: meta.genre.unwrap_or_default(),
+                tags: vec![],
+                rating: 0.0,
+                year: meta.year.unwrap_or(0),
+                duration_secs,
+                director: meta.director.unwrap_or_default(),
+                date_added: file_date_added(&abs),
+            };
+            (item, abs, rel)
         });
+    }
+
+    let mut items = Vec::new();
+    let mut index = HashMap::new();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((item, abs, rel)) => {
+                index.insert(item.id.clone(), (abs, rel));
+                items.push(item);
+            }
+            Err(e) => error!(error = %e, "probe task panicked during library scan"),
+        }
     }
     (items, index)
 }
@@ -557,8 +581,13 @@ async fn scan_ws(
         }
 
         let mut items = Vec::new();
-        let mut index = HashMap::new();
-        for (idx, entry) in entries.into_iter().enumerate() {
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(SCAN_CONCURRENCY));
+        // Each task returns the VideoItem plus its (abs, rel) paths for the index.
+        let mut tasks: tokio::task::JoinSet<(VideoItem, PathBuf, String)> =
+            tokio::task::JoinSet::new();
+
+        for entry in entries {
             let abs = entry.path().to_path_buf();
             let rel = abs
                 .strip_prefix(&library_path)
@@ -573,31 +602,48 @@ async fn scan_ws(
                 .replace(['.', '_', '-'], " ");
 
             let id = video_id(&rel);
-            let (duration_secs, meta) = probe_video(&abs).await;
+            let sem = Arc::clone(&semaphore);
 
-            index.insert(id.clone(), (abs.clone(), rel.clone()));
-            items.push(VideoItem {
-                id,
-                title: meta.title.unwrap_or(fallback_title),
-                description: String::new(),
-                genre: meta.genre.unwrap_or_default(),
-                tags: vec![],
-                rating: 0.0,
-                year: meta.year.unwrap_or(0),
-                duration_secs,
-                director: meta.director.unwrap_or_default(),
-                date_added: file_date_added(&abs),
+            tasks.spawn(async move {
+                let _permit = sem.acquire().await.expect("semaphore closed");
+                let (duration_secs, meta) = probe_video(&abs).await;
+                let item = VideoItem {
+                    id,
+                    title: meta.title.unwrap_or(fallback_title),
+                    description: String::new(),
+                    genre: meta.genre.unwrap_or_default(),
+                    tags: vec![],
+                    rating: 0.0,
+                    year: meta.year.unwrap_or(0),
+                    duration_secs,
+                    director: meta.director.unwrap_or_default(),
+                    date_added: file_date_added(&abs),
+                };
+                (item, abs, rel)
             });
+        }
 
-            let current = (idx + 1) as u32;
+        let mut index = HashMap::new();
+        let mut current = 0u32;
+        while let Some(result) = tasks.join_next().await {
+            let (item, abs, rel) = match result {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(error = %e, "probe task panicked during scan_ws");
+                    continue;
+                }
+            };
+            current += 1;
+            index.insert(item.id.clone(), (abs, rel));
             // Include the newly-scanned item so the frontend can stream
             // cards into the grid as each file is discovered.
             let msg = serde_json::json!({
                 "current": current,
                 "total": total,
-                "item": items.last().unwrap(),
+                "item": &item,
             })
             .to_string();
+            items.push(item);
             if session.text(msg).await.is_err() {
                 return; // Client disconnected mid-scan.
             }

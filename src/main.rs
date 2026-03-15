@@ -412,6 +412,63 @@ fn video_index_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(".video_index.json")
 }
 
+/// Remove any orphaned `*.tmp` files left behind by a previous unclean
+/// shutdown (e.g. SIGKILL while a transcode or sprite write was in progress).
+/// These files are always incomplete and can never be reused.
+///
+/// The cache tree is at most two levels deep:
+///   {cache_dir}/{video_id}_thumbs/sprite.tmp.jpg     (name contains ".tmp.")
+///   {cache_dir}/{video_id}/{quality}/.seg_XXXXX.ts.tmp  (extension == "tmp")
+/// so a two-level walk is sufficient.
+fn cleanup_orphaned_tmp_files(cache_dir: &Path) {
+    fn is_tmp(path: &Path) -> bool {
+        path.extension().map_or(false, |e| e == "tmp")
+            || path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map_or(false, |n| n.contains(".tmp."))
+    }
+
+    let top = match std::fs::read_dir(cache_dir) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    for entry in top.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if is_tmp(&path) {
+                let _ = std::fs::remove_file(&path);
+            }
+        } else if path.is_dir() {
+            // One level down: {video_id}_thumbs/ and {video_id}/
+            let mid = match std::fs::read_dir(&path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            for mid_entry in mid.flatten() {
+                let mid_path = mid_entry.path();
+                if mid_path.is_file() {
+                    if is_tmp(&mid_path) {
+                        let _ = std::fs::remove_file(&mid_path);
+                    }
+                } else if mid_path.is_dir() {
+                    // Two levels down: {video_id}/{quality}/
+                    let deep = match std::fs::read_dir(&mid_path) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+                    for deep_entry in deep.flatten() {
+                        let deep_path = deep_entry.path();
+                        if deep_path.is_file() && is_tmp(&deep_path) {
+                            let _ = std::fs::remove_file(&deep_path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Persist the current in-memory video list to disk so it can be restored
 /// on the next startup without waiting for a full re-scan.
 fn save_video_cache(items: &[VideoItem], cache_dir: &Path) {
@@ -2477,6 +2534,10 @@ async fn main() -> std::io::Result<()> {
         std::fs::create_dir_all(&library_path)?;
     }
     std::fs::create_dir_all(&cache_dir)?;
+
+    // Remove any *.tmp files left behind by a previous unclean shutdown.
+    // These are always incomplete and can never be reused.
+    cleanup_orphaned_tmp_files(&cache_dir);
 
     // ── Startup healthchecks (logged for journalctl) ─────────────────────
     run_startup_healthchecks(&library_path, &cache_dir).await;

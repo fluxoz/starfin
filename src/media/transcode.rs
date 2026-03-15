@@ -242,7 +242,7 @@ fn transcode_segment_inprocess(
                         let aac_ctx = ffmpeg_next::codec::context::Context::new_with_codec(aac);
                         if let Ok(mut aac_enc) = aac_ctx.encoder().audio() {
                             aac_enc.set_rate(dec.rate() as i32);
-                            aac_enc.set_channels(dec.channels() as i32);
+                            aac_enc.set_channel_layout(dec.channel_layout());
                             aac_enc.set_format(ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Packed));
                             aac_enc.set_bit_rate(128_000);
                             aac_enc.set_time_base(ffmpeg_next::Rational::new(1, dec.rate() as i32));

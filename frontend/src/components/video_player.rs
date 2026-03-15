@@ -37,11 +37,12 @@ fn snap_to_seek_anchor(time: f64) -> f64 {
         return time;
     }
     // Beyond the dense window — snap down to the nearest sparse anchor.
+    // `(seg_index / stride) * stride` always lands on a cached index: either
+    // inside the dense window (all indices < PRECACHE_SEGMENTS are cached) or
+    // on a stride multiple (which is a sparse anchor).
     let seg_index = (time / SEGMENT_DURATION_F).floor() as usize;
     let stride = SPARSE_CACHE_STRIDE_F as usize;
     let anchor_index = (seg_index / stride) * stride;
-    // Make sure we don't snap below the dense window boundary.
-    let anchor_index = anchor_index.max(PRECACHE_SEGMENTS_F as usize);
     anchor_index as f64 * SEGMENT_DURATION_F
 }
 

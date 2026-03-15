@@ -114,19 +114,13 @@ The backend uses `ffmpeg-next` (Rust FFI bindings to libavcodec/libavformat/liba
 |--------|---------------|----------|
 | `mod.rs` | FFmpeg initialization, library version strings | `ffmpeg -version` subprocess |
 | `probe.rs` | Metadata probing (duration, tags), subtitle stream listing | `ffprobe` subprocess calls |
-| `hwaccel.rs` | Hardware acceleration detection, encode testing | `ffmpeg -hwaccels` + encode test subprocesses |
+| `hwaccel.rs` | Hardware acceleration detection, encode testing (via raw FFI `av_hwdevice_ctx_create`) | `ffmpeg -hwaccels` + encode test subprocesses |
 | `thumbnail.rs` | Frame extraction, JPEG encoding, signalstats analysis | `ffmpeg -frames:v 1` + signalstats subprocess calls |
-| `transcode.rs` | HLS segment transcoding (software + GPU fallback) | `ffmpeg -c:v libx264 -f mpegts` subprocess |
+| `transcode.rs` | HLS segment transcoding (all quality tiers, software + GPU via FFI hw contexts) | `ffmpeg -c:v libx264 -f mpegts` subprocess |
 | `sprite.rs` | Sprite sheet generation (decode, scale, tile, JPEG) | `ffmpeg -vf tile` subprocess |
-| `subtitle.rs` | Subtitle extraction to WebVTT | `ffmpeg -c:s webvtt` subprocess |
+| `subtitle.rs` | Subtitle extraction to WebVTT (in-process decoding) | `ffmpeg -c:s webvtt` subprocess |
 
-### What still uses subprocesses
-
-A few operations still fall back to the ffmpeg CLI:
-
-1. **Hardware encode tests** (`hwaccel.rs`): The `ffmpeg-next` crate does not expose the full `av_hwdevice_ctx_create` API needed for NVENC/VAAPI/QSV device initialization. Encode tests run once at startup.
-2. **GPU-accelerated transcoding** (`transcode.rs`): For `Quality::High` with a detected hardware encoder, we use a subprocess to take advantage of GPU decode+encode. Software quality levels (Medium/Low) use the in-process pipeline.
-3. **Subtitle format conversion** (`subtitle.rs`): The `ffmpeg-next` subtitle decoding API is limited. Text-based subtitle extraction to WebVTT uses a targeted subprocess.
+All media operations are fully in-process — no ffmpeg subprocess calls remain.
 
 ## Testing Video Seeking
 

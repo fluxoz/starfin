@@ -1937,26 +1937,61 @@ async fn run_precache_worker(
                 "pre-caching segments"
             );
 
-            for i in missing {
+            // Use an explicit index so that when we bail out of a select!
+            // due to playback starting we don't lose the current segment and
+            // can retry it once playback ends.
+            let mut seg_idx = 0;
+            loop {
+                let i = match missing.get(seg_idx) {
+                    Some(&i) => i,
+                    None => break,
+                };
+
                 // Suspend between individual segments while playback is active.
                 while *playback_rx.borrow() {
                     let _ = playback_rx.changed().await;
                 }
 
-                // Acquire a transcode permit to bound concurrent operations.
-                // The permit is released when `_permit` is dropped at loop end.
-                let _permit = match semaphore.acquire().await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        error!(error = %e, "precache: transcode semaphore closed — worker terminating");
-                        break;
+                // Acquire a transcode permit while also watching for playback
+                // to start.  The semaphore is shared with on-demand segment
+                // requests, so we must not hold a queue position while
+                // playback is active — that would starve the real-time
+                // request waiting for the same permit.
+                let _permit = tokio::select! {
+                    biased; // prefer the semaphore arm when both are ready
+                    result = semaphore.acquire() => {
+                        match result {
+                            Ok(p) => p,
+                            Err(e) => {
+                                error!(error = %e, "precache: transcode semaphore closed — worker terminating");
+                                break;
+                            }
+                        }
+                    }
+                    _ = async { let _ = playback_rx.wait_for(|&v| v).await; } => {
+                        // Playback started while we were queued for a permit.
+                        // Don't advance seg_idx — the loop's playback-check at
+                        // the top will suspend us until idle, then retry this
+                        // same segment.
+                        continue;
                     }
                 };
+
+                // Playback may have started in the narrow window between
+                // acquiring the permit and this point.  Release immediately
+                // so on-demand requests are not starved.
+                if *playback_rx.borrow() {
+                    // _permit is dropped here, freeing the slot.
+                    // Don't advance seg_idx — retry this segment after suspend.
+                    continue;
+                }
 
                 if let Err(e) = transcode_segment(&abs_str, &hls_dir, i, &hwaccel, Quality::High).await {
                     error!(video_id = %id, segment = i, error = %e, "precache: segment transcode failed");
                     break; // Stop for this video on error.
                 }
+
+                seg_idx += 1;
             }
 
             progress.write().advance();

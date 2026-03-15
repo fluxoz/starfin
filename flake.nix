@@ -151,10 +151,17 @@
       cargoLock.lockFile = ./Cargo.lock;
 
       nativeBuildInputs = with pkgs; [ pkg-config clang ];
-      buildInputs = with pkgs; [ ffmpeg openssl ];
+      buildInputs = with pkgs; [ ffmpeg ffmpeg.dev openssl ];
 
       # bindgen (used by ffmpeg-sys-next) needs libclang.so at build time.
       LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+
+      # bindgen's internal libclang doesn't inherit the Nix CC wrapper's
+      # include paths.  Pass the ffmpeg header directory explicitly so that
+      # ffmpeg-sys-next's generated bindings can find <libavcodec/…> etc.
+      BINDGEN_EXTRA_CLANG_ARGS = builtins.concatStringsSep " " [
+        "-isystem ${pkgs.ffmpeg.dev}/include"
+      ];
 
       # Populate frontend/dist/ so rust-embed can embed the assets.
       preBuild = ''
@@ -216,6 +223,13 @@
 
       # bindgen (used by ffmpeg-sys-next) needs libclang.so at build time.
       LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
+
+      # bindgen's internal libclang doesn't inherit the Nix CC wrapper's
+      # include paths.  Pass the ffmpeg header directory explicitly so that
+      # ffmpeg-sys-next's generated bindings can find <libavcodec/…> etc.
+      BINDGEN_EXTRA_CLANG_ARGS = builtins.concatStringsSep " " [
+        "-isystem ${ffmpeg.dev}/include"
+      ];
 
       shellHook = ''
         export SHELL=/run/current-system/sw/bin/bash

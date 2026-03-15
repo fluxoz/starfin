@@ -47,6 +47,22 @@ impl HwAccel {
         }
     }
 
+    /// CLI arguments for hardware-accelerated decoding.
+    ///
+    /// Used by the subprocess transcode path to pass `-hwaccel` / device flags
+    /// before the `-i` input argument.
+    pub fn hwaccel_decode_args(&self) -> &'static [&'static str] {
+        match self {
+            HwAccel::Nvidia       => &["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"],
+            HwAccel::Vaapi        => &["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi",
+                                       "-hwaccel_device", "/dev/dri/renderD129"],
+            HwAccel::Qsv          => &["-hwaccel", "qsv"],
+            HwAccel::VideoToolbox => &["-hwaccel", "videotoolbox"],
+            HwAccel::Amf          => &["-hwaccel", "d3d11va"],
+            HwAccel::Software     => &[],
+        }
+    }
+
     pub fn encoder_quality_args(&self) -> &'static [&'static str] {
         match self {
             HwAccel::Nvidia        => &["-preset", "p7", "-tune", "hq", "-temporal-aq", "1", "-spatial-aq", "1", "-rc", "constqp", "-qp", "18"],

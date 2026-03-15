@@ -2880,23 +2880,50 @@ async fn main() -> std::io::Result<()> {
     });
     // ─────────────────────────────────────────────────────────────────────────
 
-    // ── Force-exit watchdog ───────────────────────────────────────────────────
-    // spawn_blocking threads (in-process ffmpeg transcodes) cannot be cancelled
-    // mid-execution; they keep the tokio runtime alive until they finish.  This
-    // watchdog waits for the shutdown signal, gives the runtime a brief grace
-    // period to drain naturally, then calls process::exit(0) to guarantee a
-    // timely exit regardless of how long any running transcode takes.
-    let mut watchdog_shutdown_rx = shutdown_rx.clone();
-    tokio::spawn(async move {
-        // Wait until the shutdown signal fires.
-        let _ = watchdog_shutdown_rx.wait_for(|&v| v).await;
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        info!("shutdown grace period elapsed, forcing exit");
-        std::process::exit(0);
-    });
+    // ── Force-exit watchdog (OS thread) ──────────────────────────────────────
+    // When actix-web receives SIGINT it handles the signal internally and
+    // `server.await` returns, which drops the tokio runtime and cancels all
+    // spawned tasks.  A tokio::spawn watchdog would be cancelled before it
+    // could call process::exit().  An OS thread survives the runtime teardown.
+    //
+    // spawn_blocking threads (in-process ffmpeg transcodes) also cannot be
+    // cancelled mid-execution; they keep the process alive until they finish.
+    // This watchdog guarantees a timely exit regardless.
+    {
+        let watchdog_rx = shutdown_rx.clone();
+        std::thread::spawn(move || {
+            // Poll the shutdown channel until it fires.  We can't use async
+            // here because this is a plain OS thread.
+            loop {
+                if *watchdog_rx.borrow() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            // Brief grace period to let async tasks clean up.
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            eprintln!("shutdown grace period elapsed, forcing exit");
+            std::process::exit(0);
+        });
+    }
     // ─────────────────────────────────────────────────────────────────────────
 
-    server.await
+    // `server.await` resolves when actix-web finishes (either from its own
+    // internal SIGINT handling or from server_handle.stop()).  After it
+    // returns, ensure all background workers are signalled and force exit
+    // to terminate any lingering spawn_blocking threads immediately.
+    let result = server.await;
+
+    info!("HTTP server stopped, cleaning up");
+    // Ensure shutdown is signalled even if actix handled the signal before
+    // our tokio signal handler ran.
+    let _ = shutdown_tx.send(true);
+    let _ = playback_tx.send(false);
+    transcode_semaphore.close();
+    // Brief grace for async tasks to see the signal and exit cleanly.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    info!("forcing process exit");
+    std::process::exit(result.map(|_| 0).unwrap_or(1));
 }
 
 

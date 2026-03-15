@@ -178,6 +178,10 @@ fn format_vtt_time(secs: f64) -> String {
     format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
 }
 
+/// Number of fields in an ASS dialogue event before the text content.
+/// Format: `ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text`
+const ASS_FIELDS_BEFORE_TEXT: usize = 9;
+
 /// Convert an ASS dialogue event string to plain text.
 ///
 /// The ASS rect text from ffmpeg is typically in the format:
@@ -187,7 +191,7 @@ fn format_vtt_time(secs: f64) -> String {
 /// (`{\\...}`), and convert `\\N` to newlines.
 fn ass_to_plain_text(ass: &str) -> String {
     // Find the text portion after the 8th comma.
-    let text_part = match ass.splitn(9, ',').nth(8) {
+    let text_part = match ass.splitn(ASS_FIELDS_BEFORE_TEXT, ',').last() {
         Some(t) => t,
         None => ass,
     };

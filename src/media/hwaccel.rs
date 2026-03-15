@@ -351,7 +351,8 @@ fn test_encode_blocking(accel: &HwAccel, device_path: Option<&str>) -> (bool, St
                 }
 
                 // Zero-fill the frame planes (black NV12).
-                for i in 0..8 {
+                // AV_NUM_DATA_POINTERS is 8 in FFmpeg.
+                for i in 0..8usize {
                     if (*sw_frame).data[i].is_null() { break; }
                     let linesize = (*sw_frame).linesize[i] as usize;
                     let plane_height = if i == 0 { height as usize } else { height as usize / 2 };

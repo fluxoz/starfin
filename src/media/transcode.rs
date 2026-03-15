@@ -80,7 +80,7 @@ impl Quality {
     }
 }
 
-// ── In-process software transcode (Medium / Low / High-Software) ─────────────
+// ── In-process transcode (all quality tiers) ─────────────────────────────────
 
 fn transcode_segment_inprocess(
     abs_path: &str,

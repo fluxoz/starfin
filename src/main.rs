@@ -2535,8 +2535,9 @@ async fn main() -> std::io::Result<()> {
     }
     std::fs::create_dir_all(&cache_dir)?;
 
-    // Remove any *.tmp files left behind by a previous unclean shutdown.
+    // Remove any *.tmp files left behind by a previous shutdown.
     // These are always incomplete and can never be reused.
+    info!("Cleaning any oprhaned temp files.");
     cleanup_orphaned_tmp_files(&cache_dir);
 
     // ── Startup healthchecks (logged for journalctl) ─────────────────────

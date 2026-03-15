@@ -309,10 +309,16 @@ impl PrecacheProgress {
     }
 }
 
+/// Maps a stable video ID to its `(absolute_path, relative_path)`.
+type VideoPathIndex = HashMap<String, (PathBuf, String)>;
+
 struct AppState {
     library_path: PathBuf,
     cache_dir: PathBuf,
     video_cache: Arc<RwLock<Vec<VideoItem>>>,
+    /// In-memory lookup table: video ID → (absolute path, relative path).
+    /// Built at startup and refreshed on every scan so that `find_video` is O(1).
+    video_path_index: Arc<RwLock<VideoPathIndex>>,
     /// Tracks the last time a segment was served for each video ID.
     /// Used by the background idle-eviction sweep.
     last_segment_access: RwLock<HashMap<String, Instant>>,
@@ -428,7 +434,27 @@ fn load_video_cache(cache_dir: &Path) -> Vec<VideoItem> {
     }
 }
 
-async fn scan_library(library_path: &Path) -> Vec<VideoItem> {
+/// Walk the library once and build a lookup table of ID → (absolute path, relative path).
+/// This is a fast, probe-free pass used at startup and after each scan.
+fn build_video_index(library_path: &Path) -> VideoPathIndex {
+    WalkDir::new(library_path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file() && is_video(e.path()))
+        .map(|e| {
+            let abs = e.path().to_path_buf();
+            let rel = abs
+                .strip_prefix(library_path)
+                .unwrap_or(&abs)
+                .to_string_lossy()
+                .to_string();
+            let id = video_id(&rel);
+            (id, (abs, rel))
+        })
+        .collect()
+}
+
+async fn scan_library(library_path: &Path) -> (Vec<VideoItem>, VideoPathIndex) {
     let entries: Vec<_> = WalkDir::new(library_path)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -436,6 +462,7 @@ async fn scan_library(library_path: &Path) -> Vec<VideoItem> {
         .collect();
 
     let mut items = Vec::new();
+    let mut index = HashMap::new();
     for entry in entries {
         let abs = entry.path().to_path_buf();
         let rel = abs
@@ -454,6 +481,7 @@ async fn scan_library(library_path: &Path) -> Vec<VideoItem> {
         let id = video_id(&rel);
         let (duration_secs, meta) = probe_video(&abs).await;
 
+        index.insert(id.clone(), (abs.clone(), rel.clone()));
         items.push(VideoItem {
             id,
             title: meta.title.unwrap_or(fallback_title),
@@ -467,29 +495,18 @@ async fn scan_library(library_path: &Path) -> Vec<VideoItem> {
             date_added: file_date_added(&abs),
         });
     }
-    items
+    (items, index)
 }
 
-/// Walk the library to locate a video by its stable ID.
+/// Look up a video by its stable ID using the in-memory path index.
 /// Returns `(absolute_path, relative_path)` when found.
-async fn find_video(state: &AppState, id: &str) -> Option<(PathBuf, String)> {
-    WalkDir::new(&state.library_path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file() && is_video(e.path()))
-        .find_map(|e| {
-            let abs = e.path().to_path_buf();
-            let rel = abs
-                .strip_prefix(&state.library_path)
-                .unwrap_or(&abs)
-                .to_string_lossy()
-                .to_string();
-            if video_id(&rel) == id {
-                Some((abs, rel))
-            } else {
-                None
-            }
-        })
+fn find_video(state: &AppState, id: &str) -> Option<(PathBuf, String)> {
+    state
+        .video_path_index
+        .read()
+        .expect("video path index lock poisoned")
+        .get(id)
+        .cloned()
 }
 
 // ── API handlers ─────────────────────────────────────────────────────────────
@@ -513,6 +530,7 @@ async fn scan_ws(
     let library_path = state.library_path.clone();
     let cache_dir = state.cache_dir.clone();
     let video_cache = Arc::clone(&state.video_cache);
+    let video_path_index = Arc::clone(&state.video_path_index);
     let thumb_trigger = Arc::clone(&state.thumb_trigger);
     let sprite_trigger = Arc::clone(&state.sprite_trigger);
     let precache_trigger = Arc::clone(&state.precache_trigger);
@@ -534,6 +552,7 @@ async fn scan_ws(
         }
 
         let mut items = Vec::new();
+        let mut index = HashMap::new();
         for (idx, entry) in entries.into_iter().enumerate() {
             let abs = entry.path().to_path_buf();
             let rel = abs
@@ -551,6 +570,7 @@ async fn scan_ws(
             let id = video_id(&rel);
             let (duration_secs, meta) = probe_video(&abs).await;
 
+            index.insert(id.clone(), (abs.clone(), rel.clone()));
             items.push(VideoItem {
                 id,
                 title: meta.title.unwrap_or(fallback_title),
@@ -581,6 +601,7 @@ async fn scan_ws(
         // Commit the updated library to the shared cache and persist to disk.
         save_video_cache(&items, &cache_dir);
         *video_cache.write().expect("video cache lock poisoned") = items;
+        *video_path_index.write().expect("video path index lock poisoned") = index;
 
         // Re-trigger deep thumbnail generation for any newly discovered videos.
         thumb_trigger.notify_one();
@@ -1059,7 +1080,7 @@ async fn get_playlist(
 ) -> impl Responder {
     let quality = query.quality;
 
-    let (abs_path, _) = match find_video(&state, &id).await {
+    let (abs_path, _) = match find_video(&state, &id) {
         Some(v) => v,
         None => return HttpResponse::NotFound().body("video not found"),
     };
@@ -1186,7 +1207,7 @@ async fn get_segment(
     };
 
     // Find the source video
-    let (abs_path, _) = match find_video(&state, &id).await {
+    let (abs_path, _) = match find_video(&state, &id) {
         Some(v) => v,
         None => return HttpResponse::NotFound().body("video not found"),
     };
@@ -1301,7 +1322,7 @@ async fn get_thumbnail_info(
     id: web::Path<String>,
     state: web::Data<AppState>,
 ) -> impl Responder {
-    let (abs_path, _) = match find_video(&state, &id).await {
+    let (abs_path, _) = match find_video(&state, &id) {
         Some(v) => v,
         None => return HttpResponse::NotFound().body("video not found"),
     };
@@ -1433,7 +1454,7 @@ async fn get_thumbnail_sprite(
     id: web::Path<String>,
     state: web::Data<AppState>,
 ) -> impl Responder {
-    let (abs_path, _) = match find_video(&state, &id).await {
+    let (abs_path, _) = match find_video(&state, &id) {
         Some(v) => v,
         None => return HttpResponse::NotFound().body("video not found"),
     };
@@ -1784,7 +1805,7 @@ async fn list_subtitles(
     id: web::Path<String>,
     state: web::Data<AppState>,
 ) -> impl Responder {
-    let (abs_path, _) = match find_video(&state, &id).await {
+    let (abs_path, _) = match find_video(&state, &id) {
         Some(v) => v,
         None => return HttpResponse::NotFound().body("video not found"),
     };
@@ -1825,7 +1846,7 @@ async fn get_subtitle(
 ) -> impl Responder {
     let (id, track_index) = params.into_inner();
 
-    let (abs_path, _) = match find_video(&state, &id).await {
+    let (abs_path, _) = match find_video(&state, &id) {
         Some(v) => v,
         None => return HttpResponse::NotFound().body("video not found"),
     };
@@ -2171,6 +2192,12 @@ async fn main() -> std::io::Result<()> {
     }
     let video_cache: Arc<RwLock<Vec<VideoItem>>> = Arc::new(RwLock::new(initial_items));
 
+    // Build the initial path index via a fast, probe-free library walk so that
+    // `find_video` works immediately—before the background scan completes.
+    let initial_index = build_video_index(&library_path);
+    let video_path_index: Arc<RwLock<VideoPathIndex>> =
+        Arc::new(RwLock::new(initial_index));
+
     let thumb_progress = Arc::new(RwLock::new(ThumbProgress {
         current: 0,
         total: 0,
@@ -2221,6 +2248,7 @@ async fn main() -> std::io::Result<()> {
         library_path: library_path.clone(),
         cache_dir: cache_dir.clone(),
         video_cache: Arc::clone(&video_cache),
+        video_path_index: Arc::clone(&video_path_index),
         last_segment_access: RwLock::new(HashMap::new()),
         thumb_progress: Arc::clone(&thumb_progress),
         thumb_trigger: Arc::clone(&thumb_trigger),
@@ -2242,12 +2270,14 @@ async fn main() -> std::io::Result<()> {
         let startup_library = library_path.clone();
         let startup_cache_dir = cache_dir.clone();
         let startup_cache = Arc::clone(&video_cache);
+        let startup_index = Arc::clone(&video_path_index);
         let startup_thumb_trigger = Arc::clone(&thumb_trigger);
         let startup_sprite_trigger = Arc::clone(&sprite_trigger);
         tokio::spawn(async move {
-            let items = scan_library(&startup_library).await;
+            let (items, index) = scan_library(&startup_library).await;
             save_video_cache(&items, &startup_cache_dir);
             *startup_cache.write().expect("video cache lock poisoned") = items;
+            *startup_index.write().expect("video path index lock poisoned") = index;
             startup_thumb_trigger.notify_one();
             startup_sprite_trigger.notify_one();
         });
@@ -2257,6 +2287,7 @@ async fn main() -> std::io::Result<()> {
     let bg_library_path = library_path.clone();
     let bg_cache_dir = cache_dir.clone();
     let bg_cache = Arc::clone(&video_cache);
+    let bg_index = Arc::clone(&video_path_index);
     let bg_thumb_trigger = Arc::clone(&thumb_trigger);
     let bg_sprite_trigger = Arc::clone(&sprite_trigger);
     let bg_precache_trigger = Arc::clone(&precache_trigger);
@@ -2265,9 +2296,10 @@ async fn main() -> std::io::Result<()> {
         interval.tick().await; // skip the immediate first tick (covered by startup scan)
         loop {
             interval.tick().await;
-            let items = scan_library(&bg_library_path).await;
+            let (items, index) = scan_library(&bg_library_path).await;
             save_video_cache(&items, &bg_cache_dir);
             *bg_cache.write().expect("video cache lock poisoned") = items;
+            *bg_index.write().expect("video path index lock poisoned") = index;
             bg_thumb_trigger.notify_one();
             bg_sprite_trigger.notify_one();
             bg_precache_trigger.notify_one();

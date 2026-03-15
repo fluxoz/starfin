@@ -1560,6 +1560,15 @@ const SEGMENT_DURATION: f64 = 6.0;
 /// At 6 seconds per segment, 20 segments ≈ 2 minutes of video.
 const PRECACHE_SEGMENTS: usize = 20;
 
+/// Stride for sparse seek-anchor caching beyond the initial dense pre-cache window.
+/// Every Nth segment index (where `idx % SPARSE_CACHE_STRIDE == 0`) will be
+/// pre-transcoded as a seek anchor across the full video duration.
+/// At 6 seconds per segment and a stride of 3, anchors are placed every 18 seconds.
+///
+/// NOTE: This value must stay in sync with `SPARSE_CACHE_STRIDE_F` in
+/// `frontend/src/components/video_player.rs`.
+const SPARSE_CACHE_STRIDE: usize = 3;
+
 /// Transcode a single MPEG-TS segment for a video using ffmpeg.
 ///
 /// Segments are stored in a quality-specific subdirectory so that multiple
@@ -1731,7 +1740,9 @@ async fn remove_non_precached_segments(cache_dir: &Path) -> std::io::Result<()> 
             .and_then(|s| s.strip_suffix(".ts"))
             .and_then(|s| s.parse::<usize>().ok())
         {
-            if idx >= PRECACHE_SEGMENTS {
+            // Keep segments that are either in the dense pre-cache window OR are sparse seek anchors.
+            let should_keep = idx < PRECACHE_SEGMENTS || idx % SPARSE_CACHE_STRIDE == 0;
+            if !should_keep {
                 let _ = tokio::fs::remove_file(entry.path()).await;
             }
         }
@@ -2420,9 +2431,13 @@ async fn run_precache_worker(
 
         // Partition into already-cached and needs-work.  A video counts as
         // "done" when seg_00000.ts already exists in the high-quality
-        // subdirectory (the first segment is the cheapest proxy for
-        // "pre-cache finished").
-        let (done, pending): (Vec<_>, Vec<_>) = entries.into_iter().partition(|e| {
+        // subdirectory AND the last expected sparse anchor also exists
+        // (so sparse anchors are added on re-runs if they were missing from
+        // a previous precache pass).  We probe the duration here so that we
+        // can compute the last anchor index without re-probing in the loop.
+        let mut done_count: usize = 0;
+        let mut pending: Vec<_> = Vec::new();
+        for e in entries {
             let abs = e.path();
             let rel = abs
                 .strip_prefix(&library_path)
@@ -2431,14 +2446,43 @@ async fn run_precache_worker(
             let id = video_id(&rel);
             // Precache always uses the High quality subdirectory.
             let hls_dir = cache_dir.join(&id).join(Quality::High.as_str());
-            // Quick check: if the first segment exists the batch ran before.
-            hls_dir.join("seg_00000.ts").exists()
-        });
+
+            let is_done = if !hls_dir.join("seg_00000.ts").exists() {
+                false
+            } else {
+                // First segment exists; check whether the last expected sparse
+                // anchor is also present.
+                let (dur_secs, _) = probe_video(abs).await;
+                if dur_secs == 0 {
+                    // Can't determine duration — treat as done to avoid infinite retry.
+                    true
+                } else {
+                    let total_segs = (dur_secs as f64 / SEGMENT_DURATION).ceil() as usize;
+                    if total_segs > PRECACHE_SEGMENTS {
+                        let last_anchor =
+                            ((total_segs - 1) / SPARSE_CACHE_STRIDE) * SPARSE_CACHE_STRIDE;
+                        if last_anchor >= PRECACHE_SEGMENTS {
+                            hls_dir.join(format!("seg_{:05}.ts", last_anchor)).exists()
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    }
+                }
+            };
+
+            if is_done {
+                done_count += 1;
+            } else {
+                pending.push(e);
+            }
+        }
 
         {
             let mut p = progress.write().expect("precache_progress lock poisoned");
-            p.current = done.len() as u32;
-            p.total = (done.len() + pending.len()) as u32;
+            p.current = done_count as u32;
+            p.total = (done_count + pending.len()) as u32;
             p.active = !pending.is_empty();
         }
 
@@ -2470,10 +2514,16 @@ async fn run_precache_worker(
                 continue;
             }
             let total_segments = (duration_secs as f64 / SEGMENT_DURATION).ceil() as usize;
-            let segments_to_cache = PRECACHE_SEGMENTS.min(total_segments);
+
+            // Dense: every segment in the initial pre-cache window for instant playback start.
+            // Sparse: every SPARSE_CACHE_STRIDE-th segment beyond that window as seek anchors.
+            let segments_to_cache: Vec<usize> = (0..total_segments)
+                .filter(|&i| i < PRECACHE_SEGMENTS || i % SPARSE_CACHE_STRIDE == 0)
+                .collect();
 
             // Collect only the segments that are missing.
-            let missing: Vec<usize> = (0..segments_to_cache)
+            let missing: Vec<usize> = segments_to_cache.iter()
+                .copied()
                 .filter(|i| !hls_dir.join(format!("seg_{:05}.ts", i)).exists())
                 .collect();
             if missing.is_empty() {
@@ -2504,8 +2554,9 @@ async fn run_precache_worker(
             }
 
             println!(
-                "→ Pre-caching {} segment(s) for {id} ({segments_to_cache} total)",
-                missing.len()
+                "→ Pre-caching {} segment(s) for {id} ({} total in hybrid set)",
+                missing.len(),
+                segments_to_cache.len()
             );
 
             for i in missing {

@@ -14,6 +14,37 @@ use yew::prelude::*;
 // ── Playback speed options ───────────────────────────────────────────────────
 const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
 
+// ── Seek-anchor constants ────────────────────────────────────────────────────
+// These must stay in sync with SEGMENT_DURATION, PRECACHE_SEGMENTS, and
+// SPARSE_CACHE_STRIDE in `src/main.rs`.
+const SEGMENT_DURATION_F: f64 = 6.0;
+const PRECACHE_SEGMENTS_F: f64 = 20.0;
+const SPARSE_CACHE_STRIDE_F: f64 = 3.0;
+
+/// Snaps a seek time (in seconds) down to the nearest pre-cached seek anchor.
+///
+/// Within the dense pre-cache window (`PRECACHE_SEGMENTS_F * SEGMENT_DURATION_F`
+/// seconds) every segment is cached so no snapping is needed.  Beyond that
+/// window, only every `SPARSE_CACHE_STRIDE_F`-th segment is cached, so we
+/// round down to the nearest anchor boundary.
+fn snap_to_seek_anchor(time: f64) -> f64 {
+    if time <= 0.0 {
+        return 0.0;
+    }
+    let dense_window = PRECACHE_SEGMENTS_F * SEGMENT_DURATION_F; // 120 seconds
+    if time < dense_window {
+        // Within the dense window — every segment is cached, no snapping needed.
+        return time;
+    }
+    // Beyond the dense window — snap down to the nearest sparse anchor.
+    let seg_index = (time / SEGMENT_DURATION_F).floor() as usize;
+    let stride = SPARSE_CACHE_STRIDE_F as usize;
+    let anchor_index = (seg_index / stride) * stride;
+    // Make sure we don't snap below the dense window boundary.
+    let anchor_index = anchor_index.max(PRECACHE_SEGMENTS_F as usize);
+    anchor_index as f64 * SEGMENT_DURATION_F
+}
+
 // ── Stream quality options ────────────────────────────────────────────────────
 /// (url-token, display-label) pairs for the quality selector.
 const QUALITY_OPTIONS: [(&str, &str); 3] = [
@@ -399,8 +430,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 
                 // Start position: -1 means "from the beginning" for a fresh load;
                 // a positive value resumes at the position captured before a
-                // quality-switch reinitialisation.
-                let start_position = if start_pos > 0.0 { start_pos } else { -1.0 };
+                // quality-switch reinitialisation.  Snap to the nearest seek anchor
+                // so the resume position is guaranteed to be cached.
+                let start_position = if start_pos > 0.0 { snap_to_seek_anchor(start_pos) } else { -1.0 };
                 js_sys::Reflect::set(&config, &JsValue::from_str("startPosition"), &JsValue::from_f64(start_position)).ok();
                 
                 // Seek handling improvements - nudge settings help recover from small stream gaps
@@ -684,7 +716,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     "ArrowLeft" => {
                         e.prevent_default();
                         let skip = if e.shift_key() { 10.0 } else { 5.0 };
-                        video.set_current_time((video.current_time() - skip).max(0.0));
+                        video.set_current_time(snap_to_seek_anchor((video.current_time() - skip).max(0.0)));
                         skip_indicator.set(Some(("backward".to_string(), 25.0)));
                         let skip_indicator_clone = skip_indicator.clone();
                         spawn_local(async move {
@@ -694,7 +726,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     }
                     "j" | "J" => {
                         e.prevent_default();
-                        video.set_current_time((video.current_time() - 10.0).max(0.0));
+                        video.set_current_time(snap_to_seek_anchor((video.current_time() - 10.0).max(0.0)));
                         skip_indicator.set(Some(("backward".to_string(), 25.0)));
                         let skip_indicator_clone = skip_indicator.clone();
                         spawn_local(async move {
@@ -708,7 +740,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         let skip = if e.shift_key() { 10.0 } else { 5.0 };
                         let dur = video.duration();
                         if dur.is_finite() {
-                            video.set_current_time((video.current_time() + skip).min(dur));
+                            video.set_current_time(snap_to_seek_anchor((video.current_time() + skip).min(dur)));
                         }
                         skip_indicator.set(Some(("forward".to_string(), 75.0)));
                         let skip_indicator_clone = skip_indicator.clone();
@@ -721,7 +753,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         e.prevent_default();
                         let dur = video.duration();
                         if dur.is_finite() {
-                            video.set_current_time((video.current_time() + 10.0).min(dur));
+                            video.set_current_time(snap_to_seek_anchor((video.current_time() + 10.0).min(dur)));
                         }
                         skip_indicator.set(Some(("forward".to_string(), 75.0)));
                         let skip_indicator_clone = skip_indicator.clone();
@@ -782,7 +814,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         let num: f64 = key.parse().unwrap_or(0.0);
                         let dur = video.duration();
                         if dur.is_finite() {
-                            video.set_current_time(dur * (num / 10.0));
+                            video.set_current_time(snap_to_seek_anchor(dur * (num / 10.0)));
                         }
                     }
                     // < and > - Decrease/Increase playback speed
@@ -1206,7 +1238,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 let seek_time = shared_seek_time_up.get();
 
                 if let Some(video) = video_ref_up.cast::<HtmlVideoElement>() {
-                    video.set_current_time(seek_time);
+                    video.set_current_time(snap_to_seek_anchor(seek_time));
                 }
 
                 if let Some((mousemove_closure, mouseup_closure)) =
@@ -1256,7 +1288,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     if let Some((seek_time, _)) =
                         calculate_seek_time(&e, &progress_el, video_duration)
                     {
-                        video.set_current_time(seek_time);
+                        video.set_current_time(snap_to_seek_anchor(seek_time));
                     }
                 }
             }
@@ -1301,7 +1333,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
                     if relative_x < width / 3.0 {
                         // Left third - seek backward 10 seconds
-                        video.set_current_time((video.current_time() - 10.0).max(0.0));
+                        video.set_current_time(snap_to_seek_anchor((video.current_time() - 10.0).max(0.0)));
                         skip_indicator.set(Some(("backward".to_string(), 25.0)));
                         let skip_indicator_clone = skip_indicator.clone();
                         spawn_local(async move {
@@ -1312,7 +1344,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         // Right third - seek forward 10 seconds
                         let dur = video.duration();
                         if dur.is_finite() {
-                            video.set_current_time((video.current_time() + 10.0).min(dur));
+                            video.set_current_time(snap_to_seek_anchor((video.current_time() + 10.0).min(dur)));
                         }
                         skip_indicator.set(Some(("forward".to_string(), 75.0)));
                         let skip_indicator_clone = skip_indicator.clone();

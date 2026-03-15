@@ -135,37 +135,6 @@
       '';
     };
 
-    # ── ffmpeg development headers with avfft.h compatibility stub ───────────
-    #
-    # ffmpeg-sys-next 7.1.3's build.rs unconditionally includes
-    # <libavcodec/avfft.h>, but FFmpeg ≥ 7.0 removed that header.  NixOS 25.11
-    # defaults to FFmpeg 8.0.  We wrap ffmpeg.dev to add a stub avfft.h so
-    # ffmpeg-sys-next's build script finds it immediately via FFMPEG_INCLUDE_DIR
-    # (checked before pkg-config / /usr/include fallback).
-    #
-    # The .pc files are also rewritten so pkg-config reports our patched include
-    # tree as a belt-and-suspenders fallback.
-    ffmpegDev = pkgs.runCommand "ffmpeg-dev-compat" {} ''
-      # Mirror ffmpeg.dev with symlinks (directories are real, files are links)
-      cp -rs --no-preserve=mode ${pkgs.ffmpeg.dev} $out
-
-      # Add stub avfft.h if missing (removed in FFmpeg 7.0)
-      if [ ! -e $out/include/libavcodec/avfft.h ]; then
-        printf '#ifndef AVCODEC_AVFFT_H\n#define AVCODEC_AVFFT_H\n#endif\n' \
-          > $out/include/libavcodec/avfft.h
-      fi
-
-      # Rewrite .pc files so pkg-config returns our patched include directory.
-      # After cp -rs, .pc files are symlinks; resolve and replace in-place.
-      if [ -d $out/lib/pkgconfig ]; then
-        for pc in $out/lib/pkgconfig/*.pc; do
-          real=$(readlink -f "$pc")
-          rm -f "$pc"
-          sed "s|${pkgs.ffmpeg.dev}|$out|g" "$real" > "$pc"
-        done
-      fi
-    '';
-
     # ── Phase 3: build the backend binary with the frontend dist embedded ─────
     #
     # rust-embed compiles `frontend/dist/` into the binary at build time, so
@@ -182,22 +151,10 @@
       cargoLock.lockFile = ./Cargo.lock;
 
       nativeBuildInputs = with pkgs; [ pkg-config clang ];
-      buildInputs = with pkgs; [ ffmpeg openssl ] ++ [ ffmpegDev ];
-
-      # Tell ffmpeg-sys-next's build.rs exactly where to find FFmpeg headers.
-      # This is checked first (before pkg-config /usr/include fallback) and
-      # prevents the build script from resolving to the non-existent
-      # /usr/include/libavcodec/avfft.h path that causes the bindgen failure.
-      FFMPEG_INCLUDE_DIR = "${ffmpegDev}/include";
-      FFMPEG_LIB_DIR = "${pkgs.ffmpeg.lib}/lib";
+      buildInputs = with pkgs; [ ffmpeg openssl ];
 
       # bindgen (used by ffmpeg-sys-next) needs libclang.so at build time.
       LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-
-      # bindgen's internal libclang doesn't inherit the Nix CC wrapper's
-      # include paths.  Pass the ffmpeg header directory explicitly so that
-      # ffmpeg-sys-next's generated bindings can find <libavcodec/…> etc.
-      BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${ffmpegDev}/include";
 
       # Populate frontend/dist/ so rust-embed can embed the assets.
       preBuild = ''
@@ -250,25 +207,13 @@
         tmux
         trunk
         wasm-pack
-        # ffmpeg: ffmpegDev wraps ffmpeg.dev with a stub avfft.h for
-        # ffmpeg-sys-next compatibility; the main output provides the CLI
-        # binary for HW encode tests.
+        # ffmpeg libraries for building ffmpeg-next and the ffmpeg CLI binary.
         ffmpeg
-        ffmpegDev
         openssl
       ];
 
-      # Tell ffmpeg-sys-next's build.rs exactly where to find FFmpeg headers.
-      FFMPEG_INCLUDE_DIR = "${ffmpegDev}/include";
-      FFMPEG_LIB_DIR = "${pkgs.ffmpeg.lib}/lib";
-
       # bindgen (used by ffmpeg-sys-next) needs libclang.so at build time.
       LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
-
-      # bindgen's internal libclang doesn't inherit the Nix CC wrapper's
-      # include paths.  Pass the ffmpeg header directory explicitly so that
-      # ffmpeg-sys-next's generated bindings can find <libavcodec/…> etc.
-      BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${ffmpegDev}/include";
 
       shellHook = ''
         export SHELL=/run/current-system/sw/bin/bash

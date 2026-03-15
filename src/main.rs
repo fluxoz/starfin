@@ -1652,9 +1652,9 @@ async fn get_thumbnail_sprite(
     }
 
     // Generate the sprite using the shared helper (creates dir, runs ffmpeg).
-    // Pass the playback receiver so an in-flight ffmpeg process is killed the
-    // moment a segment is served for any video.
-    if generate_sprite(&id, &abs_path, &state.cache_dir, &mut kill_rx).await {
+    // Pass the playback receiver so an in-flight task is interrupted the
+    // moment a segment is served for any video, keeping the HTTP response fast.
+    if generate_sprite(&id, &abs_path, &state.cache_dir, Some(&mut kill_rx)).await {
         match tokio::fs::read(&sprite_path).await {
             Ok(data) => HttpResponse::Ok()
                 .content_type("image/jpeg")
@@ -1672,11 +1672,16 @@ async fn get_thumbnail_sprite(
 /// ffmpeg-next decoding and the `image` crate for compositing.
 ///
 /// Creates `{cache_dir}/{id}_thumbs/sprite.jpg`.  Returns `true` on success.
+///
+/// `kill` is optional — supply `Some(rx)` when the caller needs the operation
+/// to be interruptible (e.g. the on-demand HTTP handler), or `None` to let
+/// the task run to completion regardless of playback state (used by the
+/// background worker, which already pauses *between* videos).
 async fn generate_sprite(
     id: &str,
     abs_path: &Path,
     cache_dir: &Path,
-    kill: &mut tokio::sync::watch::Receiver<bool>,
+    kill: Option<&mut tokio::sync::watch::Receiver<bool>>,
 ) -> bool {
     let sprite_dir = cache_dir.join(format!("{}_thumbs", id));
     let sprite_path = sprite_dir.join("sprite.jpg");
@@ -1704,11 +1709,14 @@ async fn generate_sprite(
         media::sprite::generate_sprite_sheet(&resolved_path, duration_secs, &sprite_dir_owned)
     });
 
-    tokio::select! {
-        result = task => result.unwrap_or(false),
-        _ = async { let _ = kill.wait_for(|&v| v).await; } => {
-            false
-        }
+    match kill {
+        None => task.await.unwrap_or(false),
+        Some(kill) => tokio::select! {
+            result = task => result.unwrap_or(false),
+            _ = async { let _ = kill.wait_for(|&v| v).await; } => {
+                false
+            }
+        },
     }
 }
 
@@ -1755,8 +1763,8 @@ async fn run_sprite_worker(
         let mut join_set: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
         let mut iter = entries.into_iter().peekable();
         loop {
-            // Pause while a video is being streamed.  In-flight tasks abort via
-            // their cloned kill receiver; their results are collected below.
+            // Pause while a video is being streamed.  The worker waits here
+            // between videos; any already-running task runs to completion.
             while *playback_rx.borrow() {
                 let _ = playback_rx.changed().await;
             }
@@ -1775,9 +1783,14 @@ async fn run_sprite_worker(
                     p.current_ids.insert(id.clone());
                 }
                 let cache_dir = cache_dir.clone();
-                let mut kill = playback_rx.clone();
                 join_set.spawn(async move {
-                    let ok = generate_sprite(&id, &abs, &cache_dir, &mut kill).await;
+                    // Pass `None` for the kill signal so the blocking task always
+                    // runs to completion.  The worker-level pause (above) already
+                    // prevents *new* sprite generations from starting while playback
+                    // is active.  Killing mid-generation would detach the
+                    // spawn_blocking thread, causing concurrent writes to the same
+                    // temp file on the next retry and a corrupted sprite.
+                    let ok = generate_sprite(&id, &abs, &cache_dir, None).await;
                     (id, ok)
                 });
             }

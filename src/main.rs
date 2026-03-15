@@ -328,8 +328,10 @@ struct AppState {
     precache_trigger: Arc<tokio::sync::Notify>,
     /// Detected hardware acceleration backend (detected once at startup).
     hwaccel: HwAccel,
-    /// Semaphore limiting the number of concurrent segment transcode operations.
-    /// Shared between the on-demand segment endpoint and the pre-cache worker.
+    /// Semaphore limiting the number of concurrent on-demand segment transcode
+    /// operations.  Used exclusively by the `get_segment` handler for real-time
+    /// playback requests.  The pre-cache background worker runs sequentially and
+    /// does not compete for these permits.
     /// The limit is set at startup from `TRANSCODE_CONCURRENCY` (default:
     /// available CPU parallelism).
     transcode_semaphore: Arc<tokio::sync::Semaphore>,
@@ -1649,7 +1651,7 @@ async fn get_thumbnail_sprite(
                 .body(format!("failed to read sprite: {e}")),
         }
     } else {
-        HttpResponse::ServiceUnavailable().body("sprite generation failed")
+        HttpResponse::ServiceUnavailable().body("sprite generation failed or unavailable")
     }
 }
 
@@ -1786,8 +1788,10 @@ async fn run_sprite_worker(
 /// Mirrors `run_thumb_worker` / `run_sprite_worker`: waits for a notification
 /// on `trigger`, walks the library, skips videos whose first
 /// [`PRECACHE_SEGMENTS`] segments already exist in the cache, and transcodes
-/// the missing ones.  Pauses while playback is active.  Progress counters are
-/// written to `progress` so the WS can drive a frontend progress bar.
+/// the missing ones.  Suspends while playback is active (checking between
+/// every individual segment) and resumes automatically once idle.  Progress
+/// counters are written to `progress` so the WS can drive a frontend progress
+/// bar.
 async fn run_precache_worker(
     library_path: PathBuf,
     cache_dir: PathBuf,
@@ -1795,7 +1799,6 @@ async fn run_precache_worker(
     progress: Arc<RwLock<PrecacheProgress>>,
     trigger: Arc<tokio::sync::Notify>,
     mut playback_rx: tokio::sync::watch::Receiver<bool>,
-    semaphore: Arc<tokio::sync::Semaphore>,
 ) {
     loop {
         trigger.notified().await;
@@ -1937,61 +1940,19 @@ async fn run_precache_worker(
                 "pre-caching segments"
             );
 
-            // Use an explicit index so that when we bail out of a select!
-            // due to playback starting we don't lose the current segment and
-            // can retry it once playback ends.
-            let mut seg_idx = 0;
-            loop {
-                let i = match missing.get(seg_idx) {
-                    Some(&i) => i,
-                    None => break,
-                };
-
+            for i in missing {
                 // Suspend between individual segments while playback is active.
+                // Matches the pattern used by run_thumb_worker / run_sprite_worker:
+                // finish the current unit of work, save it, then pause before
+                // starting the next one.
                 while *playback_rx.borrow() {
                     let _ = playback_rx.changed().await;
-                }
-
-                // Acquire a transcode permit while also watching for playback
-                // to start.  The semaphore is shared with on-demand segment
-                // requests, so we must not hold a queue position while
-                // playback is active — that would starve the real-time
-                // request waiting for the same permit.
-                let _permit = tokio::select! {
-                    biased; // prefer the semaphore arm when both are ready
-                    result = semaphore.acquire() => {
-                        match result {
-                            Ok(p) => p,
-                            Err(e) => {
-                                error!(error = %e, "precache: transcode semaphore closed — worker terminating");
-                                break;
-                            }
-                        }
-                    }
-                    _ = async { let _ = playback_rx.wait_for(|&v| v).await; } => {
-                        // Playback started while we were queued for a permit.
-                        // Don't advance seg_idx — the loop's playback-check at
-                        // the top will suspend us until idle, then retry this
-                        // same segment.
-                        continue;
-                    }
-                };
-
-                // Playback may have started in the narrow window between
-                // acquiring the permit and this point.  Release immediately
-                // so on-demand requests are not starved.
-                if *playback_rx.borrow() {
-                    // _permit is dropped here, freeing the slot.
-                    // Don't advance seg_idx — retry this segment after suspend.
-                    continue;
                 }
 
                 if let Err(e) = transcode_segment(&abs_str, &hls_dir, i, &hwaccel, Quality::High).await {
                     error!(video_id = %id, segment = i, error = %e, "precache: segment transcode failed");
                     break; // Stop for this video on error.
                 }
-
-                seg_idx += 1;
             }
 
             progress.write().advance();
@@ -2448,10 +2409,13 @@ async fn main() -> std::io::Result<()> {
     let (playback_tx, playback_rx) = tokio::sync::watch::channel(false);
     let playback_tx = Arc::new(playback_tx);
 
-    // ── Transcode concurrency semaphore ──────────────────────────────────
-    // Limits the number of simultaneous segment transcode operations so that
-    // the system is not overloaded.  Defaults to the number of available CPU
-    // threads; override with the TRANSCODE_CONCURRENCY environment variable.
+    // ── On-demand playback transcode semaphore ───────────────────────────
+    // Limits the number of simultaneous on-demand segment transcode operations
+    // so that concurrent HLS.js requests don't overload the system.  Used
+    // exclusively by the `get_segment` handler; the pre-cache background
+    // worker is fully suspended during playback and does not compete for
+    // these permits.  Defaults to the number of available CPU threads; override
+    // with the TRANSCODE_CONCURRENCY environment variable.
     let transcode_concurrency = std::env::var("TRANSCODE_CONCURRENCY")
         .ok()
         .and_then(|v| v.parse::<usize>().ok().filter(|&n| n > 0))
@@ -2463,7 +2427,7 @@ async fn main() -> std::io::Result<()> {
                 // still allowing meaningful concurrent load.
                 .unwrap_or(4)
         });
-    info!(limit = transcode_concurrency, "max concurrent transcodes (set TRANSCODE_CONCURRENCY to override)");
+    info!(limit = transcode_concurrency, "max concurrent on-demand transcodes (set TRANSCODE_CONCURRENCY to override)");
     let transcode_semaphore = Arc::new(tokio::sync::Semaphore::new(transcode_concurrency));
 
     // ── Password protection ──────────────────────────────────────────────
@@ -2585,9 +2549,8 @@ async fn main() -> std::io::Result<()> {
         let worker_progress = Arc::clone(&precache_progress);
         let worker_trigger = Arc::clone(&precache_trigger);
         let worker_playback_rx = playback_rx.clone();
-        let worker_semaphore = Arc::clone(&transcode_semaphore);
         tokio::spawn(async move {
-            run_precache_worker(worker_library, worker_cache, precache_hwaccel, worker_progress, worker_trigger, worker_playback_rx, worker_semaphore).await;
+            run_precache_worker(worker_library, worker_cache, precache_hwaccel, worker_progress, worker_trigger, worker_playback_rx).await;
         });
         // Kick off the first batch immediately after startup.
         precache_trigger.notify_one();

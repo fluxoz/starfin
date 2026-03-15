@@ -380,6 +380,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let status_clone = status.clone();
             let error_clone = error.clone();
             let hls_instance_clone = hls_instance.clone();
+            // Clones needed for the automatic quality fallback inside the HLS
+            // error handler.  We intentionally do NOT persist the fallback
+            // quality to localStorage so the user's original preference is
+            // preserved for their next session.
+            let selected_quality_for_error = selected_quality.clone();
+            let resume_position_for_error = resume_position.clone();
 
             spawn_local(async move {
                 // Give time for video element to be created
@@ -480,6 +486,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 manifest_parsed_cb.forget();
 
                 let error_for_handler = error_clone.clone();
+                let status_for_fallback = status_clone.clone();
+                let selected_quality_for_fallback = selected_quality_for_error.clone();
+                let resume_position_for_fallback = resume_position_for_error.clone();
+                let video_ref_for_fallback = video_ref_clone.clone();
                 // Store hls as JsValue for use in closure
                 let hls_js_value: JsValue = hls.clone().into();
                 let error_cb = Closure::wrap(Box::new(move |_event: JsValue, data: JsValue| {
@@ -500,6 +510,32 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         .unwrap_or_else(|| "Unknown".to_string());
                     
                     if fatal {
+                        // When "original" (direct remux) fails fatally, the source
+                        // codec is likely unsupported by the browser.  Automatically
+                        // fall back to the high-quality transcode so playback still
+                        // works, without requiring the user to manually switch.
+                        // The preference is NOT written to localStorage so the user's
+                        // "original" setting is preserved for their next session.
+                        if quality == "original" {
+                            log::warn!(
+                                "Fatal HLS error on original quality ({}), falling back to transcoded stream",
+                                error_details
+                            );
+                            // Preserve the current playback position so the transcode
+                            // stream starts from the same point.  Only save if > 0
+                            // because 0.0 already means "start from beginning" in the
+                            // resume logic (a start_pos of 0.0 would be treated as
+                            // -1.0 / "from start" by the HLS startPosition config).
+                            if let Some(video_el) = video_ref_for_fallback.cast::<HtmlVideoElement>() {
+                                let pos = video_el.current_time();
+                                if pos > 0.0 {
+                                    *resume_position_for_fallback.borrow_mut() = pos;
+                                }
+                            }
+                            status_for_fallback.set("Original stream unsupported - switching to transcoded playback...".to_string());
+                            selected_quality_for_fallback.set("high".to_string());
+                            return;
+                        }
                         // Try to recover from errors that can happen during seeking
                         // especially with on-demand transcoding where segments may take time
                         if error_type == "mediaError" {

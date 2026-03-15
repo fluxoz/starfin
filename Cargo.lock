@@ -2403,6 +2403,7 @@ dependencies = [
  "image",
  "libc",
  "mime_guess",
+ "parking_lot",
  "reqwest",
  "rust-embed",
  "serde",

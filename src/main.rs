@@ -15,7 +15,8 @@ use mime_guess::MimeGuess;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::{Mutex, RwLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -349,7 +350,7 @@ struct AppState {
     /// transcode job finishes.  All concurrent requests for the same segment
     /// subscribe to the same channel and await the result, so only one ffmpeg
     /// job is ever spawned per segment at a time.
-    segment_inflight: Arc<std::sync::Mutex<HashMap<(String, usize, Quality), Arc<tokio::sync::watch::Sender<Option<Result<(), String>>>>>>>,
+    segment_inflight: Arc<Mutex<HashMap<(String, usize, Quality), Arc<tokio::sync::watch::Sender<Option<Result<(), String>>>>>>>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -533,7 +534,6 @@ fn find_video(state: &AppState, id: &str) -> Option<(PathBuf, String)> {
     state
         .video_path_index
         .read()
-        .expect("video path index lock poisoned")
         .get(id)
         .cloned()
 }
@@ -542,7 +542,7 @@ fn find_video(state: &AppState, id: &str) -> Option<(PathBuf, String)> {
 
 /// `GET /api/videos` — list all videos with metadata (served from cache).
 async fn list_videos(state: web::Data<AppState>) -> impl Responder {
-    let items = state.video_cache.read().expect("video cache lock poisoned").clone();
+    let items = state.video_cache.read().clone();
     HttpResponse::Ok().json(serde_json::json!({ "items": items }))
 }
 
@@ -651,8 +651,8 @@ async fn scan_ws(
 
         // Commit the updated library to the shared cache and persist to disk.
         save_video_cache(&items, &cache_dir);
-        *video_cache.write().expect("video cache lock poisoned") = items;
-        *video_path_index.write().expect("video path index lock poisoned") = index;
+        *video_cache.write() = items;
+        *video_path_index.write() = index;
 
         // Re-trigger deep thumbnail generation for any newly discovered videos.
         thumb_trigger.notify_one();
@@ -866,7 +866,7 @@ async fn run_thumb_worker(
             });
 
         {
-            let mut p = progress.write().expect("thumb_progress lock poisoned");
+            let mut p = progress.write();
             p.current = quick_done.len() as u32;
             p.total = (quick_done.len() + quick_entries.len()) as u32;
             p.active = !quick_entries.is_empty();
@@ -892,7 +892,7 @@ async fn run_thumb_worker(
                     .to_string();
                 let id = video_id(&rel);
                 {
-                    let mut p = progress.write().expect("thumb_progress lock poisoned");
+                    let mut p = progress.write();
                     p.current_ids.insert(id.clone());
                 }
                 let cache_dir = cache_dir.clone();
@@ -907,7 +907,7 @@ async fn run_thumb_worker(
             }
             // Collect the next completed task.
             if let Some(Ok((id, _ok))) = join_set.join_next().await {
-                let mut p = progress.write().expect("thumb_progress lock poisoned");
+                let mut p = progress.write();
                 p.current_ids.remove(&id);
                 p.current += 1;
                 if p.current >= p.total {
@@ -933,7 +933,7 @@ async fn run_thumb_worker(
             });
 
         {
-            let mut p = progress.write().expect("thumb_progress lock poisoned");
+            let mut p = progress.write();
             p.current = deep_done.len() as u32;
             p.total = (deep_done.len() + deep_entries.len()) as u32;
             p.active = !deep_entries.is_empty();
@@ -959,7 +959,7 @@ async fn run_thumb_worker(
                     .to_string();
                 let id = video_id(&rel);
                 {
-                    let mut p = progress.write().expect("thumb_progress lock poisoned");
+                    let mut p = progress.write();
                     p.current_ids.insert(id.clone());
                 }
                 let cache_dir = cache_dir.clone();
@@ -974,7 +974,7 @@ async fn run_thumb_worker(
             }
             // Collect the next completed task.
             if let Some(Ok((id, _ok))) = join_set.join_next().await {
-                let mut p = progress.write().expect("thumb_progress lock poisoned");
+                let mut p = progress.write();
                 p.current_ids.remove(&id);
                 p.current += 1;
                 if p.current >= p.total {
@@ -1001,7 +1001,7 @@ struct ThumbProgressResponse {
 }
 
 async fn get_thumb_progress(state: web::Data<AppState>) -> impl Responder {
-    let p = state.thumb_progress.read().expect("thumb_progress lock poisoned");
+    let p = state.thumb_progress.read();
     HttpResponse::Ok().json(ThumbProgressResponse {
         current: p.current,
         total: p.total,
@@ -1039,17 +1039,17 @@ async fn progress_ws(
             ticker.tick().await;
 
             let (tc, tt, ta, tph, tids) = {
-                let p = thumb_progress.read().expect("thumb_progress lock poisoned");
+                let p = thumb_progress.read();
                 let ids: Vec<String> = p.current_ids.iter().cloned().collect();
                 (p.current, p.total, p.active, p.phase, ids)
             };
             let (sc, st, sa, sids) = {
-                let p = sprite_progress.read().expect("sprite_progress lock poisoned");
+                let p = sprite_progress.read();
                 let ids: Vec<String> = p.current_ids.iter().cloned().collect();
                 (p.current, p.total, p.active, ids)
             };
             let (pc, pt, pa, pid) = {
-                let p = precache_progress.read().expect("precache_progress lock poisoned");
+                let p = precache_progress.read();
                 (p.current, p.total, p.active, p.current_id.clone())
             };
 
@@ -1270,8 +1270,7 @@ async fn get_segment(
     {
         let mut map = state
             .last_segment_access
-            .write()
-            .expect("last_segment_access lock poisoned");
+            .write();
         map.insert(id.clone(), Instant::now());
     }
     // Signal to background workers that playback is in progress.
@@ -1336,8 +1335,7 @@ async fn get_segment(
     let maybe_rx = {
         let mut map = state
             .segment_inflight
-            .lock()
-            .expect("Failed to acquire segment_inflight lock (poisoned) while checking for existing transcode job");
+            .lock();
         if let Some(tx) = map.get(&inflight_key) {
             // Another request is already transcoding this segment – subscribe.
             Some(tx.subscribe())
@@ -1373,7 +1371,6 @@ async fn get_segment(
                 let tx = state
                     .segment_inflight
                     .lock()
-                    .expect("Failed to acquire segment_inflight lock (poisoned) while removing failed transcode job")
                     .remove(&inflight_key);
                 if let Some(tx) = tx {
                     let _ = tx.send(Some(Err(format!("semaphore closed"))));
@@ -1390,7 +1387,6 @@ async fn get_segment(
         let tx = state
             .segment_inflight
             .lock()
-            .expect("Failed to acquire segment_inflight lock (poisoned) while removing completed transcode job")
             .remove(&inflight_key);
         if let Some(tx) = tx {
             let _ = tx.send(Some(result.clone()));
@@ -1471,7 +1467,6 @@ async fn clear_cache(
     state
         .last_segment_access
         .write()
-        .expect("last_segment_access lock poisoned")
         .remove(&id);
 
     HttpResponse::NoContent().finish()
@@ -1607,18 +1602,15 @@ async fn get_processing_status(
         let thumb_on_this = state
             .thumb_progress
             .read()
-            .map(|p| p.current_ids.contains(id.as_str()))
-            .unwrap_or(false);
+            .current_ids.contains(id.as_str());
         let sprite_on_this = state
             .sprite_progress
             .read()
-            .map(|p| p.current_ids.contains(id.as_str()))
-            .unwrap_or(false);
+            .current_ids.contains(id.as_str());
         let precache_on_this = state
             .precache_progress
             .read()
-            .map(|p| p.current_id.as_deref() == Some(id.as_str()))
-            .unwrap_or(false);
+            .current_id.as_deref() == Some(id.as_str());
 
         if thumb_on_this || sprite_on_this || precache_on_this {
             "processing"
@@ -1754,7 +1746,7 @@ async fn run_sprite_worker(
             });
 
         {
-            let mut p = progress.write().expect("sprite_progress lock poisoned");
+            let mut p = progress.write();
             p.current = sprite_done.len() as u32;
             p.total = (sprite_done.len() + entries.len()) as u32;
             p.active = !entries.is_empty();
@@ -1779,7 +1771,7 @@ async fn run_sprite_worker(
                     .to_string();
                 let id = video_id(&rel);
                 {
-                    let mut p = progress.write().expect("sprite_progress lock poisoned");
+                    let mut p = progress.write();
                     p.current_ids.insert(id.clone());
                 }
                 let cache_dir = cache_dir.clone();
@@ -1794,7 +1786,7 @@ async fn run_sprite_worker(
             }
             // Collect the next completed task.
             if let Some(Ok((id, _ok))) = join_set.join_next().await {
-                let mut p = progress.write().expect("sprite_progress lock poisoned");
+                let mut p = progress.write();
                 p.current_ids.remove(&id);
                 p.current += 1;
                 if p.current >= p.total {
@@ -1884,7 +1876,7 @@ async fn run_precache_worker(
         }
 
         {
-            let mut p = progress.write().expect("precache_progress lock poisoned");
+            let mut p = progress.write();
             p.current = done_count as u32;
             p.total = (done_count + pending.len()) as u32;
             p.active = !pending.is_empty();
@@ -1907,14 +1899,14 @@ async fn run_precache_worker(
             let hls_dir = cache_dir.join(&id).join(Quality::High.as_str());
 
             {
-                let mut p = progress.write().expect("precache_progress lock poisoned");
+                let mut p = progress.write();
                 p.current_id = Some(id.clone());
             }
 
             // Determine how many segments to pre-cache (capped by video duration).
             let (duration_secs, _) = probe_video(&abs).await;
             if duration_secs == 0 {
-                progress.write().expect("precache_progress lock poisoned").advance();
+                progress.write().advance();
                 continue;
             }
             let total_segments = (duration_secs as f64 / SEGMENT_DURATION).ceil() as usize;
@@ -1931,7 +1923,7 @@ async fn run_precache_worker(
                 .filter(|i| !hls_dir.join(format!("seg_{:05}.ts", i)).exists())
                 .collect();
             if missing.is_empty() {
-                progress.write().expect("precache_progress lock poisoned").advance();
+                progress.write().advance();
                 continue;
             }
 
@@ -1939,21 +1931,21 @@ async fn run_precache_worker(
             let resolved_path = match abs.canonicalize() {
                 Ok(p) => p,
                 Err(_) => {
-                    progress.write().expect("precache_progress lock poisoned").advance();
+                    progress.write().advance();
                     continue;
                 }
             };
             let abs_str = match resolved_path.to_str() {
                 Some(s) => s.to_owned(),
                 None => {
-                    progress.write().expect("precache_progress lock poisoned").advance();
+                    progress.write().advance();
                     continue;
                 }
             };
 
             if let Err(e) = tokio::fs::create_dir_all(&hls_dir).await {
                 error!(video_id = %id, error = %e, "precache: cache dir error");
-                progress.write().expect("precache_progress lock poisoned").advance();
+                progress.write().advance();
                 continue;
             }
 
@@ -1986,7 +1978,7 @@ async fn run_precache_worker(
                 }
             }
 
-            progress.write().expect("precache_progress lock poisoned").advance();
+            progress.write().advance();
         }
     }
 }
@@ -2141,7 +2133,7 @@ fn is_authenticated(req: &HttpRequest, state: &AppState) -> bool {
         return true;
     }
     if let Some(token) = extract_token(req) {
-        let tokens = state.auth_tokens.read().expect("auth_tokens lock poisoned");
+        let tokens = state.auth_tokens.read();
         tokens.contains(&token)
     } else {
         false
@@ -2220,7 +2212,7 @@ async fn set_password(
     // Auto-login after setting password.
     let token = generate_token();
     {
-        let mut tokens = state.auth_tokens.write().expect("auth_tokens lock poisoned");
+        let mut tokens = state.auth_tokens.write();
         tokens.insert(token.clone());
     }
 
@@ -2268,7 +2260,7 @@ async fn login(
 
     let token = generate_token();
     {
-        let mut tokens = state.auth_tokens.write().expect("auth_tokens lock poisoned");
+        let mut tokens = state.auth_tokens.write();
         tokens.insert(token.clone());
     }
 
@@ -2312,7 +2304,7 @@ async fn auth_middleware(
     let authenticated = req
         .cookie("starfin_token")
         .map(|c| {
-            let tokens = state.auth_tokens.read().expect("auth_tokens lock poisoned");
+            let tokens = state.auth_tokens.read();
             tokens.contains(c.value())
         })
         .unwrap_or(false);
@@ -2494,7 +2486,7 @@ async fn main() -> std::io::Result<()> {
         password_protection,
         password_hash_path,
         auth_tokens,
-        segment_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        segment_inflight: Arc::new(Mutex::new(HashMap::new())),
     });
 
     // One-time background scan at startup to refresh the index immediately.
@@ -2510,8 +2502,8 @@ async fn main() -> std::io::Result<()> {
         tokio::spawn(async move {
             let (items, index) = scan_library(&startup_library).await;
             save_video_cache(&items, &startup_cache_dir);
-            *startup_cache.write().expect("video cache lock poisoned") = items;
-            *startup_index.write().expect("video path index lock poisoned") = index;
+            *startup_cache.write() = items;
+            *startup_index.write() = index;
             startup_thumb_trigger.notify_one();
             startup_sprite_trigger.notify_one();
         });
@@ -2532,8 +2524,8 @@ async fn main() -> std::io::Result<()> {
             interval.tick().await;
             let (items, index) = scan_library(&bg_library_path).await;
             save_video_cache(&items, &bg_cache_dir);
-            *bg_cache.write().expect("video cache lock poisoned") = items;
-            *bg_index.write().expect("video path index lock poisoned") = index;
+            *bg_cache.write() = items;
+            *bg_index.write() = index;
             bg_thumb_trigger.notify_one();
             bg_sprite_trigger.notify_one();
             bg_precache_trigger.notify_one();
@@ -2604,8 +2596,7 @@ async fn main() -> std::io::Result<()> {
                 let is_playing = {
                     let map = monitor_state
                         .last_segment_access
-                        .read()
-                        .expect("last_segment_access lock poisoned");
+                        .read();
                     map.values().any(|t| t.elapsed() < PLAYBACK_IDLE_TIMEOUT)
                 };
                 // Only send when the value actually changes to avoid
@@ -2642,8 +2633,7 @@ async fn main() -> std::io::Result<()> {
                 let idle_ids: Vec<String> = {
                     let map = sweep_state
                         .last_segment_access
-                        .read()
-                        .expect("last_segment_access lock poisoned");
+                        .read();
                     map.iter()
                         .filter(|(_, t)| t.elapsed() >= CACHE_IDLE_TIMEOUT)
                         .map(|(id, _)| id.clone())
@@ -2657,7 +2647,6 @@ async fn main() -> std::io::Result<()> {
                     sweep_state
                         .last_segment_access
                         .write()
-                        .expect("last_segment_access lock poisoned")
                         .remove(&id);
                 }
             }

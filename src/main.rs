@@ -1,3 +1,5 @@
+mod media;
+
 use actix_web::{
     App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
     body::MessageBody,

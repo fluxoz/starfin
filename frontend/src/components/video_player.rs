@@ -75,8 +75,10 @@ const CONTROLS_VICINITY_PX: f64 = 80.0;
 /// `transcode_semaphore` in the backend already limits concurrent transcode
 /// operations, so a larger buffer won't overload the system on seek.
 const HLS_MAX_BUFFER_LENGTH: f64 = 30.0;
-/// Maximum maximum buffer length in seconds (absolute cap)
-const HLS_MAX_MAX_BUFFER_LENGTH: f64 = 30.0;
+/// Maximum maximum buffer length in seconds (absolute cap).
+/// Set higher than maxBufferLength to allow the buffer to grow beyond the
+/// target when segments arrive quickly (e.g. served from cache).
+const HLS_MAX_MAX_BUFFER_LENGTH: f64 = 60.0;
 /// Maximum buffer size in bytes (60 MB)
 const HLS_MAX_BUFFER_SIZE: f64 = 60.0 * 1000.0 * 1000.0;
 /// Back buffer length in seconds (for backward seeking without refetch)

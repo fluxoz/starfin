@@ -24,8 +24,10 @@ pub struct ThumbProgressMsg {
     pub total: u32,
     pub active: bool,
     pub phase: String,
-    /// The video ID currently being thumbnailed, if any.
-    pub current_id: Option<String>,
+    /// The video IDs currently being thumbnailed (may be multiple when running
+    /// in parallel).
+    #[serde(default)]
+    pub current_ids: Vec<String>,
 }
 
 /// Sprite progress received over the `/api/progress/ws` WebSocket.
@@ -34,8 +36,10 @@ pub struct SpriteProgressMsg {
     pub current: u32,
     pub total: u32,
     pub active: bool,
-    /// The video ID currently getting a sprite sheet, if any.
-    pub current_id: Option<String>,
+    /// The video IDs currently getting sprite sheets (may be multiple when
+    /// running in parallel).
+    #[serde(default)]
+    pub current_ids: Vec<String>,
 }
 
 /// Pre-cache progress received over the `/api/progress/ws` WebSocket.

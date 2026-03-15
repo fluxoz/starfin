@@ -8,12 +8,12 @@ use yew::prelude::*;
 pub struct Props {
     pub items: Vec<Element>,
     pub on_watch: Callback<Element>,
-    /// The video ID the thumbnail worker is currently processing (from WS).
+    /// The video IDs the thumbnail worker is currently processing (from WS).
     #[prop_or_default]
-    pub thumb_current_id: Option<String>,
-    /// The video ID the sprite worker is currently processing (from WS).
+    pub thumb_current_id: Vec<String>,
+    /// The video IDs the sprite worker is currently processing (from WS).
     #[prop_or_default]
-    pub sprite_current_id: Option<String>,
+    pub sprite_current_id: Vec<String>,
     /// The video ID the pre-cache worker is currently processing (from WS).
     #[prop_or_default]
     pub precache_current_id: Option<String>,
@@ -149,9 +149,9 @@ pub fn elements_grid(props: &Props) -> Html {
         <section class="grid" aria-label="Videos grid">
             { for props.items.iter().map(|item| {
                 let is_thumb_processing =
-                    props.thumb_current_id.as_deref() == Some(item.id.as_str());
+                    props.thumb_current_id.iter().any(|id| id == &item.id);
                 let is_sprite_processing =
-                    props.sprite_current_id.as_deref() == Some(item.id.as_str());
+                    props.sprite_current_id.iter().any(|id| id == &item.id);
                 let is_precache_processing =
                     props.precache_current_id.as_deref() == Some(item.id.as_str());
 

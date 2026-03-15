@@ -1668,8 +1668,8 @@ async fn get_thumbnail_sprite(
     }
 }
 
-/// Generates the thumbnail sprite sheet for a video using in-process
-/// ffmpeg-next decoding and the `image` crate for compositing.
+/// Generates the thumbnail sprite sheet for a video via an `ffmpeg`
+/// subprocess with the `fps → scale → tile` filter chain.
 ///
 /// Creates `{cache_dir}/{id}_thumbs/sprite.jpg`.  Returns `true` on success.
 ///
@@ -1677,6 +1677,9 @@ async fn get_thumbnail_sprite(
 /// to be interruptible (e.g. the on-demand HTTP handler), or `None` to let
 /// the task run to completion regardless of playback state (used by the
 /// background worker, which already pauses *between* videos).
+///
+/// When a kill signal fires, the ffmpeg child process is terminated
+/// immediately via `child.kill()` and the temp file is cleaned up.
 async fn generate_sprite(
     id: &str,
     abs_path: &Path,
@@ -1704,19 +1707,88 @@ async fn generate_sprite(
         Err(_) => return false,
     };
 
-    let sprite_dir_owned = sprite_dir.clone();
-    let task = tokio::task::spawn_blocking(move || {
-        media::sprite::generate_sprite_sheet(&resolved_path, duration_secs, &sprite_dir_owned)
-    });
+    // Build the ffmpeg filter chain and spawn the subprocess.
+    let duration = duration_secs as f64;
+    let interval = media::sprite::THUMBNAIL_INTERVAL;
+    let num_thumbnails = ((duration / interval).ceil() as u32).max(1);
+    let columns = media::sprite::THUMBNAILS_PER_ROW.min(num_thumbnails);
+    let rows = ((num_thumbnails as f64) / (columns as f64)).ceil() as u32;
 
-    match kill {
-        None => task.await.unwrap_or(false),
-        Some(kill) => tokio::select! {
-            result = task => result.unwrap_or(false),
-            _ = async { let _ = kill.wait_for(|&v| v).await; } => {
-                false
+    let video_str = match resolved_path.to_str() {
+        Some(s) => s.to_string(),
+        None => return false,
+    };
+    let tmp_path = sprite_dir.join("sprite.tmp.jpg");
+    let tmp_str = match tmp_path.to_str() {
+        Some(s) => s.to_string(),
+        None => return false,
+    };
+    let filter = format!(
+        "fps=1/{:.1},scale={}:{},tile={}x{}",
+        interval,
+        media::sprite::THUMBNAIL_WIDTH,
+        media::sprite::THUMBNAIL_HEIGHT,
+        columns,
+        rows,
+    );
+
+    let child_result = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-i",
+            &video_str,
+            "-vf",
+            &filter,
+            "-frames:v",
+            "1",
+            "-q:v",
+            "5",
+            "-y",
+            &tmp_str,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+
+    let mut child: tokio::process::Child = match child_result {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let success = match kill {
+        None => {
+            // Background worker: wait for completion unconditionally.
+            child.wait().await.map_or(false, |s| s.success())
+        }
+        Some(kill) => {
+            // HTTP handler: allow interruption via kill signal.
+            tokio::select! {
+                result = child.wait() => result.map_or(false, |s| s.success()),
+                _ = async { let _ = kill.wait_for(|&v| v).await; } => {
+                    if let Err(e) = child.kill().await {
+                        warn!("failed to kill ffmpeg sprite subprocess: {e}");
+                    }
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return false;
+                }
             }
-        },
+        }
+    };
+
+    if !success {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return false;
+    }
+
+    match tokio::fs::rename(&tmp_path, &sprite_path).await {
+        Ok(_) => true,
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            false
+        }
     }
 }
 

@@ -1,14 +1,18 @@
-//! HLS segment transcoding — fully in-process via `ffmpeg-next`.
+//! HLS segment creation — direct remux when possible, transcode as fallback.
 //!
-//! Each segment is a 6-second MPEG-TS chunk encoded with H.264 (hardware or
-//! software) and AAC audio.  The implementation uses `ffmpeg-next`'s
-//! transcoding primitives: open input, seek, decode, (optionally) filter for
-//! scaling, encode, and mux into an mpegts output.
+//! Each segment is a 6-second MPEG-TS chunk.  For **Original** quality with
+//! browser-compatible codecs (H.264 video + AAC/MP3 audio) the segment is
+//! created by **remuxing** — copying compressed packets directly from the
+//! source file without decoding or re-encoding.  This is near-instant (pure
+//! I/O, like VLC playback) and gives performance parity with direct file
+//! access.
 //!
-//! Hardware-accelerated encoding (NVENC, VAAPI, QSV, etc.) is driven entirely
-//! through the raw `ffmpeg-next::ffi` bindings — `av_hwdevice_ctx_create`,
-//! `av_hwframe_ctx_alloc`, and `av_hwframe_transfer_data` — so no ffmpeg
-//! subprocess is needed for any quality tier.
+//! When remuxing is not possible (incompatible codec, or High/Medium/Low
+//! quality that requires re-encoding or resolution scaling) the segment is
+//! **transcoded** in-process via `ffmpeg-next`.
+//!
+//! Hardware-accelerated encoding (NVENC, VAAPI, QSV, etc.) is available for
+//! the transcode fallback path via the raw FFI bindings.
 
 use std::path::Path;
 
@@ -17,10 +21,11 @@ use super::hwaccel::HwAccel;
 /// Duration of each HLS segment in seconds.
 pub const SEGMENT_DURATION: f64 = 6.0;
 
-/// Transcode a single MPEG-TS segment.
+/// Create a single MPEG-TS segment — remux if possible, transcode otherwise.
 ///
-/// All quality tiers (High, Medium, Low) and all encoder backends (GPU and
-/// software) are handled in-process via ffmpeg-next.
+/// For **Original** quality with H.264 + AAC/MP3 source, packets are copied
+/// directly (remux).  For incompatible codecs or High/Medium/Low quality that
+/// requires re-encoding, the full transcode path is used.
 ///
 /// Writes to a temporary file first, then atomically renames.
 pub async fn transcode_segment(
@@ -40,49 +45,92 @@ pub async fn transcode_segment(
     let start_time = seg_index as f64 * SEGMENT_DURATION;
     debug_assert!(start_time >= 0.0 && start_time.is_finite());
 
-    // Run the CPU/GPU-intensive in-process transcode on a blocking thread
-    // so we don't starve the tokio runtime.
+    // Run the I/O or CPU-intensive work on a blocking thread so we don't
+    // starve the tokio runtime.
     let abs_path = abs_path.to_owned();
     let hls_dir = hls_dir.to_owned();
     let hwaccel = hwaccel.clone();
     tokio::task::spawn_blocking(move || {
-        transcode_segment_inprocess(&abs_path, &hls_dir, seg_index, &hwaccel, quality)
+        create_segment(&abs_path, &hls_dir, seg_index, &hwaccel, quality)
     })
     .await
     .map_err(|e| format!("transcode task panicked: {e}"))?
 }
 
-/// Quality level for on-demand video transcoding.
+/// Quality / mode for on-demand segment creation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Quality {
+    /// Direct remux — copy packets without re-encoding.
+    /// Fastest option: pure I/O, no CPU decode/encode.
+    /// Requires source to have browser-compatible codecs (H.264 + AAC/MP3).
+    /// Falls back to High transcode if source codecs are incompatible.
     #[default]
+    Original,
+    /// Re-encode at native resolution (CRF 18, veryslow or HW encoder).
     High,
+    /// Re-encode at ≤720p (CRF 26, fast preset).
     Medium,
+    /// Re-encode at ≤480p (CRF 30, faster preset).
     Low,
 }
 
 impl Quality {
     pub fn as_str(self) -> &'static str {
         match self {
-            Quality::High   => "high",
-            Quality::Medium => "medium",
-            Quality::Low    => "low",
+            Quality::Original => "original",
+            Quality::High     => "high",
+            Quality::Medium   => "medium",
+            Quality::Low      => "low",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Quality::High   => "High",
-            Quality::Medium => "Medium",
-            Quality::Low    => "Low",
+            Quality::Original => "Original",
+            Quality::High     => "High",
+            Quality::Medium   => "Medium",
+            Quality::Low      => "Low",
         }
+    }
+
+    /// Whether this quality level can potentially use the fast remux path
+    /// (no re-encoding).  Only Original uses remux; all others always
+    /// transcode.
+    fn can_remux(self) -> bool {
+        self == Quality::Original
     }
 }
 
-// ── In-process transcode (all quality tiers) ─────────────────────────────────
+// ── Codec compatibility ──────────────────────────────────────────────────────
 
-fn transcode_segment_inprocess(
+/// Return `true` if the source codecs are browser-compatible and can be
+/// remuxed directly into MPEG-TS without re-encoding.
+fn source_is_remuxable(ictx: &ffmpeg_next::format::context::Input) -> bool {
+    use ffmpeg_next::codec::Id;
+
+    let video_ok = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Video)
+        .map(|s| s.parameters().id() == Id::H264)
+        .unwrap_or(false);
+
+    let audio_ok = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Audio)
+        .map(|s| {
+            let id = s.parameters().id();
+            id == Id::AAC || id == Id::MP3
+        })
+        // No audio stream is fine — video-only remux is valid.
+        .unwrap_or(true);
+
+    video_ok && audio_ok
+}
+
+// ── Segment creation: decide remux vs transcode ─────────────────────────────
+
+fn create_segment(
     abs_path: &str,
     hls_dir: &Path,
     seg_index: usize,
@@ -101,6 +149,175 @@ fn transcode_segment_inprocess(
     let mut ictx = ffmpeg_next::format::input(&abs_path)
         .map_err(|e| format!("failed to open input: {e}"))?;
 
+    // Decide: remux (fast copy) or transcode (re-encode).
+    if quality.can_remux() && source_is_remuxable(&ictx) {
+        remux_segment(&mut ictx, start_time, &tmp_path)?;
+    } else {
+        // For Original quality with incompatible codecs, fall back to the
+        // same settings as High (native resolution, best quality).
+        let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
+        transcode_segment_inprocess(&mut ictx, start_time, hwaccel, effective_quality, &tmp_path)?;
+    }
+
+    // Atomic rename.
+    std::fs::rename(&tmp_path, &seg_path)
+        .map_err(|e| format!("failed to rename segment {seg_index}: {e}"))?;
+
+    Ok(())
+}
+
+// ── Remux path (direct packet copy — near-instant) ──────────────────────────
+
+/// Copy compressed packets from the source into an MPEG-TS segment without
+/// decoding or re-encoding.  This is the equivalent of
+/// `ffmpeg -ss <t> -i input -t 6 -c copy -f mpegts output.ts`
+/// and gives VLC-like performance.
+fn remux_segment(
+    ictx: &mut ffmpeg_next::format::context::Input,
+    start_time: f64,
+    tmp_path: &Path,
+) -> Result<(), String> {
+    let end_time = start_time + SEGMENT_DURATION;
+
+    // Find best video/audio streams.
+    let video_idx = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Video)
+        .map(|s| s.index());
+    let audio_idx = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Audio)
+        .map(|s| s.index());
+
+    if video_idx.is_none() {
+        return Err("no video stream found".into());
+    }
+
+    // Seek to the nearest keyframe at or before start_time.
+    let seek_ts = (start_time * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
+    let _ = ictx.seek(seek_ts, ..seek_ts);
+
+    // Collect input stream info we need (time_bases, codec params).
+    // We only copy the best video and (optionally) best audio stream.
+    let in_video_tb = ictx.stream(video_idx.unwrap()).unwrap().time_base();
+    let in_video_params = ictx.stream(video_idx.unwrap()).unwrap().parameters();
+
+    let in_audio_tb;
+    let in_audio_params;
+    if let Some(ai) = audio_idx {
+        in_audio_tb = Some(ictx.stream(ai).unwrap().time_base());
+        in_audio_params = Some(ictx.stream(ai).unwrap().parameters());
+    } else {
+        in_audio_tb = None;
+        in_audio_params = None;
+    }
+
+    // Create output muxer.
+    let mut octx = ffmpeg_next::format::output_as(tmp_path, "mpegts")
+        .map_err(|e| format!("output context: {e}"))?;
+
+    // Add output video stream, copying codec parameters from input.
+    let out_video = octx.add_stream(ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::H264))
+        .map_err(|e| format!("add video stream: {e}"))?;
+    unsafe {
+        ffmpeg_next::ffi::avcodec_parameters_copy(
+            out_video.parameters().as_mut_ptr(),
+            in_video_params.as_ptr(),
+        );
+    }
+    let out_video_idx = out_video.index();
+
+    // Add output audio stream if present.
+    let mut out_audio_idx_val: Option<usize> = None;
+    let mut out_audio_tb = ffmpeg_next::Rational::new(1, 90000);
+
+    if let Some(ref a_params) = in_audio_params {
+        let audio_codec_id = a_params.id();
+        let enc = ffmpeg_next::encoder::find(audio_codec_id);
+        if let Some(out_audio) = octx.add_stream(enc).ok() {
+            unsafe {
+                ffmpeg_next::ffi::avcodec_parameters_copy(
+                    out_audio.parameters().as_mut_ptr(),
+                    a_params.as_ptr(),
+                );
+            }
+            out_audio_tb = out_audio.time_base();
+            out_audio_idx_val = Some(out_audio.index());
+        }
+    }
+
+    octx.write_header()
+        .map_err(|e| format!("write header: {e}"))?;
+
+    // Re-read output time bases after write_header (muxer may adjust them).
+    let out_video_tb = octx.stream(out_video_idx).unwrap().time_base();
+    let out_audio_tb = out_audio_idx_val.map(|i| octx.stream(i).unwrap().time_base()).unwrap_or(out_audio_tb);
+
+    let mut got_video_keyframe = false;
+
+    for (stream, mut packet) in ictx.packets() {
+        let si = stream.index();
+        let is_video = Some(si) == video_idx;
+        let is_audio = Some(si) == audio_idx;
+
+        if !is_video && !is_audio {
+            continue;
+        }
+
+        // Convert packet PTS to seconds for time-range filtering.
+        let in_tb = if is_video { in_video_tb } else { in_audio_tb.unwrap_or(in_video_tb) };
+        let pts = packet.pts().unwrap_or(0);
+        let pts_secs = pts as f64 * f64::from(in_tb.0) / f64::from(in_tb.1);
+
+        // Past segment end → done.
+        if pts_secs >= end_time {
+            break;
+        }
+
+        if is_video {
+            // Wait for the first keyframe at or after start_time.
+            if !got_video_keyframe {
+                if !packet.is_key() || pts_secs < start_time - SEGMENT_DURATION {
+                    continue;
+                }
+                got_video_keyframe = true;
+            }
+        } else {
+            // Skip audio packets before the video keyframe region.
+            if !got_video_keyframe {
+                continue;
+            }
+        }
+
+        // Map to the output stream and rescale timestamps.
+        if is_video {
+            packet.set_stream(out_video_idx);
+            packet.rescale_ts(in_video_tb, out_video_tb);
+        } else if let Some(out_ai) = out_audio_idx_val {
+            packet.set_stream(out_ai);
+            packet.rescale_ts(in_audio_tb.unwrap(), out_audio_tb);
+        } else {
+            continue;
+        }
+
+        let _ = packet.write_interleaved(&mut octx);
+    }
+
+    octx.write_trailer()
+        .map_err(|e| format!("write trailer: {e}"))?;
+
+    Ok(())
+}
+
+// ── Transcode path (re-encode — used for incompatible codecs or scaling) ────
+
+fn transcode_segment_inprocess(
+    ictx: &mut ffmpeg_next::format::context::Input,
+    start_time: f64,
+    hwaccel: &HwAccel,
+    quality: Quality,
+    tmp_path: &Path,
+) -> Result<(), String> {
     // Seek to the segment start position.
     let seek_ts = (start_time * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
     let _ = ictx.seek(seek_ts, ..seek_ts);
@@ -132,18 +349,17 @@ fn transcode_segment_inprocess(
         let fps = if fr.den > 0 { fr.num as f64 / fr.den as f64 } else { 0.0 };
         ((*p).width as u32, (*p).height as u32, fps)
     };
-    // Use detected frame rate, fall back to 30 fps if unavailable.
     let effective_fps = if frame_rate > 0.0 && frame_rate.is_finite() { frame_rate } else { 30.0 };
 
     let (out_width, out_height, crf, preset) = match quality {
-        Quality::High => (in_width, in_height, "18", "veryslow"),
+        Quality::Original | Quality::High => (in_width, in_height, "18", "veryslow"),
         Quality::Medium => {
             let max_w = 1280u32;
             if in_width <= max_w {
                 (in_width, in_height, "26", "fast")
             } else {
                 let ratio = max_w as f64 / in_width as f64;
-                let h = ((in_height as f64 * ratio) as u32) & !1; // ensure even
+                let h = ((in_height as f64 * ratio) as u32) & !1;
                 (max_w, h, "26", "fast")
             }
         }
@@ -159,9 +375,7 @@ fn transcode_segment_inprocess(
         }
     };
 
-    // Determine encoder: use the hardware encoder for High+GPU, libx264 for
-    // software tiers.
-    let use_hw = quality == Quality::High && *hwaccel != HwAccel::Software;
+    let use_hw = matches!(quality, Quality::Original | Quality::High) && *hwaccel != HwAccel::Software;
     let encoder_name = if use_hw { hwaccel.encoder() } else { "libx264" };
 
     // Set up video decoder.
@@ -192,10 +406,8 @@ fn transcode_segment_inprocess(
         }
     }
 
-    // Run the main transcode logic; ensure hardware contexts are freed on
-    // both success and error paths.
     let result = transcode_segment_body(
-        &mut ictx,
+        ictx,
         &mut video_decoder,
         video_idx,
         video_time_base,
@@ -210,10 +422,9 @@ fn transcode_segment_inprocess(
         encoder_name,
         quality,
         preset, crf,
-        &tmp_path,
+        tmp_path,
     );
 
-    // Clean up hardware contexts.
     unsafe {
         if !hw_frames_ctx.is_null() {
             ffmpeg_next::ffi::av_buffer_unref(&mut hw_frames_ctx);
@@ -223,17 +434,15 @@ fn transcode_segment_inprocess(
         }
     }
 
-    result?;
-
-    // Atomic rename.
-    std::fs::rename(&tmp_path, &seg_path)
-        .map_err(|e| format!("failed to rename segment {seg_index}: {e}"))?;
-
-    Ok(())
+    result
 }
 
-/// Inner body of transcode_segment_inprocess, extracted to simplify cleanup of
-/// hardware device/frames contexts in the caller.
+/// Inner transcode body — decode, filter, encode, mux.
+///
+/// Audio handling uses a software resampler to convert the decoder's native
+/// sample format to the AAC encoder's required format (FLTP), and generates
+/// synthetic PTS aligned with the segment start time so that timestamps are
+/// correct regardless of the source container's time base.
 #[allow(clippy::too_many_arguments)]
 fn transcode_segment_body(
     ictx: &mut ffmpeg_next::format::context::Input,
@@ -253,7 +462,7 @@ fn transcode_segment_body(
     preset: &str, crf: &str,
     tmp_path: &Path,
 ) -> Result<(), String> {
-    // Set up video encoder.
+    // ── Video encoder setup ──────────────────────────────────────────────
     let video_encoder_codec = ffmpeg_next::encoder::find_by_name(encoder_name)
         .ok_or_else(|| format!("encoder '{}' not found", encoder_name))?;
     let video_encoder_ctx = ffmpeg_next::codec::context::Context::new_with_codec(video_encoder_codec);
@@ -263,10 +472,9 @@ fn transcode_segment_body(
         enc.set_height(out_height);
         enc.set_time_base(ffmpeg_next::Rational::new(1, 90000));
         enc.set_gop(250);
-        enc.set_max_b_frames(0); // No B-frames for independent segment decoding
+        enc.set_max_b_frames(0);
 
         if use_hw && !hw_frames_ctx.is_null() {
-            // Hardware encoder: set pixel format and attach hw_frames_ctx.
             enc.set_format(ffmpeg_next::format::Pixel::NV12);
             unsafe {
                 let ctx_ptr = enc.as_mut_ptr();
@@ -277,10 +485,8 @@ fn transcode_segment_body(
             enc.set_format(ffmpeg_next::format::Pixel::YUV420P);
         }
 
-        // Set encoder-specific options via the raw AVDictionary interface.
         let mut opts = ffmpeg_next::Dictionary::new();
         if use_hw {
-            // Apply hardware-specific quality options.
             let quality_args = hwaccel.encoder_quality_args();
             let mut i = 0;
             while i + 1 < quality_args.len() {
@@ -293,42 +499,49 @@ fn transcode_segment_body(
             opts.set("preset", preset);
             opts.set("crf", crf);
             opts.set("profile", "high");
-            opts.set("level", if quality == Quality::High { "4.2" } else { "4.1" });
+            opts.set("level", if matches!(quality, Quality::Original | Quality::High) { "4.2" } else { "4.1" });
         }
 
         let mut video_encoder = enc.open_with(opts).map_err(|e| format!("open video encoder: {e}"))?;
 
-        // Create the output muxer.
-        let mut octx = ffmpeg_next::format::output_as(&tmp_path, "mpegts")
+        // ── Output muxer ─────────────────────────────────────────────────
+        let mut octx = ffmpeg_next::format::output_as(tmp_path, "mpegts")
             .map_err(|e| format!("output context: {e}"))?;
 
-        // Add video stream to output.
         let mut out_video_stream = octx.add_stream(video_encoder_codec)
             .map_err(|e| format!("add video stream: {e}"))?;
         out_video_stream.set_parameters(&video_encoder);
         let out_video_idx = out_video_stream.index();
-        let out_video_tb = out_video_stream.time_base();
 
-        // Optionally set up audio.
+        // ── Audio encoder + resampler setup ──────────────────────────────
         let mut audio_decoder: Option<ffmpeg_next::decoder::Audio> = None;
         let mut audio_encoder_handle: Option<ffmpeg_next::encoder::Audio> = None;
+        let mut audio_resampler: Option<ffmpeg_next::software::resampling::Context> = None;
         let mut out_audio_idx: Option<usize> = None;
-        let mut _audio_time_base = ffmpeg_next::Rational::new(1, 44100);
+        let mut audio_time_base = ffmpeg_next::Rational::new(1, 44100);
+        let mut audio_sample_rate: u32 = 44100;
 
         if let Some(aud_idx) = audio_stream_idx {
             let aud_stream = ictx.stream(aud_idx).unwrap();
-            _audio_time_base = aud_stream.time_base();
+            audio_time_base = aud_stream.time_base();
             let aud_params = aud_stream.parameters();
 
             if let Ok(aud_ctx) = ffmpeg_next::codec::context::Context::from_parameters(aud_params) {
                 if let Ok(dec) = aud_ctx.decoder().audio() {
+                    audio_sample_rate = dec.rate();
+                    let dec_format = dec.format();
+                    let dec_layout = dec.channel_layout();
+
                     let aac_codec = ffmpeg_next::encoder::find_by_name("aac");
                     if let Some(aac) = aac_codec {
+                        let enc_format = ffmpeg_next::format::Sample::F32(
+                            ffmpeg_next::format::sample::Type::Planar,
+                        );
                         let aac_ctx = ffmpeg_next::codec::context::Context::new_with_codec(aac);
                         if let Ok(mut aac_enc) = aac_ctx.encoder().audio() {
                             aac_enc.set_rate(dec.rate() as i32);
-                            aac_enc.set_channel_layout(dec.channel_layout());
-                            aac_enc.set_format(ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Planar));
+                            aac_enc.set_channel_layout(dec_layout);
+                            aac_enc.set_format(enc_format);
                             aac_enc.set_bit_rate(128_000);
                             aac_enc.set_time_base(ffmpeg_next::Rational::new(1, dec.rate() as i32));
 
@@ -337,6 +550,20 @@ fn transcode_segment_body(
                                     .map_err(|e| format!("add audio stream: {e}"))?;
                                 out_aud_stream.set_parameters(&opened);
                                 out_audio_idx = Some(out_aud_stream.index());
+
+                                // Create resampler: decoder format → AAC's
+                                // required FLTP.  Also handles channel layout
+                                // and sample rate normalization.
+                                let resampler = ffmpeg_next::software::resampling::Context::get(
+                                    dec_format,
+                                    dec_layout,
+                                    dec.rate(),
+                                    enc_format,
+                                    dec_layout,
+                                    dec.rate(),
+                                ).ok();
+
+                                audio_resampler = resampler;
                                 audio_encoder_handle = Some(opened);
                                 audio_decoder = Some(dec);
                             }
@@ -349,9 +576,11 @@ fn transcode_segment_body(
         octx.write_header()
             .map_err(|e| format!("write header: {e}"))?;
 
-        // Set up scaler if needed.
-        // For hardware encoding we scale to NV12; for software we stay in
-        // YUV420P.
+        // Re-read output time bases after write_header.
+        let out_video_tb = octx.stream(out_video_idx).unwrap().time_base();
+        let out_audio_tb = out_audio_idx.map(|i| octx.stream(i).unwrap().time_base());
+
+        // ── Video scaler ─────────────────────────────────────────────────
         let sw_out_fmt = if use_hw {
             ffmpeg_next::format::Pixel::NV12
         } else {
@@ -360,8 +589,6 @@ fn transcode_segment_body(
 
         let mut scaler: Option<ffmpeg_next::software::scaling::Context> = None;
         if out_width != in_width || out_height != in_height || (use_hw && !hw_frames_ctx.is_null()) {
-            // Always set up a scaler for hw path (to convert YUV420P -> NV12),
-            // or when dimensions differ.
             scaler = ffmpeg_next::software::scaling::Context::get(
                 ffmpeg_next::format::Pixel::YUV420P,
                 in_width,
@@ -374,12 +601,14 @@ fn transcode_segment_body(
             .ok();
         }
 
+        // ── Main encode loop ─────────────────────────────────────────────
         let end_time = start_time + SEGMENT_DURATION;
         let ts_offset_90k = (start_time * 90000.0) as i64;
-        let mut frame_count: i64 = 0;
+        let mut video_frame_count: i64 = 0;
+        let mut audio_sample_count: i64 = 0;
+        let audio_ts_offset = (start_time * audio_sample_rate as f64) as i64;
         let mut done = false;
 
-        // Process packets.
         for (pkt_stream, packet) in ictx.packets() {
             if done { break; }
 
@@ -390,7 +619,6 @@ fn transcode_segment_body(
 
                 let mut decoded = ffmpeg_next::util::frame::Video::empty();
                 while video_decoder.receive_frame(&mut decoded).is_ok() {
-                    // Check if we've passed the segment end.
                     let pts = decoded.pts().unwrap_or(0);
                     let pts_secs = pts as f64 * f64::from(video_time_base.0) / f64::from(video_time_base.1);
 
@@ -398,10 +626,12 @@ fn transcode_segment_body(
                         done = true;
                         break;
                     }
+                    if pts_secs < start_time {
+                        continue;
+                    }
 
-                    // Scale if needed (also converts to NV12 for hw path).
                     let pts_increment = (90000.0 / effective_fps) as i64;
-                    let new_pts = frame_count * pts_increment + ts_offset_90k;
+                    let new_pts = video_frame_count * pts_increment + ts_offset_90k;
                     let sw_frame = if let Some(ref mut sws) = scaler {
                         let mut scaled = ffmpeg_next::util::frame::Video::empty();
                         if sws.run(&decoded, &mut scaled).is_err() {
@@ -414,8 +644,6 @@ fn transcode_segment_body(
                         decoded.clone()
                     };
 
-                    // For hardware encoding, upload the software frame to the
-                    // GPU surface before sending to the encoder.
                     let send_ok = if use_hw && !hw_frames_ctx.is_null() {
                         unsafe {
                             let mut hw_frame = ffmpeg_next::ffi::av_frame_alloc();
@@ -459,7 +687,7 @@ fn transcode_segment_body(
                             let _ = encoded.write_interleaved(&mut octx);
                         }
                     }
-                    frame_count += 1;
+                    video_frame_count += 1;
                 }
             } else if Some(pkt_stream.index()) == audio_stream_idx {
                 if let (Some(adec), Some(aenc)) =
@@ -468,11 +696,44 @@ fn transcode_segment_body(
                     if adec.send_packet(&packet).is_ok() {
                         let mut audio_frame = ffmpeg_next::util::frame::Audio::empty();
                         while adec.receive_frame(&mut audio_frame).is_ok() {
-                            if aenc.send_frame(&audio_frame).is_ok() {
+                            // Time-range filter using input time base.
+                            if let Some(apts) = audio_frame.pts() {
+                                let apts_secs = apts as f64
+                                    * f64::from(audio_time_base.0)
+                                    / f64::from(audio_time_base.1);
+                                if apts_secs < start_time || apts_secs >= end_time {
+                                    continue;
+                                }
+                            }
+
+                            // Resample to AAC-compatible format (FLTP) if
+                            // needed, then set synthetic PTS aligned with
+                            // the segment start.
+                            let frame_to_encode = if let Some(ref mut resampler) = audio_resampler {
+                                let mut resampled = ffmpeg_next::frame::Audio::empty();
+                                if resampler.run(&audio_frame, &mut resampled).is_err() {
+                                    continue;
+                                }
+                                let new_pts = audio_sample_count + audio_ts_offset;
+                                resampled.set_pts(Some(new_pts));
+                                audio_sample_count += resampled.samples() as i64;
+                                resampled
+                            } else {
+                                let new_pts = audio_sample_count + audio_ts_offset;
+                                audio_frame.set_pts(Some(new_pts));
+                                audio_sample_count += audio_frame.samples() as i64;
+                                audio_frame.clone()
+                            };
+
+                            if aenc.send_frame(&frame_to_encode).is_ok() {
                                 let mut encoded = ffmpeg_next::Packet::empty();
                                 while aenc.receive_packet(&mut encoded).is_ok() {
                                     if let Some(aud_out_idx) = out_audio_idx {
                                         encoded.set_stream(aud_out_idx);
+                                        encoded.rescale_ts(
+                                            ffmpeg_next::Rational::new(1, audio_sample_rate as i32),
+                                            out_audio_tb.unwrap_or(ffmpeg_next::Rational::new(1, 90000)),
+                                        );
                                         let _ = encoded.write_interleaved(&mut octx);
                                     }
                                 }
@@ -483,7 +744,7 @@ fn transcode_segment_body(
             }
         }
 
-        // Flush encoders.
+        // ── Flush encoders ───────────────────────────────────────────────
         let _ = video_encoder.send_eof();
         let mut encoded = ffmpeg_next::Packet::empty();
         while video_encoder.receive_packet(&mut encoded).is_ok() {
@@ -501,6 +762,10 @@ fn transcode_segment_body(
             while aenc.receive_packet(&mut aenc_pkt).is_ok() {
                 if let Some(aud_out_idx) = out_audio_idx {
                     aenc_pkt.set_stream(aud_out_idx);
+                    aenc_pkt.rescale_ts(
+                        ffmpeg_next::Rational::new(1, audio_sample_rate as i32),
+                        out_audio_tb.unwrap_or(ffmpeg_next::Rational::new(1, 90000)),
+                    );
                     let _ = aenc_pkt.write_interleaved(&mut octx);
                 }
             }

@@ -120,7 +120,7 @@ pub fn generate_sprite_sheet(
                     ffmpeg_next::format::Pixel::RGB24,
                     THUMBNAIL_WIDTH,
                     THUMBNAIL_HEIGHT,
-                    ffmpeg_next::software::scaling::Flags::BILINEAR,
+                    ffmpeg_next::software::scaling::Flags::FAST_BILINEAR,
                 )
                 .ok();
             }

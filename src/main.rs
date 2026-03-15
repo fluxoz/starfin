@@ -2659,7 +2659,7 @@ async fn main() -> std::io::Result<()> {
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
     info!(bind_addr = %bind_addr, port, "listening");
 
-    HttpServer::new(move || {
+    let server = HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
             .wrap(Logger::default())
@@ -2717,8 +2717,36 @@ async fn main() -> std::io::Result<()> {
             .route("/{tail:.*}", web::get().to(frontend))
     })
     .bind((bind_addr.as_str(), port))?
-    .run()
-    .await
+    .run();
+
+    let server_handle = server.handle();
+
+    // ── Graceful shutdown on SIGINT / SIGTERM ─────────────────────────────────
+    tokio::spawn(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+
+        #[cfg(unix)]
+        let terminate = {
+            let mut sig = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            )
+            .expect("failed to install SIGTERM handler");
+            async move { sig.recv().await }
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => info!("received SIGINT, shutting down gracefully"),
+            _ = terminate => info!("received SIGTERM, shutting down gracefully"),
+        }
+
+        server_handle.stop(true).await;
+    });
+    // ─────────────────────────────────────────────────────────────────────────
+
+    server.await
 }
 
 

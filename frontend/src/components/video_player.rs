@@ -47,10 +47,14 @@ fn snap_to_cached_segment(time: f64) -> f64 {
 
 // ── Stream quality options ────────────────────────────────────────────────────
 /// (url-token, display-label) pairs for the quality selector.
-const QUALITY_OPTIONS: [(&str, &str); 3] = [
-    ("high",   "High"),
-    ("medium", "Medium (720p)"),
-    ("low",    "Low (480p)"),
+/// "Original" uses direct remux (no re-encoding) when the source codecs are
+/// browser-compatible (H.264 + AAC/MP3), giving VLC-like performance.
+/// Falls back to high-quality transcode for incompatible sources.
+const QUALITY_OPTIONS: [(&str, &str); 4] = [
+    ("original", "Original (Direct)"),
+    ("high",     "High (Transcode)"),
+    ("medium",   "Medium (720p)"),
+    ("low",      "Low (480p)"),
 ];
 /// localStorage key used to persist the selected quality across sessions.
 const QUALITY_STORAGE_KEY: &str = "starfin_quality";
@@ -259,14 +263,15 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let playback_speed = use_state(|| 1.0_f64);
 
     // Stream quality — initialised from localStorage so the preference
-    // persists across sessions.  Defaults to "high" if nothing is stored.
+    // persists across sessions.  Defaults to "original" (direct remux)
+    // which gives VLC-like performance for compatible sources.
     let initial_quality = window()
         .and_then(|w| w.local_storage().ok())
         .flatten()
         .and_then(|s| s.get_item(QUALITY_STORAGE_KEY).ok())
         .flatten()
         .filter(|q| QUALITY_OPTIONS.iter().any(|(v, _)| v == q))
-        .unwrap_or_else(|| "high".to_string());
+        .unwrap_or_else(|| "original".to_string());
     let selected_quality = use_state(|| initial_quality);
 
     // Stores the video position to resume at when quality is changed
@@ -1760,7 +1765,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 { QUALITY_OPTIONS.iter()
                                     .find(|(v, _)| *v == selected_quality.as_str())
                                     .map(|(_, label)| *label)
-                                    .unwrap_or("High") }
+                                    .unwrap_or("Original (Direct)") }
                             </button>
                             if *quality_menu_open {
                                 <div class="player-quality__menu">
@@ -1849,7 +1854,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                             { QUALITY_OPTIONS.iter()
                                                 .find(|(v, _)| *v == selected_quality.as_str())
                                                 .map(|(_, label)| *label)
-                                                .unwrap_or("High") }
+                                            .unwrap_or("Original (Direct)") }
                                         </span>
                                     </div>
                                     <div class="player-settings__item">

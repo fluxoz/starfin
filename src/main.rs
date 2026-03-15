@@ -35,9 +35,10 @@ struct QualityQuery {
 /// `GET /api/quality-options` – list the available quality levels.
 async fn get_quality_options() -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!([
-        { "value": "high",   "label": Quality::High.label() },
-        { "value": "medium", "label": Quality::Medium.label() },
-        { "value": "low",    "label": Quality::Low.label() },
+        { "value": "original", "label": Quality::Original.label() },
+        { "value": "high",     "label": Quality::High.label() },
+        { "value": "medium",   "label": Quality::Medium.label() },
+        { "value": "low",      "label": Quality::Low.label() },
     ]))
 }
 
@@ -1141,7 +1142,7 @@ async fn remove_non_precached_segments(cache_dir: &Path) -> std::io::Result<()> 
 /// Remove non-pre-cached segments from **all** quality subdirectories of a
 /// video's cache folder (`{cache_dir}/{video_id}/{quality}/`).
 async fn remove_non_precached_segments_all_qualities(video_cache_dir: &Path) {
-    for quality_name in [Quality::High.as_str(), Quality::Medium.as_str(), Quality::Low.as_str()] {
+    for quality_name in [Quality::Original.as_str(), Quality::High.as_str(), Quality::Medium.as_str(), Quality::Low.as_str()] {
         let q_dir = video_cache_dir.join(quality_name);
         if q_dir.exists() {
             if let Err(e) = remove_non_precached_segments(&q_dir).await {
@@ -1579,11 +1580,12 @@ async fn get_processing_status(
     // seg_00000.ts as a lightweight proxy — if the pre-cache worker
     // finished, all PRECACHE_SEGMENTS files will be present.
     // Segments are now stored in quality-specific subdirectories; the
-    // precache worker always operates on the `high` quality level.
+    // precache worker always operates on the `original` quality level
+    // (direct remux for compatible sources, fast transcode fallback).
     let precache_marker = state
         .cache_dir
         .join(id.as_str())
-        .join(Quality::High.as_str())
+        .join(Quality::Original.as_str())
         .join("seg_00000.ts");
 
     let all_done = quick_marker.exists()
@@ -1831,8 +1833,8 @@ async fn run_precache_worker(
                 .unwrap_or(abs)
                 .to_string_lossy();
             let id = video_id(&rel);
-            // Precache always uses the High quality subdirectory.
-            let hls_dir = cache_dir.join(&id).join(Quality::High.as_str());
+            // Precache always uses the Original quality subdirectory.
+            let hls_dir = cache_dir.join(&id).join(Quality::Original.as_str());
 
             let is_done = if !hls_dir.join("seg_00000.ts").exists() {
                 false
@@ -1886,8 +1888,8 @@ async fn run_precache_worker(
                 .to_string_lossy()
                 .to_string();
             let id = video_id(&rel);
-            // Precache always uses the High quality subdirectory.
-            let hls_dir = cache_dir.join(&id).join(Quality::High.as_str());
+            // Precache always uses the Original quality subdirectory.
+            let hls_dir = cache_dir.join(&id).join(Quality::Original.as_str());
 
             {
                 let mut p = progress.write();
@@ -1956,7 +1958,7 @@ async fn run_precache_worker(
                     let _ = playback_rx.changed().await;
                 }
 
-                if let Err(e) = transcode_segment(&abs_str, &hls_dir, i, &hwaccel, Quality::High).await {
+                if let Err(e) = transcode_segment(&abs_str, &hls_dir, i, &hwaccel, Quality::Original).await {
                     error!(video_id = %id, segment = i, error = %e, "precache: segment transcode failed");
                     break; // Stop for this video on error.
                 }

@@ -20,9 +20,14 @@ pub const THUMBNAILS_PER_ROW: u32 = 10;
 
 /// Generate a thumbnail sprite sheet for a video.
 ///
-/// Creates `{sprite_dir}/sprite.jpg` by decoding frames at regular intervals,
-/// scaling them, and compositing into a tiled grid.  Writes to a temp file
-/// first for atomicity.
+/// Creates `{sprite_dir}/sprite.jpg` by **seeking** to each sample position
+/// and decoding one frame per thumbnail, then scaling and compositing into a
+/// tiled grid.  Writes to a temp file first for atomicity.
+///
+/// Seeking rather than sequential packet reading matches what the old
+/// `ffmpeg -vf fps=…,tile=…` subprocess did, and avoids the multi-minute
+/// decode-all-frames path that previously stalled sprite generation for any
+/// video longer than a few minutes.
 ///
 /// Returns `true` on success.
 pub fn generate_sprite_sheet(
@@ -69,12 +74,15 @@ pub fn generate_sprite_sheet(
         None => return false,
     };
 
-    let stream = ictx.stream(stream_idx).unwrap();
-    let time_base = stream.time_base();
-
-    let decoder_ctx = match ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()) {
-        Ok(ctx) => ctx,
-        Err(_) => return false,
+    // Build the decoder.  The stream borrow must be dropped before we can
+    // seek/iterate on ictx below.
+    let decoder_ctx = {
+        let stream = ictx.stream(stream_idx).unwrap();
+        match ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()) {
+            Ok(ctx) => ctx,
+            Err(_) => return false,
+        }
+        // `stream` (and its borrow of `ictx`) is dropped here.
     };
     let mut decoder = match decoder_ctx.decoder().video() {
         Ok(d) => d,
@@ -82,88 +90,89 @@ pub fn generate_sprite_sheet(
     };
 
     let mut scaler: Option<ffmpeg_next::software::scaling::Context> = None;
-    let mut thumb_index: u32 = 0;
-    let mut next_sample_time: f64 = 0.0;
+    let mut thumb_count: u32 = 0;
     let mut rgb_frame = ffmpeg_next::util::frame::Video::empty();
 
-    for (pkt_stream, packet) in ictx.packets() {
-        if thumb_index >= num_thumbnails {
-            break;
-        }
-        if pkt_stream.index() != stream_idx {
-            continue;
-        }
-        if decoder.send_packet(&packet).is_err() {
-            continue;
-        }
+    for i in 0..num_thumbnails {
+        let seek_secs = i as f64 * THUMBNAIL_INTERVAL;
+        let ts = (seek_secs * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
 
-        let mut decoded = ffmpeg_next::util::frame::Video::empty();
-        while decoder.receive_frame(&mut decoded).is_ok() {
-            if thumb_index >= num_thumbnails {
-                break;
-            }
+        // Seek to the target position.  Ignore seek errors — the demuxer will
+        // just continue from its current position.
+        let _ = ictx.seek(ts, ..ts);
 
-            let pts = decoded.pts().unwrap_or(0);
-            let pts_secs = pts as f64 * f64::from(time_base.0) / f64::from(time_base.1);
+        // Flush any frames buffered in the decoder from before the seek.
+        decoder.flush();
 
-            if pts_secs < next_sample_time {
+        // Read packets until we successfully decode and blit one frame.
+        'pkt: for (pkt_stream, packet) in ictx.packets() {
+            if pkt_stream.index() != stream_idx {
                 continue;
             }
-            next_sample_time = pts_secs + THUMBNAIL_INTERVAL;
-
-            // Initialise scaler on first usable frame.
-            if scaler.is_none() {
-                scaler = ffmpeg_next::software::scaling::Context::get(
-                    decoded.format(),
-                    decoded.width(),
-                    decoded.height(),
-                    ffmpeg_next::format::Pixel::RGB24,
-                    THUMBNAIL_WIDTH,
-                    THUMBNAIL_HEIGHT,
-                    ffmpeg_next::software::scaling::Flags::FAST_BILINEAR,
-                )
-                .ok();
-            }
-
-            let Some(ref mut sws) = scaler else {
-                continue;
-            };
-
-            if sws.run(&decoded, &mut rgb_frame).is_err() {
+            if decoder.send_packet(&packet).is_err() {
                 continue;
             }
 
-            // Copy the scaled frame into the sprite at the correct tile position.
-            let col = thumb_index % columns;
-            let row = thumb_index / columns;
-            let x_offset = col * THUMBNAIL_WIDTH;
-            let y_offset = row * THUMBNAIL_HEIGHT;
-
-            let stride = rgb_frame.stride(0);
-            let data = rgb_frame.data(0);
-            let row_bytes = THUMBNAIL_WIDTH as usize * 3;
-            let sprite_row_bytes = sprite_w as usize * 3;
-            let sprite_bytes = sprite_img.as_mut();
-            let base_dst = y_offset as usize * sprite_row_bytes + x_offset as usize * 3;
-
-            for y in 0..THUMBNAIL_HEIGHT {
-                let src_start = y as usize * stride;
-                if src_start + row_bytes > data.len() {
-                    break;
+            let mut decoded = ffmpeg_next::util::frame::Video::empty();
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                // Initialise (or re-check) the scaler on the first decoded frame.
+                if scaler.is_none() {
+                    scaler = ffmpeg_next::software::scaling::Context::get(
+                        decoded.format(),
+                        decoded.width(),
+                        decoded.height(),
+                        ffmpeg_next::format::Pixel::RGB24,
+                        THUMBNAIL_WIDTH,
+                        THUMBNAIL_HEIGHT,
+                        ffmpeg_next::software::scaling::Flags::BILINEAR,
+                    )
+                    .ok();
                 }
-                let dst_start = base_dst + y as usize * sprite_row_bytes;
-                if dst_start + row_bytes > sprite_bytes.len() {
-                    break;
-                }
-                sprite_bytes[dst_start..dst_start + row_bytes]
-                    .copy_from_slice(&data[src_start..src_start + row_bytes]);
-            }
 
-            thumb_index += 1;
+                let Some(ref mut sws) = scaler else {
+                    continue;
+                };
+
+                if sws.run(&decoded, &mut rgb_frame).is_err() {
+                    continue;
+                }
+
+                // Copy the scaled RGB frame into the correct tile in the sprite
+                // using row-wise bulk copies for efficiency.
+                let col = thumb_count % columns;
+                let row = thumb_count / columns;
+                let x_offset = col * THUMBNAIL_WIDTH;
+                let y_offset = row * THUMBNAIL_HEIGHT;
+
+                let stride = rgb_frame.stride(0);
+                let data = rgb_frame.data(0);
+                let row_bytes = THUMBNAIL_WIDTH as usize * 3;
+                let sprite_row_bytes = sprite_w as usize * 3;
+                let sprite_bytes = sprite_img.as_mut();
+                let base_dst = y_offset as usize * sprite_row_bytes + x_offset as usize * 3;
+
+                for y in 0..THUMBNAIL_HEIGHT {
+                    let src_start = y as usize * stride;
+                    if src_start + row_bytes > data.len() {
+                        break;
+                    }
+                    let dst_start = base_dst + y as usize * sprite_row_bytes;
+                    if dst_start + row_bytes > sprite_bytes.len() {
+                        break;
+                    }
+                    sprite_bytes[dst_start..dst_start + row_bytes]
+                        .copy_from_slice(&data[src_start..src_start + row_bytes]);
+                }
+
+                thumb_count += 1;
+                break 'pkt;
+            }
         }
+        // If no frame was found for this position (e.g. seek past end of file),
+        // leave the tile black and continue.
     }
 
-    if thumb_index == 0 {
+    if thumb_count == 0 {
         return false;
     }
 

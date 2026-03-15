@@ -1,15 +1,15 @@
 //! HLS segment creation — direct remux when possible, transcode as fallback.
 //!
-//! Each segment is a 6-second MPEG-TS chunk.  For **High** quality with
+//! Each segment is a 6-second MPEG-TS chunk.  For **Original** quality with
 //! browser-compatible codecs (H.264 video + AAC/MP3 audio) the segment is
 //! created by **remuxing** — copying compressed packets directly from the
 //! source file without decoding or re-encoding.  This is near-instant (pure
 //! I/O, like VLC playback) and gives performance parity with direct file
 //! access.
 //!
-//! When remuxing is not possible (incompatible codec, or Medium/Low quality
-//! that requires resolution scaling) the segment is **transcoded** in-process
-//! via `ffmpeg-next`.
+//! When remuxing is not possible (incompatible codec, or High/Medium/Low
+//! quality that requires re-encoding or resolution scaling) the segment is
+//! **transcoded** in-process via `ffmpeg-next`.
 //!
 //! Hardware-accelerated encoding (NVENC, VAAPI, QSV, etc.) is available for
 //! the transcode fallback path via the raw FFI bindings.
@@ -23,8 +23,8 @@ pub const SEGMENT_DURATION: f64 = 6.0;
 
 /// Create a single MPEG-TS segment — remux if possible, transcode otherwise.
 ///
-/// For **High** quality with H.264 + AAC/MP3 source, packets are copied
-/// directly (remux).  For incompatible codecs or Medium/Low quality that
+/// For **Original** quality with H.264 + AAC/MP3 source, packets are copied
+/// directly (remux).  For incompatible codecs or High/Medium/Low quality that
 /// requires re-encoding, the full transcode path is used.
 ///
 /// Writes to a temporary file first, then atomically renames.

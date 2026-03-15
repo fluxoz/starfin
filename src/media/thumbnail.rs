@@ -81,7 +81,7 @@ pub fn extract_frame_as_jpeg(video_path: &Path, seek_secs: f64, out_path: &Path)
                     ffmpeg_next::format::Pixel::RGB24,
                     decoded.width(),
                     decoded.height(),
-                    ffmpeg_next::software::scaling::Flags::BILINEAR,
+                    ffmpeg_next::software::scaling::Flags::FAST_BILINEAR,
                 )
                 .ok();
             }
@@ -225,7 +225,7 @@ fn compute_frame_stats(
             target_fmt,
             frame.width(),
             frame.height(),
-            ffmpeg_next::software::scaling::Flags::BILINEAR,
+            ffmpeg_next::software::scaling::Flags::FAST_BILINEAR,
         )
         .ok();
     }

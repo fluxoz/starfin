@@ -11,6 +11,7 @@
 //! spawning a subprocess.
 
 use std::path::{Path, PathBuf};
+use tracing::{info, warn};
 
 /// The hardware-acceleration backend detected at startup.
 ///
@@ -213,15 +214,12 @@ fn log_compiled_in_capabilities() {
     }
 
     if found.is_empty() {
-        println!("  Listed HW H.264 encoders: (none)");
+        info!("compiled-in HW H.264 encoders: none");
     } else {
-        println!("  Listed HW H.264 encoders:");
-        for enc in &found {
-            println!("    {}", enc);
-        }
+        info!(encoders = ?found, "compiled-in HW H.264 encoders");
     }
 
-    println!("  (generic build — compiled-in list is NOT trusted; real encode tests follow)");
+    info!("generic build — compiled-in list is NOT trusted; real encode tests follow");
 }
 
 // ── Main detection entry point ───────────────────────────────────────────────
@@ -233,63 +231,54 @@ pub async fn detect_hwaccel() -> HwAccel {
 
     log_compiled_in_capabilities();
 
-    println!();
-
     // Pre-flight: discover available hardware
     let has_nvidia = nvidia_devices_present();
     let render_devices = discover_render_devices();
 
     if has_nvidia {
-        println!("  Pre-flight: NVIDIA device nodes detected in /dev");
+        info!("pre-flight: NVIDIA device nodes detected in /dev");
     } else {
-        println!("  Pre-flight: no NVIDIA device nodes in /dev");
+        info!("pre-flight: no NVIDIA device nodes in /dev");
     }
     if render_devices.is_empty() {
-        println!("  Pre-flight: no accessible render devices in /dev/dri");
+        info!("pre-flight: no accessible render devices in /dev/dri");
     } else {
-        println!(
-            "  Pre-flight: {} accessible render device(s): {}",
-            render_devices.len(),
-            render_devices.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        info!(
+            count = render_devices.len(),
+            devices = %render_devices.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "),
+            "pre-flight: accessible render devices found"
         );
     }
 
-    println!();
-
     // NVIDIA (NVENC via CUDA)
     {
-        println!("  h264_nvenc (NVIDIA NVENC):");
         if !has_nvidia {
-            println!("    → skipped (no NVIDIA device nodes)");
+            info!("h264_nvenc (NVIDIA NVENC): skipped (no NVIDIA device nodes)");
         } else {
-            println!("    Testing real encode with h264_nvenc…");
+            info!("h264_nvenc (NVIDIA NVENC): testing real encode");
             let (ok, stderr) = test_encode(
                 "h264_nvenc",
                 &["-init_hw_device", "cuda=test"],
                 None,
             ).await;
             if ok {
-                println!("    ✓ Encode succeeded");
-                println!();
-                println!("  ★ Selected: NVIDIA (NVENC)");
-                println!("    Encoder : h264_nvenc");
+                info!(encoder = "h264_nvenc", backend = "NVIDIA (NVENC)", "selected hwaccel backend");
                 return HwAccel::Nvidia;
             } else {
                 let reason = extract_ffmpeg_error(&stderr);
-                println!("    ✗ Encode failed: {}", reason);
+                warn!(encoder = "h264_nvenc", reason = %reason, "encode test failed");
             }
         }
     }
 
     // VAAPI (AMD / Intel on Linux)
     {
-        println!("  h264_vaapi (VAAPI):");
         if render_devices.is_empty() {
-            println!("    → skipped (no accessible render devices)");
+            info!("h264_vaapi (VAAPI): skipped (no accessible render devices)");
         } else {
             for dev in &render_devices {
                 let dev_str = dev.display().to_string();
-                println!("    Testing real encode with h264_vaapi on {}…", dev_str);
+                info!(encoder = "h264_vaapi", device = %dev_str, "testing real encode");
                 let device_arg = format!("vaapi=va:{}", dev_str);
                 let (ok, stderr) = test_encode(
                     "h264_vaapi",
@@ -297,15 +286,11 @@ pub async fn detect_hwaccel() -> HwAccel {
                     Some("format=nv12,hwupload"),
                 ).await;
                 if ok {
-                    println!("    ✓ Encode succeeded on {}", dev_str);
-                    println!();
-                    println!("  ★ Selected: AMD/Intel (VAAPI)");
-                    println!("    Encoder : h264_vaapi");
-                    println!("    Device  : {}", dev_str);
+                    info!(encoder = "h264_vaapi", device = %dev_str, backend = "AMD/Intel (VAAPI)", "selected hwaccel backend");
                     return HwAccel::Vaapi;
                 } else {
                     let reason = extract_ffmpeg_error(&stderr);
-                    println!("    ✗ Failed on {}: {}", dev_str, reason);
+                    warn!(encoder = "h264_vaapi", device = %dev_str, reason = %reason, "encode test failed");
                 }
             }
         }
@@ -313,32 +298,25 @@ pub async fn detect_hwaccel() -> HwAccel {
 
     // QSV (Intel Quick Sync)
     {
-        println!("  h264_qsv (Intel QSV):");
         if render_devices.is_empty() {
-            println!("    → skipped (no accessible render devices)");
+            info!("h264_qsv (Intel QSV): skipped (no accessible render devices)");
         } else {
-            println!("    Testing real encode with h264_qsv…");
+            info!("h264_qsv (Intel QSV): testing real encode");
             let (ok, stderr) = test_encode(
                 "h264_qsv",
                 &["-init_hw_device", "qsv=test"],
                 None,
             ).await;
             if ok {
-                println!("    ✓ Encode succeeded");
-                println!();
-                println!("  ★ Selected: Intel (QSV)");
-                println!("    Encoder : h264_qsv");
+                info!(encoder = "h264_qsv", backend = "Intel (QSV)", "selected hwaccel backend");
                 return HwAccel::Qsv;
             } else {
                 let reason = extract_ffmpeg_error(&stderr);
-                println!("    ✗ Encode failed: {}", reason);
+                warn!(encoder = "h264_qsv", reason = %reason, "encode test failed");
             }
         }
     }
 
-    println!();
-    println!("  ⚠ No GPU acceleration available — falling back to CPU");
-    println!("    Encoder : libx264");
-    println!("    Transcoding will be significantly slower.");
+    warn!(encoder = "libx264", backend = "CPU (software)", "no GPU acceleration available — falling back to software encoding");
     HwAccel::Software
 }

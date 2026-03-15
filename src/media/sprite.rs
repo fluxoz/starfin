@@ -120,7 +120,7 @@ pub fn generate_sprite_sheet(
                     ffmpeg_next::format::Pixel::RGB24,
                     THUMBNAIL_WIDTH,
                     THUMBNAIL_HEIGHT,
-                    ffmpeg_next::software::scaling::Flags::BILINEAR,
+                    ffmpeg_next::software::scaling::Flags::FAST_BILINEAR,
                 )
                 .ok();
             }
@@ -141,16 +141,22 @@ pub fn generate_sprite_sheet(
 
             let stride = rgb_frame.stride(0);
             let data = rgb_frame.data(0);
+            let row_bytes = THUMBNAIL_WIDTH as usize * 3;
+            let sprite_row_bytes = sprite_w as usize * 3;
+            let sprite_bytes = sprite_img.as_mut();
+            let base_dst = y_offset as usize * sprite_row_bytes + x_offset as usize * 3;
 
             for y in 0..THUMBNAIL_HEIGHT {
                 let src_start = y as usize * stride;
-                for x in 0..THUMBNAIL_WIDTH {
-                    let src_idx = src_start + (x as usize) * 3;
-                    if src_idx + 2 < data.len() {
-                        let px = image::Rgb([data[src_idx], data[src_idx + 1], data[src_idx + 2]]);
-                        sprite_img.put_pixel(x_offset + x, y_offset + y, px);
-                    }
+                if src_start + row_bytes > data.len() {
+                    break;
                 }
+                let dst_start = base_dst + y as usize * sprite_row_bytes;
+                if dst_start + row_bytes > sprite_bytes.len() {
+                    break;
+                }
+                sprite_bytes[dst_start..dst_start + row_bytes]
+                    .copy_from_slice(&data[src_start..src_start + row_bytes]);
             }
 
             thumb_index += 1;

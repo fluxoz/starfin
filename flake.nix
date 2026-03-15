@@ -139,13 +139,18 @@
     #
     # rust-embed compiles `frontend/dist/` into the binary at build time, so
     # the frontend must be copied into place before `cargo build` runs.
+    #
+    # The backend links against ffmpeg libraries (libavcodec, libavformat,
+    # libavfilter, libswscale, libswresample) via ffmpeg-next for in-process
+    # media handling.  The ffmpeg package provides both the runtime libraries
+    # and the development headers needed by pkg-config.
     starfin = rustPlatform.buildRustPackage {
       pname = "starfin";
       inherit version;
       src = self;
       cargoLock.lockFile = ./Cargo.lock;
 
-      nativeBuildInputs = with pkgs; [ pkg-config ];
+      nativeBuildInputs = with pkgs; [ pkg-config clang ];
       buildInputs = with pkgs; [ ffmpeg openssl ];
 
       # Populate frontend/dist/ so rust-embed can embed the assets.
@@ -176,7 +181,7 @@
     # ── NixOS module ──────────────────────────────────────────────────────────
     nixosModules.default = import ./nix/module.nix { inherit self; };
 
-    # ── Development shell (unchanged) ─────────────────────────────────────────
+    # ── Development shell ─────────────────────────────────────────────────────
     devShells.${system}.default = mkShell {
       buildInputs = [
         # rust toolchain
@@ -192,7 +197,10 @@
         tmux
         trunk
         wasm-pack
+        # ffmpeg libraries (for ffmpeg-next linking) + CLI (for HW encode tests)
         ffmpeg
+        pkg-config
+        clang
       ];
 
       # Add critical environment variables for linking

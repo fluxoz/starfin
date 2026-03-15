@@ -844,10 +844,21 @@ async fn run_thumb_worker(
     progress: Arc<RwLock<ThumbProgress>>,
     trigger: Arc<tokio::sync::Notify>,
     mut playback_rx: tokio::sync::watch::Receiver<bool>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let concurrency = worker_concurrency();
     loop {
-        trigger.notified().await;
+        // Fast exit if shutdown was already signaled before we block.
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        tokio::select! {
+            _ = trigger.notified() => {}
+            _ = shutdown_rx.changed() => { return; }
+        }
+        if *shutdown_rx.borrow() {
+            return;
+        }
 
         // ── Phase 1: quick thumbnails ─────────────────────────────────────
 
@@ -881,8 +892,14 @@ async fn run_thumb_worker(
             while *playback_rx.borrow() {
                 let _ = playback_rx.changed().await;
             }
+            if *shutdown_rx.borrow() {
+                return;
+            }
             // Fill empty slots up to the concurrency limit.
             while join_set.len() < concurrency && iter.peek().is_some() {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
                 let entry = iter.next().unwrap();
                 let abs = entry.path().to_path_buf();
                 let rel = abs
@@ -914,6 +931,10 @@ async fn run_thumb_worker(
                     p.active = false;
                 }
             }
+        }
+
+        if *shutdown_rx.borrow() {
+            return;
         }
 
         // ── Phase 2: deep thumbnails ──────────────────────────────────────
@@ -948,8 +969,14 @@ async fn run_thumb_worker(
             while *playback_rx.borrow() {
                 let _ = playback_rx.changed().await;
             }
+            if *shutdown_rx.borrow() {
+                return;
+            }
             // Fill empty slots up to the concurrency limit.
             while join_set.len() < concurrency && iter.peek().is_some() {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
                 let entry = iter.next().unwrap();
                 let abs = entry.path().to_path_buf();
                 let rel = abs
@@ -1723,10 +1750,21 @@ async fn run_sprite_worker(
     progress: Arc<RwLock<SpriteProgress>>,
     trigger: Arc<tokio::sync::Notify>,
     mut playback_rx: tokio::sync::watch::Receiver<bool>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let concurrency = worker_concurrency();
     loop {
-        trigger.notified().await;
+        // Fast exit if shutdown was already signaled before we block.
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        tokio::select! {
+            _ = trigger.notified() => {}
+            _ = shutdown_rx.changed() => { return; }
+        }
+        if *shutdown_rx.borrow() {
+            return;
+        }
 
         let (sprite_done, entries): (Vec<_>, Vec<_>) = WalkDir::new(&library_path)
             .into_iter()
@@ -1760,8 +1798,14 @@ async fn run_sprite_worker(
             while *playback_rx.borrow() {
                 let _ = playback_rx.changed().await;
             }
+            if *shutdown_rx.borrow() {
+                return;
+            }
             // Fill empty slots up to the concurrency limit.
             while join_set.len() < concurrency && iter.peek().is_some() {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
                 let entry = iter.next().unwrap();
                 let abs = entry.path().to_path_buf();
                 let rel = abs
@@ -1815,9 +1859,20 @@ async fn run_precache_worker(
     trigger: Arc<tokio::sync::Notify>,
     mut playback_rx: tokio::sync::watch::Receiver<bool>,
     semaphore: Arc<tokio::sync::Semaphore>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
-        trigger.notified().await;
+        // Fast exit if shutdown was already signaled before we block.
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        tokio::select! {
+            _ = trigger.notified() => {}
+            _ = shutdown_rx.changed() => { return; }
+        }
+        if *shutdown_rx.borrow() {
+            return;
+        }
 
         let entries: Vec<_> = WalkDir::new(&library_path)
             .into_iter()
@@ -1883,9 +1938,15 @@ async fn run_precache_worker(
         }
 
         for entry in pending {
+            if *shutdown_rx.borrow() {
+                return;
+            }
             // Pause while a video is being streamed.
             while *playback_rx.borrow() {
                 let _ = playback_rx.changed().await;
+            }
+            if *shutdown_rx.borrow() {
+                return;
             }
 
             let abs = entry.path().to_path_buf();
@@ -1957,9 +2018,15 @@ async fn run_precache_worker(
             );
 
             for i in missing {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
                 // Re-check playback between individual segments.
                 while *playback_rx.borrow() {
                     let _ = playback_rx.changed().await;
+                }
+                if *shutdown_rx.borrow() {
+                    return;
                 }
 
                 // Acquire a transcode permit to bound concurrent operations.
@@ -1968,7 +2035,7 @@ async fn run_precache_worker(
                     Ok(p) => p,
                     Err(e) => {
                         error!(error = %e, "precache: transcode semaphore closed — worker terminating");
-                        break;
+                        return;
                     }
                 };
 
@@ -2432,6 +2499,13 @@ async fn main() -> std::io::Result<()> {
     let (playback_tx, playback_rx) = tokio::sync::watch::channel(false);
     let playback_tx = Arc::new(playback_tx);
 
+    // ── Shutdown channel ─────────────────────────────────────────────────
+    // Sending `true` signals all background workers to stop at their next
+    // checkpoint.  The sender is wrapped in Arc so it can be shared with
+    // the signal-handler task.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_tx = Arc::new(shutdown_tx);
+
     // ── Transcode concurrency semaphore ──────────────────────────────────
     // Limits the number of simultaneous segment transcode operations so that
     // the system is not overloaded.  Defaults to the number of available CPU
@@ -2517,11 +2591,21 @@ async fn main() -> std::io::Result<()> {
     let bg_thumb_trigger = Arc::clone(&thumb_trigger);
     let bg_sprite_trigger = Arc::clone(&sprite_trigger);
     let bg_precache_trigger = Arc::clone(&precache_trigger);
+    let mut bg_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        interval.tick().await; // skip the immediate first tick (covered by startup scan)
+        // Skip the immediate first tick (covered by startup scan).
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = bg_shutdown_rx.changed() => { return; }
+        }
         loop {
-            interval.tick().await;
+            if *bg_shutdown_rx.borrow() { return; }
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = bg_shutdown_rx.changed() => { return; }
+            }
+            if *bg_shutdown_rx.borrow() { return; }
             let (items, index) = scan_library(&bg_library_path).await;
             save_video_cache(&items, &bg_cache_dir);
             *bg_cache.write() = items;
@@ -2539,8 +2623,9 @@ async fn main() -> std::io::Result<()> {
         let worker_progress = Arc::clone(&thumb_progress);
         let worker_trigger = Arc::clone(&thumb_trigger);
         let worker_playback_rx = playback_rx.clone();
+        let worker_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            run_thumb_worker(worker_library, worker_cache, worker_progress, worker_trigger, worker_playback_rx).await;
+            run_thumb_worker(worker_library, worker_cache, worker_progress, worker_trigger, worker_playback_rx, worker_shutdown_rx).await;
         });
         // Kick off the first batch immediately after startup.
         thumb_trigger.notify_one();
@@ -2554,8 +2639,9 @@ async fn main() -> std::io::Result<()> {
         let worker_progress = Arc::clone(&sprite_progress);
         let worker_trigger = Arc::clone(&sprite_trigger);
         let worker_playback_rx = playback_rx.clone();
+        let worker_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            run_sprite_worker(worker_library, worker_cache, worker_progress, worker_trigger, worker_playback_rx).await;
+            run_sprite_worker(worker_library, worker_cache, worker_progress, worker_trigger, worker_playback_rx, worker_shutdown_rx).await;
         });
         // Kick off the first batch immediately after startup.
         sprite_trigger.notify_one();
@@ -2570,8 +2656,9 @@ async fn main() -> std::io::Result<()> {
         let worker_trigger = Arc::clone(&precache_trigger);
         let worker_playback_rx = playback_rx.clone();
         let worker_semaphore = Arc::clone(&transcode_semaphore);
+        let worker_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            run_precache_worker(worker_library, worker_cache, precache_hwaccel, worker_progress, worker_trigger, worker_playback_rx, worker_semaphore).await;
+            run_precache_worker(worker_library, worker_cache, precache_hwaccel, worker_progress, worker_trigger, worker_playback_rx, worker_semaphore, worker_shutdown_rx).await;
         });
         // Kick off the first batch immediately after startup.
         precache_trigger.notify_one();
@@ -2589,10 +2676,16 @@ async fn main() -> std::io::Result<()> {
         let monitor_thumb_trigger = Arc::clone(&thumb_trigger);
         let monitor_sprite_trigger = Arc::clone(&sprite_trigger);
         let monitor_precache_trigger = Arc::clone(&precache_trigger);
+        let mut monitor_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(2));
             loop {
-                interval.tick().await;
+                if *monitor_shutdown_rx.borrow() { return; }
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = monitor_shutdown_rx.changed() => { return; }
+                }
+                if *monitor_shutdown_rx.borrow() { return; }
                 let is_playing = {
                     let map = monitor_state
                         .last_segment_access
@@ -2622,10 +2715,16 @@ async fn main() -> std::io::Result<()> {
     // has not had a segment request for at least CACHE_IDLE_TIMEOUT.
     {
         let sweep_state = state.clone();
+        let mut sweep_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(CACHE_SWEEP_INTERVAL);
             loop {
-                interval.tick().await;
+                if *sweep_shutdown_rx.borrow() { return; }
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = sweep_shutdown_rx.changed() => { return; }
+                }
+                if *sweep_shutdown_rx.borrow() { return; }
 
                 // Collect IDs whose caches have gone idle.
                 // The read lock is held only for the in-memory scan; it is
@@ -2722,6 +2821,9 @@ async fn main() -> std::io::Result<()> {
     let server_handle = server.handle();
 
     // ── Graceful shutdown on SIGINT / SIGTERM ─────────────────────────────────
+    let shutdown_tx_signal = Arc::clone(&shutdown_tx);
+    let playback_tx_signal = Arc::clone(&playback_tx);
+    let semaphore_signal = Arc::clone(&transcode_semaphore);
     tokio::spawn(async move {
         let ctrl_c = tokio::signal::ctrl_c();
 
@@ -2742,6 +2844,13 @@ async fn main() -> std::io::Result<()> {
             _ = terminate => info!("received SIGTERM, shutting down gracefully"),
         }
 
+        // Unblock workers that are paused waiting for playback to finish.
+        let _ = playback_tx_signal.send(false);
+        // Signal all background workers to exit their loops.
+        let _ = shutdown_tx_signal.send(true);
+        // Fast-fail any pending semaphore acquires in the precache worker.
+        semaphore_signal.close();
+        // Stop accepting new HTTP requests and drain in-flight ones.
         server_handle.stop(true).await;
     });
     // ─────────────────────────────────────────────────────────────────────────

@@ -313,15 +313,17 @@ fn transcode_segment_body(
         let mut audio_decoder: Option<ffmpeg_next::decoder::Audio> = None;
         let mut audio_encoder_handle: Option<ffmpeg_next::encoder::Audio> = None;
         let mut out_audio_idx: Option<usize> = None;
-        let mut _audio_time_base = ffmpeg_next::Rational::new(1, 44100);
+        let mut audio_time_base = ffmpeg_next::Rational::new(1, 44100);
+        let mut audio_sample_rate: u32 = 44100;
 
         if let Some(aud_idx) = audio_stream_idx {
             let aud_stream = ictx.stream(aud_idx).unwrap();
-            _audio_time_base = aud_stream.time_base();
+            audio_time_base = aud_stream.time_base();
             let aud_params = aud_stream.parameters();
 
             if let Ok(aud_ctx) = ffmpeg_next::codec::context::Context::from_parameters(aud_params) {
                 if let Ok(dec) = aud_ctx.decoder().audio() {
+                    audio_sample_rate = dec.rate();
                     let aac_codec = ffmpeg_next::encoder::find_by_name("aac");
                     if let Some(aac) = aac_codec {
                         let aac_ctx = ffmpeg_next::codec::context::Context::new_with_codec(aac);
@@ -399,6 +401,17 @@ fn transcode_segment_body(
                         break;
                     }
 
+                    // Skip frames before the segment start.  After seeking,
+                    // the decoder produces frames from the nearest keyframe
+                    // (which may be well before start_time).  These reference
+                    // frames are needed internally by the decoder but must
+                    // not be encoded into the segment — otherwise the segment
+                    // would be longer than declared in the playlist and its
+                    // PTS range would overlap with the adjacent segment.
+                    if pts_secs < start_time {
+                        continue;
+                    }
+
                     // Scale if needed (also converts to NV12 for hw path).
                     let pts_increment = (90000.0 / effective_fps) as i64;
                     let new_pts = frame_count * pts_increment + ts_offset_90k;
@@ -468,11 +481,28 @@ fn transcode_segment_body(
                     if adec.send_packet(&packet).is_ok() {
                         let mut audio_frame = ffmpeg_next::util::frame::Audio::empty();
                         while adec.receive_frame(&mut audio_frame).is_ok() {
+                            // Skip audio outside the segment's time range,
+                            // mirroring the video frame filter above.
+                            if let Some(apts) = audio_frame.pts() {
+                                let apts_secs = apts as f64
+                                    * f64::from(audio_time_base.0)
+                                    / f64::from(audio_time_base.1);
+                                if apts_secs < start_time || apts_secs >= end_time {
+                                    continue;
+                                }
+                            }
                             if aenc.send_frame(&audio_frame).is_ok() {
                                 let mut encoded = ffmpeg_next::Packet::empty();
                                 while aenc.receive_packet(&mut encoded).is_ok() {
                                     if let Some(aud_out_idx) = out_audio_idx {
                                         encoded.set_stream(aud_out_idx);
+                                        // Rescale from encoder timebase
+                                        // (1/sample_rate) to the mpegts
+                                        // stream timebase (1/90 000).
+                                        encoded.rescale_ts(
+                                            ffmpeg_next::Rational::new(1, audio_sample_rate as i32),
+                                            ffmpeg_next::Rational::new(1, 90000),
+                                        );
                                         let _ = encoded.write_interleaved(&mut octx);
                                     }
                                 }
@@ -501,6 +531,10 @@ fn transcode_segment_body(
             while aenc.receive_packet(&mut aenc_pkt).is_ok() {
                 if let Some(aud_out_idx) = out_audio_idx {
                     aenc_pkt.set_stream(aud_out_idx);
+                    aenc_pkt.rescale_ts(
+                        ffmpeg_next::Rational::new(1, audio_sample_rate as i32),
+                        ffmpeg_next::Rational::new(1, 90000),
+                    );
                     let _ = aenc_pkt.write_interleaved(&mut octx);
                 }
             }

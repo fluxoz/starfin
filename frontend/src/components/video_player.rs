@@ -68,12 +68,13 @@ const CONTROLS_VICINITY_PX: f64 = 80.0;
 
 /// Maximum buffer length in seconds (forward buffer).
 ///
-/// Kept at one segment duration so that seeks into the sparse zone load only
-/// the cached anchor segment and don't eagerly trigger on-demand transcodes
-/// for adjacent non-cached segments.  During sequential playback the next
-/// segment is fetched just-in-time (6 s of runway is enough for a single
-/// transcode to complete).
-const HLS_MAX_BUFFER_LENGTH: f64 = 6.0;
+/// Set to 30 seconds so HLS.js buffers several segments ahead of the playback
+/// position.  This is critical for smooth playback when segments are transcoded
+/// on-demand: each 6-second segment can take a few seconds to encode, so the
+/// player needs enough buffer runway to absorb that latency.  The
+/// `transcode_semaphore` in the backend already limits concurrent transcode
+/// operations, so a larger buffer won't overload the system on seek.
+const HLS_MAX_BUFFER_LENGTH: f64 = 30.0;
 /// Maximum maximum buffer length in seconds (absolute cap)
 const HLS_MAX_MAX_BUFFER_LENGTH: f64 = 30.0;
 /// Maximum buffer size in bytes (60 MB)

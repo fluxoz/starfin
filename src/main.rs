@@ -276,8 +276,9 @@ struct ThumbProgress {
     active: bool,
     /// Which generation phase is running: `"quick"` or `"deep"`.
     phase: &'static str,
-    /// The video ID currently being processed, or `None` when idle.
-    current_id: Option<String>,
+    /// The set of video IDs currently being processed (may be > 1 when running
+    /// in parallel).  Empty when idle.
+    current_ids: HashSet<String>,
 }
 
 /// Tracks the progress of the sprite generation background job.
@@ -285,8 +286,9 @@ struct SpriteProgress {
     current: u32,
     total: u32,
     active: bool,
-    /// The video ID currently being processed, or `None` when idle.
-    current_id: Option<String>,
+    /// The set of video IDs currently being processed (may be > 1 when running
+    /// in parallel).  Empty when idle.
+    current_ids: HashSet<String>,
 }
 
 /// Tracks the progress of the segment pre-caching background job.
@@ -767,6 +769,16 @@ async fn generate_deep_thumbnail(
     }
 }
 
+/// Returns the number of tasks that sprite/thumbnail background workers will
+/// run concurrently.  Defaults to the number of logical CPU cores so that all
+/// available hardware is used; falls back to 4 if the OS doesn't report CPU
+/// count.
+fn worker_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
 /// Background worker that processes videos one at a time in two sequential
 /// phases.
 ///
@@ -793,6 +805,7 @@ async fn run_thumb_worker(
     trigger: Arc<tokio::sync::Notify>,
     mut playback_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    let concurrency = worker_concurrency();
     loop {
         trigger.notified().await;
 
@@ -820,31 +833,46 @@ async fn run_thumb_worker(
             p.phase = "quick";
         }
 
-        for entry in quick_entries {
-            // Pause between items while a video is being streamed.
+        let mut join_set: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
+        let mut iter = quick_entries.into_iter().peekable();
+        loop {
+            // Pause while a video is being streamed.  In-flight tasks abort via
+            // their cloned kill receiver; their results are collected below.
             while *playback_rx.borrow() {
                 let _ = playback_rx.changed().await;
             }
-
-            let abs = entry.path().to_path_buf();
-            let rel = abs
-                .strip_prefix(&library_path)
-                .unwrap_or(&abs)
-                .to_string_lossy()
-                .to_string();
-            let id = video_id(&rel);
-
-            {
-                let mut p = progress.write().expect("thumb_progress lock poisoned");
-                p.current_id = Some(id.clone());
+            // Fill empty slots up to the concurrency limit.
+            while join_set.len() < concurrency && iter.peek().is_some() {
+                let entry = iter.next().unwrap();
+                let abs = entry.path().to_path_buf();
+                let rel = abs
+                    .strip_prefix(&library_path)
+                    .unwrap_or(&abs)
+                    .to_string_lossy()
+                    .to_string();
+                let id = video_id(&rel);
+                {
+                    let mut p = progress.write().expect("thumb_progress lock poisoned");
+                    p.current_ids.insert(id.clone());
+                }
+                let cache_dir = cache_dir.clone();
+                let mut kill = playback_rx.clone();
+                join_set.spawn(async move {
+                    let ok = generate_quick_thumbnail(&id, &abs, &cache_dir, &mut kill).await;
+                    (id, ok)
+                });
             }
-            generate_quick_thumbnail(&id, &abs, &cache_dir, &mut playback_rx).await;
-
-            let mut p = progress.write().expect("thumb_progress lock poisoned");
-            p.current_id = None;
-            p.current += 1;
-            if p.current >= p.total {
-                p.active = false;
+            if join_set.is_empty() {
+                break;
+            }
+            // Collect the next completed task.
+            if let Some(Ok((id, _ok))) = join_set.join_next().await {
+                let mut p = progress.write().expect("thumb_progress lock poisoned");
+                p.current_ids.remove(&id);
+                p.current += 1;
+                if p.current >= p.total {
+                    p.active = false;
+                }
             }
         }
 
@@ -872,31 +900,46 @@ async fn run_thumb_worker(
             p.phase = "deep";
         }
 
-        for entry in deep_entries {
-            // Pause between items while a video is being streamed.
+        let mut join_set: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
+        let mut iter = deep_entries.into_iter().peekable();
+        loop {
+            // Pause while a video is being streamed.  In-flight tasks abort via
+            // their cloned kill receiver; their results are collected below.
             while *playback_rx.borrow() {
                 let _ = playback_rx.changed().await;
             }
-
-            let abs = entry.path().to_path_buf();
-            let rel = abs
-                .strip_prefix(&library_path)
-                .unwrap_or(&abs)
-                .to_string_lossy()
-                .to_string();
-            let id = video_id(&rel);
-
-            {
-                let mut p = progress.write().expect("thumb_progress lock poisoned");
-                p.current_id = Some(id.clone());
+            // Fill empty slots up to the concurrency limit.
+            while join_set.len() < concurrency && iter.peek().is_some() {
+                let entry = iter.next().unwrap();
+                let abs = entry.path().to_path_buf();
+                let rel = abs
+                    .strip_prefix(&library_path)
+                    .unwrap_or(&abs)
+                    .to_string_lossy()
+                    .to_string();
+                let id = video_id(&rel);
+                {
+                    let mut p = progress.write().expect("thumb_progress lock poisoned");
+                    p.current_ids.insert(id.clone());
+                }
+                let cache_dir = cache_dir.clone();
+                let mut kill = playback_rx.clone();
+                join_set.spawn(async move {
+                    let ok = generate_deep_thumbnail(&id, &abs, &cache_dir, &mut kill).await;
+                    (id, ok)
+                });
             }
-            generate_deep_thumbnail(&id, &abs, &cache_dir, &mut playback_rx).await;
-
-            let mut p = progress.write().expect("thumb_progress lock poisoned");
-            p.current_id = None;
-            p.current += 1;
-            if p.current >= p.total {
-                p.active = false;
+            if join_set.is_empty() {
+                break;
+            }
+            // Collect the next completed task.
+            if let Some(Ok((id, _ok))) = join_set.join_next().await {
+                let mut p = progress.write().expect("thumb_progress lock poisoned");
+                p.current_ids.remove(&id);
+                p.current += 1;
+                if p.current >= p.total {
+                    p.active = false;
+                }
             }
         }
     }
@@ -934,8 +977,8 @@ async fn get_thumb_progress(state: web::Data<AppState>) -> impl Responder {
 /// Each frame is a JSON text message:
 /// ```json
 /// {
-///   "thumb":    { "current": N, "total": M, "active": bool, "phase": "quick", "current_id": "uuid"|null },
-///   "sprite":   { "current": N, "total": M, "active": bool, "current_id": "uuid"|null },
+///   "thumb":    { "current": N, "total": M, "active": bool, "phase": "quick", "current_ids": ["uuid", ...] },
+///   "sprite":   { "current": N, "total": M, "active": bool, "current_ids": ["uuid", ...] },
 ///   "precache": { "current": N, "total": M, "active": bool, "current_id": "uuid"|null }
 /// }
 /// ```
@@ -955,13 +998,15 @@ async fn progress_ws(
         loop {
             ticker.tick().await;
 
-            let (tc, tt, ta, tph, tid) = {
+            let (tc, tt, ta, tph, tids) = {
                 let p = thumb_progress.read().expect("thumb_progress lock poisoned");
-                (p.current, p.total, p.active, p.phase, p.current_id.clone())
+                let ids: Vec<String> = p.current_ids.iter().cloned().collect();
+                (p.current, p.total, p.active, p.phase, ids)
             };
-            let (sc, st, sa, sid) = {
+            let (sc, st, sa, sids) = {
                 let p = sprite_progress.read().expect("sprite_progress lock poisoned");
-                (p.current, p.total, p.active, p.current_id.clone())
+                let ids: Vec<String> = p.current_ids.iter().cloned().collect();
+                (p.current, p.total, p.active, ids)
             };
             let (pc, pt, pa, pid) = {
                 let p = precache_progress.read().expect("precache_progress lock poisoned");
@@ -969,8 +1014,8 @@ async fn progress_ws(
             };
 
             let msg = serde_json::json!({
-                "thumb":    { "current": tc, "total": tt, "active": ta, "phase": tph, "current_id": tid },
-                "sprite":   { "current": sc, "total": st, "active": sa, "current_id": sid },
+                "thumb":    { "current": tc, "total": tt, "active": ta, "phase": tph, "current_ids": tids },
+                "sprite":   { "current": sc, "total": st, "active": sa, "current_ids": sids },
                 "precache": { "current": pc, "total": pt, "active": pa, "current_id": pid }
             })
             .to_string();
@@ -1491,12 +1536,12 @@ async fn get_processing_status(
         let thumb_on_this = state
             .thumb_progress
             .read()
-            .map(|p| p.current_id.as_deref() == Some(id.as_str()))
+            .map(|p| p.current_ids.contains(id.as_str()))
             .unwrap_or(false);
         let sprite_on_this = state
             .sprite_progress
             .read()
-            .map(|p| p.current_id.as_deref() == Some(id.as_str()))
+            .map(|p| p.current_ids.contains(id.as_str()))
             .unwrap_or(false);
         let precache_on_this = state
             .precache_progress
@@ -1616,6 +1661,7 @@ async fn run_sprite_worker(
     trigger: Arc<tokio::sync::Notify>,
     mut playback_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    let concurrency = worker_concurrency();
     loop {
         trigger.notified().await;
 
@@ -1643,31 +1689,46 @@ async fn run_sprite_worker(
             p.active = !entries.is_empty();
         }
 
-        for entry in entries {
-            // Pause between items while a video is being streamed.
+        let mut join_set: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
+        let mut iter = entries.into_iter().peekable();
+        loop {
+            // Pause while a video is being streamed.  In-flight tasks abort via
+            // their cloned kill receiver; their results are collected below.
             while *playback_rx.borrow() {
                 let _ = playback_rx.changed().await;
             }
-
-            let abs = entry.path().to_path_buf();
-            let rel = abs
-                .strip_prefix(&library_path)
-                .unwrap_or(&abs)
-                .to_string_lossy()
-                .to_string();
-            let id = video_id(&rel);
-
-            {
-                let mut p = progress.write().expect("sprite_progress lock poisoned");
-                p.current_id = Some(id.clone());
+            // Fill empty slots up to the concurrency limit.
+            while join_set.len() < concurrency && iter.peek().is_some() {
+                let entry = iter.next().unwrap();
+                let abs = entry.path().to_path_buf();
+                let rel = abs
+                    .strip_prefix(&library_path)
+                    .unwrap_or(&abs)
+                    .to_string_lossy()
+                    .to_string();
+                let id = video_id(&rel);
+                {
+                    let mut p = progress.write().expect("sprite_progress lock poisoned");
+                    p.current_ids.insert(id.clone());
+                }
+                let cache_dir = cache_dir.clone();
+                let mut kill = playback_rx.clone();
+                join_set.spawn(async move {
+                    let ok = generate_sprite(&id, &abs, &cache_dir, &mut kill).await;
+                    (id, ok)
+                });
             }
-            generate_sprite(&id, &abs, &cache_dir, &mut playback_rx).await;
-
-            let mut p = progress.write().expect("sprite_progress lock poisoned");
-            p.current_id = None;
-            p.current += 1;
-            if p.current >= p.total {
-                p.active = false;
+            if join_set.is_empty() {
+                break;
+            }
+            // Collect the next completed task.
+            if let Some(Ok((id, _ok))) = join_set.join_next().await {
+                let mut p = progress.write().expect("sprite_progress lock poisoned");
+                p.current_ids.remove(&id);
+                p.current += 1;
+                if p.current >= p.total {
+                    p.active = false;
+                }
             }
         }
     }
@@ -2268,7 +2329,7 @@ async fn main() -> std::io::Result<()> {
         total: 0,
         active: false,
         phase: "quick",
-        current_id: None,
+        current_ids: HashSet::new(),
     }));
     let thumb_trigger = Arc::new(tokio::sync::Notify::new());
 
@@ -2276,7 +2337,7 @@ async fn main() -> std::io::Result<()> {
         current: 0,
         total: 0,
         active: false,
-        current_id: None,
+        current_ids: HashSet::new(),
     }));
     let sprite_trigger = Arc::new(tokio::sync::Notify::new());
     let precache_trigger = Arc::new(tokio::sync::Notify::new());

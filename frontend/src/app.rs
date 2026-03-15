@@ -124,11 +124,11 @@ fn app_inner() -> Html {
     // Pre-cache progress state: (current, total)
     let precache_progress = use_state(|| Option::<(u32, u32)>::None);
 
-    // The video ID currently being processed by the thumbnail worker (from WS).
-    let thumb_current_id = use_state(|| Option::<String>::None);
+    // The video IDs currently being processed by the thumbnail worker (from WS).
+    let thumb_current_id = use_state(Vec::<String>::new);
 
-    // The video ID currently being processed by the sprite worker (from WS).
-    let sprite_current_id = use_state(|| Option::<String>::None);
+    // The video IDs currently being processed by the sprite worker (from WS).
+    let sprite_current_id = use_state(Vec::<String>::new);
 
     // The video ID currently being pre-cached (from WS).
     let precache_current_id = use_state(|| Option::<String>::None);
@@ -329,8 +329,8 @@ fn app_inner() -> Html {
                             }
 
                             // ── Per-video processing IDs ────────────────────
-                            thumb_current_id.set(update.thumb.current_id.clone());
-                            sprite_current_id.set(update.sprite.current_id.clone());
+                            thumb_current_id.set(update.thumb.current_ids.clone());
+                            sprite_current_id.set(update.sprite.current_ids.clone());
                             precache_current_id.set(update.precache.current_id.clone());
                         }
                     }

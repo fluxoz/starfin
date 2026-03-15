@@ -46,9 +46,6 @@ pub async fn transcode_segment(
     let start_time = seg_index as f64 * SEGMENT_DURATION;
     debug_assert!(start_time >= 0.0 && start_time.is_finite());
 
-    let tmp_filename = format!(".seg_{:05}.ts.tmp", seg_index);
-    let _tmp_path = hls_dir.join(&tmp_filename);
-
     // For High quality with a GPU encoder, use subprocess (hwaccel APIs are
     // not fully exposed in ffmpeg-next).  For Medium/Low, use in-process
     // software encoding.
@@ -144,11 +141,15 @@ fn transcode_segment_inprocess(
     let video_time_base = video_stream.time_base();
     let video_params = video_stream.parameters();
 
-    // Determine output dimensions.
-    let (in_width, in_height) = unsafe {
+    // Determine output dimensions and frame rate.
+    let (in_width, in_height, frame_rate) = unsafe {
         let p = video_params.as_ptr();
-        ((*p).width as u32, (*p).height as u32)
+        let fr = (*p).framerate;
+        let fps = if fr.den > 0 { fr.num as f64 / fr.den as f64 } else { 0.0 };
+        ((*p).width as u32, (*p).height as u32, fps)
     };
+    // Use detected frame rate, fall back to 30 fps if unavailable.
+    let effective_fps = if frame_rate > 0.0 && frame_rate.is_finite() { frame_rate } else { 30.0 };
 
     let (out_width, out_height, crf, preset) = match quality {
         Quality::High => (in_width, in_height, "18", "veryslow"),
@@ -304,15 +305,16 @@ fn transcode_segment_inprocess(
                     }
 
                     // Scale if needed.
+                    let pts_increment = (90000.0 / effective_fps) as i64;
                     let frame_to_encode = if let Some(ref mut sws) = scaler {
                         let mut scaled = ffmpeg_next::util::frame::Video::empty();
                         if sws.run(&decoded, &mut scaled).is_err() {
                             continue;
                         }
-                        scaled.set_pts(Some(frame_count * 90000 / 30 + ts_offset_90k)); // Approximate PTS
+                        scaled.set_pts(Some(frame_count * pts_increment + ts_offset_90k));
                         scaled
                     } else {
-                        decoded.set_pts(Some(frame_count * 90000 / 30 + ts_offset_90k));
+                        decoded.set_pts(Some(frame_count * pts_increment + ts_offset_90k));
                         decoded.clone()
                     };
 

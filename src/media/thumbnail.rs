@@ -217,18 +217,17 @@ fn compute_frame_stats(
     let target_fmt = ffmpeg_next::format::Pixel::YUV420P;
 
     if frame.format() != target_fmt {
-        if scaler.is_none() || scaler.as_ref().map(|_| true).unwrap_or(false) {
-            *scaler = ffmpeg_next::software::scaling::Context::get(
-                frame.format(),
-                frame.width(),
-                frame.height(),
-                target_fmt,
-                frame.width(),
-                frame.height(),
-                ffmpeg_next::software::scaling::Flags::BILINEAR,
-            )
-            .ok();
-        }
+        // (Re)initialize scaler for the current input format → YUV420P.
+        *scaler = ffmpeg_next::software::scaling::Context::get(
+            frame.format(),
+            frame.width(),
+            frame.height(),
+            target_fmt,
+            frame.width(),
+            frame.height(),
+            ffmpeg_next::software::scaling::Flags::BILINEAR,
+        )
+        .ok();
     }
 
     // If conversion is needed and scaler is available, convert.

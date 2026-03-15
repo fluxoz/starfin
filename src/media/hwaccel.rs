@@ -49,6 +49,11 @@ impl HwAccel {
         }
     }
 
+    /// Extra args to insert BEFORE `-i` for hardware-accelerated decoding.
+    ///
+    /// NOTE: The VAAPI device path is hardcoded to `/dev/dri/renderD129` for
+    /// static lifetime compatibility.  This matches the pre-existing behaviour.
+    /// A future improvement could store the discovered device path in the enum.
     pub fn hwaccel_decode_args(&self) -> &'static [&'static str] {
         match self {
             HwAccel::Nvidia => &["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"],

@@ -35,9 +35,10 @@ struct QualityQuery {
 /// `GET /api/quality-options` – list the available quality levels.
 async fn get_quality_options() -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!([
-        { "value": "high",   "label": Quality::High.label() },
-        { "value": "medium", "label": Quality::Medium.label() },
-        { "value": "low",    "label": Quality::Low.label() },
+        { "value": "original", "label": Quality::Original.label() },
+        { "value": "high",     "label": Quality::High.label() },
+        { "value": "medium",   "label": Quality::Medium.label() },
+        { "value": "low",      "label": Quality::Low.label() },
     ]))
 }
 
@@ -328,8 +329,10 @@ struct AppState {
     precache_trigger: Arc<tokio::sync::Notify>,
     /// Detected hardware acceleration backend (detected once at startup).
     hwaccel: HwAccel,
-    /// Semaphore limiting the number of concurrent segment transcode operations.
-    /// Shared between the on-demand segment endpoint and the pre-cache worker.
+    /// Semaphore limiting the number of concurrent on-demand segment transcode
+    /// operations.  Used exclusively by the `get_segment` handler for real-time
+    /// playback requests.  The pre-cache background worker runs sequentially and
+    /// does not compete for these permits.
     /// The limit is set at startup from `TRANSCODE_CONCURRENCY` (default:
     /// available CPU parallelism).
     transcode_semaphore: Arc<tokio::sync::Semaphore>,
@@ -410,6 +413,63 @@ const SCAN_CONCURRENCY: usize = 8;
 /// Path of the persisted video-index file inside `cache_dir`.
 fn video_index_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(".video_index.json")
+}
+
+/// Remove any orphaned `*.tmp` files left behind by a previous unclean
+/// shutdown (e.g. SIGKILL while a transcode or sprite write was in progress).
+/// These files are always incomplete and can never be reused.
+///
+/// The cache tree is at most two levels deep:
+///   {cache_dir}/{video_id}_thumbs/sprite.tmp.jpg     (name contains ".tmp.")
+///   {cache_dir}/{video_id}/{quality}/.seg_XXXXX.ts.tmp  (extension == "tmp")
+/// so a two-level walk is sufficient.
+fn cleanup_orphaned_tmp_files(cache_dir: &Path) {
+    fn is_tmp(path: &Path) -> bool {
+        path.extension().map_or(false, |e| e == "tmp")
+            || path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map_or(false, |n| n.contains(".tmp."))
+    }
+
+    let top = match std::fs::read_dir(cache_dir) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    for entry in top.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if is_tmp(&path) {
+                let _ = std::fs::remove_file(&path);
+            }
+        } else if path.is_dir() {
+            // One level down: {video_id}_thumbs/ and {video_id}/
+            let mid = match std::fs::read_dir(&path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            for mid_entry in mid.flatten() {
+                let mid_path = mid_entry.path();
+                if mid_path.is_file() {
+                    if is_tmp(&mid_path) {
+                        let _ = std::fs::remove_file(&mid_path);
+                    }
+                } else if mid_path.is_dir() {
+                    // Two levels down: {video_id}/{quality}/
+                    let deep = match std::fs::read_dir(&mid_path) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+                    for deep_entry in deep.flatten() {
+                        let deep_path = deep_entry.path();
+                        if deep_path.is_file() && is_tmp(&deep_path) {
+                            let _ = std::fs::remove_file(&deep_path);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Persist the current in-memory video list to disk so it can be restored
@@ -700,7 +760,6 @@ async fn generate_quick_thumbnail(
     id: &str,
     video_path: &Path,
     cache_dir: &Path,
-    kill: &mut tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     let thumb_path = cache_dir.join(format!("{}.jpg", id));
     if thumb_path.exists() {
@@ -721,18 +780,17 @@ async fn generate_quick_thumbnail(
     let video_path = video_path.to_path_buf();
     let thumb_path_clone = thumb_path.clone();
 
-    // Run the CPU-intensive frame extraction on a blocking thread.
-    let task = tokio::task::spawn_blocking(move || {
+    // Run the CPU-intensive frame extraction on a blocking thread.  The
+    // result is always awaited to completion: letting the task finish means
+    // the thumbnail is saved and won't need to be re-done when workers
+    // resume after playback ends.  The outer worker loop suspends between
+    // tasks while playback is active, so no new work is started during
+    // playback.
+    tokio::task::spawn_blocking(move || {
         media::thumbnail::extract_frame_as_jpeg(&video_path, seek_secs, &thumb_path_clone)
-    });
-
-    tokio::select! {
-        result = task => result.unwrap_or(false),
-        _ = async { let _ = kill.wait_for(|&v| v).await; } => {
-            // Can't easily cancel a blocking task, but on kill signal return false.
-            false
-        }
-    }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Two-pass deep thumbnail using in-process signalstats analysis.
@@ -748,7 +806,6 @@ async fn generate_deep_thumbnail(
     id: &str,
     video_path: &Path,
     cache_dir: &Path,
-    kill: &mut tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     let deep_marker = cache_dir.join(format!("{}.deep", id));
     if deep_marker.exists() {
@@ -768,38 +825,30 @@ async fn generate_deep_thumbnail(
     let default_time = start + length * 0.5;
 
     // Pass 1: find the best frame time via in-process signal analysis.
+    // Both passes are awaited to completion so that their results are saved
+    // and don't need to be repeated when workers resume after playback ends.
     let video_path_for_analysis = video_path_owned.clone();
-    let analysis_task = tokio::task::spawn_blocking(move || {
+    let best_time = tokio::task::spawn_blocking(move || {
         media::thumbnail::find_best_frame_via_signalstats(
             &video_path_for_analysis,
             start,
             length,
             default_time,
         )
-    });
-
-    let best_time = tokio::select! {
-        result = analysis_task => result.unwrap_or(default_time),
-        _ = async { let _ = kill.wait_for(|&v| v).await; } => {
-            return false;
-        }
-    };
+    })
+    .await
+    .unwrap_or(default_time);
 
     // Pass 2: extract the chosen frame.
     let thumb_path = cache_dir.join(format!("{}.jpg", id));
     let video_path_for_extract = video_path_owned.clone();
     let thumb_path_clone = thumb_path.clone();
 
-    let extract_task = tokio::task::spawn_blocking(move || {
+    let success = tokio::task::spawn_blocking(move || {
         media::thumbnail::extract_frame_as_jpeg(&video_path_for_extract, best_time, &thumb_path_clone)
-    });
-
-    let success = tokio::select! {
-        result = extract_task => result.unwrap_or(false),
-        _ = async { let _ = kill.wait_for(|&v| v).await; } => {
-            false
-        }
-    };
+    })
+    .await
+    .unwrap_or(false);
 
     if success {
         let _ = tokio::fs::write(&deep_marker, b"").await;
@@ -810,13 +859,20 @@ async fn generate_deep_thumbnail(
 }
 
 /// Returns the number of tasks that sprite/thumbnail background workers will
-/// run concurrently.  Defaults to the number of logical CPU cores so that all
-/// available hardware is used; falls back to 4 if the OS doesn't report CPU
-/// count.
+/// run concurrently.
+///
+/// Defaults to **1** so that background work never saturates CPU or disk I/O.
+/// With concurrency=1 each worker has at most one in-flight `spawn_blocking`
+/// task at a time, so when playback starts the worker pauses after finishing
+/// just that one task — keeping the overlap with on-demand transcoding to a
+/// minimum.
+///
+/// Override with the `WORKER_CONCURRENCY` environment variable.
 fn worker_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+    std::env::var("WORKER_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok().filter(|&n| n > 0))
+        .unwrap_or(1)
 }
 
 /// Background worker that processes videos one at a time in two sequential
@@ -844,10 +900,21 @@ async fn run_thumb_worker(
     progress: Arc<RwLock<ThumbProgress>>,
     trigger: Arc<tokio::sync::Notify>,
     mut playback_rx: tokio::sync::watch::Receiver<bool>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let concurrency = worker_concurrency();
     loop {
-        trigger.notified().await;
+        // Fast exit if shutdown was already signaled before we block.
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        tokio::select! {
+            _ = trigger.notified() => {}
+            _ = shutdown_rx.changed() => { return; }
+        }
+        if *shutdown_rx.borrow() {
+            return;
+        }
 
         // ── Phase 1: quick thumbnails ─────────────────────────────────────
 
@@ -876,13 +943,19 @@ async fn run_thumb_worker(
         let mut join_set: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
         let mut iter = quick_entries.into_iter().peekable();
         loop {
-            // Pause while a video is being streamed.  In-flight tasks abort via
-            // their cloned kill receiver; their results are collected below.
+            // Suspend while a video is being streamed: wait here until
+            // playback goes idle, then fill the next batch of tasks.
             while *playback_rx.borrow() {
                 let _ = playback_rx.changed().await;
             }
+            if *shutdown_rx.borrow() {
+                return;
+            }
             // Fill empty slots up to the concurrency limit.
             while join_set.len() < concurrency && iter.peek().is_some() {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
                 let entry = iter.next().unwrap();
                 let abs = entry.path().to_path_buf();
                 let rel = abs
@@ -896,17 +969,22 @@ async fn run_thumb_worker(
                     p.current_ids.insert(id.clone());
                 }
                 let cache_dir = cache_dir.clone();
-                let mut kill = playback_rx.clone();
                 join_set.spawn(async move {
-                    let ok = generate_quick_thumbnail(&id, &abs, &cache_dir, &mut kill).await;
+                    let ok = generate_quick_thumbnail(&id, &abs, &cache_dir).await;
                     (id, ok)
                 });
             }
             if join_set.is_empty() {
                 break;
             }
-            // Collect the next completed task.
-            if let Some(Ok((id, _ok))) = join_set.join_next().await {
+            // Collect the next completed task.  Use select! so a shutdown
+            // signal wakes us immediately rather than waiting for the
+            // in-flight spawn_blocking to finish.
+            let next = tokio::select! {
+                r = join_set.join_next() => r,
+                _ = shutdown_rx.changed() => { return; }
+            };
+            if let Some(Ok((id, _ok))) = next {
                 let mut p = progress.write();
                 p.current_ids.remove(&id);
                 p.current += 1;
@@ -914,6 +992,10 @@ async fn run_thumb_worker(
                     p.active = false;
                 }
             }
+        }
+
+        if *shutdown_rx.borrow() {
+            return;
         }
 
         // ── Phase 2: deep thumbnails ──────────────────────────────────────
@@ -943,13 +1025,19 @@ async fn run_thumb_worker(
         let mut join_set: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
         let mut iter = deep_entries.into_iter().peekable();
         loop {
-            // Pause while a video is being streamed.  In-flight tasks abort via
-            // their cloned kill receiver; their results are collected below.
+            // Suspend while a video is being streamed: wait here until
+            // playback goes idle, then fill the next batch of tasks.
             while *playback_rx.borrow() {
                 let _ = playback_rx.changed().await;
             }
+            if *shutdown_rx.borrow() {
+                return;
+            }
             // Fill empty slots up to the concurrency limit.
             while join_set.len() < concurrency && iter.peek().is_some() {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
                 let entry = iter.next().unwrap();
                 let abs = entry.path().to_path_buf();
                 let rel = abs
@@ -963,17 +1051,22 @@ async fn run_thumb_worker(
                     p.current_ids.insert(id.clone());
                 }
                 let cache_dir = cache_dir.clone();
-                let mut kill = playback_rx.clone();
                 join_set.spawn(async move {
-                    let ok = generate_deep_thumbnail(&id, &abs, &cache_dir, &mut kill).await;
+                    let ok = generate_deep_thumbnail(&id, &abs, &cache_dir).await;
                     (id, ok)
                 });
             }
             if join_set.is_empty() {
                 break;
             }
-            // Collect the next completed task.
-            if let Some(Ok((id, _ok))) = join_set.join_next().await {
+            // Collect the next completed task.  Use select! so a shutdown
+            // signal wakes us immediately rather than waiting for the
+            // in-flight spawn_blocking to finish.
+            let next = tokio::select! {
+                r = join_set.join_next() => r,
+                _ = shutdown_rx.changed() => { return; }
+            };
+            if let Some(Ok((id, _ok))) = next {
                 let mut p = progress.write();
                 p.current_ids.remove(&id);
                 p.current += 1;
@@ -1145,7 +1238,7 @@ async fn remove_non_precached_segments(cache_dir: &Path) -> std::io::Result<()> 
 /// Remove non-pre-cached segments from **all** quality subdirectories of a
 /// video's cache folder (`{cache_dir}/{video_id}/{quality}/`).
 async fn remove_non_precached_segments_all_qualities(video_cache_dir: &Path) {
-    for quality_name in [Quality::High.as_str(), Quality::Medium.as_str(), Quality::Low.as_str()] {
+    for quality_name in [Quality::Original.as_str(), Quality::High.as_str(), Quality::Medium.as_str(), Quality::Low.as_str()] {
         let q_dir = video_cache_dir.join(quality_name);
         if q_dir.exists() {
             if let Err(e) = remove_non_precached_segments(&q_dir).await {
@@ -1583,11 +1676,12 @@ async fn get_processing_status(
     // seg_00000.ts as a lightweight proxy — if the pre-cache worker
     // finished, all PRECACHE_SEGMENTS files will be present.
     // Segments are now stored in quality-specific subdirectories; the
-    // precache worker always operates on the `high` quality level.
+    // precache worker always operates on the `original` quality level
+    // (direct remux for compatible sources, fast transcode fallback).
     let precache_marker = state
         .cache_dir
         .join(id.as_str())
-        .join(Quality::High.as_str())
+        .join(Quality::Original.as_str())
         .join("seg_00000.ts");
 
     let all_done = quick_marker.exists()
@@ -1645,16 +1739,14 @@ async fn get_thumbnail_sprite(
 
     // Refuse to start generation while any video is being streamed.
     // The background worker will generate this sprite once playback ends.
-    let mut kill_rx = state.playback_tx.subscribe();
-    if *kill_rx.borrow() {
+    if *state.playback_tx.borrow() {
         return HttpResponse::ServiceUnavailable()
             .body("sprite generation paused during playback");
     }
 
     // Generate the sprite using the shared helper (creates dir, runs ffmpeg).
-    // Pass the playback receiver so an in-flight task is interrupted the
-    // moment a segment is served for any video, keeping the HTTP response fast.
-    if generate_sprite(&id, &abs_path, &state.cache_dir, Some(&mut kill_rx)).await {
+    // The task is always awaited to completion so its result is saved.
+    if generate_sprite(&id, &abs_path, &state.cache_dir).await {
         match tokio::fs::read(&sprite_path).await {
             Ok(data) => HttpResponse::Ok()
                 .content_type("image/jpeg")
@@ -1664,7 +1756,7 @@ async fn get_thumbnail_sprite(
                 .body(format!("failed to read sprite: {e}")),
         }
     } else {
-        HttpResponse::ServiceUnavailable().body("sprite generation failed or was interrupted by playback")
+        HttpResponse::ServiceUnavailable().body("sprite generation failed or unavailable")
     }
 }
 
@@ -1673,15 +1765,13 @@ async fn get_thumbnail_sprite(
 ///
 /// Creates `{cache_dir}/{id}_thumbs/sprite.jpg`.  Returns `true` on success.
 ///
-/// `kill` is optional — supply `Some(rx)` when the caller needs the operation
-/// to be interruptible (e.g. the on-demand HTTP handler), or `None` to let
-/// the task run to completion regardless of playback state (used by the
-/// background worker, which already pauses *between* videos).
+/// Always runs to completion — the outer worker loop suspends *between*
+/// tasks while playback is active, which is the correct granularity for
+/// deferring to playback without risking zombie `spawn_blocking` threads.
 async fn generate_sprite(
     id: &str,
     abs_path: &Path,
     cache_dir: &Path,
-    kill: Option<&mut tokio::sync::watch::Receiver<bool>>,
 ) -> bool {
     let sprite_dir = cache_dir.join(format!("{}_thumbs", id));
     let sprite_path = sprite_dir.join("sprite.jpg");
@@ -1705,24 +1795,14 @@ async fn generate_sprite(
     };
 
     let sprite_dir_owned = sprite_dir.clone();
-    let task = tokio::task::spawn_blocking(move || {
+    // Await the task to completion so the generated sprite is saved and won't
+    // need to be re-done when the background worker resumes after playback.
+    // The outer worker loop suspends between tasks while playback is active.
+    tokio::task::spawn_blocking(move || {
         media::sprite::generate_sprite_sheet(&resolved_path, duration_secs, &sprite_dir_owned)
-    });
-
-    match kill {
-        None => {
-            // Background worker: wait for completion unconditionally.
-            task.await.unwrap_or(false)
-        }
-        Some(kill) => {
-            tokio::select! {
-                result = task => result.unwrap_or(false),
-                _ = async { let _ = kill.wait_for(|&v| v).await; } => {
-                    false
-                }
-            }
-        }
-    }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Background worker that proactively generates sprite sheets for every video.
@@ -1736,12 +1816,23 @@ async fn run_sprite_worker(
     progress: Arc<RwLock<SpriteProgress>>,
     trigger: Arc<tokio::sync::Notify>,
     mut playback_rx: tokio::sync::watch::Receiver<bool>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     // Sprite generation uses multi-threaded keyframe-only decoding internally,
     // so running one video at a time maximises throughput without CPU contention.
     let concurrency = 1_usize;
     loop {
-        trigger.notified().await;
+        // Fast exit if shutdown was already signaled before we block.
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        tokio::select! {
+            _ = trigger.notified() => {}
+            _ = shutdown_rx.changed() => { return; }
+        }
+        if *shutdown_rx.borrow() {
+            return;
+        }
 
         let (sprite_done, entries): (Vec<_>, Vec<_>) = WalkDir::new(&library_path)
             .into_iter()
@@ -1770,13 +1861,19 @@ async fn run_sprite_worker(
         let mut join_set: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
         let mut iter = entries.into_iter().peekable();
         loop {
-            // Pause while a video is being streamed.  The worker waits here
-            // between videos; any already-running task runs to completion.
+            // Suspend while a video is being streamed: wait here until
+            // playback goes idle, then fill the next batch of tasks.
             while *playback_rx.borrow() {
                 let _ = playback_rx.changed().await;
             }
+            if *shutdown_rx.borrow() {
+                return;
+            }
             // Fill empty slots up to the concurrency limit.
             while join_set.len() < concurrency && iter.peek().is_some() {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
                 let entry = iter.next().unwrap();
                 let abs = entry.path().to_path_buf();
                 let rel = abs
@@ -1791,21 +1888,21 @@ async fn run_sprite_worker(
                 }
                 let cache_dir = cache_dir.clone();
                 join_set.spawn(async move {
-                    // Pass `None` for the kill signal so the blocking task always
-                    // runs to completion.  The worker-level pause (above) already
-                    // prevents *new* sprite generations from starting while playback
-                    // is active.  Killing mid-generation would detach the
-                    // spawn_blocking thread, causing concurrent writes to the same
-                    // temp file on the next retry and a corrupted sprite.
-                    let ok = generate_sprite(&id, &abs, &cache_dir, None).await;
+                    let ok = generate_sprite(&id, &abs, &cache_dir).await;
                     (id, ok)
                 });
             }
             if join_set.is_empty() {
                 break;
             }
-            // Collect the next completed task.
-            if let Some(Ok((id, _ok))) = join_set.join_next().await {
+            // Collect the next completed task.  Use select! so a shutdown
+            // signal wakes us immediately rather than waiting for the
+            // in-flight spawn_blocking to finish.
+            let next = tokio::select! {
+                r = join_set.join_next() => r,
+                _ = shutdown_rx.changed() => { return; }
+            };
+            if let Some(Ok((id, _ok))) = next {
                 let mut p = progress.write();
                 p.current_ids.remove(&id);
                 p.current += 1;
@@ -1825,8 +1922,10 @@ async fn run_sprite_worker(
 /// Mirrors `run_thumb_worker` / `run_sprite_worker`: waits for a notification
 /// on `trigger`, walks the library, skips videos whose first
 /// [`PRECACHE_SEGMENTS`] segments already exist in the cache, and transcodes
-/// the missing ones.  Pauses while playback is active.  Progress counters are
-/// written to `progress` so the WS can drive a frontend progress bar.
+/// the missing ones.  Suspends while playback is active (checking between
+/// every individual segment) and resumes automatically once idle.  Progress
+/// counters are written to `progress` so the WS can drive a frontend progress
+/// bar.
 async fn run_precache_worker(
     library_path: PathBuf,
     cache_dir: PathBuf,
@@ -1834,10 +1933,20 @@ async fn run_precache_worker(
     progress: Arc<RwLock<PrecacheProgress>>,
     trigger: Arc<tokio::sync::Notify>,
     mut playback_rx: tokio::sync::watch::Receiver<bool>,
-    semaphore: Arc<tokio::sync::Semaphore>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
-        trigger.notified().await;
+        // Fast exit if shutdown was already signaled before we block.
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        tokio::select! {
+            _ = trigger.notified() => {}
+            _ = shutdown_rx.changed() => { return; }
+        }
+        if *shutdown_rx.borrow() {
+            return;
+        }
 
         let entries: Vec<_> = WalkDir::new(&library_path)
             .into_iter()
@@ -1860,8 +1969,8 @@ async fn run_precache_worker(
                 .unwrap_or(abs)
                 .to_string_lossy();
             let id = video_id(&rel);
-            // Precache always uses the High quality subdirectory.
-            let hls_dir = cache_dir.join(&id).join(Quality::High.as_str());
+            // Precache always uses the Original quality subdirectory.
+            let hls_dir = cache_dir.join(&id).join(Quality::Original.as_str());
 
             let is_done = if !hls_dir.join("seg_00000.ts").exists() {
                 false
@@ -1903,9 +2012,15 @@ async fn run_precache_worker(
         }
 
         for entry in pending {
-            // Pause while a video is being streamed.
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            // Suspend while a video is being streamed; resume once idle.
             while *playback_rx.borrow() {
                 let _ = playback_rx.changed().await;
+            }
+            if *shutdown_rx.borrow() {
+                return;
             }
 
             let abs = entry.path().to_path_buf();
@@ -1915,8 +2030,8 @@ async fn run_precache_worker(
                 .to_string_lossy()
                 .to_string();
             let id = video_id(&rel);
-            // Precache always uses the High quality subdirectory.
-            let hls_dir = cache_dir.join(&id).join(Quality::High.as_str());
+            // Precache always uses the Original quality subdirectory.
+            let hls_dir = cache_dir.join(&id).join(Quality::Original.as_str());
 
             {
                 let mut p = progress.write();
@@ -1977,22 +2092,28 @@ async fn run_precache_worker(
             );
 
             for i in missing {
-                // Re-check playback between individual segments.
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+                // Suspend between individual segments while playback is active.
+                // Matches the pattern used by run_thumb_worker / run_sprite_worker:
+                // finish the current unit of work, save it, then pause before
+                // starting the next one.
                 while *playback_rx.borrow() {
                     let _ = playback_rx.changed().await;
                 }
+                if *shutdown_rx.borrow() {
+                    return;
+                }
 
-                // Acquire a transcode permit to bound concurrent operations.
-                // The permit is released when `_permit` is dropped at loop end.
-                let _permit = match semaphore.acquire().await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        error!(error = %e, "precache: transcode semaphore closed — worker terminating");
-                        break;
-                    }
+                // Run the segment creation inside a select! so a shutdown
+                // signal wakes us immediately rather than waiting for the
+                // full operation to finish.
+                let result = tokio::select! {
+                    r = transcode_segment(&abs_str, &hls_dir, i, &hwaccel, Quality::Original) => r,
+                    _ = shutdown_rx.changed() => { return; }
                 };
-
-                if let Err(e) = transcode_segment(&abs_str, &hls_dir, i, &hwaccel, Quality::High).await {
+                if let Err(e) = result {
                     error!(video_id = %id, segment = i, error = %e, "precache: segment transcode failed");
                     break; // Stop for this video on error.
                 }
@@ -2406,6 +2527,11 @@ async fn main() -> std::io::Result<()> {
     }
     std::fs::create_dir_all(&cache_dir)?;
 
+    // Remove any *.tmp files left behind by a previous shutdown.
+    // These are always incomplete and can never be reused.
+    info!("Cleaning any oprhaned temp files.");
+    cleanup_orphaned_tmp_files(&cache_dir);
+
     // ── Startup healthchecks (logged for journalctl) ─────────────────────
     run_startup_healthchecks(&library_path, &cache_dir).await;
     let hwaccel = media::hwaccel::detect_hwaccel().await;
@@ -2452,10 +2578,20 @@ async fn main() -> std::io::Result<()> {
     let (playback_tx, playback_rx) = tokio::sync::watch::channel(false);
     let playback_tx = Arc::new(playback_tx);
 
-    // ── Transcode concurrency semaphore ──────────────────────────────────
-    // Limits the number of simultaneous segment transcode operations so that
-    // the system is not overloaded.  Defaults to the number of available CPU
-    // threads; override with the TRANSCODE_CONCURRENCY environment variable.
+    // ── Shutdown channel ─────────────────────────────────────────────────
+    // Sending `true` signals all background workers to stop at their next
+    // checkpoint.  The sender is wrapped in Arc so it can be shared with
+    // the signal-handler task.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_tx = Arc::new(shutdown_tx);
+
+    // ── On-demand playback transcode semaphore ───────────────────────────
+    // Limits the number of simultaneous on-demand segment transcode operations
+    // so that concurrent HLS.js requests don't overload the system.  Used
+    // exclusively by the `get_segment` handler; the pre-cache background
+    // worker is fully suspended during playback and does not compete for
+    // these permits.  Defaults to the number of available CPU threads; override
+    // with the TRANSCODE_CONCURRENCY environment variable.
     let transcode_concurrency = std::env::var("TRANSCODE_CONCURRENCY")
         .ok()
         .and_then(|v| v.parse::<usize>().ok().filter(|&n| n > 0))
@@ -2467,7 +2603,7 @@ async fn main() -> std::io::Result<()> {
                 // still allowing meaningful concurrent load.
                 .unwrap_or(4)
         });
-    info!(limit = transcode_concurrency, "max concurrent transcodes (set TRANSCODE_CONCURRENCY to override)");
+    info!(limit = transcode_concurrency, "max concurrent on-demand transcodes (set TRANSCODE_CONCURRENCY to override)");
     let transcode_semaphore = Arc::new(tokio::sync::Semaphore::new(transcode_concurrency));
 
     // ── Password protection ──────────────────────────────────────────────
@@ -2537,11 +2673,21 @@ async fn main() -> std::io::Result<()> {
     let bg_thumb_trigger = Arc::clone(&thumb_trigger);
     let bg_sprite_trigger = Arc::clone(&sprite_trigger);
     let bg_precache_trigger = Arc::clone(&precache_trigger);
+    let mut bg_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        interval.tick().await; // skip the immediate first tick (covered by startup scan)
+        // Skip the immediate first tick (covered by startup scan).
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = bg_shutdown_rx.changed() => { return; }
+        }
         loop {
-            interval.tick().await;
+            if *bg_shutdown_rx.borrow() { return; }
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = bg_shutdown_rx.changed() => { return; }
+            }
+            if *bg_shutdown_rx.borrow() { return; }
             let (items, index) = scan_library(&bg_library_path).await;
             save_video_cache(&items, &bg_cache_dir);
             *bg_cache.write() = items;
@@ -2559,8 +2705,9 @@ async fn main() -> std::io::Result<()> {
         let worker_progress = Arc::clone(&thumb_progress);
         let worker_trigger = Arc::clone(&thumb_trigger);
         let worker_playback_rx = playback_rx.clone();
+        let worker_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            run_thumb_worker(worker_library, worker_cache, worker_progress, worker_trigger, worker_playback_rx).await;
+            run_thumb_worker(worker_library, worker_cache, worker_progress, worker_trigger, worker_playback_rx, worker_shutdown_rx).await;
         });
         // Kick off the first batch immediately after startup.
         thumb_trigger.notify_one();
@@ -2574,8 +2721,9 @@ async fn main() -> std::io::Result<()> {
         let worker_progress = Arc::clone(&sprite_progress);
         let worker_trigger = Arc::clone(&sprite_trigger);
         let worker_playback_rx = playback_rx.clone();
+        let worker_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            run_sprite_worker(worker_library, worker_cache, worker_progress, worker_trigger, worker_playback_rx).await;
+            run_sprite_worker(worker_library, worker_cache, worker_progress, worker_trigger, worker_playback_rx, worker_shutdown_rx).await;
         });
         // Kick off the first batch immediately after startup.
         sprite_trigger.notify_one();
@@ -2589,9 +2737,9 @@ async fn main() -> std::io::Result<()> {
         let worker_progress = Arc::clone(&precache_progress);
         let worker_trigger = Arc::clone(&precache_trigger);
         let worker_playback_rx = playback_rx.clone();
-        let worker_semaphore = Arc::clone(&transcode_semaphore);
+        let worker_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            run_precache_worker(worker_library, worker_cache, precache_hwaccel, worker_progress, worker_trigger, worker_playback_rx, worker_semaphore).await;
+            run_precache_worker(worker_library, worker_cache, precache_hwaccel, worker_progress, worker_trigger, worker_playback_rx, worker_shutdown_rx).await;
         });
         // Kick off the first batch immediately after startup.
         precache_trigger.notify_one();
@@ -2600,19 +2748,28 @@ async fn main() -> std::io::Result<()> {
 
     // ── Playback monitor ─────────────────────────────────────────────────────
     // Every 2 seconds, check whether any video has had a recent segment
-    // request.  When playback stops, the watch channel immediately wakes any
-    // background workers that were blocked, and they are re-triggered so
-    // processing resumes without waiting for the next 60-second library scan.
+    // request.  While the channel value is `true`, background workers suspend
+    // themselves between tasks (graceful suspend — any already-running task
+    // finishes and saves its result before the worker pauses).  When playback
+    // stops the channel flips to `false`, waking suspended workers so
+    // processing resumes immediately without waiting for the next 60-second
+    // library scan.
     {
         let monitor_state = state.clone();
         let monitor_tx = Arc::clone(&playback_tx);
         let monitor_thumb_trigger = Arc::clone(&thumb_trigger);
         let monitor_sprite_trigger = Arc::clone(&sprite_trigger);
         let monitor_precache_trigger = Arc::clone(&precache_trigger);
+        let mut monitor_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(2));
             loop {
-                interval.tick().await;
+                if *monitor_shutdown_rx.borrow() { return; }
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = monitor_shutdown_rx.changed() => { return; }
+                }
+                if *monitor_shutdown_rx.borrow() { return; }
                 let is_playing = {
                     let map = monitor_state
                         .last_segment_access
@@ -2642,10 +2799,16 @@ async fn main() -> std::io::Result<()> {
     // has not had a segment request for at least CACHE_IDLE_TIMEOUT.
     {
         let sweep_state = state.clone();
+        let mut sweep_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(CACHE_SWEEP_INTERVAL);
             loop {
-                interval.tick().await;
+                if *sweep_shutdown_rx.borrow() { return; }
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = sweep_shutdown_rx.changed() => { return; }
+                }
+                if *sweep_shutdown_rx.borrow() { return; }
 
                 // Collect IDs whose caches have gone idle.
                 // The read lock is held only for the in-memory scan; it is
@@ -2679,7 +2842,7 @@ async fn main() -> std::io::Result<()> {
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
     info!(bind_addr = %bind_addr, port, "listening");
 
-    HttpServer::new(move || {
+    let server = HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
             .wrap(Logger::default())
@@ -2737,8 +2900,89 @@ async fn main() -> std::io::Result<()> {
             .route("/{tail:.*}", web::get().to(frontend))
     })
     .bind((bind_addr.as_str(), port))?
-    .run()
-    .await
+    .run();
+
+    let server_handle = server.handle();
+
+    // ── Graceful shutdown on SIGINT / SIGTERM ─────────────────────────────────
+    let shutdown_tx_signal = Arc::clone(&shutdown_tx);
+    let playback_tx_signal = Arc::clone(&playback_tx);
+    let semaphore_signal = Arc::clone(&transcode_semaphore);
+    tokio::spawn(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+
+        #[cfg(unix)]
+        let terminate = {
+            let mut sig = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            )
+            .expect("failed to install SIGTERM handler");
+            async move { sig.recv().await }
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => info!("received SIGINT, shutting down gracefully"),
+            _ = terminate => info!("received SIGTERM, shutting down gracefully"),
+        }
+
+        // Unblock workers that are paused waiting for playback to finish.
+        let _ = playback_tx_signal.send(false);
+        // Signal all background workers to exit their loops.
+        let _ = shutdown_tx_signal.send(true);
+        // Fast-fail any pending semaphore acquires in the precache worker.
+        semaphore_signal.close();
+        // Stop accepting new HTTP requests and drain in-flight ones.
+        server_handle.stop(true).await;
+    });
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── Force-exit watchdog (OS thread) ──────────────────────────────────────
+    // When actix-web receives SIGINT it handles the signal internally and
+    // `server.await` returns, which drops the tokio runtime and cancels all
+    // spawned tasks.  A tokio::spawn watchdog would be cancelled before it
+    // could call process::exit().  An OS thread survives the runtime teardown.
+    //
+    // spawn_blocking threads (in-process ffmpeg transcodes) also cannot be
+    // cancelled mid-execution; they keep the process alive until they finish.
+    // This watchdog guarantees a timely exit regardless.
+    {
+        let watchdog_rx = shutdown_rx.clone();
+        std::thread::spawn(move || {
+            // Poll the shutdown channel until it fires.  We can't use async
+            // here because this is a plain OS thread.
+            loop {
+                if *watchdog_rx.borrow() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            // Brief grace period to let async tasks clean up.
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            eprintln!("shutdown grace period elapsed, forcing exit");
+            std::process::exit(0);
+        });
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // `server.await` resolves when actix-web finishes (either from its own
+    // internal SIGINT handling or from server_handle.stop()).  After it
+    // returns, ensure all background workers are signalled and force exit
+    // to terminate any lingering spawn_blocking threads immediately.
+    let result = server.await;
+
+    info!("HTTP server stopped, cleaning up");
+    // Ensure shutdown is signalled even if actix handled the signal before
+    // our tokio signal handler ran.
+    let _ = shutdown_tx.send(true);
+    let _ = playback_tx.send(false);
+    transcode_semaphore.close();
+    // Brief grace for async tasks to see the signal and exit cleanly.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    info!("forcing process exit");
+    std::process::exit(result.map(|_| 0).unwrap_or(1));
 }
 
 

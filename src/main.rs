@@ -2,6 +2,7 @@ mod media;
 
 use media::hwaccel::HwAccel;
 use media::transcode::Quality;
+use tracing::{error, info, warn};
 
 use actix_web::{
     App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
@@ -45,13 +46,10 @@ async fn get_quality_options() -> impl Responder {
 /// journalctl.  Checks cover: process identity, directory read/write access,
 /// ffmpeg availability, and available render devices.
 async fn run_startup_healthchecks(library_path: &Path, cache_dir: &Path) {
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║            STARFIN —  STARTUP HEALTHCHECKS                   ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    info!("STARFIN — STARTUP HEALTHCHECKS");
 
     // ── 1. Process identity ──────────────────────────────────────────────
-    println!();
-    println!("── Process identity ────────────────────────────────────────────");
+    info!("── Process identity");
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
@@ -103,27 +101,20 @@ async fn run_startup_healthchecks(library_path: &Path, cache_dir: &Path) {
         }
     };
 
-    println!("  User  : {} (uid={})", username, uid);
-    println!("  Group : {} (gid={})", groupname, gid);
-    println!("  PID   : {}", std::process::id());
+    info!(user = %username, uid, group = %groupname, gid, pid = std::process::id(), "process identity");
 
     // ── 2. Directory access checks ───────────────────────────────────────
-    println!();
-    println!("── Directory access ───────────────────────────────────────────");
+    info!("── Directory access");
     check_directory_access("VIDEO_LIBRARY_PATH", library_path);
     check_directory_access("CACHE_DIR", cache_dir);
 
     // ── 3. ffmpeg libraries (linked in-process via ffmpeg-next) ─────────
-    println!();
-    println!("── ffmpeg (in-process via ffmpeg-next) ────────────────────────");
+    info!("── ffmpeg (in-process via ffmpeg-next)");
     media::ensure_init();
-    println!("  ✓ libavcodec  {}", media::libavcodec_version_string());
-    println!("  ✓ libavformat {}", media::libavformat_version_string());
-    println!("  ✓ libavfilter {}", media::libavfilter_version_string());
+    info!(libavcodec = %media::libavcodec_version_string(), libavformat = %media::libavformat_version_string(), libavfilter = %media::libavfilter_version_string(), "ffmpeg libraries loaded");
 
     // ── 4. Render devices ────────────────────────────────────────────────
-    println!();
-    println!("── Render devices (/dev/dri) ────────────────────────────────");
+    info!("── Render devices (/dev/dri)");
     let dri_path = Path::new("/dev/dri");
     if dri_path.exists() {
         match std::fs::read_dir(dri_path) {
@@ -138,23 +129,25 @@ async fn run_startup_healthchecks(library_path: &Path, cache_dir: &Path) {
                     let name_str = name.to_string_lossy();
                     if name_str.starts_with("render") || name_str.starts_with("card") {
                         let accessible = std::fs::File::open(entry.path()).is_ok();
-                        let status = if accessible { "✓ accessible" } else { "✗ not accessible" };
-                        println!("  {} : {}", name_str, status);
+                        if accessible {
+                            info!(device = %name_str, "render device accessible");
+                        } else {
+                            warn!(device = %name_str, "render device not accessible");
+                        }
                         found_any = true;
                     }
                 }
                 if !found_any {
-                    println!("  (no render/card devices found)");
+                    info!("no render/card devices found in /dev/dri");
                 }
             }
-            Err(e) => println!("  ✗ Cannot read /dev/dri: {}", e),
+            Err(e) => warn!(error = %e, "cannot read /dev/dri"),
         }
 
         // Also check by-path symlinks for stable device identification
         let by_path = dri_path.join("by-path");
         if by_path.exists() {
-            println!();
-            println!("  Stable paths (/dev/dri/by-path):");
+            info!("── Stable paths (/dev/dri/by-path)");
             if let Ok(entries) = std::fs::read_dir(&by_path) {
                 let mut links: Vec<_> = entries
                     .filter_map(|e| e.ok())
@@ -167,17 +160,16 @@ async fn run_startup_healthchecks(library_path: &Path, cache_dir: &Path) {
                         let target = std::fs::read_link(entry.path())
                             .map(|t| t.display().to_string())
                             .unwrap_or_else(|_| "?".into());
-                        println!("    {} → {}", name_str, target);
+                        info!(link = %name_str, target = %target, "stable render device path");
                     }
                 }
             }
         }
     } else {
-        println!("  (no /dev/dri directory — no GPU devices detected)");
+        info!("no /dev/dri directory — no GPU devices detected");
     }
 
-    println!();
-    println!("── Hardware acceleration probe ─────────────────────────────────");
+    info!("── Hardware acceleration probe");
 }
 
 /// Check that a directory exists and is readable and writable by the current
@@ -186,46 +178,43 @@ fn check_directory_access(label: &str, path: &Path) {
     // Display the canonical (resolved) path when possible; fall back to the
     // raw configured path if canonicalization fails (e.g. broken symlink).
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    println!("  {} = {}", label, canonical.display());
+    info!(label, path = %canonical.display(), "checking directory access");
 
     // Existence
     if !path.exists() {
-        println!("    ✗ Directory does not exist");
+        warn!(label, path = %canonical.display(), "directory does not exist");
         return;
     }
-    println!("    ✓ Exists");
 
     // Metadata (readability)
     match std::fs::metadata(path) {
         Ok(meta) => {
-            if meta.is_dir() {
-                println!("    ✓ Is a directory");
-            } else {
-                println!("    ✗ Path exists but is NOT a directory");
+            if !meta.is_dir() {
+                warn!(label, path = %canonical.display(), "path exists but is not a directory");
                 return;
             }
         }
         Err(e) => {
-            println!("    ✗ Cannot read metadata: {}", e);
+            warn!(label, path = %canonical.display(), error = %e, "cannot read metadata");
             return;
         }
     }
 
     // Read check (can we list contents?)
-    match std::fs::read_dir(path) {
-        Ok(_) => println!("    ✓ Readable (can list contents)"),
-        Err(e) => println!("    ✗ Not readable: {}", e),
+    if let Err(e) = std::fs::read_dir(path) {
+        warn!(label, path = %canonical.display(), error = %e, "directory not readable");
+        return;
     }
 
     // Write check (try creating and removing a temp file)
     let probe = path.join(format!(".starfin_healthcheck_probe_{}", std::process::id()));
     match std::fs::write(&probe, b"healthcheck") {
         Ok(_) => {
-            println!("    ✓ Writable");
+            info!(label, path = %canonical.display(), "directory is readable and writable");
             let _ = std::fs::remove_file(&probe);
         }
         Err(e) => {
-            println!("    ✗ Not writable: {}", e);
+            warn!(label, path = %canonical.display(), error = %e, "directory not writable");
         }
     }
 }
@@ -402,10 +391,10 @@ fn save_video_cache(items: &[VideoItem], cache_dir: &Path) {
     match serde_json::to_string(items) {
         Ok(json) => {
             if let Err(e) = std::fs::write(&path, json) {
-                eprintln!("⚠ Could not save video index: {e}");
+                warn!(path = %path.display(), error = %e, "could not save video index");
             }
         }
-        Err(e) => eprintln!("⚠ Could not serialize video index: {e}"),
+        Err(e) => warn!(error = %e, "could not serialize video index"),
     }
 }
 
@@ -418,11 +407,11 @@ fn load_video_cache(cache_dir: &Path) -> Vec<VideoItem> {
     }
     match std::fs::read_to_string(&path) {
         Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
-            eprintln!("⚠ Could not parse video index: {e}");
+            warn!(path = %path.display(), error = %e, "could not parse video index");
             Vec::new()
         }),
         Err(e) => {
-            eprintln!("⚠ Could not read video index: {e}");
+            warn!(path = %path.display(), error = %e, "could not read video index");
             Vec::new()
         }
     }
@@ -1034,7 +1023,7 @@ async fn remove_non_precached_segments_all_qualities(video_cache_dir: &Path) {
         let q_dir = video_cache_dir.join(quality_name);
         if q_dir.exists() {
             if let Err(e) = remove_non_precached_segments(&q_dir).await {
-                eprintln!("cache eviction error in {}: {e}", q_dir.display());
+                error!(dir = %q_dir.display(), error = %e, "cache eviction error");
             }
         }
     }
@@ -1225,7 +1214,7 @@ async fn get_segment(
             }
         }
         Err(msg) => {
-            eprintln!("{msg}");
+            error!(error = %msg, segment = seg_index, "segment transcoding failed");
             HttpResponse::ServiceUnavailable()
                 .body(format!("segment {seg_index} transcoding failed"))
         }
@@ -1733,15 +1722,16 @@ async fn run_precache_worker(
             };
 
             if let Err(e) = tokio::fs::create_dir_all(&hls_dir).await {
-                eprintln!("precache: cache dir error for {id}: {e}");
+                error!(video_id = %id, error = %e, "precache: cache dir error");
                 progress.write().expect("precache_progress lock poisoned").advance();
                 continue;
             }
 
-            println!(
-                "→ Pre-caching {} segment(s) for {id} ({} total in hybrid set)",
-                missing.len(),
-                segments_to_cache.len()
+            info!(
+                video_id = %id,
+                missing_segments = missing.len(),
+                total_segments = segments_to_cache.len(),
+                "pre-caching segments"
             );
 
             for i in missing {
@@ -1751,7 +1741,7 @@ async fn run_precache_worker(
                 }
 
                 if let Err(e) = transcode_segment(&abs_str, &hls_dir, i, &hwaccel, Quality::High).await {
-                    eprintln!("precache: {e}");
+                    error!(video_id = %id, segment = i, error = %e, "precache: segment transcode failed");
                     break; // Stop for this video on error.
                 }
             }
@@ -1866,7 +1856,7 @@ async fn get_subtitle(
             }
         }
         Err(e) => {
-            eprintln!("subtitle extraction failed: {}", e);
+            error!(error = %e, "subtitle extraction failed");
             HttpResponse::ServiceUnavailable().body(format!("subtitle extraction failed: {e}"))
         }
     }
@@ -1974,14 +1964,14 @@ async fn set_password(
     let hashed = match hash_password(&body.password) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("password hashing failed: {e}");
+            error!(error = %e, "password hashing failed");
             return HttpResponse::InternalServerError().json(serde_json::json!({
                 "error": "Failed to hash password"
             }));
         }
     };
     if let Err(e) = std::fs::write(&state.password_hash_path, &hashed) {
-        eprintln!("failed to write password hash: {e}");
+        error!(error = %e, "failed to write password hash");
         return HttpResponse::InternalServerError().json(serde_json::json!({
             "error": "Failed to save password"
         }));
@@ -2139,6 +2129,13 @@ async fn frontend(req: HttpRequest) -> actix_web::Result<HttpResponse> {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let port = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
@@ -2160,14 +2157,12 @@ async fn main() -> std::io::Result<()> {
     // ── Startup healthchecks (logged for journalctl) ─────────────────────
     run_startup_healthchecks(&library_path, &cache_dir).await;
     let hwaccel = media::hwaccel::detect_hwaccel().await;
-    println!();
-    println!("════════════════════════════════════════════════════════════════");
 
     // Load any previously-persisted video index so the server starts with
     // known media immediately.
     let initial_items = load_video_cache(&cache_dir);
     if !initial_items.is_empty() {
-        println!("→ Loaded {} video(s) from persisted index", initial_items.len());
+        info!(count = initial_items.len(), "loaded videos from persisted index");
     }
     let video_cache: Arc<RwLock<Vec<VideoItem>>> = Arc::new(RwLock::new(initial_items));
 
@@ -2207,14 +2202,14 @@ async fn main() -> std::io::Result<()> {
     let auth_tokens: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
 
     if password_protection {
-        println!("→ Password protection: ENABLED");
+        info!("password protection: ENABLED");
         if password_hash_path.exists() {
-            println!("  ✓ Password hash found at {}", password_hash_path.display());
+            info!(path = %password_hash_path.display(), "password hash found");
         } else {
-            println!("  ⚠ No password set — first visitor will be prompted to create one");
+            warn!("no password set — first visitor will be prompted to create one");
         }
     } else {
-        println!("→ Password protection: disabled");
+        info!("password protection: disabled");
     }
 
     let state = web::Data::new(AppState {
@@ -2386,7 +2381,7 @@ async fn main() -> std::io::Result<()> {
                 for id in idle_ids {
                     let video_cache_dir = sweep_state.cache_dir.join(&id);
                     remove_non_precached_segments_all_qualities(&video_cache_dir).await;
-                    println!("→ Cache evicted (idle): {id}");
+                    info!(video_id = %id, "cache evicted (idle)");
                     sweep_state
                         .last_segment_access
                         .write()
@@ -2398,11 +2393,10 @@ async fn main() -> std::io::Result<()> {
     }
     // ─────────────────────────────────────────────────────────────────────────
 
-    println!("→ Library : {}", library_path.display());
-    println!("→ Cache   : {}", cache_dir.display());
+    info!(library = %library_path.display(), cache = %cache_dir.display(), "starting starfin");
     // Bind to loopback by default; set BIND_ADDR=0.0.0.0 to expose to the network.
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
-    println!("→ Listening on http://{bind_addr}:{port}");
+    info!(bind_addr = %bind_addr, port, "listening");
 
     HttpServer::new(move || {
         App::new()

@@ -345,6 +345,15 @@ struct AppState {
     password_hash_path: PathBuf,
     /// In-memory set of valid session tokens.
     auth_tokens: Arc<RwLock<HashSet<String>>>,
+    /// In-flight segment transcode deduplication map.
+    ///
+    /// Maps `(video_id, seg_index, quality)` to a watch-channel sender whose
+    /// current value transitions from `None` (pending) to
+    /// `Some(Ok(()))` / `Some(Err(_))` once the single authoritative
+    /// transcode job finishes.  All concurrent requests for the same segment
+    /// subscribe to the same channel and await the result, so only one ffmpeg
+    /// job is ever spawned per segment at a time.
+    segment_inflight: Arc<std::sync::Mutex<HashMap<(String, usize, Quality), Arc<tokio::sync::watch::Sender<Option<Result<(), String>>>>>>>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1230,8 +1239,64 @@ async fn get_segment(
             .body(format!("cache dir error: {e}"));
     }
 
-    // Transcode the segment on-demand (reuses the shared helper).
-    match transcode_segment(&abs_str, &hls_dir, seg_index, &state.hwaccel, quality).await {
+    // ── Segment-request deduplication ────────────────────────────────────────
+    // Only one transcode job per (video_id, seg_index, quality) should run at a
+    // time.  Concurrent requests for the same segment subscribe to a shared
+    // tokio::sync::watch channel that the "owner" of the job writes to once the
+    // transcode finishes (or fails).
+    let inflight_key = (id.clone(), seg_index, quality);
+
+    // Acquire the inflight map just long enough to check/insert – never across
+    // an await point.
+    let maybe_rx = {
+        let mut map = state
+            .segment_inflight
+            .lock()
+            .expect("Failed to acquire segment_inflight lock (poisoned) while checking for existing transcode job");
+        if let Some(tx) = map.get(&inflight_key) {
+            // Another request is already transcoding this segment – subscribe.
+            Some(tx.subscribe())
+        } else {
+            // We are the first – register a new channel in the map.
+            let (tx, _initial_rx) =
+                tokio::sync::watch::channel::<Option<Result<(), String>>>(None);
+            map.insert(inflight_key.clone(), Arc::new(tx));
+            None
+        }
+    };
+
+    let transcode_result: Result<(), String> = if let Some(mut rx) = maybe_rx {
+        // Wait for the owner's transcode to produce a result.
+        loop {
+            // Sender dropped means the owner's task was cancelled/panicked.
+            if rx.changed().await.is_err() {
+                break Err(format!("segment {seg_index} transcoding cancelled"));
+            }
+            if let Some(result) = rx.borrow().clone() {
+                break result;
+            }
+        }
+    } else {
+        // We own the transcode job.
+        let result = transcode_segment(&abs_str, &hls_dir, seg_index, &state.hwaccel, quality).await;
+
+        // Remove from the inflight map first (no new subscribers can join
+        // after this point) then broadcast the result to existing waiters.
+        let tx = state
+            .segment_inflight
+            .lock()
+            .expect("Failed to acquire segment_inflight lock (poisoned) while removing completed transcode job")
+            .remove(&inflight_key);
+        if let Some(tx) = tx {
+            let _ = tx.send(Some(result.clone()));
+        }
+
+        result
+    };
+
+    // Serve the segment from the transcode result (either from our own job or
+    // from waiting on a concurrent request that owned the transcode).
+    match transcode_result {
         Ok(()) => {
             match tokio::fs::read(&seg_path).await {
                 Ok(data) => HttpResponse::Ok()
@@ -2261,6 +2326,7 @@ async fn main() -> std::io::Result<()> {
         password_protection,
         password_hash_path,
         auth_tokens,
+        segment_inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
     });
 
     // One-time background scan at startup to refresh the index immediately.

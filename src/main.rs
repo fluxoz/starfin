@@ -801,13 +801,20 @@ async fn generate_deep_thumbnail(
 }
 
 /// Returns the number of tasks that sprite/thumbnail background workers will
-/// run concurrently.  Defaults to the number of logical CPU cores so that all
-/// available hardware is used; falls back to 4 if the OS doesn't report CPU
-/// count.
+/// run concurrently.
+///
+/// Defaults to **1** so that background work never saturates CPU or disk I/O.
+/// With concurrency=1 each worker has at most one in-flight `spawn_blocking`
+/// task at a time, so when playback starts the worker pauses after finishing
+/// just that one task — keeping the overlap with on-demand transcoding to a
+/// minimum.
+///
+/// Override with the `WORKER_CONCURRENCY` environment variable.
 fn worker_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+    std::env::var("WORKER_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok().filter(|&n| n > 0))
+        .unwrap_or(1)
 }
 
 /// Background worker that processes videos one at a time in two sequential

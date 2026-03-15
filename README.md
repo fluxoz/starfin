@@ -6,7 +6,7 @@ A self-hosted media server written in Rust, inspired by Jellyfin. Built for perf
 
 ## Features
 
-- **Video library scanning** — Automatically discovers video files and extracts metadata via FFprobe.
+- **Video library scanning** — Automatically discovers video files and extracts metadata via in-process ffmpeg-next.
 - **HLS adaptive streaming** — Streams video as MPEG-TS segments with an m3u8 playlist, compatible with all major browsers.
 - **Hardware-accelerated transcoding** — Detects and uses the best available encoder:
   - NVIDIA NVENC (CUDA)
@@ -27,8 +27,11 @@ A self-hosted media server written in Rust, inspired by Jellyfin. Built for perf
 
 - [Rust](https://www.rust-lang.org/tools/install) (Edition 2024 or later)
 - [Trunk](https://trunkrs.dev/) — WASM bundler for the frontend
-- [FFmpeg](https://ffmpeg.org/download.html) — Required at runtime for transcoding and thumbnail generation
+- FFmpeg development libraries (`libavcodec-dev`, `libavformat-dev`, `libavfilter-dev`, `libswscale-dev`, `libswresample-dev`) — Required at build time for linking via `ffmpeg-next`
+- [FFmpeg](https://ffmpeg.org/download.html) CLI — Still needed at runtime for GPU-accelerated HW encode tests at startup and subtitle format conversion
 - WASM target: `rustup target add wasm32-unknown-unknown`
+- `pkg-config` — Used by `ffmpeg-next` to locate the FFmpeg libraries
+- `clang` — Required by `ffmpeg-sys-next` for C bindings generation
 
 > **Tip:** If you use [Nix](https://nixos.org/), run `nix develop` (or `nix --extra-experimental-features 'nix-command flakes' develop`) to drop into a shell with all dependencies pre-configured.
 
@@ -296,7 +299,7 @@ See [DEVELOPMENT.md](DEVELOPMENT.md) for detailed instructions on setting up the
 | Backend language | Rust (Actix-web, Tokio) |
 | Frontend language | Rust → WebAssembly (Yew framework) |
 | Frontend build tool | Trunk |
-| Video processing | FFmpeg / FFprobe |
+| Video processing | ffmpeg-next (in-process Rust FFI) + FFmpeg CLI (HW tests, subtitle conversion) |
 | Streaming format | HLS (MPEG-TS + m3u8) |
 | In-browser playback | HLS.js (vendored) |
 | Dev environment | Nix Flakes |

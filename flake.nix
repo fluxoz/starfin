@@ -126,7 +126,7 @@
         # Transform index.html: replace data-trunk directives with standard
         # HTML and inject the WASM module initialisation script.
         sed \
-          -e 's|<link data-trunk rel="css" href="\([^"]*\)" />|<link rel="stylesheet" href="\1" />|g' \
+          -e 's|<link data-trunk rel="css" href="\([^\"]*\)" />|<link rel="stylesheet" href="\1" />|g' \
           -e '/data-trunk rel="copy-dir"/d' \
           -e '/data-trunk rel="copy-file"/d' \
           -e "s|</head>|<script type=\"module\">import init from '/starfin-frontend.js'; init();</script>\n</head>|" \
@@ -139,14 +139,22 @@
     #
     # rust-embed compiles `frontend/dist/` into the binary at build time, so
     # the frontend must be copied into place before `cargo build` runs.
+    #
+    # The backend links against ffmpeg libraries (libavcodec, libavformat,
+    # libavfilter, libswscale, libswresample) via ffmpeg-next for in-process
+    # media handling.  The ffmpeg package provides both the runtime libraries
+    # and the development headers needed by pkg-config.
     starfin = rustPlatform.buildRustPackage {
       pname = "starfin";
       inherit version;
       src = self;
       cargoLock.lockFile = ./Cargo.lock;
 
-      nativeBuildInputs = with pkgs; [ pkg-config ];
+      nativeBuildInputs = with pkgs; [ pkg-config clang ];
       buildInputs = with pkgs; [ ffmpeg openssl ];
+
+      # bindgen (used by ffmpeg-sys-next) needs libclang.so at build time.
+      LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
       # Populate frontend/dist/ so rust-embed can embed the assets.
       preBuild = ''
@@ -176,8 +184,15 @@
     # ── NixOS module ──────────────────────────────────────────────────────────
     nixosModules.default = import ./nix/module.nix { inherit self; };
 
-    # ── Development shell (unchanged) ─────────────────────────────────────────
+    # ── Development shell ─────────────────────────────────────────────────────
     devShells.${system}.default = mkShell {
+      # pkg-config and clang must be in nativeBuildInputs so their setup hooks
+      # fire and wire PKG_CONFIG_PATH from the entries in buildInputs.
+      nativeBuildInputs = [
+        pkg-config
+        clang
+      ];
+
       buildInputs = [
         # rust toolchain
         rustWithWasm
@@ -192,10 +207,14 @@
         tmux
         trunk
         wasm-pack
+        # ffmpeg libraries for building ffmpeg-next and the ffmpeg CLI binary.
         ffmpeg
+        openssl
       ];
 
-      # Add critical environment variables for linking
+      # bindgen (used by ffmpeg-sys-next) needs libclang.so at build time.
+      LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
+
       shellHook = ''
         export SHELL=/run/current-system/sw/bin/bash
       '';

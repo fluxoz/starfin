@@ -1,3 +1,8 @@
+mod media;
+
+use media::hwaccel::HwAccel;
+use media::transcode::Quality;
+
 use actix_web::{
     App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
     body::MessageBody,
@@ -11,128 +16,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
-use tokio::process::Command;
 use uuid::Uuid;
 use walkdir::WalkDir;
 use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash::{SaltString, rand_core::OsRng}};
 
-// ── Hardware acceleration ─────────────────────────────────────────────────────
-
-/// The hardware acceleration backend detected at startup.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum HwAccel {
-    /// NVIDIA GPU via NVENC/CUDA
-    Nvidia,
-    /// AMD or Intel GPU on Linux via VAAPI
-    Vaapi,
-    /// Intel GPU via Quick Sync Video
-    Qsv,
-    /// Apple GPU via VideoToolbox (macOS)
-    VideoToolbox,
-    /// AMD GPU on Windows via AMF
-    Amf,
-    /// Pure software fallback (libx264)
-    Software,
-}
-
-impl HwAccel {
-    /// Human-readable label shown in the dashboard.
-    fn label(&self) -> &'static str {
-        match self {
-            HwAccel::Nvidia       => "NVIDIA (NVENC)",
-            HwAccel::Vaapi        => "AMD/Intel (VAAPI)",
-            HwAccel::Qsv          => "Intel (QSV)",
-            HwAccel::VideoToolbox => "Apple (VideoToolbox)",
-            HwAccel::Amf          => "AMD (AMF)",
-            HwAccel::Software     => "CPU (software)",
-        }
-    }
-
-    /// The `-c:v` encoder name to pass to ffmpeg for transcoding.
-    fn encoder(&self) -> &'static str {
-        match self {
-            HwAccel::Nvidia       => "h264_nvenc",
-            HwAccel::Vaapi        => "h264_vaapi",
-            HwAccel::Qsv          => "h264_qsv",
-            HwAccel::VideoToolbox => "h264_videotoolbox",
-            HwAccel::Amf          => "h264_amf",
-            HwAccel::Software     => "libx264",
-        }
-    }
-
-    /// Extra args to insert BEFORE `-i` for hardware-accelerated decoding.
-    fn hwaccel_decode_args(&self) -> &'static [&'static str] {
-        match self {
-            HwAccel::Nvidia => &["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"],
-            HwAccel::Vaapi  => &["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi",
-                                  "-hwaccel_device", "/dev/dri/renderD129"],
-            HwAccel::Qsv          => &["-hwaccel", "qsv"],
-            HwAccel::VideoToolbox => &["-hwaccel", "videotoolbox"],
-            HwAccel::Amf          => &["-hwaccel", "d3d11va"],
-            HwAccel::Software     => &[],
-        }
-    }
-
-    /// Extra quality/preset args appended after `-c:v <encoder>`.
-    /// For the software encoder this also includes the compatibility args
-    /// needed for broad HLS player support.
-    fn encoder_quality_args(&self) -> &'static [&'static str] {
-        match self {
-            HwAccel::Nvidia        => &["-preset", "p7", "-tune", "hq", "-temporal-aq", "1", "-spatial-aq", "1", "-rc", "constqp", "-qp", "18"],
-            HwAccel::Vaapi         => &["-profile:v", "high", "-qp", "18"],
-            HwAccel::Qsv           => &["-preset", "veryslow", "-global_quality", "18"],
-            HwAccel::VideoToolbox  => &["-qp", "18", "-profile:v", "high"],
-            HwAccel::Amf           => &["-quality", "quality", "-rc", "cqp", "-qp", "18"],
-            HwAccel::Software      => &["-preset", "veryslow",
-                                        "-crf", "18",
-                                        "-pix_fmt", "yuv420p",
-                                        "-profile:v", "high",
-                                        "-level", "4.2"],
-        }
-    }
-}
-
-
 // ── Stream quality ────────────────────────────────────────────────────────────
-
-/// Quality level for on-demand video transcoding.
-///
-/// - `High`   – full source resolution, high-quality hardware-accelerated
-///              encode (current default behaviour).
-/// - `Medium` – software encode, scaled to at most 1280 px wide (≈ 720 p for
-///              16:9 content), CRF 26.  Suitable for moderate-speed connections
-///              and mid-range client hardware.
-/// - `Low`    – software encode, scaled to at most 854 px wide (≈ 480 p for
-///              16:9 content), CRF 30.  Ideal for low-power / low-bandwidth
-///              devices.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Quality {
-    #[default]
-    High,
-    Medium,
-    Low,
-}
-
-impl Quality {
-    /// URL-safe ASCII token used in query strings and cache-directory names.
-    fn as_str(self) -> &'static str {
-        match self {
-            Quality::High   => "high",
-            Quality::Medium => "medium",
-            Quality::Low    => "low",
-        }
-    }
-
-    /// Human-readable display label shown in the player UI.
-    fn label(self) -> &'static str {
-        match self {
-            Quality::High   => "High",
-            Quality::Medium => "Medium",
-            Quality::Low    => "Low",
-        }
-    }
-}
 
 /// Query-string struct used by the playlist and segment endpoints so that
 /// `?quality=medium` is deserialized into a `Quality` value automatically.
@@ -149,297 +37,6 @@ async fn get_quality_options() -> impl Responder {
         { "value": "medium", "label": Quality::Medium.label() },
         { "value": "low",    "label": Quality::Low.label() },
     ]))
-}
-
-/// Run an ffmpeg command and return (success, stderr_output) for diagnostics.
-async fn run_ffmpeg_probe(args: &[&str]) -> (bool, String) {
-    match tokio::process::Command::new("ffmpeg")
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-    {
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
-            (o.status.success(), stderr)
-        }
-        Err(e) => (false, format!("failed to spawn ffmpeg: {}", e)),
-    }
-}
-
-/// Discover all accessible render device nodes under /dev/dri, preferring
-/// stable by-path symlinks over raw renderDxxx nodes.
-fn discover_render_devices() -> Vec<PathBuf> {
-    let mut devices = Vec::new();
-
-    // Prefer stable PCI-path symlinks (survive device re-enumeration).
-    let by_path = Path::new("/dev/dri/by-path");
-    if by_path.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(by_path) {
-            let mut links: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-            links.sort_by_key(|e| e.file_name());
-            for entry in links {
-                if entry.file_name().to_string_lossy().contains("render") {
-                    // Resolve the symlink to its canonical path so ffmpeg can open it.
-                    if let Ok(real) = entry.path().canonicalize() {
-                        if std::fs::File::open(&real).is_ok() {
-                            devices.push(real);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Fall back to raw renderD* nodes that weren't already found via by-path.
-    let dri = Path::new("/dev/dri");
-    if dri.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(dri) {
-            let mut nodes: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-            nodes.sort_by_key(|e| e.file_name());
-            for entry in nodes {
-                let name = entry.file_name();
-                if name.to_string_lossy().starts_with("renderD") {
-                    let path = entry.path();
-                    if !devices.contains(&path) && std::fs::File::open(&path).is_ok() {
-                        devices.push(path);
-                    }
-                }
-            }
-        }
-    }
-
-    devices
-}
-
-/// Check whether NVIDIA GPU devices are present on the system.
-fn nvidia_devices_present() -> bool {
-    if let Ok(entries) = std::fs::read_dir("/dev") {
-        for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with("nvidia") {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Attempt a real one-frame encode using the given encoder and extra ffmpeg
-/// args.  This catches cases where a generic build advertises an encoder but
-/// the underlying hardware / driver is absent.
-async fn test_encode(encoder: &str, extra_pre_input: &[&str], extra_filter: Option<&str>) -> (bool, String) {
-    let mut args: Vec<&str> = vec!["-hide_banner", "-y"];
-    args.extend_from_slice(extra_pre_input);
-    args.extend_from_slice(&["-f", "lavfi", "-i", "color=black:s=256x256:d=0.04:r=25"]);
-    args.extend_from_slice(&["-frames:v", "1"]);
-    if let Some(vf) = extra_filter {
-        args.extend_from_slice(&["-vf", vf]);
-    }
-    args.extend_from_slice(&["-c:v", encoder, "-f", "null", "-"]);
-    run_ffmpeg_probe(&args).await
-}
-
-/// Extract a concise error reason from ffmpeg stderr output.
-fn extract_ffmpeg_error(stderr: &str) -> String {
-    for line in stderr.lines().rev() {
-        let t = line.trim();
-        if t.contains("Cannot load") || t.contains("No such file")
-            || t.contains("not found") || t.contains("Failed")
-            || t.contains("Error") || t.contains("error")
-            || t.contains("does not support") || t.contains("Unknown")
-            || t.contains("No device") || t.contains("Device setup failed")
-            || t.contains("cannot open") || t.contains("Permission denied")
-        {
-            return t.to_string();
-        }
-    }
-    stderr
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("unknown error")
-        .trim()
-        .to_string()
-}
-
-/// Probe which GPU encoder is available by attempting a real one-frame encode
-/// with each backend in priority order.  Called once at startup.
-///
-/// Because ffmpeg may be compiled generically and report encoders/hwaccels
-/// that are not actually usable on the current hardware, we do NOT trust the
-/// compiled-in list as a gate.  Instead we run a real encode test for every
-/// candidate and only select one that produces a successful exit code.
-async fn detect_hwaccel() -> HwAccel {
-    // ── Informational: log what ffmpeg reports as compiled in ─────────────
-    if let Ok(output) = tokio::process::Command::new("ffmpeg")
-        .args(["-hwaccels"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-    {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            let mut methods: Vec<&str> = Vec::new();
-            let mut in_list = false;
-            for line in text.lines() {
-                let t = line.trim();
-                if t == "Hardware acceleration methods:" {
-                    in_list = true;
-                    continue;
-                }
-                if in_list && !t.is_empty() && t != "none" {
-                    methods.push(t);
-                }
-            }
-            methods.sort();
-            println!("  Compiled-in hwaccels: {}", methods.join(", "));
-            println!("  (generic build — compiled-in list is NOT trusted; real encode tests follow)");
-        }
-    }
-
-    // ── Informational: log which HW H.264 encoders ffmpeg lists ──────────
-    if let Ok(output) = tokio::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-encoders"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-    {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            let hw_encoders: Vec<&str> = text
-                .lines()
-                .filter(|l| {
-                    let t = l.trim();
-                    t.contains("h264_nvenc")
-                        || t.contains("h264_vaapi")
-                        || t.contains("h264_qsv")
-                        || t.contains("h264_amf")
-                        || t.contains("h264_videotoolbox")
-                })
-                .map(|l| l.trim())
-                .collect();
-            if hw_encoders.is_empty() {
-                println!("  Listed HW H.264 encoders: (none)");
-            } else {
-                println!("  Listed HW H.264 encoders:");
-                for enc in &hw_encoders {
-                    println!("    {}", enc);
-                }
-            }
-        }
-    }
-
-    println!();
-
-    // ── Pre-flight: discover available hardware ──────────────────────────
-    let has_nvidia = nvidia_devices_present();
-    let render_devices = discover_render_devices();
-
-    if has_nvidia {
-        println!("  Pre-flight: NVIDIA device nodes detected in /dev");
-    } else {
-        println!("  Pre-flight: no NVIDIA device nodes in /dev");
-    }
-    if render_devices.is_empty() {
-        println!("  Pre-flight: no accessible render devices in /dev/dri");
-    } else {
-        println!(
-            "  Pre-flight: {} accessible render device(s): {}",
-            render_devices.len(),
-            render_devices.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
-        );
-    }
-
-    println!();
-
-    // ── NVIDIA (NVENC via CUDA) ──────────────────────────────────────────
-    {
-        println!("  h264_nvenc (NVIDIA NVENC):");
-        if !has_nvidia {
-            println!("    → skipped (no NVIDIA device nodes)");
-        } else {
-            println!("    Testing real encode with h264_nvenc…");
-            let (ok, stderr) = test_encode(
-                "h264_nvenc",
-                &["-init_hw_device", "cuda=test"],
-                None,
-            ).await;
-            if ok {
-                println!("    ✓ Encode succeeded");
-                println!();
-                println!("  ★ Selected: NVIDIA (NVENC)");
-                println!("    Encoder : h264_nvenc");
-                return HwAccel::Nvidia;
-            } else {
-                let reason = extract_ffmpeg_error(&stderr);
-                println!("    ✗ Encode failed: {}", reason);
-            }
-        }
-    }
-
-    // ── VAAPI (AMD / Intel on Linux) ─────────────────────────────────────
-    {
-        println!("  h264_vaapi (VAAPI):");
-        if render_devices.is_empty() {
-            println!("    → skipped (no accessible render devices)");
-        } else {
-            for dev in &render_devices {
-                let dev_str = dev.display().to_string();
-                println!("    Testing real encode with h264_vaapi on {}…", dev_str);
-                let device_arg = format!("vaapi=va:{}", dev_str);
-                let (ok, stderr) = test_encode(
-                    "h264_vaapi",
-                    &["-init_hw_device", &device_arg],
-                    Some("format=nv12,hwupload"),
-                ).await;
-                if ok {
-                    println!("    ✓ Encode succeeded on {}", dev_str);
-                    println!();
-                    println!("  ★ Selected: AMD/Intel (VAAPI)");
-                    println!("    Encoder : h264_vaapi");
-                    println!("    Device  : {}", dev_str);
-                    return HwAccel::Vaapi;
-                } else {
-                    let reason = extract_ffmpeg_error(&stderr);
-                    println!("    ✗ Failed on {}: {}", dev_str, reason);
-                }
-            }
-        }
-    }
-
-    // ── QSV (Intel Quick Sync) ───────────────────────────────────────────
-    {
-        println!("  h264_qsv (Intel QSV):");
-        if render_devices.is_empty() {
-            println!("    → skipped (no accessible render devices)");
-        } else {
-            println!("    Testing real encode with h264_qsv…");
-            let (ok, stderr) = test_encode(
-                "h264_qsv",
-                &["-init_hw_device", "qsv=test"],
-                None,
-            ).await;
-            if ok {
-                println!("    ✓ Encode succeeded");
-                println!();
-                println!("  ★ Selected: Intel (QSV)");
-                println!("    Encoder : h264_qsv");
-                return HwAccel::Qsv;
-            } else {
-                let reason = extract_ffmpeg_error(&stderr);
-                println!("    ✗ Encode failed: {}", reason);
-            }
-        }
-    }
-
-    println!();
-    println!("  ⚠ No GPU acceleration available — falling back to CPU");
-    println!("    Encoder : libx264");
-    println!("    Transcoding will be significantly slower.");
-    HwAccel::Software
 }
 
 // ── Startup healthchecks ──────────────────────────────────────────────────────
@@ -516,31 +113,13 @@ async fn run_startup_healthchecks(library_path: &Path, cache_dir: &Path) {
     check_directory_access("VIDEO_LIBRARY_PATH", library_path);
     check_directory_access("CACHE_DIR", cache_dir);
 
-    // ── 3. ffmpeg availability ───────────────────────────────────────────
+    // ── 3. ffmpeg libraries (linked in-process via ffmpeg-next) ─────────
     println!();
-    println!("── ffmpeg ─────────────────────────────────────────────────────");
-    match tokio::process::Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-    {
-        Ok(output) if output.status.success() => {
-            let version_str = String::from_utf8_lossy(&output.stdout);
-            // Print only the first line (e.g. "ffmpeg version 6.1 Copyright ...")
-            if let Some(first_line) = version_str.lines().next() {
-                println!("  ✓ {}", first_line);
-            }
-        }
-        Ok(_) => {
-            println!("  ✗ ffmpeg found but returned an error");
-        }
-        Err(e) => {
-            println!("  ✗ ffmpeg not found: {}", e);
-            println!("    Transcoding and thumbnail generation will not work!");
-        }
-    }
+    println!("── ffmpeg (in-process via ffmpeg-next) ────────────────────────");
+    media::ensure_init();
+    println!("  ✓ libavcodec  {}", media::libavcodec_version_string());
+    println!("  ✓ libavformat {}", media::libavformat_version_string());
+    println!("  ✓ libavfilter {}", media::libavfilter_version_string());
 
     // ── 4. Render devices ────────────────────────────────────────────────
     println!();
@@ -791,60 +370,22 @@ fn file_date_added(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-// ── ffprobe metadata ─────────────────────────────────────────────────────────
+// ── Metadata probing (via ffmpeg-next in-process) ────────────────────────────
 
-#[derive(Default)]
-struct FfprobeMeta {
-    title: Option<String>,
-    genre: Option<String>,
-    year: Option<u16>,
-    director: Option<String>,
-}
+/// Alias for the metadata struct from the media module.
+type FfprobeMeta = media::probe::ProbeMeta;
 
-/// Run `ffprobe` to extract duration (seconds) and embedded tags.
-/// Silently returns defaults if `ffprobe` is not installed.
+/// Probe a video file for its duration and metadata using the in-process
+/// ffmpeg-next library (replaces the old `ffprobe` subprocess call).
+///
+/// Because ffmpeg-next calls are synchronous (they block while reading the
+/// file header), we run them on a blocking Tokio thread so the async runtime
+/// is not starved.
 async fn probe_video(path: &Path) -> (u32, FfprobeMeta) {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_entries",
-            "format=duration:format_tags=title,genre,date,artist,director",
-            path.to_str().unwrap_or(""),
-        ])
-        .output()
-        .await;
-
-    let Ok(output) = output else {
-        return (0, FfprobeMeta::default());
-    };
-
-    let json: serde_json::Value =
-        serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null);
-
-    let duration = json["format"]["duration"]
-        .as_str()
-        .and_then(|s| s.parse::<f64>().ok())
-        .map(|d| d as u32)
-        .unwrap_or(0);
-
-    let tags = &json["format"]["tags"];
-    let meta = FfprobeMeta {
-        title: tags["title"].as_str().map(str::to_owned),
-        genre: tags["genre"].as_str().map(str::to_owned),
-        year: tags["date"]
-            .as_str()
-            .and_then(|s| s.get(..4))
-            .and_then(|s| s.parse().ok()),
-        director: tags["director"]
-            .as_str()
-            .or_else(|| tags["artist"].as_str())
-            .map(str::to_owned),
-    };
-
-    (duration, meta)
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || media::probe::probe_video(&path))
+        .await
+        .unwrap_or((0, FfprobeMeta::default()))
 }
 
 // ── Library scanning ─────────────────────────────────────────────────────────
@@ -1081,11 +622,8 @@ async fn get_thumbnail(
 
 /// Quick one-shot thumbnail: seeks to a **fresh random** position within
 /// 20–80% of the video runtime and grabs a single frame.  The position is
-/// different every time this function is called so repeated runs will pick
-/// different frames.
-///
-/// ffmpeg stdout **and** stderr are suppressed so no ffmpeg output appears in
-/// the main process.
+/// Quick thumbnail: seek to a random position in [20%, 80%) of the video and
+/// extract a single frame as JPEG.  Uses the in-process ffmpeg-next library.
 async fn generate_quick_thumbnail(
     id: &str,
     video_path: &Path,
@@ -1104,58 +642,36 @@ async fn generate_quick_thumbnail(
     let duration = duration_secs as f64;
 
     // Pick a fresh random position in [20 %, 80 %) of the runtime.
-    // Uuid::new_v4() uses a CSPRNG, giving a different value every call.
     let random_byte = Uuid::new_v4().as_bytes()[0];
-    let fraction = random_byte as f64 / 255.0; // maps to [0.0, 1.0]
-    let seek_secs = format!("{:.3}", (duration * (0.20 + fraction * 0.60)).max(1.0));
+    let fraction = random_byte as f64 / 255.0;
+    let seek_secs = (duration * (0.20 + fraction * 0.60)).max(1.0);
 
-    let video_str = match video_path.to_str() {
-        Some(s) => s.to_owned(),
-        None => return false,
-    };
-    let thumb_str = match thumb_path.to_str() {
-        Some(s) => s.to_owned(),
-        None => return false,
-    };
+    let video_path = video_path.to_path_buf();
+    let thumb_path_clone = thumb_path.clone();
 
-    let Ok(mut child) = Command::new("ffmpeg")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .args([
-            "-hwaccel", "auto",
-            "-y", "-ss", &seek_secs, "-i", &video_str,
-            "-frames:v", "1", "-q:v", "2",
-            &thumb_str,
-        ])
-        .spawn()
-    else {
-        return false;
-    };
+    // Run the CPU-intensive frame extraction on a blocking thread.
+    let task = tokio::task::spawn_blocking(move || {
+        media::thumbnail::extract_frame_as_jpeg(&video_path, seek_secs, &thumb_path_clone)
+    });
 
     tokio::select! {
-        result = child.wait() => result.map(|s| s.success()).unwrap_or(false),
+        result = task => result.unwrap_or(false),
         _ = async { let _ = kill.wait_for(|&v| v).await; } => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            // Can't easily cancel a blocking task, but on kill signal return false.
             false
         }
     }
 }
 
-/// Two-pass ffmpeg thumbnail that uses `signalstats` to pick the most visually
-/// appealing frame from the 20–80% window of the video:
+/// Two-pass deep thumbnail using in-process signalstats analysis.
 ///
-/// Pass 1 — sample frames at 1 fps/5 s and capture signal statistics.
-/// Parse SATAVG (colour saturation) and BRNG (out-of-range pixel ratio) for
-/// each frame.  Prefer frames with high saturation and low BRNG (i.e. neither
-/// overexposed nor underexposed).
+/// Pass 1 — analyse frames in the 20–80% window using YUV signal statistics
+/// to find the most visually appealing frame (highest saturation, lowest
+/// out-of-range pixel ratio).
 ///
-/// Pass 2 — seek directly to the chosen timestamp and write a single JPEG.
-/// ffmpeg stdout **and** stderr are suppressed in pass 2.
+/// Pass 2 — extract and encode that specific frame as JPEG.
 ///
-/// A side-car marker file `{id}.deep` is created on success so the job is
-/// skipped on subsequent runs.
+/// A side-car marker file `{id}.deep` is created on success.
 async fn generate_deep_thumbnail(
     id: &str,
     video_path: &Path,
@@ -1174,104 +690,41 @@ async fn generate_deep_thumbnail(
 
     let duration = duration_secs as f64;
     let start = duration * 0.20;
-    let length = duration * 0.60; // analyze 20 % – 80 %
+    let length = duration * 0.60;
 
-    let video_str = match video_path.to_str() {
-        Some(s) => s.to_owned(),
-        None => return false,
-    };
+    let video_path_owned = video_path.to_path_buf();
+    let default_time = start + length * 0.5;
 
-    // Pass 1: run signalstats on one frame every 5 seconds within the window.
-    let Ok(mut child) = Command::new("ffmpeg")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .args([
-            "-hwaccel",
-            "auto",
-            "-ss",
-            &format!("{:.3}", start),
-            "-t",
-            &format!("{:.3}", length),
-            "-i",
-            &video_str,
-            "-vf",
-            "fps=1/5,signalstats",
-            "-f",
-            "null",
-            "-",
-        ])
-        .spawn()
-    else {
-        return false;
-    };
-
-    // Drain stderr concurrently to prevent the pipe buffer from filling and
-    // blocking ffmpeg before it exits (avoids a potential deadlock).
-    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
-    let stderr_task = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt as _;
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf).await;
-        buf
+    // Pass 1: find the best frame time via in-process signal analysis.
+    let video_path_for_analysis = video_path_owned.clone();
+    let analysis_task = tokio::task::spawn_blocking(move || {
+        media::thumbnail::find_best_frame_via_signalstats(
+            &video_path_for_analysis,
+            start,
+            length,
+            default_time,
+        )
     });
 
-    let default_time = start + length * 0.5;
-    let wait_result = tokio::select! {
-        result = child.wait() => result,
+    let best_time = tokio::select! {
+        result = analysis_task => result.unwrap_or(default_time),
         _ = async { let _ = kill.wait_for(|&v| v).await; } => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            stderr_task.abort();
             return false;
         }
     };
 
-    let stderr_bytes = stderr_task.await.unwrap_or_default();
-    let best_time = match wait_result {
-        Ok(_) => {
-            let stderr = String::from_utf8_lossy(&stderr_bytes);
-            find_best_frame_time(&stderr, default_time)
-        }
-        Err(_) => default_time,
-    };
-
+    // Pass 2: extract the chosen frame.
     let thumb_path = cache_dir.join(format!("{}.jpg", id));
-    let thumb_str = match thumb_path.to_str() {
-        Some(s) => s.to_owned(),
-        None => return false,
-    };
+    let video_path_for_extract = video_path_owned.clone();
+    let thumb_path_clone = thumb_path.clone();
 
-    // Pass 2: extract the chosen frame.  Suppress stdout/stderr so no
-    // ffmpeg output appears in the main process.
-    let Ok(mut child) = Command::new("ffmpeg")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .args([
-            "-hwaccel",
-            "auto",
-            "-y",
-            "-ss",
-            &format!("{:.3}", best_time),
-            "-i",
-            &video_str,
-            "-frames:v",
-            "1",
-            "-q:v",
-            "2",
-            &thumb_str,
-        ])
-        .spawn()
-    else {
-        return false;
-    };
+    let extract_task = tokio::task::spawn_blocking(move || {
+        media::thumbnail::extract_frame_as_jpeg(&video_path_for_extract, best_time, &thumb_path_clone)
+    });
 
     let success = tokio::select! {
-        result = child.wait() => result.map(|s| s.success()).unwrap_or(false),
+        result = extract_task => result.unwrap_or(false),
         _ = async { let _ = kill.wait_for(|&v| v).await; } => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
             false
         }
     };
@@ -1282,55 +735,6 @@ async fn generate_deep_thumbnail(
     } else {
         false
     }
-}
-
-/// Maximum fraction of out-of-range pixels (BRNG) a frame may have to be
-/// considered well-exposed.  Frames above this threshold are skipped.
-const MAX_BRNG: f64 = 5.0;
-
-/// Parse the signalstats stderr output and return the `pts_time` of the frame
-/// with the highest `SATAVG` whose `BRNG` (out-of-range pixel fraction) is
-/// below `MAX_BRNG`.  Falls back to `default_time` when no qualifying frame
-/// is found.
-fn find_best_frame_time(stderr: &str, default_time: f64) -> f64 {
-    let mut best_time: Option<f64> = None;
-    let mut best_satavg = -1.0_f64;
-
-    for line in stderr.lines() {
-        if !line.contains("signalstats") {
-            continue;
-        }
-        let Some(pts_time) = parse_float_field(line, "pts_time:") else {
-            continue;
-        };
-        let Some(satavg) = parse_float_field(line, "SATAVG:") else {
-            continue;
-        };
-        // When BRNG is absent treat the frame as over/under-exposed.
-        let brng = parse_float_field(line, "BRNG:").unwrap_or(f64::MAX);
-
-        // Skip overexposed / underexposed frames.
-        if brng > MAX_BRNG {
-            continue;
-        }
-        if satavg > best_satavg {
-            best_satavg = satavg;
-            best_time = Some(pts_time);
-        }
-    }
-
-    best_time.unwrap_or(default_time)
-}
-
-/// Extract a `f64` value from a signalstats output line immediately after the
-/// given `field` label (e.g. `"pts_time:"`, `"SATAVG:"`).
-fn parse_float_field(line: &str, field: &str) -> Option<f64> {
-    let idx = line.find(field)?;
-    let after = &line[idx + field.len()..];
-    let end = after
-        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
-        .unwrap_or(after.len());
-    after[..end].parse().ok()
 }
 
 /// Background worker that processes videos one at a time in two sequential
@@ -1553,7 +957,7 @@ async fn progress_ws(
 /// Segment duration in seconds for on-demand HLS generation.
 /// Apple recommends 6 seconds; common range is 2–10 seconds.
 /// Jellyfin/Plex default to 6 second segments.
-const SEGMENT_DURATION: f64 = 6.0;
+const SEGMENT_DURATION: f64 = media::transcode::SEGMENT_DURATION;
 
 /// Number of segments at the start of each video to pre-cache so that
 /// playback can begin immediately without waiting for on-demand transcoding.
@@ -1569,7 +973,9 @@ const PRECACHE_SEGMENTS: usize = 20;
 /// `frontend/src/components/video_player.rs`.
 const SPARSE_CACHE_STRIDE: usize = 3;
 
-/// Transcode a single MPEG-TS segment for a video using ffmpeg.
+/// Transcode a single MPEG-TS segment for a video using ffmpeg-next
+/// (in-process for software encoding, subprocess for GPU-accelerated High
+/// quality).
 ///
 /// Segments are stored in a quality-specific subdirectory so that multiple
 /// quality levels can be cached independently.
@@ -1583,141 +989,7 @@ async fn transcode_segment(
     hwaccel: &HwAccel,
     quality: Quality,
 ) -> Result<(), String> {
-    let filename = format!("seg_{:05}.ts", seg_index);
-    let seg_path = hls_dir.join(&filename);
-
-    // Already exists (another caller may have created it concurrently).
-    if seg_path.exists() {
-        return Ok(());
-    }
-
-    let start_time = seg_index as f64 * SEGMENT_DURATION;
-    debug_assert!(start_time >= 0.0 && start_time.is_finite());
-
-    let ts_offset = format!("{:.3}", start_time);
-    let tmp_filename = format!(".seg_{:05}.ts.tmp", seg_index);
-
-    let mut cmd = Command::new("ffmpeg");
-    cmd.current_dir(hls_dir)
-       .stdin(std::process::Stdio::null());
-
-    match quality {
-        Quality::High => {
-            // High quality: hardware-accelerated decode + encode at full source
-            // resolution, identical to the previous single-quality behaviour.
-
-            // Prepend GPU decode args before the input.
-            for arg in hwaccel.hwaccel_decode_args() {
-                cmd.arg(arg);
-            }
-
-            cmd.args([
-                "-y", "-nostdin",
-                "-ss", &format!("{:.3}", start_time),
-                "-i", abs_path,
-                "-t", &format!("{:.3}", SEGMENT_DURATION),
-            ]);
-
-            // GPU encoder + quality preset.
-            cmd.args(["-c:v", hwaccel.encoder()]);
-            cmd.args(hwaccel.encoder_quality_args());
-
-            // Disable B-frames.  B-frames require DTS/PTS reordering which makes
-            // the first decodable frame in an MPEG-TS segment *not* the first
-            // stored packet.  When HLS.js seeks and the browser appends a segment
-            // to a SourceBuffer for independent decoding, this mismatch causes
-            // "avcodec_send_packet error: End of file" decode failures.  Disabling
-            // B-frames ensures DTS == PTS order and each segment is independently
-            // decodable from its very first packet.
-            cmd.args(["-bf", "0"]);
-
-            // For NVENC, promote forced keyframes to true IDR frames.  Without this
-            // flag NVENC may emit a closed-GOP I-frame instead of an IDR, which
-            // does not flush the decoder's reference picture buffer and can leave
-            // the browser unable to decode the segment in isolation.
-            if *hwaccel == HwAccel::Nvidia {
-                cmd.args(["-forced-idr", "1"]);
-            }
-
-            cmd.args([
-                // Force a keyframe at encoding timestamp 0 (the first frame of this
-                // segment).  Using "0" rather than "expr:gte(t,0)" is intentional:
-                // the expression gte(t,0) is always true and would make *every*
-                // frame a keyframe, which is extremely inefficient with hardware
-                // encoders.
-                "-force_key_frames", "0",
-                "-c:a", "aac",
-                "-b:a", "128k",
-                "-output_ts_offset", &ts_offset,
-                "-f", "mpegts",
-                &tmp_filename,
-            ]);
-        }
-
-        Quality::Medium | Quality::Low => {
-            // Medium / Low quality: software decode + libx264 encode with
-            // resolution scaling.  Hardware acceleration is intentionally skipped
-            // here to keep the filter pipeline simple and universally compatible
-            // across all platforms.
-            //
-            // Resolution targets (width-based, height auto, always even):
-            //   Medium – max 1280 px wide  ≈ 720 p for 16:9 content,  CRF 26
-            //   Low    – max  854 px wide  ≈ 480 p for 16:9 content,  CRF 30
-            //
-            // The `min(iw\,MAX)` expression in the scale filter is ffmpeg filter
-            // syntax where `\,` is an escaped comma inside an option value.  When
-            // the process is spawned directly (no shell), the backslash is passed
-            // verbatim to ffmpeg's filter parser, which interprets `\,` as a
-            // literal comma inside the function call.  The `-2` height token
-            // auto-calculates height while keeping it divisible by 2.
-
-            let (max_width, crf, preset) = match quality {
-                Quality::Medium => ("1280", "26", "fast"),
-                Quality::Low    => ("854",  "30", "faster"),
-                // Safety: this arm only executes for Medium | Low (see outer match).
-                Quality::High   => unreachable!("Quality::High is handled by the outer match arm"),
-            };
-            let scale_filter = format!("scale=min(iw\\,{}):-2", max_width);
-
-            cmd.args([
-                "-y", "-nostdin",
-                "-ss", &format!("{:.3}", start_time),
-                "-i", abs_path,
-                "-t", &format!("{:.3}", SEGMENT_DURATION),
-                "-c:v", "libx264",
-                "-preset", preset,
-                "-crf", crf,
-                "-vf", &scale_filter,
-                "-pix_fmt", "yuv420p",
-                "-profile:v", "high",
-                "-level", "4.1",
-                "-bf", "0",
-                "-force_key_frames", "0",
-                "-c:a", "aac",
-                "-b:a", "128k",
-                "-output_ts_offset", &ts_offset,
-                "-f", "mpegts",
-                &tmp_filename,
-            ]);
-        }
-    }
-
-    match cmd.output().await {
-        Ok(out) if out.status.success() => {
-            tokio::fs::rename(hls_dir.join(&tmp_filename), &seg_path)
-                .await
-                .map_err(|e| format!("failed to rename segment {seg_index}: {e}"))
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let _ = tokio::fs::remove_file(hls_dir.join(&tmp_filename)).await;
-            Err(format!("ffmpeg segment {seg_index} failed: {stderr}"))
-        }
-        Err(e) => {
-            let _ = tokio::fs::remove_file(hls_dir.join(&tmp_filename)).await;
-            Err(format!("failed to execute ffmpeg for segment {seg_index}: {e}"))
-        }
-    }
+    media::transcode::transcode_segment(abs_path, hls_dir, seg_index, hwaccel, quality).await
 }
 
 /// Remove cached segments beyond the pre-cache range from a quality-specific
@@ -2006,10 +1278,10 @@ async fn clear_cache(
 // ── Thumbnail sprite generation ──────────────────────────────────────────────
 
 /// Thumbnail sprite configuration
-const THUMBNAIL_INTERVAL: f64 = 10.0; // Generate thumbnail every 10 seconds
-const THUMBNAIL_WIDTH: u32 = 640;
-const THUMBNAIL_HEIGHT: u32 = 360;
-const THUMBNAILS_PER_ROW: u32 = 10;
+const THUMBNAIL_INTERVAL: f64 = media::sprite::THUMBNAIL_INTERVAL;
+const THUMBNAIL_WIDTH: u32 = media::sprite::THUMBNAIL_WIDTH;
+const THUMBNAIL_HEIGHT: u32 = media::sprite::THUMBNAIL_HEIGHT;
+const THUMBNAILS_PER_ROW: u32 = media::sprite::THUMBNAILS_PER_ROW;
 
 /// Response for thumbnail sprite info
 #[derive(Clone, Serialize)]
@@ -2202,11 +1474,10 @@ async fn get_thumbnail_sprite(
     }
 }
 
-/// Generates the thumbnail sprite sheet for a video.
+/// Generates the thumbnail sprite sheet for a video using in-process
+/// ffmpeg-next decoding and the `image` crate for compositing.
 ///
-/// Creates `{cache_dir}/{id}_thumbs/sprite.jpg` by running `ffmpeg` with the
-/// tile filter.  Returns `true` on success, `false` on any error.  Skips
-/// generation if the file already exists.
+/// Creates `{cache_dir}/{id}_thumbs/sprite.jpg`.  Returns `true` on success.
 async fn generate_sprite(
     id: &str,
     abs_path: &Path,
@@ -2233,101 +1504,15 @@ async fn generate_sprite(
         Ok(p) => p,
         Err(_) => return false,
     };
-    let abs_str = match resolved_path.to_str() {
-        Some(s) => s.to_owned(),
-        None => return false,
-    };
 
-    let duration = duration_secs as f64;
-    let num_thumbnails = ((duration / THUMBNAIL_INTERVAL).ceil() as u32).max(1);
-    let columns = THUMBNAILS_PER_ROW.min(num_thumbnails);
-    let rows = (num_thumbnails as f64 / columns as f64).ceil() as u32;
+    let sprite_dir_owned = sprite_dir.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        media::sprite::generate_sprite_sheet(&resolved_path, duration_secs, &sprite_dir_owned)
+    });
 
-    let fps = 1.0 / THUMBNAIL_INTERVAL;
-    let tile_layout = format!("{}x{}", columns, rows);
-    let scale = format!("scale={}:{}", THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
-
-    // Write to a temp file first so that `sprite.jpg` only exists once the
-    // file is fully written.  An interrupted or failed ffmpeg run would
-    // otherwise leave a partial `sprite.jpg` that the status check would
-    // mistake for a completed sprite.
-    let tmp_path = sprite_dir.join("sprite.tmp.jpg");
-    let tmp_path_str = match tmp_path.to_str() {
-        Some(s) => s.to_owned(),
-        None => return false,
-    };
-
-    let Ok(child) = Command::new("ffmpeg")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .args([
-            "-y",
-            "-nostdin",
-            "-hwaccel",
-            "auto",
-            "-i",
-            &abs_str,
-            "-vf",
-            &format!(
-                "fps={},{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,tile={}",
-                fps, scale, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, tile_layout
-            ),
-            "-frames:v",
-            "1",
-            "-q:v",
-            "5",
-            &tmp_path_str,
-        ])
-        .spawn()
-    else {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return false;
-    };
-
-    // Save the PID before wait_with_output() moves the Child handle so we can
-    // still send SIGKILL if the playback kill signal fires.
-    let child_pid = child.id();
-
-    let output = tokio::select! {
-        result = child.wait_with_output() => result,
+    tokio::select! {
+        result = task => result.unwrap_or(false),
         _ = async { let _ = kill.wait_for(|&v| v).await; } => {
-            // child was moved into wait_with_output; kill by saved PID
-            #[cfg(unix)]
-            if let Some(pid) = child_pid {
-                // SAFETY: pid is a valid child process PID obtained from
-                // Child::id() before the Child was moved. The process is still
-                // alive (wait_with_output is still pending) when this fires.
-                // Ignoring the return value is intentional: if the process
-                // already exited between the select firing and this call,
-                // kill returns ESRCH, which is harmless.
-                let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-            }
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return false;
-        }
-    };
-
-    match output {
-        Ok(out) if out.status.success() => {
-            // Atomically promote the temp file to the final path so that
-            // `sprite.jpg` is never visible in a partially-written state.
-            if tokio::fs::rename(&tmp_path, &sprite_path).await.is_ok() {
-                true
-            } else {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                false
-            }
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            eprintln!("ffmpeg sprite generation failed for {id}: {stderr}");
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            false
-        }
-        Err(e) => {
-            eprintln!("failed to execute ffmpeg for sprite {id}: {e}");
-            let _ = tokio::fs::remove_file(&tmp_path).await;
             false
         }
     }
@@ -2593,6 +1778,8 @@ struct SubtitleTracksResponse {
 }
 
 /// `GET /api/videos/{id}/subtitles` — list available subtitle tracks
+///
+/// Uses in-process ffmpeg-next probing to enumerate subtitle streams.
 async fn list_subtitles(
     id: web::Path<String>,
     state: web::Data<AppState>,
@@ -2609,50 +1796,29 @@ async fn list_subtitles(
                 .body(format!("failed to resolve video path: {e}"))
         }
     };
-    let abs_str = match resolved_path.to_str() {
-        Some(s) => s.to_owned(),
-        None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
-    };
 
-    // Use ffprobe to get subtitle stream info
-    let output = Command::new("ffprobe")
-        .args([
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_streams",
-            "-select_streams", "s",
-            &abs_str,
-        ])
-        .output()
-        .await;
+    let streams = tokio::task::spawn_blocking(move || {
+        media::probe::list_subtitle_streams(&resolved_path)
+    })
+    .await
+    .unwrap_or_default();
 
-    let Ok(output) = output else {
-        return HttpResponse::ServiceUnavailable().body("ffprobe not available");
-    };
-
-    let json: serde_json::Value =
-        serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null);
-
-    let mut tracks = Vec::new();
-    if let Some(streams) = json["streams"].as_array() {
-        for (i, stream) in streams.iter().enumerate() {
-            let language = stream["tags"]["language"].as_str().map(str::to_owned);
-            let title = stream["tags"]["title"].as_str().map(str::to_owned);
-            let codec = stream["codec_name"].as_str().unwrap_or("unknown").to_owned();
-            
-            tracks.push(SubtitleTrack {
-                index: i as u32,
-                language,
-                title,
-                codec,
-            });
-        }
-    }
+    let tracks: Vec<SubtitleTrack> = streams
+        .into_iter()
+        .map(|s| SubtitleTrack {
+            index: s.index,
+            language: s.language,
+            title: s.title,
+            codec: s.codec_name,
+        })
+        .collect();
 
     HttpResponse::Ok().json(SubtitleTracksResponse { tracks })
 }
 
 /// `GET /api/videos/{id}/subtitles/{index}.vtt` — get subtitle track as WebVTT
+///
+/// Uses the media::subtitle module for extraction.
 async fn get_subtitle(
     params: web::Path<(String, u32)>,
     state: web::Data<AppState>,
@@ -2687,32 +1853,9 @@ async fn get_subtitle(
                 .body(format!("failed to resolve video path: {e}"))
         }
     };
-    let abs_str = match resolved_path.to_str() {
-        Some(s) => s.to_owned(),
-        None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
-    };
 
-    let vtt_path_str = match vtt_path.to_str() {
-        Some(s) => s.to_owned(),
-        None => return HttpResponse::InternalServerError().body("vtt path is not valid UTF-8"),
-    };
-
-    // Extract and convert subtitle to WebVTT using ffmpeg
-    let output = Command::new("ffmpeg")
-        .stdin(std::process::Stdio::null())
-        .args([
-            "-y",
-            "-nostdin",
-            "-i", &abs_str,
-            "-map", &format!("0:s:{}", track_index),
-            "-c:s", "webvtt",
-            &vtt_path_str,
-        ])
-        .output()
-        .await;
-
-    match output {
-        Ok(out) if out.status.success() => {
+    match media::subtitle::extract_subtitle_to_vtt(&resolved_path, track_index, &vtt_path).await {
+        Ok(()) => {
             match tokio::fs::read_to_string(&vtt_path).await {
                 Ok(data) => HttpResponse::Ok()
                     .content_type("text/vtt")
@@ -2722,14 +1865,9 @@ async fn get_subtitle(
                     .body(format!("failed to read subtitle: {e}")),
             }
         }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            eprintln!("ffmpeg subtitle extraction failed: {}", stderr);
-            HttpResponse::ServiceUnavailable().body("subtitle extraction failed")
-        }
         Err(e) => {
-            eprintln!("failed to execute ffmpeg for subtitle: {}", e);
-            HttpResponse::ServiceUnavailable().body(format!("failed to execute ffmpeg: {e}"))
+            eprintln!("subtitle extraction failed: {}", e);
+            HttpResponse::ServiceUnavailable().body(format!("subtitle extraction failed: {e}"))
         }
     }
 }
@@ -3021,7 +2159,7 @@ async fn main() -> std::io::Result<()> {
 
     // ── Startup healthchecks (logged for journalctl) ─────────────────────
     run_startup_healthchecks(&library_path, &cache_dir).await;
-    let hwaccel = detect_hwaccel().await;
+    let hwaccel = media::hwaccel::detect_hwaccel().await;
     println!();
     println!("════════════════════════════════════════════════════════════════");
 

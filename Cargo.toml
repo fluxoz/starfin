@@ -10,6 +10,8 @@ actix-session = { version = "0.10", features = ["cookie-session"] }
 actix-web = "4"
 actix-web-lab = "0.24"
 actix-ws = "0.4.0"
+ffmpeg-next = "8.0"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 mime_guess = "2.0.5"
 reqwest = "0.13.2"
 rust-embed = "8.5"

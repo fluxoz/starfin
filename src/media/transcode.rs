@@ -829,8 +829,13 @@ fn hybrid_segment(
     let mut video_pts_offset: Option<i64> = None;
 
     // Audio synthetic PTS (in 1/sample_rate time base).
+    // Must start at 0 to match the rebased video PTS (which is also zeroed
+    // via video_pts_offset).  Using start_time as an offset here would make
+    // audio start at e.g. 6 s while video starts at 0 s — a per-segment A/V
+    // desync that causes HLS.js to enter a retry loop for every segment after
+    // the first.
     let mut audio_sample_count: i64 = 0;
-    let audio_ts_offset = (start_time * audio_sample_rate as f64) as i64;
+    let audio_ts_offset = 0i64;
 
     for (stream, mut packet) in ictx.packets() {
         if let Some(k) = kill {

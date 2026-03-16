@@ -1,13 +1,19 @@
 //! HLS segment creation — direct remux when possible, transcode as fallback.
 //!
 //! Each segment is a 6-second MPEG-TS chunk.  For **Original** quality with
-//! browser-compatible codecs (H.264 video + AAC/MP3 audio) the segment is
-//! created by **remuxing** — copying compressed packets directly from the
+//! browser-compatible codecs (H.264 video + stereo AAC/MP3 audio) the segment
+//! is created by **remuxing** — copying compressed packets directly from the
 //! source file without decoding or re-encoding.  This is near-instant (pure
 //! I/O, like VLC playback) and gives performance parity with direct file
 //! access.
 //!
-//! When remuxing is not possible (incompatible codec, or High/Medium/Low
+//! When the video is H.264 but the audio isn't directly usable in browsers
+//! (e.g. multi-channel 5.1/7.1 AAC, or a non-AAC codec like FLAC/AC-3) the
+//! **hybrid** path copies video packets losslessly while transcoding only the
+//! audio to stereo AAC — giving the speed of remux with browser-compatible
+//! output.
+//!
+//! When remuxing is not possible (incompatible video codec, or High/Medium/Low
 //! quality that requires re-encoding or resolution scaling) the segment is
 //! **transcoded** in-process via `ffmpeg-next`.
 //!
@@ -23,9 +29,11 @@ pub const SEGMENT_DURATION: f64 = 6.0;
 
 /// Create a single MPEG-TS segment — remux if possible, transcode otherwise.
 ///
-/// For **Original** quality with H.264 + AAC/MP3 source, packets are copied
-/// directly (remux).  For incompatible codecs or High/Medium/Low quality that
-/// requires re-encoding, the full transcode path is used.
+/// For **Original** quality with H.264 + stereo AAC/MP3 source, packets are
+/// copied directly (remux).  For H.264 video with multi-channel or
+/// incompatible audio, video packets are copied and only audio is transcoded
+/// to stereo AAC (hybrid).  For incompatible video codecs or lower quality
+/// tiers, the full transcode path is used.
 ///
 /// Writes to a temporary file first, then atomically renames.
 pub async fn transcode_segment(
@@ -104,28 +112,42 @@ impl Quality {
 
 // ── Codec compatibility ──────────────────────────────────────────────────────
 
-/// Return `true` if the source codecs are browser-compatible and can be
-/// remuxed directly into MPEG-TS without re-encoding.
-fn source_is_remuxable(ictx: &ffmpeg_next::format::context::Input) -> bool {
+/// Return `true` if the video stream is H.264 and can be packet-copied into
+/// MPEG-TS without re-encoding.
+fn video_is_remuxable(ictx: &ffmpeg_next::format::context::Input) -> bool {
+    ictx.streams()
+        .best(ffmpeg_next::media::Type::Video)
+        .map(|s| s.parameters().id() == ffmpeg_next::codec::Id::H264)
+        .unwrap_or(false)
+}
+
+/// Return `true` if the audio stream can be packet-copied into MPEG-TS and
+/// played by web browsers.  This requires:
+///   1. Codec is AAC or MP3 (browser-compatible).
+///   2. Channel count ≤ 2 (stereo/mono).  Browsers cannot decode multi-channel
+///      AAC (e.g. 5.1/7.1) in HLS/MPEG-TS — the audio track is simply dropped.
+///
+/// Returns `true` when there is no audio stream (video-only remux is fine).
+fn audio_is_remuxable(ictx: &ffmpeg_next::format::context::Input) -> bool {
     use ffmpeg_next::codec::Id;
 
-    let video_ok = ictx
-        .streams()
-        .best(ffmpeg_next::media::Type::Video)
-        .map(|s| s.parameters().id() == Id::H264)
-        .unwrap_or(false);
-
-    let audio_ok = ictx
-        .streams()
+    ictx.streams()
         .best(ffmpeg_next::media::Type::Audio)
         .map(|s| {
             let id = s.parameters().id();
-            id == Id::AAC || id == Id::MP3
+            let codec_ok = id == Id::AAC || id == Id::MP3;
+            // Read channel count from codec parameters.
+            let channels = unsafe { (*s.parameters().as_ptr()).ch_layout.nb_channels };
+            let channels_ok = channels <= 2;
+            codec_ok && channels_ok
         })
         // No audio stream is fine — video-only remux is valid.
-        .unwrap_or(true);
+        .unwrap_or(true)
+}
 
-    video_ok && audio_ok
+/// Full remux: both video and audio can be packet-copied.
+fn source_is_remuxable(ictx: &ffmpeg_next::format::context::Input) -> bool {
+    video_is_remuxable(ictx) && audio_is_remuxable(ictx)
 }
 
 // ── Segment creation: decide remux vs transcode ─────────────────────────────
@@ -151,7 +173,12 @@ fn create_segment(
 
     // Decide: remux (fast copy) or transcode (re-encode).
     if quality.can_remux() && source_is_remuxable(&ictx) {
+        // Pure remux — both video and audio packets copied directly.
         remux_segment(&mut ictx, start_time, &tmp_path)?;
+    } else if quality.can_remux() && video_is_remuxable(&ictx) {
+        // Hybrid — video packets copied, audio transcoded to stereo AAC.
+        // This handles multi-channel AAC, non-AAC/MP3 codecs, etc.
+        hybrid_segment(&mut ictx, start_time, &tmp_path)?;
     } else {
         // For Original quality with incompatible codecs, fall back to the
         // same settings as High (native resolution, best quality).
@@ -332,6 +359,307 @@ fn remux_segment(
         }
 
         let _ = packet.write_interleaved(&mut octx);
+    }
+
+    octx.write_trailer()
+        .map_err(|e| format!("write trailer: {e}"))?;
+
+    Ok(())
+}
+
+// ── Hybrid path (video remux + audio transcode to stereo AAC) ───────────────
+
+/// Copy video packets directly while decoding and re-encoding the audio
+/// stream to stereo AAC.  This is used when the video is H.264 (browser-
+/// compatible) but the audio cannot be remuxed — typically because it is
+/// multi-channel (5.1/7.1) AAC which browsers don't support in HLS/MPEG-TS.
+///
+/// Gives the best quality+speed trade-off: lossless video copy (like remux)
+/// with only lightweight audio transcoding.
+fn hybrid_segment(
+    ictx: &mut ffmpeg_next::format::context::Input,
+    start_time: f64,
+    tmp_path: &Path,
+) -> Result<(), String> {
+    let end_time = start_time + SEGMENT_DURATION;
+
+    // Find best video/audio streams.
+    let video_idx = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Video)
+        .map(|s| s.index());
+    let audio_idx = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Audio)
+        .map(|s| s.index());
+
+    if video_idx.is_none() {
+        return Err("no video stream found".into());
+    }
+
+    // Seek to the nearest keyframe at or before start_time.
+    let seek_ts = (start_time * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
+    let _ = ictx.seek(seek_ts, ..seek_ts);
+
+    // Collect input video stream info.
+    let in_video_tb = ictx.stream(video_idx.unwrap()).unwrap().time_base();
+    let in_video_params = ictx.stream(video_idx.unwrap()).unwrap().parameters();
+
+    // Collect input audio stream info.
+    let in_audio_tb;
+    let in_audio_params;
+    if let Some(ai) = audio_idx {
+        in_audio_tb = Some(ictx.stream(ai).unwrap().time_base());
+        in_audio_params = Some(ictx.stream(ai).unwrap().parameters());
+    } else {
+        in_audio_tb = None;
+        in_audio_params = None;
+    }
+
+    // Create output muxer.
+    let mut octx = ffmpeg_next::format::output_as(tmp_path, "mpegts")
+        .map_err(|e| format!("output context: {e}"))?;
+
+    // Add output video stream — parameters copied directly from input.
+    let out_video = octx.add_stream(ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::H264))
+        .map_err(|e| format!("add video stream: {e}"))?;
+    unsafe {
+        ffmpeg_next::ffi::avcodec_parameters_copy(
+            out_video.parameters().as_mut_ptr(),
+            in_video_params.as_ptr(),
+        );
+    }
+    let out_video_idx = out_video.index();
+
+    // ── Audio decoder + encoder + resampler setup ────────────────────────
+    let mut audio_decoder: Option<ffmpeg_next::decoder::Audio> = None;
+    let mut audio_encoder_handle: Option<ffmpeg_next::encoder::Audio> = None;
+    let mut audio_resampler: Option<ffmpeg_next::software::resampling::Context> = None;
+    let mut out_audio_idx: Option<usize> = None;
+    let mut audio_sample_rate: u32 = 48000;
+    let mut audio_time_base = ffmpeg_next::Rational::new(1, 48000);
+
+    if let Some(ref a_params) = in_audio_params {
+        let aud_idx = audio_idx.unwrap();
+        audio_time_base = in_audio_tb.unwrap();
+
+        match ffmpeg_next::codec::context::Context::from_parameters(a_params.clone()) {
+            Ok(aud_ctx) => match aud_ctx.decoder().audio() {
+                Ok(dec) => {
+                    audio_sample_rate = dec.rate();
+                    let dec_format = dec.format();
+                    let raw_dec_layout = dec.channel_layout();
+
+                    // Handle empty/unspecified channel layout.
+                    let dec_layout = if raw_dec_layout.channels() > 0 {
+                        raw_dec_layout
+                    } else {
+                        let ch = dec.channels() as i32;
+                        let ch = if ch > 0 { ch } else { 2 };
+                        eprintln!(
+                            "[hybrid] audio stream has no channel layout, \
+                             defaulting to standard layout for {ch} channel(s)"
+                        );
+                        ffmpeg_next::channel_layout::ChannelLayout::default(ch)
+                    };
+
+                    // Always output MONO or STEREO for browser compatibility.
+                    let enc_layout = if dec_layout.channels() == 1 {
+                        ffmpeg_next::channel_layout::ChannelLayout::MONO
+                    } else {
+                        ffmpeg_next::channel_layout::ChannelLayout::STEREO
+                    };
+
+                    let aac_codec = ffmpeg_next::encoder::find_by_name("aac");
+                    if let Some(aac) = aac_codec {
+                        let enc_format = ffmpeg_next::format::Sample::F32(
+                            ffmpeg_next::format::sample::Type::Planar,
+                        );
+                        let aac_ctx = ffmpeg_next::codec::context::Context::new_with_codec(aac);
+                        match aac_ctx.encoder().audio() {
+                            Ok(mut aac_enc) => {
+                                aac_enc.set_rate(dec.rate() as i32);
+                                aac_enc.set_channel_layout(enc_layout);
+                                aac_enc.set_format(enc_format);
+                                aac_enc.set_bit_rate(256_000);
+                                aac_enc.set_time_base(ffmpeg_next::Rational::new(1, dec.rate() as i32));
+
+                                match aac_enc.open_as(aac) {
+                                    Ok(opened) => {
+                                        let mut out_aud_stream = octx.add_stream(aac)
+                                            .map_err(|e| format!("add audio stream: {e}"))?;
+                                        out_aud_stream.set_parameters(&opened);
+                                        out_audio_idx = Some(out_aud_stream.index());
+
+                                        match ffmpeg_next::software::resampling::Context::get(
+                                            dec_format,
+                                            dec_layout,
+                                            dec.rate(),
+                                            enc_format,
+                                            enc_layout,
+                                            dec.rate(),
+                                        ) {
+                                            Ok(r) => {
+                                                audio_resampler = Some(r);
+                                                audio_encoder_handle = Some(opened);
+                                                audio_decoder = Some(dec);
+                                            }
+                                            Err(e) => {
+                                                eprintln!("[hybrid] failed to create audio resampler: {e}");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[hybrid] failed to open AAC encoder (channels={}, layout={:?}): {e}",
+                                            enc_layout.channels(), enc_layout
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[hybrid] failed to init AAC encoder context for stream {aud_idx}: {e}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[hybrid] failed to open audio decoder for stream {aud_idx}: {e}");
+                }
+            },
+            Err(e) => {
+                eprintln!("[hybrid] failed to create audio decoder context for stream {aud_idx}: {e}");
+            }
+        }
+    }
+
+    octx.write_header()
+        .map_err(|e| format!("write header: {e}"))?;
+
+    // Re-read output time bases after write_header (muxer may adjust them).
+    let out_video_tb = octx.stream(out_video_idx).unwrap().time_base();
+    let out_audio_tb = out_audio_idx.map(|i| octx.stream(i).unwrap().time_base());
+
+    let mut got_video_keyframe = false;
+    let mut video_pts_offset: Option<i64> = None;
+
+    // Audio synthetic PTS (in 1/sample_rate time base).
+    let mut audio_sample_count: i64 = 0;
+    let audio_ts_offset = (start_time * audio_sample_rate as f64) as i64;
+
+    for (stream, mut packet) in ictx.packets() {
+        let si = stream.index();
+        let is_video = Some(si) == video_idx;
+        let is_audio = Some(si) == audio_idx;
+
+        if !is_video && !is_audio {
+            continue;
+        }
+
+        // Convert packet PTS to seconds for time-range filtering.
+        let in_tb = if is_video { in_video_tb } else { in_audio_tb.unwrap_or(in_video_tb) };
+        let pts = packet.pts().unwrap_or(0);
+        let pts_secs = pts as f64 * f64::from(in_tb.0) / f64::from(in_tb.1);
+
+        // Past segment end → done.
+        if pts_secs >= end_time {
+            break;
+        }
+
+        if is_video {
+            // Wait for the first keyframe at or after start_time.
+            if !got_video_keyframe {
+                if !packet.is_key() || pts_secs < start_time - SEGMENT_DURATION {
+                    continue;
+                }
+                got_video_keyframe = true;
+            }
+
+            // Copy video packet directly (remux).
+            packet.set_stream(out_video_idx);
+            packet.rescale_ts(in_video_tb, out_video_tb);
+            if video_pts_offset.is_none() {
+                video_pts_offset = packet.dts().or(packet.pts());
+            }
+            if let (Some(offset), Some(p)) = (video_pts_offset, packet.pts()) {
+                packet.set_pts(Some(p - offset));
+            }
+            if let (Some(offset), Some(d)) = (video_pts_offset, packet.dts()) {
+                packet.set_dts(Some(d - offset));
+            }
+            let _ = packet.write_interleaved(&mut octx);
+        } else if is_audio {
+            // Skip audio before the video keyframe.
+            if !got_video_keyframe {
+                continue;
+            }
+
+            // Decode → resample → encode audio to stereo AAC.
+            if let (Some(adec), Some(aenc)) =
+                (&mut audio_decoder, &mut audio_encoder_handle)
+            {
+                if adec.send_packet(&packet).is_ok() {
+                    let mut audio_frame = ffmpeg_next::util::frame::Audio::empty();
+                    while adec.receive_frame(&mut audio_frame).is_ok() {
+                        // Time-range filter.
+                        if let Some(apts) = audio_frame.pts() {
+                            let apts_secs = apts as f64
+                                * f64::from(audio_time_base.0)
+                                / f64::from(audio_time_base.1);
+                            if apts_secs < start_time || apts_secs >= end_time {
+                                continue;
+                            }
+                        }
+
+                        let frame_to_encode = if let Some(ref mut resampler) = audio_resampler {
+                            let mut resampled = ffmpeg_next::frame::Audio::empty();
+                            if resampler.run(&audio_frame, &mut resampled).is_err() {
+                                continue;
+                            }
+                            let new_pts = audio_sample_count + audio_ts_offset;
+                            resampled.set_pts(Some(new_pts));
+                            audio_sample_count += resampled.samples() as i64;
+                            resampled
+                        } else {
+                            let new_pts = audio_sample_count + audio_ts_offset;
+                            audio_frame.set_pts(Some(new_pts));
+                            audio_sample_count += audio_frame.samples() as i64;
+                            audio_frame.clone()
+                        };
+
+                        if aenc.send_frame(&frame_to_encode).is_ok() {
+                            let mut encoded = ffmpeg_next::Packet::empty();
+                            while aenc.receive_packet(&mut encoded).is_ok() {
+                                if let Some(aud_out_idx) = out_audio_idx {
+                                    encoded.set_stream(aud_out_idx);
+                                    encoded.rescale_ts(
+                                        ffmpeg_next::Rational::new(1, audio_sample_rate as i32),
+                                        out_audio_tb.unwrap_or(ffmpeg_next::Rational::new(1, 90000)),
+                                    );
+                                    let _ = encoded.write_interleaved(&mut octx);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Flush audio encoder.
+    if let Some(ref mut aenc) = audio_encoder_handle {
+        let _ = aenc.send_eof();
+        let mut aenc_pkt = ffmpeg_next::Packet::empty();
+        while aenc.receive_packet(&mut aenc_pkt).is_ok() {
+            if let Some(aud_out_idx) = out_audio_idx {
+                aenc_pkt.set_stream(aud_out_idx);
+                aenc_pkt.rescale_ts(
+                    ffmpeg_next::Rational::new(1, audio_sample_rate as i32),
+                    out_audio_tb.unwrap_or(ffmpeg_next::Rational::new(1, 90000)),
+                );
+                let _ = aenc_pkt.write_interleaved(&mut octx);
+            }
+        }
     }
 
     octx.write_trailer()

@@ -33,6 +33,8 @@ struct SpriteStatus {
 #[derive(Properties, PartialEq)]
 pub struct VideoCardThumbProps {
     pub video_id: String,
+    /// Title of the video, used as the `alt` text for the thumbnail image.
+    pub title: String,
     /// Bumps whenever a background worker finishes a video or a batch.
     /// Used for cache-busting thumbnails and retrying sprite loads.
     #[prop_or_default]
@@ -290,10 +292,18 @@ pub fn video_card_thumb(props: &VideoCardThumbProps) -> Html {
     html! {
         <div
             class="card__thumb"
-            style={format!("background-image: url('{thumbnail_url}')")}
             onmouseenter={on_mouse_enter}
             onmouseleave={on_mouse_leave}
         >
+            // Use <img loading="lazy"> so the browser only fetches this thumbnail
+            // when the card is near the viewport, and cancels the request when the
+            // card is removed from the DOM (window slides away).
+            <img
+                class="card__thumb-img"
+                src={thumbnail_url}
+                loading="lazy"
+                alt={format!("{} thumbnail", props.title)}
+            />
             <canvas
                 ref={canvas_ref}
                 class={if show_canvas { "card__preview-canvas card__preview-canvas--visible" } else { "card__preview-canvas" }}

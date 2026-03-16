@@ -98,8 +98,22 @@ pub fn app() -> Html {
     html! { <AppInner /> }
 }
 
+/// Returns the CSS-grid column count for the given viewport width.
+/// Mirrors the breakpoints in `main.css`:
+///   < 520 px → 1 column, 520–899 px → 2 columns, ≥ 900 px → 3 columns.
+fn col_count_for_width(win_width: f64) -> usize {
+    if win_width >= 900.0 { 3 } else if win_width >= 520.0 { 2 } else { 1 }
+}
+
 #[function_component(AppInner)]
 fn app_inner() -> Html {
+    /// Number of cards kept in the DOM at any one time (the virtual window).
+    /// 30 items = 10 rows (3 cols) keeps the DOM very lean: only visible cards
+    /// plus a small buffer above/below are ever present.
+    const WINDOW_SIZE: usize = 30;
+    /// Initial estimate for one card's rendered height plus the grid row-gap (16 px).
+    /// Updated after the first real render by measuring an actual `.card` element.
+    const CARD_ROW_HEIGHT_ESTIMATE: f64 = 440.0;
     let query = use_state(|| "".to_string());
     let sort_by = use_state(|| SortBy::DateAddedNewest);
 
@@ -159,6 +173,22 @@ fn app_inner() -> Html {
     // Scroll-to-top button visibility state
     let show_scroll_top = use_state(|| false);
 
+    // Virtual window: index of the first item currently rendered.  Only items
+    // [window_start .. window_start + WINDOW_SIZE] are in the DOM; spacers
+    // above and below fill the remaining document height so scroll position is
+    // preserved as the window slides.
+    let window_start = use_state(|| 0_usize);
+    // UseRef mirror — readable inside the scroll closure (created once at
+    // mount) without stale-capture issues.
+    let window_start_ref = use_mut_ref(|| 0_usize);
+
+    // Tracks total items length for the scroll closure.
+    let total_items_len_ref = use_mut_ref(|| 0_usize);
+
+    // Measured height (px) of one rendered card row (card height + 16 px gap).
+    // Starts as an estimate; updated once the first card is in the DOM.
+    let card_row_height_ref = use_mut_ref(|| CARD_ROW_HEIGHT_ESTIMATE);
+
     // Hardware acceleration renderer name
     let hwaccel_label = use_state(|| Option::<String>::None);
 
@@ -175,9 +205,54 @@ fn app_inner() -> Html {
         });
     }
 
-    // Listen for scroll events on the window to toggle the back-to-top button.
+    // Keep window_start_ref in sync with window_start so the scroll closure
+    // (created once at mount) can always read the latest value.
+    {
+        let window_start_ref = window_start_ref.clone();
+        use_effect_with(*window_start, move |&start| {
+            *window_start_ref.borrow_mut() = start;
+            || ()
+        });
+    }
+
+    // Keep total_items_len_ref in sync with the items list length.
+    {
+        let total_items_len_ref = total_items_len_ref.clone();
+        use_effect_with((*items).len(), move |&len| {
+            *total_items_len_ref.borrow_mut() = len;
+            || ()
+        });
+    }
+
+    // Measure the actual card row height once items are first rendered so the
+    // spacer calculations are accurate.
+    {
+        let card_row_height_ref = card_row_height_ref.clone();
+        use_effect_with((*items).len() > 0, move |&has_items| {
+            if has_items {
+                if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                    if let Some(card) = doc.query_selector(".card").ok().flatten() {
+                        let h = card.get_bounding_client_rect().height();
+                        if h > 0.0 {
+                            // 16 px is the grid row-gap from main.css
+                            *card_row_height_ref.borrow_mut() = h + 16.0;
+                        }
+                    }
+                }
+            }
+            || ()
+        });
+    }
+
+    // Listen for scroll events: toggle the back-to-top button and slide the
+    // virtual window so that only WINDOW_SIZE cards are in the DOM at a time.
     {
         let show_scroll_top = show_scroll_top.clone();
+        let window_start = window_start.clone();
+        let window_start_ref = window_start_ref.clone();
+        let total_items_len_ref = total_items_len_ref.clone();
+        let card_row_height_ref = card_row_height_ref.clone();
+        let query_ref = query_ref.clone();
         use_effect_with((), move |_| {
             let window = web_sys::window().expect("no window");
 
@@ -185,6 +260,51 @@ fn app_inner() -> Html {
                 if let Some(w) = web_sys::window() {
                     let scroll_y = w.scroll_y().unwrap_or(0.0);
                     show_scroll_top.set(scroll_y > 300.0);
+
+                    // Virtual windowing: only active when no search filter is
+                    // in use.  `query_ref` (a UseRef) is read here because
+                    // UseStateHandle captures would be stale in this closure.
+                    if query_ref.borrow().is_empty() {
+                        let total = *total_items_len_ref.borrow();
+                        if total > WINDOW_SIZE {
+                            let row_height = *card_row_height_ref.borrow();
+                            let win_width = w
+                                .inner_width()
+                                .ok()
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(1280.0);
+                            let col_count = col_count_for_width(win_width);
+
+                            // How many pixels of the rendered grid section are
+                            // above the top of the viewport.
+                            let scrolled_past_grid = w
+                                .document()
+                                .and_then(|d| d.query_selector(".grid").ok().flatten())
+                                .map(|el| (-el.get_bounding_client_rect().top()).max(0.0))
+                                .unwrap_or(0.0);
+
+                            // Rows of rendered cards above the viewport.
+                            let rows_above =
+                                (scrolled_past_grid / row_height).floor() as usize;
+                            // Corresponding absolute item index.
+                            let current_start = *window_start_ref.borrow();
+                            let items_above = rows_above * col_count;
+                            let absolute_top = current_start + items_above;
+
+                            // Keep 1 row of look-behind above the viewport.
+                            let new_start = absolute_top
+                                .saturating_sub(col_count)
+                                // Align to a row boundary for clean window edges.
+                                / col_count * col_count;
+                            let new_start =
+                                new_start.min(total.saturating_sub(WINDOW_SIZE));
+
+                            if new_start != current_start {
+                                *window_start_ref.borrow_mut() = new_start;
+                                window_start.set(new_start);
+                            }
+                        }
+                    }
                 }
             });
 
@@ -213,6 +333,8 @@ fn app_inner() -> Html {
         let items = items.clone();
         let loading = loading.clone();
         let error = error.clone();
+        let window_start = window_start.clone();
+        let window_start_ref = window_start_ref.clone();
 
         use_effect_with(((*query).clone(), (*sort_by).clone()), move |_| {
             let query = (*query).clone();
@@ -221,6 +343,10 @@ fn app_inner() -> Html {
             // Keep refs current so the interval can read the latest values.
             *query_ref.borrow_mut() = query.clone();
             *sort_by_ref.borrow_mut() = sort_by.clone();
+
+            // Reset the virtual window to the top on every filter/sort change.
+            window_start.set(0);
+            *window_start_ref.borrow_mut() = 0;
 
             loading.set(true);
             error.set(None);
@@ -447,14 +573,22 @@ fn app_inner() -> Html {
         })
     };
 
-    let on_scroll_top = Callback::from(move |_: MouseEvent| {
-        if let Some(window) = web_sys::window() {
-            let opts = web_sys::ScrollToOptions::new();
-            opts.set_top(0.0);
-            opts.set_behavior(web_sys::ScrollBehavior::Smooth);
-            window.scroll_to_with_scroll_to_options(&opts);
-        }
-    });
+    let on_scroll_top = {
+        let window_start = window_start.clone();
+        let window_start_ref = window_start_ref.clone();
+        Callback::from(move |_: MouseEvent| {
+            // Reset the virtual window to the first WINDOW_SIZE cards.
+            window_start.set(0);
+            *window_start_ref.borrow_mut() = 0;
+            // Scroll to the top of the page.
+            if let Some(window) = web_sys::window() {
+                let opts = web_sys::ScrollToOptions::new();
+                opts.set_top(0.0);
+                opts.set_behavior(web_sys::ScrollBehavior::Smooth);
+                window.scroll_to_with_scroll_to_options(&opts);
+            }
+        })
+    };
 
     let on_random = {
         let items = items.clone();
@@ -544,6 +678,37 @@ fn app_inner() -> Html {
     };
 
     let app_class = if *dark_mode { "app dark-mode" } else { "app" };
+
+    // Virtual windowing: when no search filter is active and the library is
+    // large enough, only render the WINDOW_SIZE cards around the current
+    // scroll position.  Spacer divs above and below preserve document height
+    // so the scrollbar stays proportional.  When a filter is active, all
+    // matching results are shown without any windowing.
+    let is_filtered = !(*query).is_empty();
+    let total = (*items).len();
+    let (displayed_items, top_pad, bottom_pad) = if is_filtered || total <= WINDOW_SIZE {
+        ((*items).clone(), 0.0_f64, 0.0_f64)
+    } else {
+        let start = *window_start;
+        let end = (start + WINDOW_SIZE).min(total);
+        let slice = (*items)[start..end].to_vec();
+
+        // Column count mirrors the CSS grid breakpoints in main.css.
+        let win_width = web_sys::window()
+            .and_then(|w| w.inner_width().ok().and_then(|v| v.as_f64()))
+            .unwrap_or(1280.0);
+        let col_count = col_count_for_width(win_width);
+        let row_height = *card_row_height_ref.borrow();
+
+        // Spacer heights = number of rows hidden above / below × row height.
+        // top_rows: floor division — window_start is always row-aligned.
+        let top_rows = start / col_count;
+        let bottom_items = total.saturating_sub(end);
+        // bottom_rows: ceiling division — partial bottom rows still need space.
+        let bottom_rows = (bottom_items + col_count - 1) / col_count;
+
+        (slice, top_rows as f64 * row_height, bottom_rows as f64 * row_height)
+    };
 
     // Compute progress percentage and label for the scan progress bar.
     let (scan_pct, scan_label) = match *scan_progress {
@@ -724,13 +889,15 @@ fn app_inner() -> Html {
                     <div class="notice notice--loading">{ "Loading…" }</div>
                 } else {
                     <ElementsGrid
-                        items={(*items).clone()}
+                        items={displayed_items}
                         on_watch={on_watch}
                         on_edit={on_edit}
                         on_favorite_toggle={on_favorite_toggle}
                         thumb_current_id={(*thumb_current_id).clone()}
                         sprite_current_id={(*sprite_current_id).clone()}
                         precache_current_id={(*precache_current_id).clone()}
+                        top_pad={top_pad}
+                        bottom_pad={bottom_pad}
                     />
                 }
             </main>

@@ -19,6 +19,12 @@ pub struct Props {
     /// The video ID the pre-cache worker is currently processing (from WS).
     #[prop_or_default]
     pub precache_current_id: Option<String>,
+    /// Height in pixels of the virtual spacer above the rendered window.
+    #[prop_or_default]
+    pub top_pad: f64,
+    /// Height in pixels of the virtual spacer below the rendered window.
+    #[prop_or_default]
+    pub bottom_pad: f64,
 }
 
 #[derive(Properties, PartialEq)]
@@ -95,6 +101,7 @@ fn video_card(props: &CardProps) -> Html {
             <div class="card__thumb-wrap">
                 <VideoCardThumb
                     video_id={item.id.clone()}
+                    title={item.title.clone()}
                     processing_version={*local_version}
                 />
                 <button
@@ -198,28 +205,38 @@ pub fn elements_grid(props: &Props) -> Html {
     }
 
     html! {
-        <section class="grid" aria-label="Videos grid">
-            { for props.items.iter().map(|item| {
-                let is_thumb_processing =
-                    props.thumb_current_id.iter().any(|id| id == &item.id);
-                let is_sprite_processing =
-                    props.sprite_current_id.iter().any(|id| id == &item.id);
-                let is_precache_processing =
-                    props.precache_current_id.as_deref() == Some(item.id.as_str());
+        <>
+            // Top spacer maintains document height for items scrolled above the window.
+            if props.top_pad > 0.0 {
+                <div aria-hidden="true" style={format!("height:{}px", props.top_pad as u32)} />
+            }
+            <section class="grid" aria-label="Videos grid">
+                { for props.items.iter().map(|item| {
+                    let is_thumb_processing =
+                        props.thumb_current_id.iter().any(|id| id == &item.id);
+                    let is_sprite_processing =
+                        props.sprite_current_id.iter().any(|id| id == &item.id);
+                    let is_precache_processing =
+                        props.precache_current_id.as_deref() == Some(item.id.as_str());
 
-                html! {
-                    <VideoCard
-                        key={item.id.clone()}
-                        item={item.clone()}
-                        on_watch={props.on_watch.clone()}
-                        on_edit={props.on_edit.clone()}
-                        on_favorite_toggle={props.on_favorite_toggle.clone()}
-                        is_thumb_processing={is_thumb_processing}
-                        is_sprite_processing={is_sprite_processing}
-                        is_precache_processing={is_precache_processing}
-                    />
-                }
-            }) }
-        </section>
+                    html! {
+                        <VideoCard
+                            key={item.id.clone()}
+                            item={item.clone()}
+                            on_watch={props.on_watch.clone()}
+                            on_edit={props.on_edit.clone()}
+                            on_favorite_toggle={props.on_favorite_toggle.clone()}
+                            is_thumb_processing={is_thumb_processing}
+                            is_sprite_processing={is_sprite_processing}
+                            is_precache_processing={is_precache_processing}
+                        />
+                    }
+                }) }
+            </section>
+            // Bottom spacer maintains document height for items below the window.
+            if props.bottom_pad > 0.0 {
+                <div aria-hidden="true" style={format!("height:{}px", props.bottom_pad as u32)} />
+            }
+        </>
     }
 }

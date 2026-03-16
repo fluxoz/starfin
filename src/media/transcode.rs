@@ -174,11 +174,17 @@ fn video_is_remuxable(ictx: &ffmpeg_next::format::context::Input) -> bool {
         .unwrap_or(false)
 }
 
-/// Return `true` if the audio stream can be packet-copied into MPEG-TS and
-/// played by web browsers.  This requires:
+/// Return `true` if the audio stream can be packet-copied into an fMP4
+/// segment and played by web browsers.  This requires:
 ///   1. Codec is AAC or MP3 (browser-compatible).
 ///   2. Channel count ≤ 2 (stereo/mono).  Browsers cannot decode multi-channel
 ///      AAC (e.g. 5.1/7.1) in HLS/MPEG-TS — the audio track is simply dropped.
+///   3. For AAC, extradata must be present.  MPEG-TS carries AAC in ADTS
+///      framing (no extradata); the MP4 container requires raw AAC with an
+///      AudioSpecificConfig stored in the `esds` atom.  Without the
+///      `aac_adtstoasc` bitstream filter (not available in our bindings) the
+///      MP4 muxer rejects every packet.  Routing through the hybrid path
+///      (decode + re-encode) avoids this issue entirely.
 ///
 /// Returns `true` when there is no audio stream (video-only remux is fine).
 fn audio_is_remuxable(ictx: &ffmpeg_next::format::context::Input) -> bool {
@@ -187,16 +193,25 @@ fn audio_is_remuxable(ictx: &ffmpeg_next::format::context::Input) -> bool {
     ictx.streams()
         .best(ffmpeg_next::media::Type::Audio)
         .map(|s| {
-            let id = s.parameters().id();
+            let params = s.parameters();
+            let id = params.id();
             let codec_ok = id == Id::AAC || id == Id::MP3;
             // Read channel count from codec parameters.
             // SAFETY: `s.parameters().as_ptr()` returns a valid pointer to an
             // initialized `AVCodecParameters` owned by the stream.  We only
             // read the `ch_layout.nb_channels` field (a plain integer) through
             // the pointer — no mutation, no lifetime extension.
-            let channels = unsafe { (*s.parameters().as_ptr()).ch_layout.nb_channels };
+            let channels = unsafe { (*params.as_ptr()).ch_layout.nb_channels };
             let channels_ok = channels <= 2;
-            codec_ok && channels_ok
+            // AAC from MPEG-TS uses ADTS framing (extradata_size == 0) which
+            // is incompatible with the MP4 container.  Only allow remux when
+            // extradata is present (raw AAC from MKV/MP4 sources).
+            let extradata_ok = if id == Id::AAC {
+                unsafe { (*params.as_ptr()).extradata_size > 0 }
+            } else {
+                true
+            };
+            codec_ok && channels_ok && extradata_ok
         })
         // No audio stream is fine — video-only remux is valid.
         .unwrap_or(true)
@@ -567,6 +582,10 @@ fn remux_segment(
             out_video.parameters().as_mut_ptr(),
             in_video_params.as_ptr(),
         );
+        // Clear codec_tag so the MP4 muxer auto-selects the correct tag
+        // (e.g. avc1 for H.264).  Source containers like MPEG-TS use
+        // incompatible tags (0x1B) that the MP4 muxer rejects.
+        (*out_video.parameters().as_mut_ptr()).codec_tag = 0;
     }
     let out_video_idx = out_video.index();
 
@@ -584,6 +603,8 @@ fn remux_segment(
                         out_audio.parameters().as_mut_ptr(),
                         a_params.as_ptr(),
                     );
+                    // Clear codec_tag — same reason as video above.
+                    (*out_audio.parameters().as_mut_ptr()).codec_tag = 0;
                 }
                 out_audio_tb = out_audio.time_base();
                 out_audio_idx_val = Some(out_audio.index());
@@ -696,8 +717,13 @@ fn remux_segment(
         let _ = packet.write_interleaved(&mut octx);
     }
 
-    octx.write_trailer()
-        .map_err(|e| format!("write trailer: {e}"))?;
+    // Use raw FFI for write_trailer: the fMP4 muxer returns a positive value
+    // (trailer size in bytes) on success, but the ffmpeg-next binding treats
+    // any non-zero return as an error.  Only negative values are real errors.
+    let trailer_ret = unsafe { ffmpeg_next::ffi::av_write_trailer(octx.as_mut_ptr()) };
+    if trailer_ret < 0 {
+        return Err(format!("write trailer: error code {trailer_ret}"));
+    }
 
     Ok(())
 }
@@ -767,6 +793,10 @@ fn hybrid_segment(
             out_video.parameters().as_mut_ptr(),
             in_video_params.as_ptr(),
         );
+        // Clear codec_tag so the MP4 muxer auto-selects the correct tag
+        // (e.g. avc1 for H.264).  Source containers like MPEG-TS use
+        // incompatible tags (0x1B) that the MP4 muxer rejects.
+        (*out_video.parameters().as_mut_ptr()).codec_tag = 0;
     }
     let out_video_idx = out_video.index();
 
@@ -938,7 +968,9 @@ fn hybrid_segment(
             if let (Some(offset), Some(d)) = (video_pts_offset, packet.dts()) {
                 packet.set_dts(Some(d - offset));
             }
-            let _ = packet.write_interleaved(&mut octx);
+            if let Err(e) = packet.write_interleaved(&mut octx) {
+                eprintln!("[hybrid] video write_interleaved failed: {e}");
+            }
         } else if is_audio {
             // Skip audio before the video keyframe.
             if !got_video_keyframe {
@@ -1049,8 +1081,13 @@ fn hybrid_segment(
         }
     }
 
-    octx.write_trailer()
-        .map_err(|e| format!("write trailer: {e}"))?;
+    // Use raw FFI for write_trailer: the fMP4 muxer returns a positive value
+    // (trailer size in bytes) on success, but the ffmpeg-next binding treats
+    // any non-zero return as an error.  Only negative values are real errors.
+    let trailer_ret = unsafe { ffmpeg_next::ffi::av_write_trailer(octx.as_mut_ptr()) };
+    if trailer_ret < 0 {
+        return Err(format!("write trailer: error code {trailer_ret}"));
+    }
 
     Ok(())
 }
@@ -1616,8 +1653,13 @@ fn transcode_segment_body(
             }
         }
 
-        octx.write_trailer()
-            .map_err(|e| format!("write trailer: {e}"))?;
+        // Use raw FFI for write_trailer: the fMP4 muxer returns a positive value
+        // (trailer size in bytes) on success, but the ffmpeg-next binding treats
+        // any non-zero return as an error.  Only negative values are real errors.
+        let trailer_ret = unsafe { ffmpeg_next::ffi::av_write_trailer(octx.as_mut_ptr()) };
+        if trailer_ret < 0 {
+            return Err(format!("write trailer: error code {trailer_ret}"));
+        }
     }
 
     Ok(())
@@ -1680,6 +1722,37 @@ mod tests {
         let out = Path::new("/tmp/test_media/test_remux_stereo.mp4");
         remux_segment(&mut ictx, 0.0, out, None).expect("remux segment failed");
         verify_segment(out, true);
+    }
+
+    #[test]
+    fn test_remux_mpegts_stereo_aac() {
+        let test_file = "/tmp/test_media/test_mpegts_stereo.ts";
+        if !Path::new(test_file).exists() { return; }
+        super::super::ensure_init();
+
+        let mut ictx = ffmpeg_next::format::input(&test_file).unwrap();
+        // MPEG-TS AAC audio uses ADTS framing (no extradata) which is
+        // incompatible with the MP4 container.  The audio should NOT be
+        // flagged as remuxable, routing through the hybrid path instead.
+        assert!(video_is_remuxable(&ictx), "H.264 video should be remuxable");
+        assert!(!audio_is_remuxable(&ictx), "MPEG-TS ADTS AAC should not be remuxable into MP4");
+
+        // Hybrid path: copy video, transcode audio.
+        let out = Path::new("/tmp/test_media/test_hybrid_mpegts.mp4");
+        hybrid_segment(&mut ictx, 0.0, out, None).expect("hybrid segment from MPEG-TS failed");
+        verify_segment(out, true);
+    }
+
+    #[test]
+    fn test_remux_mpegts_video_only() {
+        let test_file = "/tmp/test_media/test_mpegts_video_only.ts";
+        if !Path::new(test_file).exists() { return; }
+        super::super::ensure_init();
+        let mut ictx = ffmpeg_next::format::input(&test_file).unwrap();
+        let out = Path::new("/tmp/test_media/test_remux_video_only.mp4");
+        remux_segment(&mut ictx, 0.0, out, None).expect("remux video-only MPEG-TS failed");
+        let octx = ffmpeg_next::format::input(out).unwrap();
+        assert!(octx.streams().best(ffmpeg_next::media::Type::Video).is_some());
     }
 
     #[test]

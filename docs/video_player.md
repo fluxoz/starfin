@@ -28,19 +28,19 @@
 ```
 Browser
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│  VideoPlayer (Yew function component)                                           │
+│  VideoPlayer (shell) ──▶ ControlBar ──▶ ProgressBar                            │
 │                                                                                 │
 │   ┌─────────────┐   sourceopen   ┌───────────────┐   appendBuffer  ┌─────────┐ │
 │   │ MediaSource │──────────────▶│  SourceBuffer  │◀────────────── │ fetch() │ │
 │   │  (blob URL) │               │  video/mp4     │                 │ seg_N   │ │
 │   └──────┬──────┘               └───────┬────────┘                 └─────────┘ │
 │          │ src=blob:…                   │ updateend                             │
-│          ▼                             │                                        │
-│   ┌─────────────┐                      ▼                                        │
-│   │ <video> el  │◀────────── pump_segments() called every                       │
-│   │ (HtmlVideo  │             150 ms interval OR on seeked event                │
-│   │  Element)   │                                                               │
-│   └─────────────┘                                                               │
+│          ▼                              ▼                                       │
+│   ┌─────────────┐              ┌────────────────┐                              │
+│   │ <video> el  │              │  PumpMsg chan   │◀── TopUp (150ms interval)    │
+│   │ (HtmlVideo  │              │  pump_loop()   │◀── Seek (seeked handler)     │
+│   │  Element)   │              │  state machine │◀── AppendComplete (updateend)│
+│   └─────────────┘              └────────────────┘                              │
 │                                                                                 │
 │   Yew state (use_state / use_mut_ref) drives all UI re-renders                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -56,7 +56,9 @@ HLS.js or other JavaScript library. The Rust/WASM code:
 1. Parses the server-produced M3U8 playlist into a list of segment URLs.
 2. Creates a `MediaSource` + `SourceBuffer` and sets `video.src` to the corresponding
    blob URL.
-3. Feeds segments into the `SourceBuffer` one at a time via a recurring pump function.
+3. Feeds segments into the `SourceBuffer` via a channel-driven async state machine
+   (`pump_loop`) that processes `TopUp`, `Seek`, `AppendComplete`, `FetchComplete`,
+   and `Shutdown` messages.
 
 **Safari** receives the M3U8 URL directly (native HLS); the MSE path is skipped.
 
@@ -130,19 +132,45 @@ or mutated too frequently to warrant a full re-render.
 
 ```
 MseState {
-    media_source: MediaSource,   // Owned MSE MediaSource object
-    source_buffer: SourceBuffer, // Single SourceBuffer (video/mp4; codecs="avc1.42E01E,mp4a.40.2")
-    object_url: String,          // blob: URL created with Url::create_object_url_with_source()
-                                 //   → set as video.src; revoked on cleanup
-    segments: Vec<SegmentInfo>,  // Parsed segment list (URL + duration) from M3U8
-    next_seg: usize,             // Index of the next segment to fetch
-    is_appending: bool,          // Guards concurrent appends; true while appendBuffer is in-flight
-    generation: u32,             // Monotonic seek counter — stale appends are discarded when
-                                 //   the generation at fetch-start differs from the current value
+    media_source: MediaSource,       // Owned MSE MediaSource object
+    source_buffer: SourceBuffer,     // Single SourceBuffer (video/mp4; codecs="avc1.42E01E,mp4a.40.2")
+    object_url: String,              // blob: URL → set as video.src; revoked on cleanup
+    segments: Vec<SegmentInfo>,      // Parsed segment list (URL + duration) from M3U8
+    next_seg: usize,                 // Index of the next segment to fetch
+    generation: u32,                 // Monotonic seek counter — stale appends are discarded
+    pump_tx: UnboundedSender<PumpMsg>, // Channel sender for the pump loop
+    _updateend_closure: Closure,     // Persistent updateend listener (properly dropped on cleanup)
 }
 ```
 
-### 3.2 Segment format
+### 3.2 Pump channel messages
+
+```
+enum PumpMsg {
+    AppendComplete,              // SourceBuffer updateend fired
+    TopUp,                       // Top up buffer (150ms interval / initial kick)
+    Seek(f64),                   // Seek to unbuffered position
+    FetchComplete(u32, Vec<u8>), // Fetch succeeded (generation, bytes)
+    FetchFailed(u32),            // Fetch failed after retries (generation)
+    Shutdown,                    // Terminate the pump loop
+}
+```
+
+### 3.3 Pump state machine
+
+```
+enum PumpState { Idle, Fetching, Appending }
+
+Idle ──TopUp/AppendComplete──▶ try_start_fetch() → Fetching (if buffer needs data)
+Fetching ──FetchComplete──▶ check generation → try_append_bytes() → Appending
+Fetching ──FetchFailed──▶ Idle
+Fetching ──Seek──▶ Idle (generation bumped; stale FetchComplete ignored)
+Appending ──AppendComplete──▶ advance next_seg → Idle → try_start_fetch() → …
+Appending ──Seek──▶ Idle (generation bumped)
+Any ──Shutdown──▶ Exit
+```
+
+### 3.4 Segment format
 
 All segments are **fragmented MP4** (fMP4) — not MPEG-TS. The server emits
 `movflags=frag_keyframe+empty_moov+default_base_moof`. The MIME type used for
@@ -198,37 +226,52 @@ sequenceDiagram
 
 ## 5. Segment Pump Loop
 
-`pump_segments(state, video)` is the core media feeding function. It is called from:
+The pump is a **channel-driven async state machine** (`pump_loop`) that runs as a
+single `spawn_local` task.  All external triggers communicate through an
+`mpsc::unbounded()` channel:
 
-- The `updateend` event listener (after each `appendBuffer` completes).
-- The 150 ms polling interval (to top up the buffer as playback advances).
-- The `seeked` event handler (after seeking to an unbuffered position).
+| Trigger | Sends | When |
+|---|---|---|
+| 150 ms polling interval | `TopUp` | Every 150 ms |
+| `seeked` event listener | `Seek(time)` | When a seek lands in unbuffered territory |
+| Persistent `updateend` listener | `AppendComplete` | After every `appendBuffer` or `remove()` completes |
+| Cleanup (unmount / quality change) | `Shutdown` | Before dropping `MseState` |
+| Fetch task (spawned by pump) | `FetchComplete(gen, bytes)` / `FetchFailed(gen)` | When a segment fetch finishes |
 
 ```mermaid
-flowchart TD
-    A([pump_segments called]) --> B{state is None?}
-    B -- yes --> Z([return])
-    B -- no --> C{is_appending?}
-    C -- yes --> Z
-    C -- no --> D{buffered_ahead ≥ MSE_TARGET_BUFFER_S\nAND next_seg > 0?}
-    D -- yes --> Z
-    D -- no --> E{next_seg ≥ segments.len?}
-    E -- yes --> F[mediaSource.end_of_stream]
-    F --> Z
-    E -- no --> G[pick segments[next_seg].url\nset is_appending = true]
-    G --> H[spawn_local: fetch segment bytes]
-    H --> I{fetch OK?}
-    I -- error --> J[is_appending = false\nreturn]
-    I -- ok --> K[register one-shot updateend listener\non SourceBuffer]
-    K --> L[source_buffer.appendBuffer(bytes)]
-    L --> M([updateend fires])
-    M --> N[is_appending = false\nnext_seg += 1]
-    N --> A
+stateDiagram-v2
+    [*] --> Idle : pump_loop starts
+
+    Idle --> Fetching : TopUp/AppendComplete → try_start_fetch() succeeds
+    Idle --> Idle : TopUp/AppendComplete → buffer full or end-of-stream
+
+    Fetching --> Appending : FetchComplete → generation matches → appendBuffer OK
+    Fetching --> Idle : FetchComplete → generation mismatch (stale)
+    Fetching --> Idle : FetchFailed
+    Fetching --> Idle : Seek → generation bumped
+
+    Appending --> Idle : AppendComplete → next_seg += 1
+    Appending --> Idle : Seek → generation bumped
+
+    Idle --> [*] : Shutdown
+    Fetching --> [*] : Shutdown
+    Appending --> [*] : Shutdown
 ```
 
-**Back-buffer trimming** happens in the `seeked` handler: when a seek lands outside the
-buffered range, `source_buffer.remove(0, current_time - MSE_BACK_BUFFER_S)` is called
-before resetting `next_seg`.
+**Key improvements over the previous `pump_segments` function:**
+
+1. **No memory leaks** — the persistent `updateend` closure is stored in `MseState`
+   and properly removed on cleanup, instead of one-shot closures being `.forget()`-ed.
+2. **Non-blocking seek handling** — fetch tasks run independently; the pump loop can
+   process `Seek` messages immediately even while a fetch is in-flight.
+3. **Retry with back-off** — failed fetches are retried up to 3 times with exponential
+   back-off (500 ms → 1 s → 2 s) before reporting `FetchFailed`.
+4. **Generation-based staleness** — every `Seek` increments `generation`; stale
+   `FetchComplete` messages are silently discarded.
+
+**Back-buffer trimming** is performed inside `handle_pump_seek()`: when a seek
+occurs, `source_buffer.remove(0, current_time - MSE_BACK_BUFFER_S)` is called
+(if the source buffer is not already updating).
 
 ---
 
@@ -248,10 +291,10 @@ flowchart LR
     V --> B{new time already buffered?}
     B -- yes --> P([video resumes playing])
     B -- no --> E[seeked event fires]
-    E --> TR[trim back-buffer\nremove 0..current_time-5s]
-    TR --> R[reset next_seg\nis_appending = false]
-    R --> PMP[pump_segments]
-    PMP --> P
+    E --> CH[send PumpMsg::Seek\nthrough channel]
+    CH --> HS[handle_pump_seek:\nbump generation\ntrim back-buffer\nreset next_seg]
+    HS --> F[try_start_fetch → Fetching]
+    F --> P
 ```
 
 `snap_to_cached_segment` maps the seek target to the server's pre-cache grid.
@@ -302,7 +345,7 @@ A single `gloo_timers::callback::Interval` fires every 150 ms (registered once v
 | Update `is_playing` | `!video.paused()` |
 | Update `is_buffering` | `video.ready_state() < 3 && !video.paused()` |
 | Update `video_ended` | `video.ended()` |
-| Top up MSE buffer | `pump_segments(mse_state, video)` |
+| Top up MSE buffer | Send `PumpMsg::TopUp` through the channel |
 
 ---
 
@@ -312,9 +355,9 @@ A single `gloo_timers::callback::Interval` fires every 150 ms (registered once v
 
 | Event | Handler | Action |
 |---|---|---|
-| `onclick` | `on_video_click` | Single click → play/pause after 300 ms (debounced for double-tap detection). Double-click in left/right third → seek ±10 s. |
+| `onclick` | `on_video_click` | Single click → play/pause after 300 ms (debounced for double-tap detection via `Option<f64>`). Double-click in left/right third → seek ±10 s. |
 | `ondblclick` | `on_video_dblclick` | Toggle fullscreen. |
-| `seeked` | (raw event listener) | Detect out-of-buffer seeks; reset MSE `next_seg` and re-pump. |
+| `seeked` | (raw event listener) | Detect out-of-buffer seeks; send `PumpMsg::Seek(time)` through the channel. |
 
 ### 9.2 Progress bar events
 
@@ -384,24 +427,31 @@ A single `gloo_timers::callback::Interval` fires every 150 ms (registered once v
 
 ## 11. Known Complexity & Refactor Notes
 
-### 11.1 Single monolithic function component
-The entire player is one `#[function_component]` function (~1,600 lines).
-All state, effects, and callbacks are defined inline with liberal `clone()` chains.
-Suggested split:
-- `MsePlayer` — owns `mse_state`, playlist fetching, `pump_segments`, seek logic.
-- `ControlBar` — owns all control callbacks and UI state.
-- `ProgressBar` — owns drag/hover/thumbnail state.
-- `VideoPlayer` (shell) — composes the above with props passing.
+### 11.1 ~~Single monolithic function component~~ ✅ Resolved
+~~The entire player is one `#[function_component]` function (~1,600 lines).
+All state, effects, and callbacks are defined inline with liberal `clone()` chains.~~
+
+The player is now split into three components:
+- **`ProgressBar`** — presentational component for the progress bar area
+  (progress track, buffered/played bars, hover line, thumb, thumbnail preview).
+- **`ControlBar`** — presentational component for the bottom controls
+  (play/pause, volume, time, speed menu, quality menu, captions, fullscreen);
+  embeds `ProgressBar`.
+- **`VideoPlayer`** (shell) — owns all state, effects, and MSE logic; composes
+  `ControlBar` and passes state/callbacks as props.
 
 ### 11.2 ~~`is_appending` guard vs. `updateend`~~ ✅ Resolved
 ~~`pump_segments` relies on the `updateend` closure to reset `is_appending` and
 re-call itself. This creates a chain of one-shot closures. If `updateend` fires
 twice (or not at all on error), the pump stalls.~~
 
-The `updateend` callback now checks the `generation` counter before committing
-the append result, making the one-shot closure chain resilient to interleaved
-seeks.  Stale callbacks (from a previous generation) discard their result and
-re-pump with the current segment pointer.
+Replaced with a **channel-driven async state machine** (`pump_loop`) using
+`futures::channel::mpsc::unbounded()`.  A single persistent `updateend`
+listener sends `PumpMsg::AppendComplete` through the channel.  The pump loop
+processes messages with a clear `Idle → Fetching → Appending` state machine.
+No closures are `.forget()`-ed; the persistent listener is stored in `MseState`
+and properly removed on cleanup.  Fetch tasks run independently via
+`spawn_local`, so seeks are processed immediately even during in-flight fetches.
 
 ### 11.3 ~~Fullscreen state is tracked manually~~ ✅ Resolved
 ~~`is_fullscreen` is set synchronously in the click/keyboard handlers but is **not**

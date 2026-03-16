@@ -234,15 +234,20 @@ fn remux_segment(
     if let Some(ref a_params) = in_audio_params {
         let audio_codec_id = a_params.id();
         let enc = ffmpeg_next::encoder::find(audio_codec_id);
-        if let Some(out_audio) = octx.add_stream(enc).ok() {
-            unsafe {
-                ffmpeg_next::ffi::avcodec_parameters_copy(
-                    out_audio.parameters().as_mut_ptr(),
-                    a_params.as_ptr(),
-                );
+        match octx.add_stream(enc) {
+            Ok(out_audio) => {
+                unsafe {
+                    ffmpeg_next::ffi::avcodec_parameters_copy(
+                        out_audio.parameters().as_mut_ptr(),
+                        a_params.as_ptr(),
+                    );
+                }
+                out_audio_tb = out_audio.time_base();
+                out_audio_idx_val = Some(out_audio.index());
             }
-            out_audio_tb = out_audio.time_base();
-            out_audio_idx_val = Some(out_audio.index());
+            Err(e) => {
+                eprintln!("[remux] failed to add audio stream (codec {:?}): {e}", audio_codec_id);
+            }
         }
     }
 
@@ -254,6 +259,10 @@ fn remux_segment(
     let out_audio_tb = out_audio_idx_val.map(|i| octx.stream(i).unwrap().time_base()).unwrap_or(out_audio_tb);
 
     let mut got_video_keyframe = false;
+    // PTS offsets (in output time base) used to rebase timestamps so each
+    // segment starts near PTS 0, preventing A/V desync in HLS players.
+    let mut video_pts_offset: Option<i64> = None;
+    let mut audio_pts_offset: Option<i64> = None;
 
     for (stream, mut packet) in ictx.packets() {
         let si = stream.index();
@@ -293,9 +302,29 @@ fn remux_segment(
         if is_video {
             packet.set_stream(out_video_idx);
             packet.rescale_ts(in_video_tb, out_video_tb);
+            // Record the first video PTS as the offset to rebase to zero.
+            if video_pts_offset.is_none() {
+                video_pts_offset = packet.pts();
+            }
+            if let (Some(offset), Some(p)) = (video_pts_offset, packet.pts()) {
+                packet.set_pts(Some(p - offset));
+            }
+            if let (Some(offset), Some(d)) = (video_pts_offset, packet.dts()) {
+                packet.set_dts(Some(d - offset));
+            }
         } else if let Some(out_ai) = out_audio_idx_val {
             packet.set_stream(out_ai);
             packet.rescale_ts(in_audio_tb.unwrap(), out_audio_tb);
+            // Record the first audio PTS as the offset to rebase to zero.
+            if audio_pts_offset.is_none() {
+                audio_pts_offset = packet.pts();
+            }
+            if let (Some(offset), Some(p)) = (audio_pts_offset, packet.pts()) {
+                packet.set_pts(Some(p - offset));
+            }
+            if let (Some(offset), Some(d)) = (audio_pts_offset, packet.dts()) {
+                packet.set_dts(Some(d - offset));
+            }
         } else {
             continue;
         }
@@ -526,49 +555,83 @@ fn transcode_segment_body(
             audio_time_base = aud_stream.time_base();
             let aud_params = aud_stream.parameters();
 
-            if let Ok(aud_ctx) = ffmpeg_next::codec::context::Context::from_parameters(aud_params) {
-                if let Ok(dec) = aud_ctx.decoder().audio() {
-                    audio_sample_rate = dec.rate();
-                    let dec_format = dec.format();
-                    let dec_layout = dec.channel_layout();
+            match ffmpeg_next::codec::context::Context::from_parameters(aud_params) {
+                Ok(aud_ctx) => match aud_ctx.decoder().audio() {
+                    Ok(dec) => {
+                        audio_sample_rate = dec.rate();
+                        let dec_format = dec.format();
+                        let dec_layout = dec.channel_layout();
 
-                    let aac_codec = ffmpeg_next::encoder::find_by_name("aac");
-                    if let Some(aac) = aac_codec {
-                        let enc_format = ffmpeg_next::format::Sample::F32(
-                            ffmpeg_next::format::sample::Type::Planar,
-                        );
-                        let aac_ctx = ffmpeg_next::codec::context::Context::new_with_codec(aac);
-                        if let Ok(mut aac_enc) = aac_ctx.encoder().audio() {
-                            aac_enc.set_rate(dec.rate() as i32);
-                            aac_enc.set_channel_layout(dec_layout);
-                            aac_enc.set_format(enc_format);
-                            aac_enc.set_bit_rate(128_000);
-                            aac_enc.set_time_base(ffmpeg_next::Rational::new(1, dec.rate() as i32));
+                        // Downmix to stereo if source is multi-channel because
+                        // the native AAC encoder only reliably supports mono and stereo.
+                        let enc_layout = if dec_layout.channels() > 2 {
+                            ffmpeg_next::channel_layout::ChannelLayout::STEREO
+                        } else {
+                            dec_layout
+                        };
 
-                            if let Ok(opened) = aac_enc.open_as(aac) {
-                                let mut out_aud_stream = octx.add_stream(aac)
-                                    .map_err(|e| format!("add audio stream: {e}"))?;
-                                out_aud_stream.set_parameters(&opened);
-                                out_audio_idx = Some(out_aud_stream.index());
+                        let aac_codec = ffmpeg_next::encoder::find_by_name("aac");
+                        if let Some(aac) = aac_codec {
+                            let enc_format = ffmpeg_next::format::Sample::F32(
+                                ffmpeg_next::format::sample::Type::Planar,
+                            );
+                            let aac_ctx = ffmpeg_next::codec::context::Context::new_with_codec(aac);
+                            match aac_ctx.encoder().audio() {
+                                Ok(mut aac_enc) => {
+                                    aac_enc.set_rate(dec.rate() as i32);
+                                    aac_enc.set_channel_layout(enc_layout);
+                                    aac_enc.set_format(enc_format);
+                                    aac_enc.set_bit_rate(128_000);
+                                    aac_enc.set_time_base(ffmpeg_next::Rational::new(1, dec.rate() as i32));
 
-                                // Create resampler: decoder format → AAC's
-                                // required FLTP.  Also handles channel layout
-                                // and sample rate normalization.
-                                let resampler = ffmpeg_next::software::resampling::Context::get(
-                                    dec_format,
-                                    dec_layout,
-                                    dec.rate(),
-                                    enc_format,
-                                    dec_layout,
-                                    dec.rate(),
-                                ).ok();
+                                    match aac_enc.open_as(aac) {
+                                        Ok(opened) => {
+                                            let mut out_aud_stream = octx.add_stream(aac)
+                                                .map_err(|e| format!("add audio stream: {e}"))?;
+                                            out_aud_stream.set_parameters(&opened);
+                                            out_audio_idx = Some(out_aud_stream.index());
 
-                                audio_resampler = resampler;
-                                audio_encoder_handle = Some(opened);
-                                audio_decoder = Some(dec);
+                                            // Create resampler: decoder format → AAC's required FLTP.
+                                            // Also handles channel layout downmix and sample rate normalization.
+                                            match ffmpeg_next::software::resampling::Context::get(
+                                                dec_format,
+                                                dec_layout,
+                                                dec.rate(),
+                                                enc_format,
+                                                enc_layout,
+                                                dec.rate(),
+                                            ) {
+                                                Ok(r) => {
+                                                    audio_resampler = Some(r);
+                                                    audio_encoder_handle = Some(opened);
+                                                    audio_decoder = Some(dec);
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[transcode] failed to create audio resampler: {e}");
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[transcode] failed to open AAC encoder (channels={}, layout={:?}): {e}",
+                                                enc_layout.channels(),
+                                                enc_layout
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[transcode] failed to initialize AAC encoder context for stream {aud_idx}: {e}");
+                                }
                             }
                         }
                     }
+                    Err(e) => {
+                        eprintln!("[transcode] failed to open audio decoder for stream {aud_idx}: {e}");
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[transcode] failed to create audio decoder context for stream {aud_idx}: {e}");
                 }
             }
         }

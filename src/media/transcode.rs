@@ -171,13 +171,21 @@ fn frame_channel_layout(frame: &ffmpeg_next::frame::Audio) -> ffmpeg_next::chann
         return layout;
     }
     // The frame data has channels but no layout metadata.  Use the channel
-    // count from the frame (read via FFI since the high-level API may also
-    // return 0 from channel_layout().channels()).
+    // count from the frame.  `Audio::channels()` reads from the high-level
+    // wrapper; if that also returns 0 (e.g. the wrapper reads from
+    // ch_layout.nb_channels before the layout is fully initialised), fall
+    // through to the raw AVFrame field.
     let ch = frame.channels() as i32;
     let ch = if ch > 0 { ch } else {
-        // Last resort: read nb_channels from the raw AVFrame.
+        // FFI fallback: read nb_channels directly from the raw AVFrame.
+        // This can differ from the wrapper when ch_layout.order is
+        // AV_CHANNEL_ORDER_UNSPEC but nb_channels is still set.
         let raw_ch = unsafe { (*frame.as_ptr()).ch_layout.nb_channels };
-        if raw_ch > 0 { raw_ch } else { 2 }
+        if raw_ch > 0 { raw_ch } else {
+            // All detection methods failed — default to stereo as a safe
+            // baseline since virtually all media players handle stereo.
+            2
+        }
     };
     ffmpeg_next::channel_layout::ChannelLayout::default(ch)
 }
@@ -221,7 +229,13 @@ fn encode_audio_frame(
         ffmpeg_next::format::Sample::F64(_) => 8,
         ffmpeg_next::format::Sample::I16(_) => 2,
         ffmpeg_next::format::Sample::I32(_) => 4,
-        _ => 4, // default to 4 for unknown
+        other => {
+            // Should not happen in practice (AAC encoder requires FLTP →
+            // F32 Planar, so the resampler always outputs that).  Default
+            // to 4 bytes (32-bit) as a best guess.
+            eprintln!("[audio] unexpected sample format {other:?}, assuming 4 bytes/sample");
+            4
+        }
     };
     let is_planar = frame.is_planar();
     let mut written = 0u32;
@@ -257,6 +271,7 @@ fn encode_audio_frame(
         unsafe {
             let chunk_frame = ffmpeg_next::ffi::av_frame_alloc();
             if chunk_frame.is_null() {
+                eprintln!("[audio] av_frame_alloc failed (out of memory)");
                 break;
             }
             (*chunk_frame).format = (*frame.as_ptr()).format;
@@ -272,6 +287,7 @@ fn encode_audio_frame(
             // Allocate sample buffers.
             let ret = ffmpeg_next::ffi::av_frame_get_buffer(chunk_frame, 0);
             if ret < 0 {
+                eprintln!("[audio] av_frame_get_buffer failed (error {ret})");
                 ffmpeg_next::ffi::av_frame_free(&mut (chunk_frame as *mut _));
                 break;
             }

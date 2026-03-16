@@ -323,7 +323,6 @@ fn design_aero() -> DesignConfig {
             ".filters{ backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); border-width: 1px; }\n",
             ".notice{ backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }\n",
             ".section-header{ border-bottom-width: 1px; }\n",
-            ".card__top{ border-radius: 16px 16px 0 0; }\n",
             ".scan-btn{ border-width: 1px; }\n",
             ".random-btn{ border-width: 1px; }\n",
             ".scroll-top-btn{ border-width: 1px; border-radius: 50%; }\n",

@@ -1156,7 +1156,7 @@ body{
   font-size: 13px;
   padding: 8px 10px;
   background: rgba(0,0,0,.06);
-  border: 1.5px solid rgba(0,0,0,.2);
+  border: var(--border-width, 1.5px) solid rgba(0,0,0,.2);
   border-radius: var(--radius, 2px);
   color: var(--text, #1a1a1a);
   outline: none;
@@ -1207,10 +1207,10 @@ body{
   margin: 2px 0 0;
   padding: 4px 0;
   list-style: none;
-  background: var(--card-bg, #fff);
-  border: 1.5px solid rgba(0,0,0,.2);
+  background: #fff;
+  border: var(--border-width, 1.5px) solid rgba(0,0,0,.2);
   border-radius: var(--radius, 2px);
-  box-shadow: 0 4px 12px rgba(0,0,0,.12);
+  box-shadow: var(--shadow, 0 4px 12px rgba(0,0,0,.12));
   max-height: 180px;
   overflow-y: auto;
 }
@@ -1383,9 +1383,9 @@ body{
   border-color: var(--border);
 }
 .app.dark-mode .meta-suggestions{
-  background: var(--card-bg, #1e1e1e);
+  background: var(--card-top-bg, #1e1e1e);
   border-color: var(--input-border);
-  box-shadow: 0 4px 14px rgba(0,0,0,.4);
+  box-shadow: var(--shadow, 0 4px 14px rgba(0,0,0,.5));
 }
 .app.dark-mode .meta-suggestions__item{
   color: var(--text);

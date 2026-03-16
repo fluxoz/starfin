@@ -31,6 +31,11 @@ use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash::{SaltStrin
 /// Set the `THEME` environment variable to one of: `jetson` (default), `nord`,
 /// `catppuccin`, or `dracula`.
 ///
+/// ### Preset designs
+/// Set the `DESIGN` environment variable to one of: `editorial` (default),
+/// `neubrutalist`, or `aero`.  Designs control the UX style language
+/// (typography, geometry, effects) and are composable with any color theme.
+///
 /// ### Custom themes
 /// Point `THEME_FILE` at a TOML file to use a fully custom palette.  See the
 /// bundled `themes/example.toml` for the file format.
@@ -38,6 +43,10 @@ use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash::{SaltStrin
 #[derive(Clone, Debug, Deserialize)]
 struct ThemeMeta {
     name: String,
+    /// Optional design preset name (e.g. "neubrutalist", "aero").
+    /// Overridden by the `DESIGN` environment variable.
+    #[serde(default)]
+    design: Option<String>,
 }
 
 /// One mode (light or dark) of a theme — each field maps directly to a CSS
@@ -71,9 +80,38 @@ struct ThemeMode {
     empty_bg: Option<String>,
 }
 
+/// Design tokens control the structural UX appearance: typography, geometry,
+/// and visual effects.  Each field maps to a CSS custom property.  All fields
+/// are optional — omitted values keep the built-in editorial defaults from
+/// `main.css`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct DesignTokens {
+    font_body: Option<String>,
+    font_heading: Option<String>,
+    border_width: Option<String>,
+    heading_transform: Option<String>,
+    heading_spacing: Option<String>,
+    heading_weight: Option<String>,
+}
+
+/// A design defines the UX style language — typography, geometry, and visual
+/// effects.  Designs are composable with any color theme.
+struct DesignConfig {
+    name: String,
+    /// CSS custom property declarations for the design tokens.
+    tokens: DesignTokens,
+    /// Additional CSS rules specific to this design (structural overrides
+    /// that cannot be expressed as simple custom properties).
+    extra_css: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct ThemeConfig {
     meta: ThemeMeta,
+    /// Custom design token overrides from the TOML `[design]` section.
+    #[serde(default)]
+    design: DesignTokens,
     #[serde(default)]
     light: ThemeMode,
     #[serde(default)]
@@ -163,11 +201,169 @@ impl ThemeConfig {
     }
 }
 
+impl DesignTokens {
+    /// Emit CSS custom property declarations for every design token that is `Some`.
+    fn to_css_declarations(&self) -> String {
+        let mut out = String::new();
+        let fields: &[(&str, &Option<String>)] = &[
+            ("--font-body",         &self.font_body),
+            ("--font-heading",      &self.font_heading),
+            ("--border-width",      &self.border_width),
+            ("--heading-transform", &self.heading_transform),
+            ("--heading-spacing",   &self.heading_spacing),
+            ("--heading-weight",    &self.heading_weight),
+        ];
+        for (prop, value) in fields {
+            if let Some(v) = value {
+                let sanitized = sanitize_css_value(v);
+                out.push_str(&format!("  {}: {};\n", prop, sanitized));
+            }
+        }
+        out
+    }
+
+    /// Merge another set of tokens on top, overriding only the fields that are
+    /// `Some` in `overrides`.
+    fn merge(&mut self, overrides: &DesignTokens) {
+        if overrides.font_body.is_some()         { self.font_body = overrides.font_body.clone(); }
+        if overrides.font_heading.is_some()      { self.font_heading = overrides.font_heading.clone(); }
+        if overrides.border_width.is_some()      { self.border_width = overrides.border_width.clone(); }
+        if overrides.heading_transform.is_some() { self.heading_transform = overrides.heading_transform.clone(); }
+        if overrides.heading_spacing.is_some()   { self.heading_spacing = overrides.heading_spacing.clone(); }
+        if overrides.heading_weight.is_some()    { self.heading_weight = overrides.heading_weight.clone(); }
+    }
+}
+
+impl DesignConfig {
+    /// Generate a CSS stylesheet for this design.  Includes custom property
+    /// declarations in `:root` and any additional structural CSS rules.
+    fn to_css(&self) -> String {
+        let decls = self.tokens.to_css_declarations();
+        if decls.is_empty() && self.extra_css.is_empty() {
+            return String::new();
+        }
+        let mut css = format!("/* Design: {} */\n", self.name);
+        if !decls.is_empty() {
+            css.push_str(":root{\n");
+            css.push_str(&decls);
+            css.push_str("}\n");
+        }
+        if !self.extra_css.is_empty() {
+            css.push_str(&self.extra_css);
+            css.push('\n');
+        }
+        css
+    }
+}
+
+// ── Design presets ────────────────────────────────────────────────────────────
+
+/// Built-in "Editorial" design — the default.  Monospace typography, uppercase
+/// headings, thick borders, and a technical/industrial feel.  Returns empty CSS
+/// so `main.css` defaults apply unchanged.
+fn design_editorial() -> DesignConfig {
+    DesignConfig {
+        name: "Editorial".into(),
+        tokens: DesignTokens::default(),
+        extra_css: String::new(),
+    }
+}
+
+/// Built-in "Neubrutalist" design — bold system-ui sans-serif typography, zero
+/// border-radius, extra-thick borders, and hard offset drop shadows.
+fn design_neubrutalist() -> DesignConfig {
+    DesignConfig {
+        name: "Neubrutalist".into(),
+        tokens: DesignTokens {
+            font_body:         Some("system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif".into()),
+            font_heading:      Some("system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif".into()),
+            border_width:      Some("3px".into()),
+            heading_transform: Some("uppercase".into()),
+            heading_spacing:   Some("1px".into()),
+            heading_weight:    Some("900".into()),
+        },
+        extra_css: concat!(
+            "/* Neubrutalist structural overrides */\n",
+            ":root{ --radius: 0px; --shadow: 5px 5px 0 rgba(0,0,0,.25); }\n",
+            ".card{ box-shadow: 5px 5px 0 var(--card-border); }\n",
+            ".btn,.chip[aria-pressed=\"true\"]{ box-shadow: 3px 3px 0 rgba(0,0,0,.3); }\n",
+            ".btn:hover{ transform: translate(1px,1px); box-shadow: 2px 2px 0 rgba(0,0,0,.3); }\n",
+            ".input,.select{ box-shadow: 3px 3px 0 var(--input-border); }\n",
+            ".badge{ box-shadow: 2px 2px 0 rgba(0,0,0,.2); }\n",
+            ".scroll-top-btn{ box-shadow: 4px 4px 0 rgba(0,0,0,.3); }\n",
+            ".section-header{ border-bottom-width: 4px; }\n",
+            ".app.dark-mode{ --shadow: 5px 5px 0 rgba(0,0,0,.5); }\n",
+            ".app.dark-mode .card{ box-shadow: 5px 5px 0 var(--card-border); }\n",
+            ".app.dark-mode .btn,.app.dark-mode .chip[aria-pressed=\"true\"]{ box-shadow: 3px 3px 0 rgba(255,255,255,.1); }\n",
+            ".app.dark-mode .btn:hover{ box-shadow: 2px 2px 0 rgba(255,255,255,.1); }\n",
+            ".app.dark-mode .input,.app.dark-mode .select{ box-shadow: 3px 3px 0 var(--input-border); }\n",
+        ).into(),
+    }
+}
+
+/// Built-in "Aero" design — glass morphism inspired by Y2K / early-2000s
+/// aesthetics (think Nokia, Aqua, Windows Vista).  Rounded corners, translucent
+/// panels with backdrop-filter blur, and soft shadows.
+fn design_aero() -> DesignConfig {
+    DesignConfig {
+        name: "Aero".into(),
+        tokens: DesignTokens {
+            font_body:         Some("system-ui, -apple-system, 'Segoe UI', Tahoma, sans-serif".into()),
+            font_heading:      Some("system-ui, -apple-system, 'Segoe UI', Tahoma, sans-serif".into()),
+            border_width:      Some("1px".into()),
+            heading_transform: Some("none".into()),
+            heading_spacing:   Some("0.5px".into()),
+            heading_weight:    Some("600".into()),
+        },
+        extra_css: concat!(
+            "/* Aero / Glass Y2K structural overrides */\n",
+            ":root{ --radius: 16px; --shadow: 0 8px 32px rgba(0,0,0,.10); }\n",
+            ".card{ backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); }\n",
+            ".topbar{ backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }\n",
+            ".filters{ backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); border-width: 1px; }\n",
+            ".notice{ backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }\n",
+            ".section-header{ border-bottom-width: 1px; }\n",
+            ".card__top{ border-radius: 16px 16px 0 0; }\n",
+            ".scan-btn{ border-width: 1px; }\n",
+            ".random-btn{ border-width: 1px; }\n",
+            ".scroll-top-btn{ border-width: 1px; border-radius: 50%; }\n",
+            ".app.dark-mode{ --shadow: 0 8px 32px rgba(0,0,0,.30); }\n",
+        ).into(),
+    }
+}
+
+/// Resolve the active design from environment variables and theme config.
+///
+/// * `DESIGN` — preset name: `editorial` (default), `neubrutalist`, `aero`.
+///   Takes precedence over the TOML `meta.design` field.
+/// * Custom tokens from the TOML `[design]` section are merged on top of the
+///   selected preset.
+fn resolve_design(theme: &ThemeConfig) -> DesignConfig {
+    let name = std::env::var("DESIGN")
+        .ok()
+        .or_else(|| theme.meta.design.clone())
+        .unwrap_or_default()
+        .to_lowercase();
+
+    let mut design = match name.as_str() {
+        "neubrutalist" | "brutalist" => { info!(design = "Neubrutalist", "using design preset"); design_neubrutalist() }
+        "aero" | "glass" | "y2k"    => { info!(design = "Aero", "using design preset"); design_aero() }
+        "editorial"                  => { info!(design = "Editorial", "using design preset"); design_editorial() }
+        _                            => { info!(design = "Editorial", "using default design"); design_editorial() }
+    };
+
+    // Merge any custom token overrides from the TOML [design] section.
+    design.tokens.merge(&theme.design);
+
+    design
+}
+
 /// Built-in "Jetson" theme — the default.  Returns an empty CSS string because
 /// `main.css` already defines these values.
 fn theme_jetson() -> ThemeConfig {
     ThemeConfig {
-        meta: ThemeMeta { name: "Jetson".into() },
+        meta: ThemeMeta { name: "Jetson".into(), design: None },
+        design: DesignTokens::default(),
         light: ThemeMode::default(),
         dark: ThemeMode::default(),
     }
@@ -177,7 +373,8 @@ fn theme_jetson() -> ThemeConfig {
 /// popular Nord color scheme.
 fn theme_nord() -> ThemeConfig {
     ThemeConfig {
-        meta: ThemeMeta { name: "Nord".into() },
+        meta: ThemeMeta { name: "Nord".into(), design: None },
+        design: DesignTokens::default(),
         light: ThemeMode {
             bg:            Some("#eceff4".into()),
             panel:         Some("rgba(46,52,64,.04)".into()),
@@ -233,7 +430,8 @@ fn theme_nord() -> ThemeConfig {
 /// Catppuccin project (Latte for light, Mocha for dark).
 fn theme_catppuccin() -> ThemeConfig {
     ThemeConfig {
-        meta: ThemeMeta { name: "Catppuccin".into() },
+        meta: ThemeMeta { name: "Catppuccin".into(), design: None },
+        design: DesignTokens::default(),
         light: ThemeMode {
             bg:            Some("#eff1f5".into()),
             panel:         Some("rgba(76,79,105,.04)".into()),
@@ -288,7 +486,8 @@ fn theme_catppuccin() -> ThemeConfig {
 /// Built-in "Dracula" theme — the popular purple/pink/green dark-first palette.
 fn theme_dracula() -> ThemeConfig {
     ThemeConfig {
-        meta: ThemeMeta { name: "Dracula".into() },
+        meta: ThemeMeta { name: "Dracula".into(), design: None },
+        design: DesignTokens::default(),
         light: ThemeMode {
             bg:            Some("#f8f8f2".into()),
             panel:         Some("rgba(40,42,54,.04)".into()),
@@ -344,7 +543,8 @@ fn theme_dracula() -> ThemeConfig {
 ///
 /// * `THEME` — preset name: `jetson`, `nord`, `catppuccin`, `dracula`.
 /// * `THEME_FILE` — path to a user-supplied TOML file (takes precedence over
-///   `THEME` if both are set).
+///   `THEME` if both are set).  May also include a `[design]` section and
+///   `meta.design` field to select or customise the UX design.
 fn resolve_theme() -> ThemeConfig {
     /// Maximum theme file size (100 KiB) — prevents DoS via oversized files.
     const MAX_THEME_FILE_SIZE: u64 = 100 * 1024;
@@ -3030,9 +3230,17 @@ async fn main() -> std::io::Result<()> {
         info!("password protection: disabled");
     }
 
-    // ── Theme ─────────────────────────────────────────────────────────────
+    // ── Theme & Design ──────────────────────────────────────────────────
     let theme = resolve_theme();
-    let theme_css = theme.to_css();
+    let design = resolve_design(&theme);
+    let design_css = design.to_css();
+    let theme_css_raw = theme.to_css();
+    // Design CSS is loaded first so theme colors can override design defaults.
+    let theme_css = if design_css.is_empty() {
+        theme_css_raw
+    } else {
+        format!("{}{}", design_css, theme_css_raw)
+    };
 
     let state = web::Data::new(AppState {
         library_path: library_path.clone(),
@@ -3508,6 +3716,77 @@ accent = "#123456"
             sanitize_css_value("2px solid rgba(0,0,0,.3)"),
             "2px solid rgba(0,0,0,.3)"
         );
+    }
+
+    // ── Design tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn editorial_design_produces_empty_css() {
+        let design = design_editorial();
+        assert_eq!(design.name, "Editorial");
+        assert!(design.to_css().is_empty(), "Editorial (default) should emit no CSS");
+    }
+
+    #[test]
+    fn neubrutalist_design_produces_css() {
+        let design = design_neubrutalist();
+        let css = design.to_css();
+        assert!(css.contains("/* Design: Neubrutalist */"));
+        assert!(css.contains("--font-body:"));
+        assert!(css.contains("--border-width: 3px"));
+        assert!(css.contains("--radius: 0px"));
+        // Structural overrides present.
+        assert!(css.contains("box-shadow:"));
+    }
+
+    #[test]
+    fn aero_design_produces_css() {
+        let design = design_aero();
+        let css = design.to_css();
+        assert!(css.contains("/* Design: Aero */"));
+        assert!(css.contains("--font-body:"));
+        assert!(css.contains("--border-width: 1px"));
+        assert!(css.contains("--radius: 16px"));
+        assert!(css.contains("backdrop-filter:"));
+    }
+
+    #[test]
+    fn design_tokens_merge() {
+        let mut base = DesignTokens {
+            font_body: Some("monospace".into()),
+            border_width: Some("2px".into()),
+            ..Default::default()
+        };
+        let overrides = DesignTokens {
+            border_width: Some("5px".into()),
+            heading_weight: Some("400".into()),
+            ..Default::default()
+        };
+        base.merge(&overrides);
+        assert_eq!(base.font_body.as_deref(), Some("monospace"));
+        assert_eq!(base.border_width.as_deref(), Some("5px"));
+        assert_eq!(base.heading_weight.as_deref(), Some("400"));
+    }
+
+    #[test]
+    fn toml_with_design_section_parses() {
+        let toml_str = r##"
+[meta]
+name = "Design Test"
+design = "aero"
+
+[design]
+font_body = "system-ui, sans-serif"
+
+[light]
+accent = "#123456"
+"##;
+        let config: ThemeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.meta.name, "Design Test");
+        assert_eq!(config.meta.design.as_deref(), Some("aero"));
+        assert_eq!(config.design.font_body.as_deref(), Some("system-ui, sans-serif"));
+        let css = config.to_css();
+        assert!(css.contains("--accent: #123456"));
     }
 }
 

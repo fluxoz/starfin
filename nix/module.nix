@@ -16,6 +16,7 @@
 #               bindAddr = "0.0.0.0";
 #               openFirewall = true;
 #               theme = "nord";          # or "catppuccin", "dracula", "jetson"
+#               design = "editorial";    # or "neubrutalist", "aero"
 #               # themeFile = ./my-theme.toml;   # fully custom TOML theme
 #             };
 #           }
@@ -110,6 +111,23 @@ in
       '';
     };
 
+    design = mkOption {
+      type = types.enum [ "editorial" "neubrutalist" "aero" ];
+      default = "editorial";
+      example = "neubrutalist";
+      description = ''
+        UX design (style language).  Controls typography, geometry, and
+        visual effects independently of the color theme.
+
+        - **editorial** – monospace, uppercase, thick borders (default)
+        - **neubrutalist** – sans-serif, zero radius, hard shadows
+        - **aero** – glass morphism, rounded, translucent (Y2K aesthetic)
+
+        Designs are composable with any color theme
+        (`DESIGN` environment variable).
+      '';
+    };
+
     themeFile = mkOption {
       type = types.nullOr types.path;
       default = null;
@@ -184,6 +202,7 @@ in
         VIDEO_LIBRARY_PATH = toString cfg.videoLibraryPath;
         CACHE_DIR = toString cfg.cacheDir;
         THEME = cfg.theme;
+        DESIGN = cfg.design;
       } // (lib.optionalAttrs cfg.passwordProtection {
         PASSWORD_PROTECTION = "true";
       }) // (lib.optionalAttrs (cfg.themeFile != null) {

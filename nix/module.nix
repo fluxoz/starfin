@@ -15,6 +15,8 @@
 #               videoLibraryPath = "/mnt/videos";
 #               bindAddr = "0.0.0.0";
 #               openFirewall = true;
+#               theme = "nord";          # or "catppuccin", "dracula", "jetson"
+#               # themeFile = ./my-theme.toml;   # fully custom TOML theme
 #             };
 #           }
 #         ];
@@ -91,6 +93,34 @@ in
       '';
     };
 
+    theme = mkOption {
+      type = types.enum [ "jetson" "nord" "catppuccin" "dracula" ];
+      default = "jetson";
+      example = "nord";
+      description = ''
+        UI color theme.  Starfin ships with four built-in presets:
+
+        - **jetson** – warm beige with orange accents (default)
+        - **nord** – Arctic, cool-blue toned (Nord color scheme)
+        - **catppuccin** – soothing pastels (Catppuccin Latte / Mocha)
+        - **dracula** – purple / pink dark-first palette
+
+        Set to a preset name, or use `themeFile` for a fully custom TOML
+        theme (`THEME` environment variable).
+      '';
+    };
+
+    themeFile = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      example = literalExpression "./my-theme.toml";
+      description = ''
+        Path to a custom TOML theme file.  When set this takes precedence
+        over the `theme` option.  See `themes/example.toml` in the Starfin
+        repository for the file format (`THEME_FILE` environment variable).
+      '';
+    };
+
     user = mkOption {
       type = types.str;
       default = "starfin";
@@ -153,8 +183,11 @@ in
         BIND_ADDR = cfg.bindAddr;
         VIDEO_LIBRARY_PATH = toString cfg.videoLibraryPath;
         CACHE_DIR = toString cfg.cacheDir;
+        THEME = cfg.theme;
       } // (lib.optionalAttrs cfg.passwordProtection {
         PASSWORD_PROTECTION = "true";
+      }) // (lib.optionalAttrs (cfg.themeFile != null) {
+        THEME_FILE = toString cfg.themeFile;
       }) // cfg.extraEnvironment;
 
       serviceConfig = {

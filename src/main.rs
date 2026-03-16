@@ -22,6 +22,380 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash::{SaltString, rand_core::OsRng}};
 
+// ── Theme system ─────────────────────────────────────────────────────────────
+
+/// TOML-based theme configuration.  A theme defines CSS custom properties for
+/// both light and dark modes, giving end-users full control over the UI palette.
+///
+/// ### Preset themes
+/// Set the `THEME` environment variable to one of: `jetson` (default), `nord`,
+/// `catppuccin`, or `dracula`.
+///
+/// ### Custom themes
+/// Point `THEME_FILE` at a TOML file to use a fully custom palette.  See the
+/// bundled `themes/example.toml` for the file format.
+
+#[derive(Clone, Debug, Deserialize)]
+struct ThemeMeta {
+    name: String,
+}
+
+/// One mode (light or dark) of a theme — each field maps directly to a CSS
+/// custom property.  All fields are optional so a user-supplied TOML only needs
+/// to override the values they care about; anything omitted inherits the
+/// built-in Jetson defaults.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct ThemeMode {
+    bg: Option<String>,
+    panel: Option<String>,
+    panel_2: Option<String>,
+    text: Option<String>,
+    muted: Option<String>,
+    border: Option<String>,
+    accent: Option<String>,
+    accent_2: Option<String>,
+    danger: Option<String>,
+    radius: Option<String>,
+    shadow: Option<String>,
+    sidebar_bg: Option<String>,
+    topbar_bg: Option<String>,
+    topbar_border: Option<String>,
+    card_bg: Option<String>,
+    card_border: Option<String>,
+    card_top_bg: Option<String>,
+    card_top_color: Option<String>,
+    input_bg: Option<String>,
+    input_border: Option<String>,
+    notice_bg: Option<String>,
+    empty_bg: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ThemeConfig {
+    meta: ThemeMeta,
+    #[serde(default)]
+    light: ThemeMode,
+    #[serde(default)]
+    dark: ThemeMode,
+}
+
+impl ThemeMode {
+    /// Emit CSS custom property declarations for every field that is `Some`.
+    /// Values are sanitized to prevent CSS injection.
+    fn to_css_declarations(&self) -> String {
+        let mut out = String::new();
+        let fields: &[(&str, &Option<String>)] = &[
+            ("--bg",            &self.bg),
+            ("--panel",         &self.panel),
+            ("--panel-2",       &self.panel_2),
+            ("--text",          &self.text),
+            ("--muted",         &self.muted),
+            ("--border",        &self.border),
+            ("--accent",        &self.accent),
+            ("--accent-2",      &self.accent_2),
+            ("--danger",        &self.danger),
+            ("--radius",        &self.radius),
+            ("--shadow",        &self.shadow),
+            ("--sidebar-bg",    &self.sidebar_bg),
+            ("--topbar-bg",     &self.topbar_bg),
+            ("--topbar-border", &self.topbar_border),
+            ("--card-bg",       &self.card_bg),
+            ("--card-border",   &self.card_border),
+            ("--card-top-bg",   &self.card_top_bg),
+            ("--card-top-color",&self.card_top_color),
+            ("--input-bg",      &self.input_bg),
+            ("--input-border",  &self.input_border),
+            ("--notice-bg",     &self.notice_bg),
+            ("--empty-bg",      &self.empty_bg),
+        ];
+        for (prop, value) in fields {
+            if let Some(v) = value {
+                let sanitized = sanitize_css_value(v);
+                out.push_str(&format!("  {}: {};\n", prop, sanitized));
+            }
+        }
+        out
+    }
+}
+
+/// Sanitize a CSS custom property value to prevent injection.
+///
+/// Strips characters that could break out of a CSS declaration (`{`, `}`, `;`,
+/// `<`, `>`) and removes `url(` / `expression(` function calls.  This is a
+/// defense-in-depth measure — theme files are operator-controlled, not
+/// user-supplied, but we sanitize anyway.
+fn sanitize_css_value(value: &str) -> String {
+    let stripped: String = value
+        .chars()
+        .filter(|c| !matches!(c, '{' | '}' | ';' | '<' | '>' | '\\'))
+        .collect();
+    // Reject url() and expression() to prevent resource loading / script execution.
+    let lower = stripped.to_lowercase();
+    if lower.contains("url(") || lower.contains("expression(") || lower.contains("javascript:") {
+        return String::new();
+    }
+    stripped
+}
+
+impl ThemeConfig {
+    /// Generate a complete CSS stylesheet that overrides the default (Jetson)
+    /// custom properties.  Returns an empty string for the built-in Jetson
+    /// theme so the default `main.css` values apply unchanged.
+    fn to_css(&self) -> String {
+        let light = self.light.to_css_declarations();
+        let dark = self.dark.to_css_declarations();
+        if light.is_empty() && dark.is_empty() {
+            return String::new();
+        }
+        let mut css = format!("/* Theme: {} */\n", self.meta.name);
+        if !light.is_empty() {
+            css.push_str(":root{\n");
+            css.push_str(&light);
+            css.push_str("}\n");
+        }
+        if !dark.is_empty() {
+            css.push_str(".app.dark-mode{\n");
+            css.push_str(&dark);
+            css.push_str("}\n");
+        }
+        css
+    }
+}
+
+/// Built-in "Jetson" theme — the default.  Returns an empty CSS string because
+/// `main.css` already defines these values.
+fn theme_jetson() -> ThemeConfig {
+    ThemeConfig {
+        meta: ThemeMeta { name: "Jetson".into() },
+        light: ThemeMode::default(),
+        dark: ThemeMode::default(),
+    }
+}
+
+/// Built-in "Nord" theme — Arctic, cool-blue toned palette inspired by the
+/// popular Nord color scheme.
+fn theme_nord() -> ThemeConfig {
+    ThemeConfig {
+        meta: ThemeMeta { name: "Nord".into() },
+        light: ThemeMode {
+            bg:            Some("#eceff4".into()),
+            panel:         Some("rgba(46,52,64,.04)".into()),
+            panel_2:       Some("rgba(46,52,64,.07)".into()),
+            text:          Some("#2e3440".into()),
+            muted:         Some("#4c566a".into()),
+            border:        Some("rgba(46,52,64,.12)".into()),
+            accent:        Some("#5e81ac".into()),
+            accent_2:      Some("#3b4252".into()),
+            danger:        Some("#bf616a".into()),
+            radius:        Some("6px".into()),
+            shadow:        Some("0 2px 8px rgba(46,52,64,.10)".into()),
+            sidebar_bg:    Some("#5e81ac".into()),
+            topbar_bg:     Some("#d8dee9".into()),
+            topbar_border: Some("2px solid rgba(46,52,64,.10)".into()),
+            card_bg:       Some("rgba(255,255,255,.70)".into()),
+            card_border:   Some("rgba(46,52,64,.15)".into()),
+            card_top_bg:   Some("#3b4252".into()),
+            card_top_color:Some("#eceff4".into()),
+            input_bg:      Some("rgba(255,255,255,.60)".into()),
+            input_border:  Some("rgba(46,52,64,.18)".into()),
+            notice_bg:     Some("rgba(255,255,255,.65)".into()),
+            empty_bg:      Some("rgba(255,255,255,.45)".into()),
+        },
+        dark: ThemeMode {
+            bg:            Some("#2e3440".into()),
+            panel:         Some("rgba(255,255,255,.04)".into()),
+            panel_2:       Some("rgba(255,255,255,.07)".into()),
+            text:          Some("#d8dee9".into()),
+            muted:         Some("#81a1c1".into()),
+            border:        Some("rgba(255,255,255,.10)".into()),
+            accent:        Some("#88c0d0".into()),
+            accent_2:      Some("#434c5e".into()),
+            danger:        Some("#bf616a".into()),
+            shadow:        Some("0 2px 8px rgba(0,0,0,.40)".into()),
+            sidebar_bg:    Some("#5e81ac".into()),
+            topbar_bg:     Some("#3b4252".into()),
+            topbar_border: Some("1px solid rgba(255,255,255,.08)".into()),
+            card_bg:       Some("rgba(255,255,255,.06)".into()),
+            card_border:   Some("rgba(255,255,255,.10)".into()),
+            card_top_bg:   Some("#434c5e".into()),
+            card_top_color:Some("#d8dee9".into()),
+            input_bg:      Some("rgba(255,255,255,.06)".into()),
+            input_border:  Some("rgba(255,255,255,.12)".into()),
+            notice_bg:     Some("rgba(255,255,255,.06)".into()),
+            empty_bg:      Some("rgba(255,255,255,.04)".into()),
+            radius:        None,
+        },
+    }
+}
+
+/// Built-in "Catppuccin" theme — soothing pastel palette from the popular
+/// Catppuccin project (Latte for light, Mocha for dark).
+fn theme_catppuccin() -> ThemeConfig {
+    ThemeConfig {
+        meta: ThemeMeta { name: "Catppuccin".into() },
+        light: ThemeMode {
+            bg:            Some("#eff1f5".into()),
+            panel:         Some("rgba(76,79,105,.04)".into()),
+            panel_2:       Some("rgba(76,79,105,.07)".into()),
+            text:          Some("#4c4f69".into()),
+            muted:         Some("#6c6f85".into()),
+            border:        Some("rgba(76,79,105,.12)".into()),
+            accent:        Some("#8839ef".into()),
+            accent_2:      Some("#5c5f77".into()),
+            danger:        Some("#d20f39".into()),
+            radius:        Some("8px".into()),
+            shadow:        Some("0 2px 8px rgba(76,79,105,.10)".into()),
+            sidebar_bg:    Some("#8839ef".into()),
+            topbar_bg:     Some("#e6e9ef".into()),
+            topbar_border: Some("2px solid rgba(76,79,105,.08)".into()),
+            card_bg:       Some("rgba(255,255,255,.65)".into()),
+            card_border:   Some("rgba(76,79,105,.12)".into()),
+            card_top_bg:   Some("#5c5f77".into()),
+            card_top_color:Some("#eff1f5".into()),
+            input_bg:      Some("rgba(255,255,255,.55)".into()),
+            input_border:  Some("rgba(76,79,105,.15)".into()),
+            notice_bg:     Some("rgba(255,255,255,.60)".into()),
+            empty_bg:      Some("rgba(255,255,255,.40)".into()),
+        },
+        dark: ThemeMode {
+            bg:            Some("#1e1e2e".into()),
+            panel:         Some("rgba(205,214,244,.04)".into()),
+            panel_2:       Some("rgba(205,214,244,.07)".into()),
+            text:          Some("#cdd6f4".into()),
+            muted:         Some("#a6adc8".into()),
+            border:        Some("rgba(205,214,244,.10)".into()),
+            accent:        Some("#cba6f7".into()),
+            accent_2:      Some("#45475a".into()),
+            danger:        Some("#f38ba8".into()),
+            shadow:        Some("0 2px 8px rgba(0,0,0,.40)".into()),
+            sidebar_bg:    Some("#8839ef".into()),
+            topbar_bg:     Some("#313244".into()),
+            topbar_border: Some("1px solid rgba(205,214,244,.08)".into()),
+            card_bg:       Some("rgba(205,214,244,.06)".into()),
+            card_border:   Some("rgba(205,214,244,.10)".into()),
+            card_top_bg:   Some("#45475a".into()),
+            card_top_color:Some("#cdd6f4".into()),
+            input_bg:      Some("rgba(205,214,244,.06)".into()),
+            input_border:  Some("rgba(205,214,244,.12)".into()),
+            notice_bg:     Some("rgba(205,214,244,.06)".into()),
+            empty_bg:      Some("rgba(205,214,244,.04)".into()),
+            radius:        None,
+        },
+    }
+}
+
+/// Built-in "Dracula" theme — the popular purple/pink/green dark-first palette.
+fn theme_dracula() -> ThemeConfig {
+    ThemeConfig {
+        meta: ThemeMeta { name: "Dracula".into() },
+        light: ThemeMode {
+            bg:            Some("#f8f8f2".into()),
+            panel:         Some("rgba(40,42,54,.04)".into()),
+            panel_2:       Some("rgba(40,42,54,.07)".into()),
+            text:          Some("#282a36".into()),
+            muted:         Some("#6272a4".into()),
+            border:        Some("rgba(40,42,54,.12)".into()),
+            accent:        Some("#bd93f9".into()),
+            accent_2:      Some("#44475a".into()),
+            danger:        Some("#ff5555".into()),
+            radius:        Some("6px".into()),
+            shadow:        Some("0 2px 8px rgba(40,42,54,.12)".into()),
+            sidebar_bg:    Some("#bd93f9".into()),
+            topbar_bg:     Some("#e8e8e2".into()),
+            topbar_border: Some("2px solid rgba(40,42,54,.10)".into()),
+            card_bg:       Some("rgba(255,255,255,.65)".into()),
+            card_border:   Some("rgba(40,42,54,.15)".into()),
+            card_top_bg:   Some("#44475a".into()),
+            card_top_color:Some("#f8f8f2".into()),
+            input_bg:      Some("rgba(255,255,255,.55)".into()),
+            input_border:  Some("rgba(40,42,54,.18)".into()),
+            notice_bg:     Some("rgba(255,255,255,.60)".into()),
+            empty_bg:      Some("rgba(255,255,255,.40)".into()),
+        },
+        dark: ThemeMode {
+            bg:            Some("#282a36".into()),
+            panel:         Some("rgba(248,248,242,.04)".into()),
+            panel_2:       Some("rgba(248,248,242,.07)".into()),
+            text:          Some("#f8f8f2".into()),
+            muted:         Some("#6272a4".into()),
+            border:        Some("rgba(248,248,242,.10)".into()),
+            accent:        Some("#bd93f9".into()),
+            accent_2:      Some("#44475a".into()),
+            danger:        Some("#ff5555".into()),
+            shadow:        Some("0 2px 8px rgba(0,0,0,.50)".into()),
+            sidebar_bg:    Some("#bd93f9".into()),
+            topbar_bg:     Some("#44475a".into()),
+            topbar_border: Some("1px solid rgba(248,248,242,.08)".into()),
+            card_bg:       Some("rgba(248,248,242,.06)".into()),
+            card_border:   Some("rgba(248,248,242,.10)".into()),
+            card_top_bg:   Some("#44475a".into()),
+            card_top_color:Some("#f8f8f2".into()),
+            input_bg:      Some("rgba(248,248,242,.06)".into()),
+            input_border:  Some("rgba(248,248,242,.12)".into()),
+            notice_bg:     Some("rgba(248,248,242,.06)".into()),
+            empty_bg:      Some("rgba(248,248,242,.04)".into()),
+            radius:        None,
+        },
+    }
+}
+
+/// Resolve the active theme from environment variables.
+///
+/// * `THEME` — preset name: `jetson`, `nord`, `catppuccin`, `dracula`.
+/// * `THEME_FILE` — path to a user-supplied TOML file (takes precedence over
+///   `THEME` if both are set).
+fn resolve_theme() -> ThemeConfig {
+    /// Maximum theme file size (100 KiB) — prevents DoS via oversized files.
+    const MAX_THEME_FILE_SIZE: u64 = 100 * 1024;
+
+    // A custom TOML file takes highest precedence.
+    if let Ok(path) = std::env::var("THEME_FILE") {
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.len() > MAX_THEME_FILE_SIZE => {
+                warn!(
+                    path = %path,
+                    size = meta.len(),
+                    limit = MAX_THEME_FILE_SIZE,
+                    "THEME_FILE exceeds size limit; falling back to preset"
+                );
+            }
+            _ => {
+                match std::fs::read_to_string(&path) {
+                    Ok(contents) => match toml::from_str::<ThemeConfig>(&contents) {
+                        Ok(cfg) => {
+                            info!(path = %path, name = %cfg.meta.name, "loaded custom theme");
+                            return cfg;
+                        }
+                        Err(e) => {
+                            warn!(path = %path, error = %e, "failed to parse THEME_FILE; falling back to preset");
+                        }
+                    },
+                    Err(e) => {
+                        warn!(path = %path, error = %e, "failed to read THEME_FILE; falling back to preset");
+                    }
+                }
+            }
+        }
+    }
+
+    let name = std::env::var("THEME").unwrap_or_default().to_lowercase();
+    match name.as_str() {
+        "nord"       => { info!(theme = "Nord", "using preset theme"); theme_nord() }
+        "catppuccin" => { info!(theme = "Catppuccin", "using preset theme"); theme_catppuccin() }
+        "dracula"    => { info!(theme = "Dracula", "using preset theme"); theme_dracula() }
+        _            => { info!(theme = "Jetson", "using default theme"); theme_jetson() }
+    }
+}
+
+/// `GET /api/theme.css` — returns the active theme as a CSS stylesheet.
+async fn get_theme_css(state: web::Data<AppState>) -> HttpResponse {
+    HttpResponse::Ok()
+        .insert_header((header::CONTENT_TYPE, "text/css; charset=utf-8"))
+        .insert_header((header::CACHE_CONTROL, "no-cache"))
+        .body(state.theme_css.clone())
+}
+
 // ── Stream quality ────────────────────────────────────────────────────────────
 
 /// Query-string struct used by the playlist and segment endpoints so that
@@ -354,6 +728,8 @@ struct AppState {
     /// subscribe to the same channel and await the result, so only one ffmpeg
     /// job is ever spawned per segment at a time.
     segment_inflight: Arc<Mutex<HashMap<(String, usize, Quality), Arc<tokio::sync::watch::Sender<Option<Result<(), String>>>>>>>,
+    /// Pre-rendered CSS for the active theme (served at `/api/theme.css`).
+    theme_css: String,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -2424,9 +2800,10 @@ async fn auth_middleware(
 ) -> Result<ServiceResponse<impl MessageBody + 'static>, Error> {
     let path = req.path().to_string();
 
-    // Auth endpoints and static frontend assets are always accessible.
+    // Auth endpoints, theme CSS, and static frontend assets are always accessible.
     let is_exempt = path.starts_with("/api/auth/")
         || path == "/api/health"
+        || path == "/api/theme.css"
         || !path.starts_with("/api/");
 
     if is_exempt {
@@ -2466,7 +2843,10 @@ fn content_type(path: &str) -> header::HeaderValue {
     header::HeaderValue::from_str(mime.as_ref()).unwrap()
 }
 
-async fn frontend(req: HttpRequest) -> actix_web::Result<HttpResponse> {
+async fn frontend(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> actix_web::Result<HttpResponse> {
     let tail = req.match_info().query("tail");
     let mut path = tail.trim_start_matches('/');
     if path.is_empty() {
@@ -2474,25 +2854,51 @@ async fn frontend(req: HttpRequest) -> actix_web::Result<HttpResponse> {
     }
 
     if let Some(file) = Assets::get(path) {
-        let cache = if path == "index.html" {
-            "no-cache"
-        } else {
-            "public, max-age=31536000, immutable"
-        };
+        if path == "index.html" {
+            // Inject the theme stylesheet link before </head> so it loads
+            // after main.css and overrides the default Jetson variables.
+            let html = String::from_utf8_lossy(&file.data);
+            let themed = if !state.theme_css.is_empty() {
+                html.replacen(
+                    "</head>",
+                    "<link rel=\"stylesheet\" href=\"/api/theme.css\" />\n</head>",
+                    1,
+                )
+            } else {
+                html.into_owned()
+            };
+            return Ok(HttpResponse::Ok()
+                .insert_header((header::CONTENT_TYPE, content_type(path)))
+                .insert_header((header::CACHE_CONTROL, "no-cache"))
+                .body(themed));
+        }
         return Ok(HttpResponse::Ok()
             .insert_header((header::CONTENT_TYPE, content_type(path)))
-            .insert_header((header::CACHE_CONTROL, cache))
+            .insert_header((
+                header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable",
+            ))
             .body(file.data.into_owned()));
     }
 
     if let Some(index) = Assets::get("index.html") {
+        let html = String::from_utf8_lossy(&index.data);
+        let themed = if !state.theme_css.is_empty() {
+            html.replacen(
+                "</head>",
+                "<link rel=\"stylesheet\" href=\"/api/theme.css\" />\n</head>",
+                1,
+            )
+        } else {
+            html.into_owned()
+        };
         return Ok(HttpResponse::Ok()
             .insert_header((
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("text/html; charset=utf-8"),
             ))
             .insert_header((header::CACHE_CONTROL, "no-cache"))
-            .body(index.data.into_owned()));
+            .body(themed));
     }
 
     Err(actix_web::error::ErrorNotFound("asset not found"))
@@ -2624,6 +3030,10 @@ async fn main() -> std::io::Result<()> {
         info!("password protection: disabled");
     }
 
+    // ── Theme ─────────────────────────────────────────────────────────────
+    let theme = resolve_theme();
+    let theme_css = theme.to_css();
+
     let state = web::Data::new(AppState {
         library_path: library_path.clone(),
         cache_dir: cache_dir.clone(),
@@ -2643,6 +3053,7 @@ async fn main() -> std::io::Result<()> {
         password_hash_path,
         auth_tokens,
         segment_inflight: Arc::new(Mutex::new(HashMap::new())),
+        theme_css,
     });
 
     // One-time background scan at startup to refresh the index immediately.
@@ -2851,6 +3262,8 @@ async fn main() -> std::io::Result<()> {
             .route("/api/auth/status", web::get().to(auth_status))
             .route("/api/auth/set-password", web::post().to(set_password))
             .route("/api/auth/login", web::post().to(login))
+            // ── Theme (always accessible) ────────────────────────────────
+            .route("/api/theme.css", web::get().to(get_theme_css))
             // ── Protected API routes ─────────────────────────────────────
             .route("/api/health", web::get().to(|| async { "ok" }))
             .route("/api/debug/transcode", web::get().to(get_transcode_debug))
@@ -2983,6 +3396,119 @@ async fn main() -> std::io::Result<()> {
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     info!("forcing process exit");
     std::process::exit(result.map(|_| 0).unwrap_or(1));
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jetson_theme_produces_empty_css() {
+        let theme = theme_jetson();
+        assert_eq!(theme.meta.name, "Jetson");
+        assert!(theme.to_css().is_empty(), "Jetson (default) should emit no CSS overrides");
+    }
+
+    #[test]
+    fn nord_theme_produces_css() {
+        let theme = theme_nord();
+        let css = theme.to_css();
+        assert!(css.contains("/* Theme: Nord */"));
+        assert!(css.contains(":root{"));
+        assert!(css.contains(".app.dark-mode{"));
+        assert!(css.contains("--accent: #5e81ac"));
+    }
+
+    #[test]
+    fn catppuccin_theme_produces_css() {
+        let theme = theme_catppuccin();
+        let css = theme.to_css();
+        assert!(css.contains("/* Theme: Catppuccin */"));
+        assert!(css.contains("--accent: #8839ef"));
+    }
+
+    #[test]
+    fn dracula_theme_produces_css() {
+        let theme = theme_dracula();
+        let css = theme.to_css();
+        assert!(css.contains("/* Theme: Dracula */"));
+        assert!(css.contains("--accent: #bd93f9"));
+    }
+
+    #[test]
+    fn toml_round_trip() {
+        let toml_str = r##"
+[meta]
+name = "Test Theme"
+
+[light]
+bg = "#ffffff"
+accent = "#ff0000"
+
+[dark]
+bg = "#000000"
+accent = "#00ff00"
+"##;
+        let config: ThemeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.meta.name, "Test Theme");
+        let css = config.to_css();
+        assert!(css.contains("--bg: #ffffff"));
+        assert!(css.contains("--accent: #ff0000"));
+        assert!(css.contains("--bg: #000000"));
+        assert!(css.contains("--accent: #00ff00"));
+    }
+
+    #[test]
+    fn partial_toml_works() {
+        let toml_str = r##"
+[meta]
+name = "Minimal"
+
+[light]
+accent = "#123456"
+"##;
+        let config: ThemeConfig = toml::from_str(toml_str).unwrap();
+        let css = config.to_css();
+        assert!(css.contains("--accent: #123456"));
+        // Dark section should be absent (no dark overrides).
+        assert!(!css.contains(".app.dark-mode"));
+    }
+
+    #[test]
+    fn example_toml_file_parses() {
+        let contents = std::fs::read_to_string("themes/example.toml")
+            .expect("themes/example.toml should exist");
+        let config: ThemeConfig = toml::from_str(&contents)
+            .expect("example.toml should be valid");
+        assert_eq!(config.meta.name, "My Custom Theme");
+        let css = config.to_css();
+        assert!(css.contains(":root{"));
+        assert!(css.contains(".app.dark-mode{"));
+    }
+
+    #[test]
+    fn css_values_are_sanitized() {
+        // Braces, semicolons, and angle brackets are stripped.
+        assert_eq!(sanitize_css_value("red; } .x { color: blue"), "red  .x  color: blue");
+        // url() is rejected.
+        assert_eq!(sanitize_css_value("url(http://evil.com)"), "");
+        // expression() is rejected.
+        assert_eq!(sanitize_css_value("expression(alert(1))"), "");
+        // javascript: is rejected.
+        assert_eq!(sanitize_css_value("javascript:alert(1)"), "");
+        // Normal values pass through unchanged.
+        assert_eq!(sanitize_css_value("#ff4500"), "#ff4500");
+        assert_eq!(
+            sanitize_css_value("rgba(255,255,255,.6)"),
+            "rgba(255,255,255,.6)"
+        );
+        assert_eq!(
+            sanitize_css_value("2px solid rgba(0,0,0,.3)"),
+            "2px solid rgba(0,0,0,.3)"
+        );
+    }
 }
 
 

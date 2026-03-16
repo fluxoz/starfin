@@ -906,26 +906,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             video.set_current_time(dur);
                         }
                     }
-                    // P - Toggle Picture-in-Picture
-                    "p" | "P" => {
-                        e.prevent_default();
-                        let doc = web_sys::window().unwrap().document().unwrap();
-                        let pip_element = js_sys::Reflect::get(&doc, &JsValue::from_str("pictureInPictureElement"))
-                            .ok()
-                            .and_then(|v| if v.is_null() || v.is_undefined() { None } else { Some(v) });
-                        
-                        if pip_element.is_some() {
-                            let _ = js_sys::Reflect::get(&doc, &JsValue::from_str("exitPictureInPicture"))
-                                .ok()
-                                .and_then(|f| f.dyn_ref::<Function>().cloned())
-                                .map(|f| f.call0(&doc));
-                        } else {
-                            let _ = js_sys::Reflect::get(&video, &JsValue::from_str("requestPictureInPicture"))
-                                .ok()
-                                .and_then(|f| f.dyn_ref::<Function>().cloned())
-                                .map(|f| f.call0(&video));
-                        }
-                    }
                     _ => {}
                 }
             });
@@ -1424,34 +1404,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
-    // Picture-in-Picture toggle
-    let on_pip_toggle = {
-        let video_ref = video_ref.clone();
-        Callback::from(move |_| {
-            if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-                // Check if PiP is currently active
-                let doc = web_sys::window().unwrap().document().unwrap();
-                let pip_element = js_sys::Reflect::get(&doc, &JsValue::from_str("pictureInPictureElement"))
-                    .ok()
-                    .and_then(|v| if v.is_null() || v.is_undefined() { None } else { Some(v) });
-                
-                if pip_element.is_some() {
-                    // Exit PiP
-                    let _ = js_sys::Reflect::get(&doc, &JsValue::from_str("exitPictureInPicture"))
-                        .ok()
-                        .and_then(|f| f.dyn_ref::<Function>().cloned())
-                        .map(|f| f.call0(&doc));
-                } else {
-                    // Enter PiP
-                    let _ = js_sys::Reflect::get(&video, &JsValue::from_str("requestPictureInPicture"))
-                        .ok()
-                        .and_then(|f| f.dyn_ref::<Function>().cloned())
-                        .map(|f| f.call0(&video));
-                }
-            }
-        })
-    };
-
     // Captions menu toggle
     let on_captions_toggle = {
         let captions_menu_open = captions_menu_open.clone();
@@ -1851,11 +1803,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             </div>
                         }
 
-                        // Picture-in-Picture button
-                        <button class="player-controls__btn" onclick={on_pip_toggle} title="Picture-in-Picture (p)">
-                            { icon_pip() }
-                        </button>
-
                         // Fullscreen button
                         <button class="player-controls__btn" onclick={on_fullscreen_toggle} title="Fullscreen (f)">
                             { fullscreen_icon }
@@ -1989,14 +1936,6 @@ fn icon_fullscreen_exit() -> Html {
     html! {
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="1em" height="1em" aria-hidden="true">
             <path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"/>
-        </svg>
-    }
-}
-
-fn icon_pip() -> Html {
-    html! {
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="1em" height="1em" aria-hidden="true">
-            <path d="M19 11h-8v6h8v-6zm4 8V4.98C23 3.88 22.1 3 21 3H3C1.9 3 1 3.88 1 4.98V19c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2zm-2 .02H3V4.97h18v14.05z"/>
         </svg>
     }
 }

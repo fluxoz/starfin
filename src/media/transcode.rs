@@ -27,6 +27,10 @@ use super::hwaccel::HwAccel;
 /// Duration of each HLS segment in seconds.
 pub const SEGMENT_DURATION: f64 = 6.0;
 
+/// Bitrate for AAC audio encoding in the transcode and hybrid paths.
+/// 256 kbps stereo AAC-LC is transparent quality for music and dialogue.
+const AAC_ENCODE_BITRATE: usize = 256_000;
+
 /// Create a single MPEG-TS segment — remux if possible, transcode otherwise.
 ///
 /// For **Original** quality with H.264 + stereo AAC/MP3 source, packets are
@@ -137,6 +141,10 @@ fn audio_is_remuxable(ictx: &ffmpeg_next::format::context::Input) -> bool {
             let id = s.parameters().id();
             let codec_ok = id == Id::AAC || id == Id::MP3;
             // Read channel count from codec parameters.
+            // SAFETY: `s.parameters().as_ptr()` returns a valid pointer to an
+            // initialized `AVCodecParameters` owned by the stream.  We only
+            // read the `ch_layout.nb_channels` field (a plain integer) through
+            // the pointer — no mutation, no lifetime extension.
             let channels = unsafe { (*s.parameters().as_ptr()).ch_layout.nb_channels };
             let channels_ok = channels <= 2;
             codec_ok && channels_ok
@@ -481,7 +489,7 @@ fn hybrid_segment(
                                 aac_enc.set_rate(dec.rate() as i32);
                                 aac_enc.set_channel_layout(enc_layout);
                                 aac_enc.set_format(enc_format);
-                                aac_enc.set_bit_rate(256_000);
+                                aac_enc.set_bit_rate(AAC_ENCODE_BITRATE);
                                 aac_enc.set_time_base(ffmpeg_next::Rational::new(1, dec.rate() as i32));
 
                                 match aac_enc.open_as(aac) {
@@ -933,7 +941,7 @@ fn transcode_segment_body(
                                     aac_enc.set_rate(dec.rate() as i32);
                                     aac_enc.set_channel_layout(enc_layout);
                                     aac_enc.set_format(enc_format);
-                                    aac_enc.set_bit_rate(256_000);
+                                    aac_enc.set_bit_rate(AAC_ENCODE_BITRATE);
                                     aac_enc.set_time_base(ffmpeg_next::Rational::new(1, dec.rate() as i32));
 
                                     match aac_enc.open_as(aac) {

@@ -1,3 +1,5 @@
+use futures::channel::mpsc;
+use futures::StreamExt;
 use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
 use gloo_timers::future::TimeoutFuture;
@@ -100,6 +102,23 @@ fn get_buffer_end(video: &HtmlVideoElement) -> f64 {
     0.0
 }
 
+/// Calculate seek time and position from a mouse event on the progress bar.
+fn calculate_seek_time(
+    e: &MouseEvent,
+    progress_el: &web_sys::HtmlElement,
+    video_duration: f64,
+) -> Option<(f64, f64)> {
+    let rect = progress_el.get_bounding_client_rect();
+    let click_x = e.client_x() as f64 - rect.left();
+    let width = rect.width();
+    if width > 0.0 && video_duration.is_finite() && video_duration > 0.0 {
+        let seek_ratio = (click_x / width).clamp(0.0, 1.0);
+        Some((seek_ratio * video_duration, seek_ratio * 100.0))
+    } else {
+        None
+    }
+}
+
 // ── Thumbnail Preview State ──────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -137,6 +156,29 @@ struct SegmentInfo {
     duration: f64,
 }
 
+#[allow(dead_code)]
+enum PumpMsg {
+    /// SourceBuffer `updateend` event fired.
+    AppendComplete,
+    /// Top up buffer (from 150ms interval or initial kick).
+    TopUp,
+    /// Seek to unbuffered position — reset segment pointer.
+    Seek(f64),
+    /// Fetch completed successfully.
+    FetchComplete(u32, Vec<u8>),
+    /// Fetch failed after retries.
+    FetchFailed(u32),
+    /// Shutdown the pump loop.
+    Shutdown,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PumpState {
+    Idle,
+    Fetching,
+    Appending,
+}
+
 struct MseState {
     media_source: web_sys::MediaSource,
     source_buffer: web_sys::SourceBuffer,
@@ -146,15 +188,18 @@ struct MseState {
     segments: Vec<SegmentInfo>,
     /// Index of the next segment to fetch.
     next_seg: usize,
-    /// True while `SourceBuffer.appendBuffer` is in progress.
-    is_appending: bool,
     /// Monotonically increasing counter incremented on every seek to
-    /// unbuffered territory.  Stale `updateend` callbacks compare their
-    /// captured generation against the current value and discard the
-    /// append result when they differ, preventing wrong-segment appends
-    /// during rapid seeks (§11.6).
+    /// unbuffered territory.  Stale callbacks compare their captured
+    /// generation against the current value (§11.6).
     generation: u32,
+    /// Channel sender for the pump loop.
+    pump_tx: mpsc::UnboundedSender<PumpMsg>,
+    /// Persistent `updateend` closure — stored here so it is properly
+    /// dropped on cleanup instead of being `.forget()`-ed (§11.2).
+    _updateend_closure: Closure<dyn Fn()>,
 }
+
+// ── URL / playlist helpers ───────────────────────────────────────────────────
 
 /// Resolve a relative segment path against the playlist URL.
 ///
@@ -211,161 +256,570 @@ fn parse_m3u8(text: &str, playlist_url: &str) -> Vec<SegmentInfo> {
     segments
 }
 
+// ── Channel-based MSE pump (§11.2) ──────────────────────────────────────────
+
 /// Maximum number of retry attempts for a failed segment fetch (§11.7).
 const SEGMENT_FETCH_MAX_RETRIES: u32 = 3;
 /// Initial retry delay in milliseconds; doubled on each subsequent attempt.
 const SEGMENT_FETCH_RETRY_BASE_MS: u32 = 500;
 
-/// Pump the next HLS segment into the MSE SourceBuffer.
-///
-/// Returns immediately if:
-/// - `state` is `None` (not yet initialised),
-/// - a previous append is still in flight (`is_appending`), or
-/// - the forward buffer already exceeds `MSE_TARGET_BUFFER_S`.
-///
-/// When all segments have been fed, signals end-of-stream on the MediaSource.
-///
-/// The function captures the current `generation` before starting the async
-/// fetch.  If a seek occurs while the fetch is in-flight the generation will
-/// have been incremented, and the stale response is discarded instead of
-/// appended to the SourceBuffer (§11.6).
-///
-/// On fetch failure the request is retried up to `SEGMENT_FETCH_MAX_RETRIES`
-/// times with exponential back-off (§11.7).
-fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) {
-    let (seg_url, pump_gen) = {
-        let mut borrow = state.borrow_mut();
-        let mse = match borrow.as_mut() {
-            Some(s) => s,
-            None => return,
-        };
-        if mse.is_appending {
-            return;
+/// The main pump loop — a single async task driven by channel messages.
+async fn pump_loop(
+    mut rx: mpsc::UnboundedReceiver<PumpMsg>,
+    state: Rc<RefCell<Option<MseState>>>,
+    video: HtmlVideoElement,
+) {
+    let mut pump_state = PumpState::Idle;
+
+    while let Some(msg) = rx.next().await {
+        match msg {
+            PumpMsg::Shutdown => break,
+
+            PumpMsg::Seek(time) => {
+                handle_pump_seek(&state, &video, time);
+                pump_state = PumpState::Idle;
+            }
+
+            PumpMsg::AppendComplete => {
+                if pump_state == PumpState::Appending {
+                    if let Some(s) = state.borrow_mut().as_mut() {
+                        s.next_seg += 1;
+                    }
+                    pump_state = PumpState::Idle;
+                }
+                // Ignore spurious updateend (e.g. from remove())
+            }
+
+            PumpMsg::FetchComplete(pump_gen, bytes) => {
+                if pump_state != PumpState::Fetching || !check_generation(&state, pump_gen) {
+                    pump_state = PumpState::Idle;
+                } else if try_append_bytes(&state, &bytes) {
+                    pump_state = PumpState::Appending;
+                    continue; // Wait for AppendComplete, don't try to start fetch
+                } else {
+                    pump_state = PumpState::Idle;
+                }
+            }
+
+            PumpMsg::FetchFailed(_) => {
+                pump_state = PumpState::Idle;
+            }
+
+            PumpMsg::TopUp => {}
         }
-        let buffered_ahead = get_buffer_end(&video) - video.current_time();
+
+        // If idle, try to start a new fetch
+        if pump_state == PumpState::Idle {
+            if try_start_fetch(&state, &video) {
+                pump_state = PumpState::Fetching;
+            }
+        }
+    }
+}
+
+/// Handle a seek to unbuffered territory: increment generation, trim
+/// back-buffer (if the source buffer is not busy), and reset next_seg.
+fn handle_pump_seek(
+    state: &Rc<RefCell<Option<MseState>>>,
+    _video: &HtmlVideoElement,
+    time: f64,
+) {
+    let mut borrow = state.borrow_mut();
+    if let Some(mse) = borrow.as_mut() {
+        mse.generation = mse.generation.wrapping_add(1);
+        if !mse.source_buffer.updating() {
+            let remove_end = (time - MSE_BACK_BUFFER_S).max(0.0);
+            if remove_end > 0.0 {
+                let _ = mse.source_buffer.remove(0.0, remove_end);
+            }
+        }
+        let snapped = snap_to_cached_segment(time);
+        mse.next_seg = (snapped / SEGMENT_DURATION_F) as usize;
+    }
+}
+
+/// If the pump is idle and the buffer is below the target, spawn an async
+/// fetch task for the next segment.  Returns `true` when a fetch was started.
+fn try_start_fetch(
+    state: &Rc<RefCell<Option<MseState>>>,
+    video: &HtmlVideoElement,
+) -> bool {
+    let (seg_url, pump_gen, tx) = {
+        let borrow = state.borrow();
+        let mse = match borrow.as_ref() {
+            Some(s) => s,
+            None => return false,
+        };
+        if mse.source_buffer.updating() {
+            return false;
+        }
+        let buffered_ahead = get_buffer_end(video) - video.current_time();
         if buffered_ahead >= MSE_TARGET_BUFFER_S && mse.next_seg != 0 {
-            return;
+            return false;
         }
         if mse.next_seg >= mse.segments.len() {
             let _ = mse.media_source.end_of_stream();
-            return;
+            return false;
         }
         let url = mse.segments[mse.next_seg].url.clone();
-        mse.is_appending = true;
-        (url, mse.generation)
+        (url, mse.generation, mse.pump_tx.clone())
     };
 
-    let state_clone = state.clone();
-    let video_clone = video.clone();
     spawn_local(async move {
-        // Fetch with retry (§11.7).
-        let mut bytes_opt: Option<Vec<u8>> = None;
-        for attempt in 0..=SEGMENT_FETCH_MAX_RETRIES {
-            match Request::get(&seg_url).send().await {
-                Ok(r) => match r.binary().await {
-                    Ok(b) => {
-                        bytes_opt = Some(b);
-                        break;
-                    }
-                    Err(e) => {
-                        log::warn!("Segment read error (attempt {}): {e:?}", attempt + 1);
-                    }
-                },
-                Err(e) => {
-                    log::warn!("Segment fetch error (attempt {}): {e:?}", attempt + 1);
-                }
-            }
-            if attempt < SEGMENT_FETCH_MAX_RETRIES {
-                let delay = SEGMENT_FETCH_RETRY_BASE_MS * (1 << attempt);
-                TimeoutFuture::new(delay).await;
-            }
-        }
-
-        let bytes = match bytes_opt {
-            Some(b) => b,
-            None => {
-                log::error!("Failed to fetch segment after {} retries: {seg_url}", SEGMENT_FETCH_MAX_RETRIES);
-                if let Some(s) = state_clone.borrow_mut().as_mut() {
-                    s.is_appending = false;
-                }
-                return;
-            }
-        };
-
-        // Check generation — discard stale result if a seek occurred (§11.6).
-        {
-            let borrow = state_clone.borrow();
-            match borrow.as_ref() {
-                Some(s) if s.generation != pump_gen => {
-                    // A seek happened while we were fetching; drop this response.
-                    drop(borrow);
-                    if let Some(s) = state_clone.borrow_mut().as_mut() {
-                        s.is_appending = false;
-                    }
-                    // Re-pump with the new generation's segment pointer.
-                    pump_segments(state_clone, video_clone);
-                    return;
-                }
-                None => return,
-                _ => {}
-            }
-        }
-
-        let source_buffer = {
-            let borrow = state_clone.borrow();
-            match borrow.as_ref() {
-                Some(s) => s.source_buffer.clone(),
-                None => return,
-            }
-        };
-
-        // One-shot updateend listener: advance segment pointer and re-pump.
-        // Captures the generation so stale callbacks are ignored (§11.2/§11.6).
-        let state_for_end = state_clone.clone();
-        let video_for_end = video_clone.clone();
-        let updateend_cb = Closure::once(Box::new(move || {
-            {
-                let mut borrow = state_for_end.borrow_mut();
-                if let Some(s) = borrow.as_mut() {
-                    // Discard if a seek has since invalidated this append.
-                    if s.generation != pump_gen {
-                        s.is_appending = false;
-                        drop(borrow);
-                        pump_segments(state_for_end, video_for_end);
-                        return;
-                    }
-                    s.is_appending = false;
-                    s.next_seg += 1;
-                }
-            }
-            let s = state_for_end;
-            let v = video_for_end;
-            spawn_local(async move {
-                pump_segments(s, v);
-            });
-        }) as Box<dyn FnOnce()>);
-        source_buffer
-            .add_event_listener_with_callback(
-                "updateend",
-                updateend_cb.as_ref().unchecked_ref(),
-            )
-            .ok();
-        updateend_cb.forget();
-
-        let uint8_array = js_sys::Uint8Array::from(bytes.as_slice());
-        let array_buffer = uint8_array.buffer();
-        if source_buffer
-            .append_buffer_with_array_buffer(&array_buffer)
-            .is_err()
-        {
-            if let Some(s) = state_clone.borrow_mut().as_mut() {
-                s.is_appending = false;
-            }
-        }
+        fetch_segment_with_retry(seg_url, pump_gen, tx).await;
     });
+
+    true
 }
 
-// ── Component ────────────────────────────────────────────────────────────────
+/// Fetch a segment with exponential-backoff retry (§11.7) and report the
+/// result back through the channel.
+async fn fetch_segment_with_retry(
+    url: String,
+    pump_gen: u32,
+    tx: mpsc::UnboundedSender<PumpMsg>,
+) {
+    let mut bytes_opt: Option<Vec<u8>> = None;
+    for attempt in 0..=SEGMENT_FETCH_MAX_RETRIES {
+        match Request::get(&url).send().await {
+            Ok(r) => match r.binary().await {
+                Ok(b) => {
+                    bytes_opt = Some(b);
+                    break;
+                }
+                Err(e) => {
+                    log::warn!("Segment read error (attempt {}): {e:?}", attempt + 1);
+                }
+            },
+            Err(e) => {
+                log::warn!("Segment fetch error (attempt {}): {e:?}", attempt + 1);
+            }
+        }
+        if attempt < SEGMENT_FETCH_MAX_RETRIES {
+            let delay = SEGMENT_FETCH_RETRY_BASE_MS * (1 << attempt);
+            TimeoutFuture::new(delay).await;
+        }
+    }
+
+    match bytes_opt {
+        Some(bytes) => {
+            let _ = tx.unbounded_send(PumpMsg::FetchComplete(pump_gen, bytes));
+        }
+        None => {
+            log::error!(
+                "Failed to fetch segment after {} retries: {url}",
+                SEGMENT_FETCH_MAX_RETRIES
+            );
+            let _ = tx.unbounded_send(PumpMsg::FetchFailed(pump_gen));
+        }
+    }
+}
+
+/// Try to append raw bytes to the SourceBuffer.  Returns `true` on success.
+fn try_append_bytes(state: &Rc<RefCell<Option<MseState>>>, bytes: &[u8]) -> bool {
+    let borrow = state.borrow();
+    let mse = match borrow.as_ref() {
+        Some(s) => s,
+        None => return false,
+    };
+    let uint8_array = js_sys::Uint8Array::from(bytes);
+    let array_buffer = uint8_array.buffer();
+    mse.source_buffer
+        .append_buffer_with_array_buffer(&array_buffer)
+        .is_ok()
+}
+
+/// Compare a captured generation against the current MseState generation.
+fn check_generation(state: &Rc<RefCell<Option<MseState>>>, pump_gen: u32) -> bool {
+    state
+        .borrow()
+        .as_ref()
+        .map_or(false, |s| s.generation == pump_gen)
+}
+
+// ── ProgressBar component (§11.1) ────────────────────────────────────────────
+
+#[derive(Properties, PartialEq)]
+struct ProgressBarProps {
+    pub progress_ref: NodeRef,
+    pub thumbnail_canvas_ref: NodeRef,
+    pub duration: f64,
+    pub current_time: f64,
+    pub buffered_end: f64,
+    pub is_dragging: bool,
+    pub is_hovering_progress: bool,
+    pub hover_time: f64,
+    pub hover_position: f64,
+    pub drag_time: f64,
+    pub thumbnail_info: Option<ThumbnailInfo>,
+    pub on_click: Callback<MouseEvent>,
+    pub on_mousedown: Callback<MouseEvent>,
+    pub on_mousemove: Callback<MouseEvent>,
+    pub on_mouseleave: Callback<MouseEvent>,
+}
+
+#[function_component]
+fn ProgressBar(props: &ProgressBarProps) -> Html {
+    let progress_percent = if props.duration > 0.0 {
+        (props.current_time / props.duration * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+    let buffered_percent = if props.duration > 0.0 {
+        (props.buffered_end / props.duration * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+
+    let preview_style = if props.is_hovering_progress || props.is_dragging {
+        let left = props.hover_position.clamp(5.0, 95.0);
+        format!("left: {}%; display: block;", left)
+    } else {
+        "display: none;".to_string()
+    };
+
+    let preview_time = if props.is_dragging {
+        props.drag_time
+    } else {
+        props.hover_time
+    };
+
+    html! {
+        <div class="player-progress-container">
+            // Thumbnail preview
+            <div class="player-preview" style={preview_style}>
+                <canvas
+                    ref={props.thumbnail_canvas_ref.clone()}
+                    class="player-preview__canvas"
+                    width="160"
+                    height="90"
+                />
+                <div class="player-preview__time">{ format_time(preview_time) }</div>
+            </div>
+
+            // Progress bar
+            <div
+                ref={props.progress_ref.clone()}
+                class="player-progress"
+                onclick={props.on_click.clone()}
+                onmousedown={props.on_mousedown.clone()}
+                onmousemove={props.on_mousemove.clone()}
+                onmouseleave={props.on_mouseleave.clone()}
+            >
+                <div
+                    class="player-progress__buffered"
+                    style={format!("width: {}%", buffered_percent)}
+                />
+                <div
+                    class="player-progress__played"
+                    style={format!("width: {}%", progress_percent)}
+                />
+                // Hover indicator line
+                if props.is_hovering_progress || props.is_dragging {
+                    <div
+                        class="player-progress__hover-line"
+                        style={format!("left: {}%", if props.is_dragging { progress_percent } else { props.hover_position })}
+                    />
+                }
+                <div
+                    class={if props.is_dragging { "player-progress__thumb player-progress__thumb--dragging" } else { "player-progress__thumb" }}
+                    style={format!("left: {}%", progress_percent)}
+                />
+            </div>
+        </div>
+    }
+}
+
+// ── ControlBar component (§11.1) ─────────────────────────────────────────────
+
+#[derive(Properties, PartialEq)]
+struct ControlBarProps {
+    // Layout
+    pub visible: bool,
+    // Progress bar (forwarded)
+    pub progress_ref: NodeRef,
+    pub thumbnail_canvas_ref: NodeRef,
+    pub duration: f64,
+    pub current_time: f64,
+    pub buffered_end: f64,
+    pub is_dragging: bool,
+    pub is_hovering_progress: bool,
+    pub hover_time: f64,
+    pub hover_position: f64,
+    pub drag_time: f64,
+    pub thumbnail_info: Option<ThumbnailInfo>,
+    pub on_progress_click: Callback<MouseEvent>,
+    pub on_progress_mousedown: Callback<MouseEvent>,
+    pub on_progress_hover: Callback<MouseEvent>,
+    pub on_progress_leave: Callback<MouseEvent>,
+    // Playback
+    pub is_playing: bool,
+    pub video_ended: bool,
+    pub playback_speed: f64,
+    pub speed_menu_open: bool,
+    pub on_play_pause: Callback<()>,
+    pub on_speed_toggle: Callback<MouseEvent>,
+    pub on_speed_select: Callback<f64>,
+    // Volume
+    pub volume: f64,
+    pub is_muted: bool,
+    pub volume_slider_visible: bool,
+    pub on_volume_toggle: Callback<()>,
+    pub on_volume_change: Callback<web_sys::InputEvent>,
+    pub on_volume_enter: Callback<()>,
+    pub on_volume_leave: Callback<()>,
+    // Quality
+    pub selected_quality: String,
+    pub quality_menu_open: bool,
+    pub on_quality_toggle: Callback<MouseEvent>,
+    pub on_quality_select: Callback<String>,
+    // Captions
+    pub subtitle_tracks: Vec<SubtitleTrack>,
+    pub active_subtitle: Option<u32>,
+    pub captions_menu_open: bool,
+    pub on_captions_toggle: Callback<MouseEvent>,
+    pub on_caption_select: Callback<Option<u32>>,
+    // Fullscreen
+    pub is_fullscreen: bool,
+    pub on_fullscreen_toggle: Callback<()>,
+}
+
+#[function_component]
+fn ControlBar(props: &ControlBarProps) -> Html {
+    let controls_class = if props.visible {
+        "player-controls"
+    } else {
+        "player-controls player-controls--hidden"
+    };
+
+    let play_pause_icon: Html = if props.video_ended {
+        icon_replay()
+    } else if props.is_playing {
+        icon_pause()
+    } else {
+        icon_play()
+    };
+
+    let volume_icon: Html = if props.is_muted || props.volume == 0.0 {
+        icon_volume_muted()
+    } else if props.volume < 0.5 {
+        icon_volume_low()
+    } else {
+        icon_volume_high()
+    };
+
+    let fullscreen_icon: Html = if props.is_fullscreen {
+        icon_fullscreen_exit()
+    } else {
+        icon_fullscreen_enter()
+    };
+
+    let time_display = format!(
+        "{} / {}",
+        format_time(props.current_time),
+        format_time(props.duration)
+    );
+
+    let on_play_pause = props.on_play_pause.clone();
+    let on_volume_toggle = props.on_volume_toggle.clone();
+    let on_fullscreen_toggle = props.on_fullscreen_toggle.clone();
+
+    html! {
+        <div class={controls_class}>
+            <ProgressBar
+                progress_ref={props.progress_ref.clone()}
+                thumbnail_canvas_ref={props.thumbnail_canvas_ref.clone()}
+                duration={props.duration}
+                current_time={props.current_time}
+                buffered_end={props.buffered_end}
+                is_dragging={props.is_dragging}
+                is_hovering_progress={props.is_hovering_progress}
+                hover_time={props.hover_time}
+                hover_position={props.hover_position}
+                drag_time={props.drag_time}
+                thumbnail_info={props.thumbnail_info.clone()}
+                on_click={props.on_progress_click.clone()}
+                on_mousedown={props.on_progress_mousedown.clone()}
+                on_mousemove={props.on_progress_hover.clone()}
+                on_mouseleave={props.on_progress_leave.clone()}
+            />
+
+            // Bottom controls
+            <div class="player-controls__bottom">
+                // Left side controls
+                <div class="player-controls__left">
+                    <button
+                        class="player-controls__btn"
+                        onclick={Callback::from(move |_| on_play_pause.emit(()))}
+                        title="Play/Pause (k)"
+                    >
+                        { play_pause_icon }
+                    </button>
+
+                    // Volume control
+                    <div
+                        class="player-volume"
+                        onmouseenter={Callback::from({
+                            let on_enter = props.on_volume_enter.clone();
+                            move |_: MouseEvent| on_enter.emit(())
+                        })}
+                        onmouseleave={Callback::from({
+                            let on_leave = props.on_volume_leave.clone();
+                            move |_: MouseEvent| on_leave.emit(())
+                        })}
+                    >
+                        <button
+                            class="player-controls__btn"
+                            onclick={Callback::from(move |_| on_volume_toggle.emit(()))}
+                            title="Mute (m)"
+                        >
+                            { volume_icon }
+                        </button>
+                        <div class={if props.volume_slider_visible { "player-volume__slider player-volume__slider--visible" } else { "player-volume__slider" }}>
+                            <input
+                                type="range"
+                                min="0"
+                                max="1"
+                                step="0.05"
+                                value={props.volume.to_string()}
+                                oninput={props.on_volume_change.clone()}
+                                class="player-volume__input"
+                            />
+                        </div>
+                    </div>
+
+                    <span class="player-controls__time">{ time_display }</span>
+                </div>
+
+                // Right side controls
+                <div class="player-controls__right">
+                    // Playback speed
+                    <div class="player-speed">
+                        <button
+                            class="player-controls__btn player-controls__btn--text"
+                            onclick={props.on_speed_toggle.clone()}
+                            title="Playback speed"
+                        >
+                            { format!("{}x", props.playback_speed) }
+                        </button>
+                        if props.speed_menu_open {
+                            <div class="player-speed__menu">
+                                { for PLAYBACK_SPEEDS.iter().map(|&speed| {
+                                    let on_select = props.on_speed_select.clone();
+                                    let is_active = (props.playback_speed - speed).abs() < 0.01;
+                                    html! {
+                                        <button
+                                            class={if is_active { "player-speed__option player-speed__option--active" } else { "player-speed__option" }}
+                                            onclick={Callback::from(move |e: MouseEvent| {
+                                                e.stop_propagation();
+                                                on_select.emit(speed);
+                                            })}
+                                        >
+                                            { format!("{}x", speed) }
+                                        </button>
+                                    }
+                                })}
+                            </div>
+                        }
+                    </div>
+
+                    // Quality selector
+                    <div class="player-quality">
+                        <button
+                            class="player-controls__btn player-controls__btn--text"
+                            onclick={props.on_quality_toggle.clone()}
+                            title="Stream quality"
+                        >
+                            { QUALITY_OPTIONS.iter()
+                                .find(|(v, _)| *v == props.selected_quality.as_str())
+                                .map(|(_, label)| *label)
+                                .unwrap_or("Original (Direct)") }
+                        </button>
+                        if props.quality_menu_open {
+                            <div class="player-quality__menu">
+                                { for QUALITY_OPTIONS.iter().map(|(value, label)| {
+                                    let on_select = props.on_quality_select.clone();
+                                    let is_active = props.selected_quality.as_str() == *value;
+                                    let value_str = value.to_string();
+                                    html! {
+                                        <button
+                                            class={if is_active { "player-quality__option player-quality__option--active" } else { "player-quality__option" }}
+                                            onclick={Callback::from(move |e: MouseEvent| {
+                                                e.stop_propagation();
+                                                on_select.emit(value_str.clone());
+                                            })}
+                                        >
+                                            { *label }
+                                        </button>
+                                    }
+                                })}
+                            </div>
+                        }
+                    </div>
+
+                    // Captions button (only show if subtitles available)
+                    if !props.subtitle_tracks.is_empty() {
+                        <div class="player-captions">
+                            <button
+                                class={if props.active_subtitle.is_some() { "player-controls__btn player-controls__btn--active" } else { "player-controls__btn" }}
+                                onclick={props.on_captions_toggle.clone()}
+                                title="Captions (c)"
+                            >
+                                { "CC" }
+                            </button>
+                            if props.captions_menu_open {
+                                <div class="player-captions__menu">
+                                    <button
+                                        class={if props.active_subtitle.is_none() { "player-captions__option player-captions__option--active" } else { "player-captions__option" }}
+                                        onclick={Callback::from({
+                                            let on_select = props.on_caption_select.clone();
+                                            move |e: MouseEvent| {
+                                                e.stop_propagation();
+                                                on_select.emit(None);
+                                            }
+                                        })}
+                                    >
+                                        { "Off" }
+                                    </button>
+                                    { for props.subtitle_tracks.iter().map(|track| {
+                                        let on_select = props.on_caption_select.clone();
+                                        let is_active = props.active_subtitle == Some(track.index);
+                                        let label = track.title.clone()
+                                            .or_else(|| track.language.clone())
+                                            .unwrap_or_else(|| format!("Track {}", track.index + 1));
+                                        let track_index = track.index;
+                                        html! {
+                                            <button
+                                                class={if is_active { "player-captions__option player-captions__option--active" } else { "player-captions__option" }}
+                                                onclick={Callback::from(move |e: MouseEvent| {
+                                                    e.stop_propagation();
+                                                    on_select.emit(Some(track_index));
+                                                })}
+                                            >
+                                                { label }
+                                            </button>
+                                        }
+                                    })}
+                                </div>
+                            }
+                        </div>
+                    }
+
+                    // Fullscreen button
+                    <button
+                        class="player-controls__btn"
+                        onclick={Callback::from(move |_| on_fullscreen_toggle.emit(()))}
+                        title="Fullscreen (f)"
+                    >
+                        { fullscreen_icon }
+                    </button>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+// ── VideoPlayer component (§11.1 shell) ──────────────────────────────────────
 
 #[derive(Properties, PartialEq)]
 pub struct VideoPlayerProps {
@@ -664,6 +1118,22 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             0
                         };
 
+                        // §11.2: Create channel for the pump loop.
+                        let (pump_tx, pump_rx) = mpsc::unbounded();
+
+                        // Create a single persistent updateend closure that sends
+                        // through the channel instead of being forgotten.
+                        let updateend_tx = pump_tx.clone();
+                        let updateend_closure = Closure::<dyn Fn()>::new(move || {
+                            let _ = updateend_tx.unbounded_send(PumpMsg::AppendComplete);
+                        });
+                        source_buffer
+                            .add_event_listener_with_callback(
+                                "updateend",
+                                updateend_closure.as_ref().unchecked_ref(),
+                            )
+                            .ok();
+
                         // Store MSE state.
                         *mse_state.borrow_mut() = Some(MseState {
                             media_source,
@@ -671,8 +1141,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             object_url,
                             segments,
                             next_seg: start_seg,
-                            is_appending: false,
                             generation: 0,
+                            pump_tx: pump_tx.clone(),
+                            _updateend_closure: updateend_closure,
                         });
 
                         status.set(String::new());
@@ -680,8 +1151,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             video.set_current_time(snap_to_cached_segment(start_pos));
                         }
 
-                        // Kick off the segment pump.
-                        pump_segments(mse_state, video);
+                        // Start the pump loop as a spawned task.
+                        let mse_state_for_pump = mse_state.clone();
+                        let video_for_pump = video.clone();
+                        spawn_local(pump_loop(pump_rx, mse_state_for_pump, video_for_pump));
+
+                        // Kick off the initial segment fetch.
+                        let _ = pump_tx.unbounded_send(PumpMsg::TopUp);
                     });
                 }) as Box<dyn FnOnce()>);
 
@@ -699,7 +1175,19 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let mse_state_for_cleanup = mse_state.clone();
             let video_ref_for_cleanup = video_ref.clone();
             move || {
+                // §11.2: Send Shutdown before dropping MseState.
+                {
+                    let borrow = mse_state_for_cleanup.borrow();
+                    if let Some(mse) = borrow.as_ref() {
+                        let _ = mse.pump_tx.unbounded_send(PumpMsg::Shutdown);
+                    }
+                }
                 if let Some(state) = mse_state_for_cleanup.borrow_mut().take() {
+                    // Remove the persistent updateend listener.
+                    let _ = state.source_buffer.remove_event_listener_with_callback(
+                        "updateend",
+                        state._updateend_closure.as_ref().unchecked_ref(),
+                    );
                     let _ = state.media_source.end_of_stream();
                     let _ = web_sys::Url::revoke_object_url(&state.object_url);
                     if let Some(video) = video_ref_for_cleanup.cast::<HtmlVideoElement>() {
@@ -736,16 +1224,16 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 } else {
                                     0
                                 };
-                                
+
                                 let max_index = info.columns * info.rows - 1;
                                 let thumb_index = thumb_index.min(max_index);
-                                
+
                                 let col = thumb_index % info.columns;
                                 let row = thumb_index / info.columns;
-                                
+
                                 let sx = (col * info.thumb_width) as f64;
                                 let sy = (row * info.thumb_height) as f64;
-                                
+
                                 // Clear canvas and draw the thumbnail portion
                                 ctx.clear_rect(0.0, 0.0, canvas.width() as f64, canvas.height() as f64);
                                 let _ = ctx.draw_image_with_html_image_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
@@ -763,7 +1251,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         );
     }
 
-    // Update time/duration periodically and pump MSE segments
+    // Update time/duration periodically and send TopUp to pump loop
     {
         let video_ref = video_ref.clone();
         let current_time = current_time.clone();
@@ -797,15 +1285,23 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     // Check if video ended
                     video_ended.set(video.ended());
 
-                    // Top up the MSE buffer as playback advances
-                    pump_segments(mse_state_for_interval.clone(), video);
+                    // Send TopUp to the pump loop
+                    let tx = {
+                        let borrow = mse_state_for_interval.borrow();
+                        borrow.as_ref().map(|s| s.pump_tx.clone())
+                    };
+                    if let Some(tx) = tx {
+                        let _ = tx.unbounded_send(PumpMsg::TopUp);
+                    }
                 }
             });
             move || drop(interval)
         });
     }
 
-    // Handle seeks to unbuffered positions for the MSE player
+    // Handle seeks to unbuffered positions for the MSE player — sends
+    // PumpMsg::Seek through the channel instead of manipulating state
+    // directly (§11.2).
     {
         let video_ref = video_ref.clone();
         let mse_state = mse_state.clone();
@@ -826,25 +1322,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         return;
                     }
 
-                    // Seeking to unbuffered territory — increment the generation
-                    // counter to invalidate any in-flight fetches from the previous
-                    // position, then reset the segment pointer and re-pump (§11.6).
-                    {
-                        let mut borrow = mse_state_for_seeked.borrow_mut();
-                        if let Some(mse) = borrow.as_mut() {
-                            mse.generation = mse.generation.wrapping_add(1);
-                            if !mse.source_buffer.updating() {
-                                let remove_end = (current_time - MSE_BACK_BUFFER_S).max(0.0);
-                                if remove_end > 0.0 {
-                                    let _ = mse.source_buffer.remove(0.0, remove_end);
-                                }
-                            }
-                            let snapped = snap_to_cached_segment(current_time);
-                            mse.next_seg = (snapped / SEGMENT_DURATION_F) as usize;
-                            mse.is_appending = false;
-                        }
+                    // Send Seek through the channel (§11.2 / §11.6).
+                    let tx = {
+                        let borrow = mse_state_for_seeked.borrow();
+                        borrow.as_ref().map(|s| s.pump_tx.clone())
+                    };
+                    if let Some(tx) = tx {
+                        let _ = tx.unbounded_send(PumpMsg::Seek(current_time));
                     }
-                    pump_segments(mse_state_for_seeked.clone(), video_for_seeked.clone());
                 });
 
                 video
@@ -1245,6 +1730,20 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
+    // Volume slider visibility
+    let on_volume_enter = {
+        let volume_slider_visible = volume_slider_visible.clone();
+        Callback::from(move |_| {
+            volume_slider_visible.set(true);
+        })
+    };
+    let on_volume_leave = {
+        let volume_slider_visible = volume_slider_visible.clone();
+        Callback::from(move |_| {
+            volume_slider_visible.set(false);
+        })
+    };
+
     // Fullscreen toggle
     let on_fullscreen_toggle = {
         let container_ref = container_ref.clone();
@@ -1287,8 +1786,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             }
         })
     };
-
-    // Settings toggle removed - gear icon had no functional purpose
 
     // Quality menu toggle
     let on_quality_toggle = {
@@ -1334,23 +1831,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             quality_menu_open.set(false);
         })
     };
-
-    // Helper function to calculate seek time from mouse position
-    fn calculate_seek_time(
-        e: &MouseEvent,
-        progress_el: &web_sys::HtmlElement,
-        video_duration: f64,
-    ) -> Option<(f64, f64)> {
-        let rect = progress_el.get_bounding_client_rect();
-        let click_x = e.client_x() as f64 - rect.left();
-        let width = rect.width();
-        if width > 0.0 && video_duration.is_finite() && video_duration > 0.0 {
-            let seek_ratio = (click_x / width).clamp(0.0, 1.0);
-            Some((seek_ratio * video_duration, seek_ratio * 100.0))
-        } else {
-            None
-        }
-    }
 
     // Progress bar hover handler
     let on_progress_hover = {
@@ -1647,7 +2127,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         Callback::from(move |track_index: Option<u32>| {
             captions_menu_open.set(false);
             active_subtitle.set(track_index);
-            
+
             if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
                 // Remove all existing <track> child elements to avoid
                 // accumulating hidden tracks on repeated selections.
@@ -1663,7 +2143,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 for el in to_remove {
                     video.remove_child(&el).ok();
                 }
-                
+
                 if let Some(index) = track_index {
                     // Create a single new <track> element.
                     let doc = web_sys::window().unwrap().document().unwrap();
@@ -1671,9 +2151,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         track_el.set_attribute("kind", "captions").ok();
                         track_el.set_attribute("src", &format!("/api/videos/{}/subtitles/{}.vtt", video_id, index)).ok();
                         track_el.set_attribute("default", "").ok();
-                        
+
                         video.append_child(&track_el).ok();
-                        
+
                         // Enable the newly added track.
                         let text_tracks = video.text_tracks();
                         if let Some(tracks) = text_tracks {
@@ -1687,69 +2167,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
-    // Calculate progress percentages
-    let progress_percent = if *duration > 0.0 {
-        (*current_time / *duration * 100.0).min(100.0)
-    } else {
-        0.0
-    };
-    let buffered_percent = if *duration > 0.0 {
-        (*buffered_end / *duration * 100.0).min(100.0)
-    } else {
-        0.0
-    };
-
-    let time_display = format!(
-        "{} / {}",
-        format_time(*current_time),
-        format_time(*duration)
-    );
-    let play_pause_icon: Html = if *video_ended {
-        icon_replay()
-    } else if *is_playing {
-        icon_pause()
-    } else {
-        icon_play()
-    };
-
-    let volume_icon: Html = if *is_muted || *volume == 0.0 {
-        icon_volume_muted()
-    } else if *volume < 0.5 {
-        icon_volume_low()
-    } else {
-        icon_volume_high()
-    };
-
-    let fullscreen_icon: Html = if *is_fullscreen {
-        icon_fullscreen_exit()
-    } else {
-        icon_fullscreen_enter()
-    };
-
-    let controls_class = if *controls_visible {
-        "player-controls"
-    } else {
-        "player-controls player-controls--hidden"
-    };
-
     let container_class = if *is_fullscreen {
         "player-overlay player-overlay--fullscreen"
     } else {
         "player-overlay"
-    };
-
-    // Calculate thumbnail preview position
-    let preview_style = if *is_hovering_progress || *is_dragging {
-        let left = (*hover_position).clamp(5.0, 95.0);
-        format!("left: {}%; display: block;", left)
-    } else {
-        "display: none;".to_string()
-    };
-
-    let preview_time = if *is_dragging {
-        *drag_time
-    } else {
-        *hover_time
     };
 
     html! {
@@ -1832,207 +2253,50 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 </div>
             }
 
-            // Controls bar
-            <div class={controls_class}>
-                // Progress bar container
-                <div class="player-progress-container">
-                    // Thumbnail preview
-                    <div class="player-preview" style={preview_style}>
-                        <canvas ref={thumbnail_canvas_ref} class="player-preview__canvas" width="160" height="90"></canvas>
-                        <div class="player-preview__time">{ format_time(preview_time) }</div>
-                    </div>
-
-                    // Progress bar
-                    <div
-                        ref={progress_ref}
-                        class="player-progress"
-                        onclick={on_progress_click}
-                        onmousedown={on_progress_mousedown}
-                        onmousemove={on_progress_hover}
-                        onmouseleave={on_progress_leave}
-                    >
-                        <div
-                            class="player-progress__buffered"
-                            style={format!("width: {}%", buffered_percent)}
-                        />
-                        <div
-                            class="player-progress__played"
-                            style={format!("width: {}%", progress_percent)}
-                        />
-                        // Hover indicator line
-                        if *is_hovering_progress || *is_dragging {
-                            <div
-                                class="player-progress__hover-line"
-                                style={format!("left: {}%", if *is_dragging { progress_percent } else { *hover_position })}
-                            />
-                        }
-                        <div
-                            class={if *is_dragging { "player-progress__thumb player-progress__thumb--dragging" } else { "player-progress__thumb" }}
-                            style={format!("left: {}%", progress_percent)}
-                        />
-                    </div>
-                </div>
-
-                // Bottom controls
-                <div class="player-controls__bottom">
-                    // Left side controls
-                    <div class="player-controls__left">
-                        <button class="player-controls__btn" onclick={on_play_pause} title="Play/Pause (k)">
-                            { play_pause_icon }
-                        </button>
-
-                        // Volume control
-                        <div
-                            class="player-volume"
-                            onmouseenter={Callback::from({
-                                let volume_slider_visible = volume_slider_visible.clone();
-                                move |_| volume_slider_visible.set(true)
-                            })}
-                            onmouseleave={Callback::from({
-                                let volume_slider_visible = volume_slider_visible.clone();
-                                move |_| volume_slider_visible.set(false)
-                            })}
-                        >
-                            <button class="player-controls__btn" onclick={on_volume_toggle} title="Mute (m)">
-                                { volume_icon }
-                            </button>
-                            <div class={if *volume_slider_visible { "player-volume__slider player-volume__slider--visible" } else { "player-volume__slider" }}>
-                                <input
-                                    type="range"
-                                    min="0"
-                                    max="1"
-                                    step="0.05"
-                                    value={volume.to_string()}
-                                    oninput={on_volume_change}
-                                    class="player-volume__input"
-                                />
-                            </div>
-                        </div>
-
-                        <span class="player-controls__time">{ time_display }</span>
-                    </div>
-
-                    // Right side controls
-                    <div class="player-controls__right">
-                        // Playback speed
-                        <div class="player-speed">
-                            <button
-                                class="player-controls__btn player-controls__btn--text"
-                                onclick={on_speed_toggle}
-                                title="Playback speed"
-                            >
-                                { format!("{}x", *playback_speed) }
-                            </button>
-                            if *speed_menu_open {
-                                <div class="player-speed__menu">
-                                    { for PLAYBACK_SPEEDS.iter().map(|&speed| {
-                                        let on_select = on_speed_select.clone();
-                                        let is_active = (*playback_speed - speed).abs() < 0.01;
-                                        html! {
-                                            <button
-                                                class={if is_active { "player-speed__option player-speed__option--active" } else { "player-speed__option" }}
-                                                onclick={Callback::from(move |e: MouseEvent| {
-                                                    e.stop_propagation();
-                                                    on_select.emit(speed);
-                                                })}
-                                            >
-                                                { format!("{}x", speed) }
-                                            </button>
-                                        }
-                                    })}
-                                </div>
-                            }
-                        </div>
-
-                        // Quality selector
-                        <div class="player-quality">
-                            <button
-                                class="player-controls__btn player-controls__btn--text"
-                                onclick={on_quality_toggle}
-                                title="Stream quality"
-                            >
-                                { QUALITY_OPTIONS.iter()
-                                    .find(|(v, _)| *v == selected_quality.as_str())
-                                    .map(|(_, label)| *label)
-                                    .unwrap_or("Original (Direct)") }
-                            </button>
-                            if *quality_menu_open {
-                                <div class="player-quality__menu">
-                                    { for QUALITY_OPTIONS.iter().map(|(value, label)| {
-                                        let on_select = on_quality_select.clone();
-                                        let is_active = selected_quality.as_str() == *value;
-                                        let value_str = value.to_string();
-                                        html! {
-                                            <button
-                                                class={if is_active { "player-quality__option player-quality__option--active" } else { "player-quality__option" }}
-                                                onclick={Callback::from(move |e: MouseEvent| {
-                                                    e.stop_propagation();
-                                                    on_select.emit(value_str.clone());
-                                                })}
-                                            >
-                                                { *label }
-                                            </button>
-                                        }
-                                    })}
-                                </div>
-                            }
-                        </div>
-
-                        // Captions button (only show if subtitles available)
-                        if !subtitle_tracks.is_empty() {
-                            <div class="player-captions">
-                                <button
-                                    class={if active_subtitle.is_some() { "player-controls__btn player-controls__btn--active" } else { "player-controls__btn" }}
-                                    onclick={on_captions_toggle}
-                                    title="Captions (c)"
-                                >
-                                    { "CC" }
-                                </button>
-                                if *captions_menu_open {
-                                    <div class="player-captions__menu">
-                                        <button
-                                            class={if active_subtitle.is_none() { "player-captions__option player-captions__option--active" } else { "player-captions__option" }}
-                                            onclick={Callback::from({
-                                                let on_select = on_caption_select.clone();
-                                                move |e: MouseEvent| {
-                                                    e.stop_propagation();
-                                                    on_select.emit(None);
-                                                }
-                                            })}
-                                        >
-                                            { "Off" }
-                                        </button>
-                                        { for subtitle_tracks.iter().map(|track| {
-                                            let on_select = on_caption_select.clone();
-                                            let is_active = *active_subtitle == Some(track.index);
-                                            let label = track.title.clone()
-                                                .or_else(|| track.language.clone())
-                                                .unwrap_or_else(|| format!("Track {}", track.index + 1));
-                                            let track_index = track.index;
-                                            html! {
-                                                <button
-                                                    class={if is_active { "player-captions__option player-captions__option--active" } else { "player-captions__option" }}
-                                                    onclick={Callback::from(move |e: MouseEvent| {
-                                                        e.stop_propagation();
-                                                        on_select.emit(Some(track_index));
-                                                    })}
-                                                >
-                                                    { label }
-                                                </button>
-                                            }
-                                        })}
-                                    </div>
-                                }
-                            </div>
-                        }
-
-                        // Fullscreen button
-                        <button class="player-controls__btn" onclick={on_fullscreen_toggle} title="Fullscreen (f)">
-                            { fullscreen_icon }
-                        </button>
-                    </div>
-                </div>
-            </div>
+            // Controls bar (§11.1 — ControlBar sub-component)
+            <ControlBar
+                visible={*controls_visible}
+                progress_ref={progress_ref}
+                thumbnail_canvas_ref={thumbnail_canvas_ref}
+                duration={*duration}
+                current_time={*current_time}
+                buffered_end={*buffered_end}
+                is_dragging={*is_dragging}
+                is_hovering_progress={*is_hovering_progress}
+                hover_time={*hover_time}
+                hover_position={*hover_position}
+                drag_time={*drag_time}
+                thumbnail_info={(*thumbnail_info).clone()}
+                on_progress_click={on_progress_click}
+                on_progress_mousedown={on_progress_mousedown}
+                on_progress_hover={on_progress_hover}
+                on_progress_leave={on_progress_leave}
+                is_playing={*is_playing}
+                video_ended={*video_ended}
+                playback_speed={*playback_speed}
+                speed_menu_open={*speed_menu_open}
+                on_play_pause={on_play_pause}
+                on_speed_toggle={on_speed_toggle}
+                on_speed_select={on_speed_select}
+                volume={*volume}
+                is_muted={*is_muted}
+                volume_slider_visible={*volume_slider_visible}
+                on_volume_toggle={on_volume_toggle}
+                on_volume_change={on_volume_change}
+                on_volume_enter={on_volume_enter}
+                on_volume_leave={on_volume_leave}
+                selected_quality={(*selected_quality).clone()}
+                quality_menu_open={*quality_menu_open}
+                on_quality_toggle={on_quality_toggle}
+                on_quality_select={on_quality_select}
+                subtitle_tracks={(*subtitle_tracks).clone()}
+                active_subtitle={*active_subtitle}
+                captions_menu_open={*captions_menu_open}
+                on_captions_toggle={on_captions_toggle}
+                on_caption_select={on_caption_select}
+                is_fullscreen={*is_fullscreen}
+                on_fullscreen_toggle={on_fullscreen_toggle}
+            />
         </div>
     }
 }

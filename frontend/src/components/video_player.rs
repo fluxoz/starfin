@@ -156,7 +156,6 @@ struct SegmentInfo {
     duration: f64,
 }
 
-#[allow(dead_code)]
 enum PumpMsg {
     /// SourceBuffer `updateend` event fired.
     AppendComplete,
@@ -166,8 +165,8 @@ enum PumpMsg {
     Seek(f64),
     /// Fetch completed successfully.
     FetchComplete(u32, Vec<u8>),
-    /// Fetch failed after retries.
-    FetchFailed(u32),
+    /// Fetch failed after retries (carries generation for staleness check).
+    FetchFailed(#[allow(dead_code)] u32),
     /// Shutdown the pump loop.
     Shutdown,
 }
@@ -301,8 +300,12 @@ async fn pump_loop(
                 }
             }
 
-            PumpMsg::FetchFailed(_) => {
-                pump_state = PumpState::Idle;
+            PumpMsg::FetchFailed(pump_gen) => {
+                // Only reset to idle if this failure is for the current generation;
+                // a stale failure should not disturb an in-progress fetch.
+                if pump_state == PumpState::Fetching && check_generation(&state, pump_gen) {
+                    pump_state = PumpState::Idle;
+                }
             }
 
             PumpMsg::TopUp => {}

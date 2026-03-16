@@ -156,7 +156,7 @@ pub fn filters_bar(props: &Props) -> Html {
                     </select>
                 </label>
 
-                <label class="field">
+                <div class="field">
                     <span class="field__label">{ "Tags" }</span>
                     <MultiSelect
                         values={props.all_tags.clone()}
@@ -165,9 +165,9 @@ pub fn filters_bar(props: &Props) -> Html {
                         placeholder="No tags defined"
                         label="Filter by tags"
                     />
-                </label>
+                </div>
 
-                <label class="field">
+                <div class="field">
                     <span class="field__label">{ "Actors" }</span>
                     <MultiSelect
                         values={props.all_actors.clone()}
@@ -176,9 +176,9 @@ pub fn filters_bar(props: &Props) -> Html {
                         placeholder="No actors defined"
                         label="Filter by actors"
                     />
-                </label>
+                </div>
 
-                <label class="field">
+                <div class="field">
                     <span class="field__label">{ "Categories" }</span>
                     <MultiSelect
                         values={props.all_categories.clone()}
@@ -187,7 +187,7 @@ pub fn filters_bar(props: &Props) -> Html {
                         placeholder="No categories defined"
                         label="Filter by categories"
                     />
-                </label>
+                </div>
             </div>
         </section>
     }

@@ -609,14 +609,6 @@ body{
   color: var(--muted);
 }
 
-/* Invisible full-viewport backdrop to close the dropdown on outside click */
-.multi-select__backdrop{
-  position: fixed;
-  inset: 0;
-  z-index: 200;
-  background: rgba(0,0,0,.01); /* near-transparent: captures clicks, subtle focus cue */
-}
-
 /* Dropdown list */
 .multi-select__dropdown{
   position: absolute;

@@ -100,6 +100,10 @@ pub fn app() -> Html {
 
 #[function_component(AppInner)]
 fn app_inner() -> Html {
+    /// Initial number of grid items shown before the user scrolls.
+    const INITIAL_VISIBLE_COUNT: usize = 100;
+    /// Number of additional items revealed per scroll-to-bottom event.
+    const LOAD_MORE_INCREMENT: usize = 50;
     let query = use_state(|| "".to_string());
     let sort_by = use_state(|| SortBy::DateAddedNewest);
 
@@ -159,6 +163,18 @@ fn app_inner() -> Html {
     // Scroll-to-top button visibility state
     let show_scroll_top = use_state(|| false);
 
+    // Lazy loading: number of items to show when no search/filter is active.
+    // Starts at INITIAL_VISIBLE_COUNT; grows by LOAD_MORE_INCREMENT each time
+    // the user scrolls near the bottom.
+    let visible_count = use_state(|| INITIAL_VISIBLE_COUNT);
+    // Mirror ref so the scroll closure (set up once on mount) always reads the
+    // current value rather than the stale value captured at mount time.
+    let visible_count_ref = use_mut_ref(|| INITIAL_VISIBLE_COUNT);
+
+    // Tracks the total number of items currently in the list so the scroll
+    // closure can stop incrementing once everything is visible.
+    let total_items_len_ref = use_mut_ref(|| 0_usize);
+
     // Hardware acceleration renderer name
     let hwaccel_label = use_state(|| Option::<String>::None);
 
@@ -175,9 +191,33 @@ fn app_inner() -> Html {
         });
     }
 
-    // Listen for scroll events on the window to toggle the back-to-top button.
+    // Keep visible_count_ref in sync with visible_count so the scroll closure
+    // (created once at mount) can always read the latest value.
+    {
+        let visible_count_ref = visible_count_ref.clone();
+        use_effect_with(*visible_count, move |&count| {
+            *visible_count_ref.borrow_mut() = count;
+            || ()
+        });
+    }
+
+    // Keep total_items_len_ref in sync with the items list length.
+    {
+        let total_items_len_ref = total_items_len_ref.clone();
+        use_effect_with((*items).len(), move |&len| {
+            *total_items_len_ref.borrow_mut() = len;
+            || ()
+        });
+    }
+
+    // Listen for scroll events on the window to toggle the back-to-top button
+    // and to trigger lazy loading of additional grid items.
     {
         let show_scroll_top = show_scroll_top.clone();
+        let visible_count = visible_count.clone();
+        let visible_count_ref = visible_count_ref.clone();
+        let total_items_len_ref = total_items_len_ref.clone();
+        let query_ref = query_ref.clone();
         use_effect_with((), move |_| {
             let window = web_sys::window().expect("no window");
 
@@ -185,6 +225,32 @@ fn app_inner() -> Html {
                 if let Some(w) = web_sys::window() {
                     let scroll_y = w.scroll_y().unwrap_or(0.0);
                     show_scroll_top.set(scroll_y > 300.0);
+
+                    // Lazy loading: load more items when the user scrolls near
+                    // the bottom and no search filter is currently active.
+                    // `query_ref` is used here instead of the `query` state
+                    // because this closure is captured once at mount; reading
+                    // `query_ref` (a UseRef) always gives the current value,
+                    // whereas a captured UseStateHandle would be stale.
+                    if query_ref.borrow().is_empty() {
+                        let total = *total_items_len_ref.borrow();
+                        let current = *visible_count_ref.borrow();
+                        if current < total {
+                            let window_h = w
+                                .inner_height()
+                                .ok()
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(800.0);
+                            let doc_h = w
+                                .document()
+                                .and_then(|d| d.document_element())
+                                .map(|e| e.scroll_height() as f64)
+                                .unwrap_or(0.0);
+                            if doc_h > 0.0 && scroll_y + window_h >= doc_h - 400.0 {
+                                visible_count.set(current + LOAD_MORE_INCREMENT);
+                            }
+                        }
+                    }
                 }
             });
 
@@ -213,6 +279,8 @@ fn app_inner() -> Html {
         let items = items.clone();
         let loading = loading.clone();
         let error = error.clone();
+        let visible_count = visible_count.clone();
+        let visible_count_ref = visible_count_ref.clone();
 
         use_effect_with(((*query).clone(), (*sort_by).clone()), move |_| {
             let query = (*query).clone();
@@ -221,6 +289,11 @@ fn app_inner() -> Html {
             // Keep refs current so the interval can read the latest values.
             *query_ref.borrow_mut() = query.clone();
             *sort_by_ref.borrow_mut() = sort_by.clone();
+
+            // Reset lazy-load pagination on every filter/sort change so the
+            // new result set is always shown from the beginning.
+            visible_count.set(INITIAL_VISIBLE_COUNT);
+            *visible_count_ref.borrow_mut() = INITIAL_VISIBLE_COUNT;
 
             loading.set(true);
             error.set(None);
@@ -545,6 +618,18 @@ fn app_inner() -> Html {
 
     let app_class = if *dark_mode { "app dark-mode" } else { "app" };
 
+    // Lazy loading: when no search filter is active, only show the first
+    // `visible_count` items so we don't render thousands of cards at once.
+    // When a filter is active, always show all matching results.
+    let is_filtered = !(*query).is_empty();
+    let displayed_items = if is_filtered {
+        (*items).clone()
+    } else {
+        let n = (*visible_count).min((*items).len());
+        (*items)[..n].to_vec()
+    };
+    let has_more = !is_filtered && *visible_count < (*items).len();
+
     // Compute progress percentage and label for the scan progress bar.
     let (scan_pct, scan_label) = match *scan_progress {
         Some((current, total)) if total > 0 => (
@@ -724,13 +809,14 @@ fn app_inner() -> Html {
                     <div class="notice notice--loading">{ "Loading…" }</div>
                 } else {
                     <ElementsGrid
-                        items={(*items).clone()}
+                        items={displayed_items}
                         on_watch={on_watch}
                         on_edit={on_edit}
                         on_favorite_toggle={on_favorite_toggle}
                         thumb_current_id={(*thumb_current_id).clone()}
                         sprite_current_id={(*sprite_current_id).clone()}
                         precache_current_id={(*precache_current_id).clone()}
+                        has_more={has_more}
                     />
                 }
             </main>

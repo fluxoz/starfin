@@ -19,6 +19,9 @@ pub struct Props {
     /// The video ID the pre-cache worker is currently processing (from WS).
     #[prop_or_default]
     pub precache_current_id: Option<String>,
+    /// Whether there are more items to load via lazy scrolling.
+    #[prop_or_default]
+    pub has_more: bool,
 }
 
 #[derive(Properties, PartialEq)]
@@ -198,28 +201,33 @@ pub fn elements_grid(props: &Props) -> Html {
     }
 
     html! {
-        <section class="grid" aria-label="Videos grid">
-            { for props.items.iter().map(|item| {
-                let is_thumb_processing =
-                    props.thumb_current_id.iter().any(|id| id == &item.id);
-                let is_sprite_processing =
-                    props.sprite_current_id.iter().any(|id| id == &item.id);
-                let is_precache_processing =
-                    props.precache_current_id.as_deref() == Some(item.id.as_str());
+        <>
+            <section class="grid" aria-label="Videos grid">
+                { for props.items.iter().map(|item| {
+                    let is_thumb_processing =
+                        props.thumb_current_id.iter().any(|id| id == &item.id);
+                    let is_sprite_processing =
+                        props.sprite_current_id.iter().any(|id| id == &item.id);
+                    let is_precache_processing =
+                        props.precache_current_id.as_deref() == Some(item.id.as_str());
 
-                html! {
-                    <VideoCard
-                        key={item.id.clone()}
-                        item={item.clone()}
-                        on_watch={props.on_watch.clone()}
-                        on_edit={props.on_edit.clone()}
-                        on_favorite_toggle={props.on_favorite_toggle.clone()}
-                        is_thumb_processing={is_thumb_processing}
-                        is_sprite_processing={is_sprite_processing}
-                        is_precache_processing={is_precache_processing}
-                    />
-                }
-            }) }
-        </section>
+                    html! {
+                        <VideoCard
+                            key={item.id.clone()}
+                            item={item.clone()}
+                            on_watch={props.on_watch.clone()}
+                            on_edit={props.on_edit.clone()}
+                            on_favorite_toggle={props.on_favorite_toggle.clone()}
+                            is_thumb_processing={is_thumb_processing}
+                            is_sprite_processing={is_sprite_processing}
+                            is_precache_processing={is_precache_processing}
+                        />
+                    }
+                }) }
+            </section>
+            if props.has_more {
+                <div class="grid-load-more">{ "Loading more…" }</div>
+            }
+        </>
     }
 }

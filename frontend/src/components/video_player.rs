@@ -166,7 +166,7 @@ enum PumpMsg {
     /// Fetch completed successfully.
     FetchComplete(u32, Vec<u8>),
     /// Fetch failed after retries (carries generation for staleness check).
-    FetchFailed(#[allow(dead_code)] u32),
+    FetchFailed(u32),
     /// Shutdown the pump loop.
     Shutdown,
 }
@@ -275,7 +275,7 @@ async fn pump_loop(
             PumpMsg::Shutdown => break,
 
             PumpMsg::Seek(time) => {
-                handle_pump_seek(&state, &video, time);
+                handle_pump_seek(&state, time);
                 pump_state = PumpState::Idle;
             }
 
@@ -324,7 +324,6 @@ async fn pump_loop(
 /// back-buffer (if the source buffer is not busy), and reset next_seg.
 fn handle_pump_seek(
     state: &Rc<RefCell<Option<MseState>>>,
-    _video: &HtmlVideoElement,
     time: f64,
 ) {
     let mut borrow = state.borrow_mut();

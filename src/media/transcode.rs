@@ -573,6 +573,10 @@ fn remux_segment(
     let out_audio_tb = out_audio_idx_val.map(|i| octx.stream(i).unwrap().time_base()).unwrap_or(out_audio_tb);
 
     let mut got_video_keyframe = false;
+    // PTS offsets (in output time base) used to rebase timestamps so each
+    // segment starts near PTS 0, preventing A/V desync in HLS players.
+    let mut video_pts_offset: Option<i64> = None;
+    let mut audio_pts_offset: Option<i64> = None;
 
     for (stream, mut packet) in ictx.packets() {
         if let Some(k) = kill {
@@ -600,15 +604,14 @@ fn remux_segment(
         }
 
         if is_video {
-            // Accept the first keyframe returned by the seek — this may be
-            // slightly before `start_time` when the source GOP boundaries
-            // don't align with the segment grid.  The resulting overlap with
-            // the previous segment is handled correctly by HLS.js because we
-            // keep the original continuous PTS values (no rebasing).  This
-            // approach — identical to how `ffmpeg -hls_time` works — ensures
-            // no content is ever lost between segments.
+            // Wait for the first keyframe at or after start_time.
+            // Only accept keyframes whose PTS is at or after the declared
+            // segment start so consecutive segments never share overlapping
+            // content.  Accepting a keyframe from *before* start_time would
+            // cause the player to replay already-seen frames at every segment
+            // boundary, producing a stutter at every segment transition.
             if !got_video_keyframe {
-                if !packet.is_key() {
+                if !packet.is_key() || pts_secs < start_time {
                     continue;
                 }
                 got_video_keyframe = true;
@@ -621,18 +624,34 @@ fn remux_segment(
         }
 
         // Map to the output stream and rescale timestamps.
-        // We keep the original continuous PTS/DTS values (just rescaled to
-        // the output time base) so that HLS.js sees a seamless timeline
-        // across segment boundaries.  Previous code rebased PTS to zero per
-        // segment, which broke playback when GOP boundaries did not align
-        // with the segment grid — the player would see a content jump at
-        // every segment transition whose first keyframe was past start_time.
         if is_video {
             packet.set_stream(out_video_idx);
             packet.rescale_ts(in_video_tb, out_video_tb);
+            // Record the first video DTS (or PTS) as the offset to rebase to
+            // zero.  Using DTS prevents negative DTS values for B-frame
+            // content where DTS < PTS on the first packet.
+            if video_pts_offset.is_none() {
+                video_pts_offset = packet.dts().or(packet.pts());
+            }
+            if let (Some(offset), Some(p)) = (video_pts_offset, packet.pts()) {
+                packet.set_pts(Some(p - offset));
+            }
+            if let (Some(offset), Some(d)) = (video_pts_offset, packet.dts()) {
+                packet.set_dts(Some(d - offset));
+            }
         } else if let Some(out_ai) = out_audio_idx_val {
             packet.set_stream(out_ai);
             packet.rescale_ts(in_audio_tb.unwrap(), out_audio_tb);
+            // Record the first audio DTS (or PTS) as the offset to rebase to zero.
+            if audio_pts_offset.is_none() {
+                audio_pts_offset = packet.dts().or(packet.pts());
+            }
+            if let (Some(offset), Some(p)) = (audio_pts_offset, packet.pts()) {
+                packet.set_pts(Some(p - offset));
+            }
+            if let (Some(offset), Some(d)) = (audio_pts_offset, packet.dts()) {
+                packet.set_dts(Some(d - offset));
+            }
         } else {
             continue;
         }
@@ -812,6 +831,7 @@ fn hybrid_segment(
     let out_audio_tb = out_audio_idx.map(|i| octx.stream(i).unwrap().time_base());
 
     let mut got_video_keyframe = false;
+    let mut video_pts_offset: Option<i64> = None;
 
     // Audio synthetic PTS (in 1/sample_rate time base).
     let mut audio_sample_count: i64 = 0;
@@ -843,19 +863,29 @@ fn hybrid_segment(
         }
 
         if is_video {
-            // Accept the first keyframe returned by the seek — see the
-            // matching comment in remux_segment for the full rationale.
+            // Wait for the first keyframe at or after start_time.
+            // See the same comment in remux_segment — accepting a keyframe
+            // from before start_time causes content overlap between segments
+            // and the resulting duplicate frames appear as stuttering.
             if !got_video_keyframe {
-                if !packet.is_key() {
+                if !packet.is_key() || pts_secs < start_time {
                     continue;
                 }
                 got_video_keyframe = true;
             }
 
-            // Copy video packet directly (remux) — keep original continuous
-            // PTS/DTS so that HLS.js sees a seamless timeline.
+            // Copy video packet directly (remux).
             packet.set_stream(out_video_idx);
             packet.rescale_ts(in_video_tb, out_video_tb);
+            if video_pts_offset.is_none() {
+                video_pts_offset = packet.dts().or(packet.pts());
+            }
+            if let (Some(offset), Some(p)) = (video_pts_offset, packet.pts()) {
+                packet.set_pts(Some(p - offset));
+            }
+            if let (Some(offset), Some(d)) = (video_pts_offset, packet.dts()) {
+                packet.set_dts(Some(d - offset));
+            }
             let _ = packet.write_interleaved(&mut octx);
         } else if is_audio {
             // Skip audio before the video keyframe.

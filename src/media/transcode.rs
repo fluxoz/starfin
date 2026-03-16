@@ -212,12 +212,19 @@ fn remux_segment(
         in_audio_params = None;
     }
 
+    // Extract audio sample rate so we can normalise to 1/sample_rate precision,
+    // matching the time-base used by the transcode path.
+    let in_audio_sample_rate: i32 = in_audio_params
+        .as_ref()
+        .map(|p| unsafe { (*p.as_ptr()).sample_rate })
+        .unwrap_or(44100);
+
     // Create output muxer.
     let mut octx = ffmpeg_next::format::output_as(tmp_path, "mpegts")
         .map_err(|e| format!("output context: {e}"))?;
 
     // Add output video stream, copying codec parameters from input.
-    let out_video = octx.add_stream(ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::H264))
+    let mut out_video = octx.add_stream(ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::H264))
         .map_err(|e| format!("add video stream: {e}"))?;
     unsafe {
         ffmpeg_next::ffi::avcodec_parameters_copy(
@@ -225,6 +232,9 @@ fn remux_segment(
             in_video_params.as_ptr(),
         );
     }
+    // Explicitly set 1/90000 time base before write_header so the remux
+    // path uses the same precision as the transcode path.
+    out_video.set_time_base(ffmpeg_next::Rational::new(1, 90000));
     let out_video_idx = out_video.index();
 
     // Add output audio stream if present.
@@ -234,13 +244,16 @@ fn remux_segment(
     if let Some(ref a_params) = in_audio_params {
         let audio_codec_id = a_params.id();
         let enc = ffmpeg_next::encoder::find(audio_codec_id);
-        if let Some(out_audio) = octx.add_stream(enc).ok() {
+        if let Some(mut out_audio) = octx.add_stream(enc).ok() {
             unsafe {
                 ffmpeg_next::ffi::avcodec_parameters_copy(
                     out_audio.parameters().as_mut_ptr(),
                     a_params.as_ptr(),
                 );
             }
+            // Set normalised 1/sample_rate audio time base, matching the
+            // transcode path's synthetic-PTS time base.
+            out_audio.set_time_base(ffmpeg_next::Rational::new(1, in_audio_sample_rate));
             out_audio_tb = out_audio.time_base();
             out_audio_idx_val = Some(out_audio.index());
         }
@@ -254,6 +267,10 @@ fn remux_segment(
     let out_audio_tb = out_audio_idx_val.map(|i| octx.stream(i).unwrap().time_base()).unwrap_or(out_audio_tb);
 
     let mut got_video_keyframe = false;
+
+    // Pre-compute normalised time bases used for rescaling in the packet loop.
+    let norm_video_tb = ffmpeg_next::Rational::new(1, 90000);
+    let norm_audio_tb = ffmpeg_next::Rational::new(1, in_audio_sample_rate);
 
     for (stream, mut packet) in ictx.packets() {
         let si = stream.index();
@@ -290,12 +307,27 @@ fn remux_segment(
         }
 
         // Map to the output stream and rescale timestamps.
+        // For video: rescale via the normalised 1/90000 time base, matching
+        // the synthetic PTS precision used by the transcode path.
+        // For audio: rescale via 1/audio_sample_rate first to normalise
+        // precision to sample-level granularity (matching the transcode path's
+        // cumulative sample counter), then to the muxer's actual time base.
+        // Also ensure DTS is set — some source files omit it for audio packets,
+        // which can confuse the MPEG-TS muxer's interleaver.
         if is_video {
             packet.set_stream(out_video_idx);
-            packet.rescale_ts(in_video_tb, out_video_tb);
+            packet.rescale_ts(in_video_tb, norm_video_tb);
+            packet.rescale_ts(norm_video_tb, out_video_tb);
+            if packet.dts().is_none() {
+                packet.set_dts(packet.pts());
+            }
         } else if let Some(out_ai) = out_audio_idx_val {
             packet.set_stream(out_ai);
-            packet.rescale_ts(in_audio_tb.unwrap(), out_audio_tb);
+            packet.rescale_ts(in_audio_tb.unwrap(), norm_audio_tb);
+            packet.rescale_ts(norm_audio_tb, out_audio_tb);
+            if packet.dts().is_none() {
+                packet.set_dts(packet.pts());
+            }
         } else {
             continue;
         }
@@ -606,7 +638,11 @@ fn transcode_segment_body(
         let ts_offset_90k = (start_time * 90000.0) as i64;
         let mut video_frame_count: i64 = 0;
         let mut audio_sample_count: i64 = 0;
-        let audio_ts_offset = (start_time * audio_sample_rate as f64) as i64;
+        // Computed lazily on the first accepted audio frame so that the offset
+        // is anchored to the actual decoded frame position rather than to the
+        // rounded start_time.  This avoids up to one AAC frame (~23 ms) of
+        // audio lead/trail caused by seek jitter and codec look-ahead.
+        let mut audio_ts_offset: Option<i64> = None;
         let mut done = false;
 
         for (pkt_stream, packet) in ictx.packets() {
@@ -697,29 +733,42 @@ fn transcode_segment_body(
                         let mut audio_frame = ffmpeg_next::util::frame::Audio::empty();
                         while adec.receive_frame(&mut audio_frame).is_ok() {
                             // Time-range filter using input time base.
-                            if let Some(apts) = audio_frame.pts() {
-                                let apts_secs = apts as f64
+                            let apts_secs = audio_frame.pts().map(|apts| {
+                                apts as f64
                                     * f64::from(audio_time_base.0)
-                                    / f64::from(audio_time_base.1);
-                                if apts_secs < start_time || apts_secs >= end_time {
+                                    / f64::from(audio_time_base.1)
+                            });
+                            if let Some(secs) = apts_secs {
+                                if secs < start_time || secs >= end_time {
                                     continue;
                                 }
                             }
 
+                            // Anchor the audio PTS offset to the first accepted
+                            // frame's actual position in time.  Computing the
+                            // offset lazily here (rather than from start_time
+                            // before the loop) avoids up to one AAC frame of
+                            // drift caused by seek jitter and codec buffering.
+                            let offset = *audio_ts_offset.get_or_insert_with(|| {
+                                apts_secs
+                                    .map(|secs| (secs * audio_sample_rate as f64) as i64)
+                                    .unwrap_or_else(|| (start_time * audio_sample_rate as f64) as i64)
+                            });
+
                             // Resample to AAC-compatible format (FLTP) if
                             // needed, then set synthetic PTS aligned with
-                            // the segment start.
+                            // the actual segment start.
                             let frame_to_encode = if let Some(ref mut resampler) = audio_resampler {
                                 let mut resampled = ffmpeg_next::frame::Audio::empty();
                                 if resampler.run(&audio_frame, &mut resampled).is_err() {
                                     continue;
                                 }
-                                let new_pts = audio_sample_count + audio_ts_offset;
+                                let new_pts = audio_sample_count + offset;
                                 resampled.set_pts(Some(new_pts));
                                 audio_sample_count += resampled.samples() as i64;
                                 resampled
                             } else {
-                                let new_pts = audio_sample_count + audio_ts_offset;
+                                let new_pts = audio_sample_count + offset;
                                 audio_frame.set_pts(Some(new_pts));
                                 audio_sample_count += audio_frame.samples() as i64;
                                 audio_frame.clone()
@@ -732,7 +781,7 @@ fn transcode_segment_body(
                                         encoded.set_stream(aud_out_idx);
                                         encoded.rescale_ts(
                                             ffmpeg_next::Rational::new(1, audio_sample_rate as i32),
-                                            out_audio_tb.unwrap_or(ffmpeg_next::Rational::new(1, 90000)),
+                                            out_audio_tb.unwrap_or(ffmpeg_next::Rational::new(1, audio_sample_rate as i32)),
                                         );
                                         let _ = encoded.write_interleaved(&mut octx);
                                     }
@@ -764,7 +813,7 @@ fn transcode_segment_body(
                     aenc_pkt.set_stream(aud_out_idx);
                     aenc_pkt.rescale_ts(
                         ffmpeg_next::Rational::new(1, audio_sample_rate as i32),
-                        out_audio_tb.unwrap_or(ffmpeg_next::Rational::new(1, 90000)),
+                        out_audio_tb.unwrap_or(ffmpeg_next::Rational::new(1, audio_sample_rate as i32)),
                     );
                     let _ = aenc_pkt.write_interleaved(&mut octx);
                 }

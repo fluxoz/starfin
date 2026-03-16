@@ -4,6 +4,7 @@ use crate::components;
 use components::{
     filters::FiltersBar,
     grid::ElementsGrid,
+    media_edit_modal::MediaEditModal,
     password_modal::PasswordModal,
     video_player::VideoPlayer,
 };
@@ -112,6 +113,7 @@ fn app_inner() -> Html {
     let loading = use_state(|| false);
     let error = use_state(|| Option::<String>::None);
     let selected = use_state(|| Option::<Element>::None);
+    let editing = use_state(|| Option::<Element>::None);
     let scanning = use_state(|| false);
     let scan_progress = use_state(|| Option::<(u32, u32)>::None);
 
@@ -361,6 +363,75 @@ fn app_inner() -> Html {
         Callback::from(move |_| selected.set(None))
     };
 
+    let on_edit = {
+        let editing = editing.clone();
+        Callback::from(move |item: Element| editing.set(Some(item)))
+    };
+
+    let on_close_edit = {
+        let editing = editing.clone();
+        Callback::from(move |_| editing.set(None))
+    };
+
+    let on_metadata_saved = {
+        let items = items.clone();
+        let editing = editing.clone();
+        Callback::from(move |updated: Element| {
+            let mut list = (*items).clone();
+            if let Some(pos) = list.iter().position(|e| e.id == updated.id) {
+                list[pos] = updated;
+            }
+            items.set(list);
+            editing.set(None);
+        })
+    };
+
+    let on_favorite_toggle = {
+        let items = items.clone();
+        Callback::from(move |item: Element| {
+            let new_fav = !item.favorite;
+            let vid = item.id.clone();
+            let items = items.clone();
+
+            // Optimistic update: flip immediately so the UI feels instant.
+            {
+                let mut list = (*items).clone();
+                if let Some(pos) = list.iter().position(|e| e.id == vid) {
+                    list[pos].favorite = new_fav;
+                }
+                items.set(list);
+            }
+
+            spawn_local(async move {
+                match api::update_metadata(
+                    &vid,
+                    Some(new_fav),
+                    None,
+                    None,
+                    None,
+                    None,
+                ).await {
+                    Ok(updated) => {
+                        // Reconcile with the server response.
+                        let mut list = (*items).clone();
+                        if let Some(pos) = list.iter().position(|e| e.id == updated.id) {
+                            list[pos] = updated;
+                        }
+                        items.set(list);
+                    }
+                    Err(_) => {
+                        // Roll back the optimistic update on error.
+                        let mut list = (*items).clone();
+                        if let Some(pos) = list.iter().position(|e| e.id == vid) {
+                            list[pos].favorite = !new_fav;
+                        }
+                        items.set(list);
+                    }
+                }
+            });
+        })
+    };
+
     let on_toggle_dark_mode = {
         let dark_mode = dark_mode.clone();
         Callback::from(move |_| {
@@ -544,6 +615,15 @@ fn app_inner() -> Html {
                     />
                 }
 
+                // Media edit modal — rendered on top of the library when editing.
+                if let Some(edit_item) = &*editing {
+                    <MediaEditModal
+                        item={edit_item.clone()}
+                        on_close={on_close_edit.clone()}
+                        on_saved={on_metadata_saved.clone()}
+                    />
+                }
+
                 <header class="topbar">
                     <div class="topbar__inner">
                         <div class="topbar__left">
@@ -646,6 +726,8 @@ fn app_inner() -> Html {
                     <ElementsGrid
                         items={(*items).clone()}
                         on_watch={on_watch}
+                        on_edit={on_edit}
+                        on_favorite_toggle={on_favorite_toggle}
                         thumb_current_id={(*thumb_current_id).clone()}
                         sprite_current_id={(*sprite_current_id).clone()}
                         precache_current_id={(*precache_current_id).clone()}

@@ -12,6 +12,15 @@ pub struct Element {
     pub duration_secs: u32,
     pub director: String,
     pub date_added: u64,
+    /// Whether the user has favorited this media file.
+    #[serde(default)]
+    pub favorite: bool,
+    /// User-defined list of actors / people appearing in the media.
+    #[serde(default)]
+    pub actors: Vec<String>,
+    /// User-defined genre / category labels.
+    #[serde(default)]
+    pub categories: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

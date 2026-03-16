@@ -683,6 +683,18 @@ body{
   font-weight: 700;
 }
 
+.card__rating{
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.card__rating-icon{
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
 .btn{
   padding: 8px 12px;
   border-radius: var(--radius);
@@ -695,10 +707,19 @@ body{
   text-transform: uppercase;
   letter-spacing: 1px;
   font-family: var(--font-body);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 .btn:hover{
   background: #cc3700;
   border-color: #cc3700;
+}
+.btn__icon{
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+  flex-shrink: 0;
 }
 
 /* Notices */
@@ -811,6 +832,369 @@ body{
 .btn--watch:hover{
   background: #cc3700;
   border-color: #cc3700;
+}
+
+/* ── Edit button variant ─────────────────────────────────────────────────── */
+.btn--edit{
+  background: transparent;
+  border-color: var(--border);
+  color: var(--muted);
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+.btn--edit:hover{
+  border-color: var(--accent);
+  color: var(--accent);
+  background: transparent;
+}
+
+/* ── Card footer actions ─────────────────────────────────────────────────── */
+.card__footer-actions{
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+/* Right group inside the footer: rating + watch button */
+.card__footer-right{
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+/* ── Thumbnail wrapper with favorite overlay ─────────────────────────────── */
+.card__thumb-wrap{
+  position: relative;
+}
+
+/* ── Favorite heart button on card ───────────────────────────────────────── */
+@keyframes fav-pop{
+  0%{ transform: scale(1); }
+  40%{ transform: scale(1.4); }
+  70%{ transform: scale(.9); }
+  100%{ transform: scale(1); }
+}
+.card__fav{
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  background: rgba(0,0,0,.45);
+  border: none;
+  border-radius: 50%;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background .12s;
+  padding: 0;
+}
+.card__fav:hover{
+  background: rgba(0,0,0,.65);
+}
+.card__fav-icon{
+  width: 18px;
+  height: 18px;
+  fill: rgba(255,255,255,.7);
+  stroke: none;
+  transition: fill .12s, transform .12s;
+}
+.card__fav--active .card__fav-icon{
+  fill: #ff2d55;
+  animation: fav-pop .32s ease;
+}
+
+/* ── Metadata edit modal ─────────────────────────────────────────────────── */
+@keyframes meta-backdrop-in{
+  from{ opacity: 0; }
+  to{ opacity: 1; }
+}
+@keyframes meta-modal-in{
+  from{ opacity: 0; transform: scale(.96) translateY(-10px); }
+  to{ opacity: 1; transform: scale(1) translateY(0); }
+}
+.meta-backdrop{
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,.35);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  animation: meta-backdrop-in .18s ease;
+}
+.meta-modal{
+  background: var(--bg, #c8bfb0);
+  border: var(--border-width) solid rgba(0,0,0,.3);
+  border-radius: var(--radius, 2px);
+  padding: 32px 28px 28px;
+  width: 440px;
+  max-width: 92vw;
+  max-height: 85vh;
+  overflow-y: auto;
+  font-family: var(--font-body);
+  box-shadow: 0 8px 32px rgba(0,0,0,.4);
+  animation: meta-modal-in .18s ease;
+}
+.meta-modal__header{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.meta-modal__title{
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--text, #1a1a1a);
+}
+.meta-modal__close{
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 4px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.meta-modal__close:hover{
+  color: var(--text);
+}
+.meta-modal__close-icon{
+  width: 16px;
+  height: 16px;
+}
+.meta-modal__media-title{
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 20px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.meta-modal__form{
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+/* ── Metadata field blocks ───────────────────────────────────────────────── */
+.meta-field{
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.meta-field__label{
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--muted, #4a4a4a);
+}
+.meta-field__row{
+  display: flex;
+  gap: 6px;
+}
+.meta-field__input{
+  flex: 1;
+  font-family: inherit;
+  font-size: 13px;
+  padding: 8px 10px;
+  background: rgba(0,0,0,.06);
+  border: 1.5px solid rgba(0,0,0,.2);
+  border-radius: var(--radius, 2px);
+  color: var(--text, #1a1a1a);
+  outline: none;
+  transition: border-color .15s;
+}
+.meta-field__input:focus{
+  border-color: var(--accent, #ff4500);
+}
+.meta-field__input::placeholder{
+  color: var(--muted, #4a4a4a);
+  opacity: .6;
+}
+.meta-field__add{
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: var(--radius, 2px);
+  width: 34px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: opacity .15s;
+}
+.meta-field__add:hover{
+  opacity: .85;
+}
+.meta-field__add-icon{
+  width: 18px;
+  height: 18px;
+}
+
+/* ── Metadata chip list ──────────────────────────────────────────────────── */
+.meta-chips{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.meta-chip{
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text);
+  background: rgba(0,0,0,.06);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 8px;
+}
+.meta-chip__remove{
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+}
+.meta-chip__remove:hover{
+  color: var(--danger, #cc0000);
+}
+.meta-chip__remove-icon{
+  width: 12px;
+  height: 12px;
+}
+
+/* ── Favorite toggle button in modal ─────────────────────────────────────── */
+.meta-fav-btn{
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: border-color .15s, color .15s;
+}
+.meta-fav-btn:hover{
+  border-color: #ff2d55;
+  color: #ff2d55;
+}
+.meta-fav-btn--active{
+  border-color: #ff2d55;
+  color: #ff2d55;
+}
+.meta-fav-btn__icon{
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+
+/* ── Star rating widget ──────────────────────────────────────────────────── */
+.meta-rating{
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.meta-rating__star{
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px;
+  color: var(--muted);
+  line-height: 1;
+  transition: color .12s, transform .12s;
+}
+.meta-rating__star svg{
+  width: 22px;
+  height: 22px;
+  fill: currentColor;
+  stroke: none;
+  display: block;
+}
+.meta-rating__star:hover{
+  color: #f5c518;
+  transform: scale(1.15);
+}
+.meta-rating__star--filled{
+  color: #f5c518;
+}
+.meta-rating__label{
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  margin-left: 4px;
+  letter-spacing: 1px;
+}
+
+/* ── Modal save button ───────────────────────────────────────────────────── */
+.meta-modal__save{
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  padding: 10px 20px;
+  background: var(--accent, #ff4500);
+  color: white;
+  border: none;
+  border-radius: var(--radius, 2px);
+  cursor: pointer;
+  transition: opacity .15s;
+  margin-top: 4px;
+}
+.meta-modal__save:hover:not(:disabled){
+  opacity: .85;
+}
+.meta-modal__save:disabled{
+  opacity: .5;
+  cursor: not-allowed;
+}
+.meta-modal__error{
+  font-size: 11px;
+  color: var(--danger, #cc0000);
+  font-weight: 600;
+  letter-spacing: .04em;
+}
+
+/* ── Dark mode overrides for metadata modal ──────────────────────────────── */
+.app.dark-mode .meta-modal{
+  background: var(--card-top-bg);
+  border-color: var(--input-border);
+}
+.app.dark-mode .meta-field__input{
+  background: var(--input-bg);
+  border-color: var(--input-border);
+  color: var(--text);
+}
+.app.dark-mode .meta-field__input::placeholder{
+  color: var(--muted);
+}
+.app.dark-mode .meta-chip{
+  background: rgba(255,255,255,.06);
+  border-color: var(--border);
 }
 
 /* ── Video player overlay ────────────────────────────────────────────────── */

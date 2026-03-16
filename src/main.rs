@@ -816,6 +816,15 @@ struct VideoItem {
     director: String,
     /// Unix timestamp (seconds) of the file's last modification time.
     date_added: u64,
+    /// Whether the user has favorited this media file.
+    #[serde(default)]
+    favorite: bool,
+    /// User-defined list of actors / people appearing in the media.
+    #[serde(default)]
+    actors: Vec<String>,
+    /// User-defined genre / category labels.
+    #[serde(default)]
+    categories: Vec<String>,
 }
 
 // ── Cache eviction constants ─────────────────────────────────────────────────
@@ -1144,6 +1153,9 @@ async fn scan_library(library_path: &Path) -> (Vec<VideoItem>, VideoPathIndex) {
                 duration_secs,
                 director: meta.director.unwrap_or_default(),
                 date_added: file_date_added(&abs),
+                favorite: false,
+                actors: vec![],
+                categories: vec![],
             };
             (item, abs, rel)
         });
@@ -1163,6 +1175,22 @@ async fn scan_library(library_path: &Path) -> (Vec<VideoItem>, VideoPathIndex) {
     (items, index)
 }
 
+/// Carry over user-edited metadata fields from a previous cache snapshot into
+/// freshly-scanned items.  This ensures that favorites, tags, actors, and
+/// categories survive library rescans.
+fn merge_user_metadata(items: &mut [VideoItem], previous: &[VideoItem]) {
+    let prev_map: HashMap<&str, &VideoItem> = previous.iter().map(|v| (v.id.as_str(), v)).collect();
+    for item in items.iter_mut() {
+        if let Some(prev) = prev_map.get(item.id.as_str()) {
+            item.favorite = prev.favorite;
+            item.rating = prev.rating;
+            item.tags.clone_from(&prev.tags);
+            item.actors.clone_from(&prev.actors);
+            item.categories.clone_from(&prev.categories);
+        }
+    }
+}
+
 /// Look up a video by its stable ID using the in-memory path index.
 /// Returns `(absolute_path, relative_path)` when found.
 fn find_video(state: &AppState, id: &str) -> Option<(PathBuf, String)> {
@@ -1179,6 +1207,63 @@ fn find_video(state: &AppState, id: &str) -> Option<(PathBuf, String)> {
 async fn list_videos(state: web::Data<AppState>) -> impl Responder {
     let items = state.video_cache.read().clone();
     HttpResponse::Ok().json(serde_json::json!({ "items": items }))
+}
+
+/// Request body for `PATCH /api/videos/{id}/metadata`.
+#[derive(Deserialize)]
+struct UpdateMetadataRequest {
+    #[serde(default)]
+    favorite: Option<bool>,
+    #[serde(default)]
+    rating: Option<f64>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    actors: Option<Vec<String>>,
+    #[serde(default)]
+    categories: Option<Vec<String>>,
+}
+
+/// `PATCH /api/videos/{id}/metadata` — update user-defined metadata for a video.
+async fn update_metadata(
+    id: web::Path<String>,
+    body: web::Json<UpdateMetadataRequest>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let video_id = id.into_inner();
+    let mut cache = state.video_cache.write();
+    let item = match cache.iter_mut().find(|v| v.id == video_id) {
+        Some(v) => v,
+        None => return HttpResponse::NotFound().json(serde_json::json!({"error": "video not found"})),
+    };
+
+    if let Some(fav) = body.favorite {
+        item.favorite = fav;
+    }
+    if let Some(r) = body.rating {
+        item.rating = r.clamp(0.0, 5.0);
+    }
+    if let Some(ref tags) = body.tags {
+        item.tags = tags.clone();
+    }
+    if let Some(ref actors) = body.actors {
+        item.actors = actors.clone();
+    }
+    if let Some(ref categories) = body.categories {
+        item.categories = categories.clone();
+    }
+
+    let updated = item.clone();
+    let items_snapshot = cache.clone();
+    drop(cache);
+
+    // Persist to disk in the background so the response isn't delayed.
+    let cache_dir = state.cache_dir.clone();
+    actix_web::rt::spawn(async move {
+        save_video_cache(&items_snapshot, &cache_dir);
+    });
+
+    HttpResponse::Ok().json(updated)
 }
 
 /// `GET /api/scan/ws` — WebSocket endpoint that starts an immediate library scan and
@@ -1200,6 +1285,9 @@ async fn scan_ws(
     let precache_trigger = Arc::clone(&state.precache_trigger);
 
     actix_web::rt::spawn(async move {
+        // Snapshot the existing cache so we can preserve user-edited metadata.
+        let previous = video_cache.read().clone();
+
         // Enumerate all video files up-front so we can report a total.
         let entries: Vec<_> = WalkDir::new(&library_path)
             .into_iter()
@@ -1253,6 +1341,9 @@ async fn scan_ws(
                     duration_secs,
                     director: meta.director.unwrap_or_default(),
                     date_added: file_date_added(&abs),
+                    favorite: false,
+                    actors: vec![],
+                    categories: vec![],
                 };
                 (item, abs, rel)
             });
@@ -1285,6 +1376,7 @@ async fn scan_ws(
         }
 
         // Commit the updated library to the shared cache and persist to disk.
+        merge_user_metadata(&mut items, &previous);
         save_video_cache(&items, &cache_dir);
         *video_cache.write() = items;
         *video_path_index.write() = index;
@@ -3274,7 +3366,9 @@ async fn main() -> std::io::Result<()> {
         let startup_thumb_trigger = Arc::clone(&thumb_trigger);
         let startup_sprite_trigger = Arc::clone(&sprite_trigger);
         tokio::spawn(async move {
-            let (items, index) = scan_library(&startup_library).await;
+            let previous = startup_cache.read().clone();
+            let (mut items, index) = scan_library(&startup_library).await;
+            merge_user_metadata(&mut items, &previous);
             save_video_cache(&items, &startup_cache_dir);
             *startup_cache.write() = items;
             *startup_index.write() = index;
@@ -3306,7 +3400,11 @@ async fn main() -> std::io::Result<()> {
                 _ = bg_shutdown_rx.changed() => { return; }
             }
             if *bg_shutdown_rx.borrow() { return; }
-            let (items, index) = scan_library(&bg_library_path).await;
+            let (mut items, index) = scan_library(&bg_library_path).await;
+            {
+                let previous = bg_cache.read();
+                merge_user_metadata(&mut items, &previous);
+            }
             save_video_cache(&items, &bg_cache_dir);
             *bg_cache.write() = items;
             *bg_index.write() = index;
@@ -3480,6 +3578,10 @@ async fn main() -> std::io::Result<()> {
             .route("/api/progress/ws", web::get().to(progress_ws))
             .route("/api/thumbnails/progress", web::get().to(get_thumb_progress))
             .route("/api/videos", web::get().to(list_videos))
+            .route(
+                "/api/videos/{id}/metadata",
+                web::patch().to(update_metadata),
+            )
             .route("/api/videos/{id}/thumbnail", web::get().to(get_thumbnail))
             .route(
                 "/api/videos/{id}/thumbnails/info",

@@ -8,7 +8,7 @@ use components::{
     password_modal::PasswordModal,
     video_player::VideoPlayer,
 };
-use crate::models::{Element, SortBy};
+use crate::models::{Element, MetadataFilter, SortBy};
 
 use futures::StreamExt;
 use gloo_net::websocket::{futures::WebSocket, Message};
@@ -102,12 +102,14 @@ pub fn app() -> Html {
 fn app_inner() -> Html {
     let query = use_state(|| "".to_string());
     let sort_by = use_state(|| SortBy::DateAddedNewest);
+    let meta_filter = use_state(MetadataFilter::default);
 
     // Mutable refs that always hold the *current* query and sort order so that
     // the auto-refresh interval (which is set up only once on mount) can read
     // the latest values without capturing stale UseStateHandle Rc pointers.
     let query_ref = use_mut_ref(|| "".to_string());
     let sort_by_ref = use_mut_ref(|| SortBy::DateAddedNewest);
+    let meta_filter_ref = use_mut_ref(MetadataFilter::default);
 
     let items = use_state(|| Vec::<Element>::new());
     let loading = use_state(|| false);
@@ -201,46 +203,55 @@ fn app_inner() -> Html {
         });
     }
 
-    // Fetch on load and whenever query/sort changes.
-    // Also keeps query_ref / sort_by_ref in sync so the auto-refresh interval
-    // can read the current filter values.
+    // Fetch on load and whenever query/sort/meta_filter changes.
+    // Also keeps query_ref / sort_by_ref / meta_filter_ref in sync so the
+    // auto-refresh interval (which is set up only once on mount) can read
+    // the latest values without capturing stale UseStateHandle Rc pointers.
     {
         let query = query.clone();
         let sort_by = sort_by.clone();
+        let meta_filter = meta_filter.clone();
         let query_ref = query_ref.clone();
         let sort_by_ref = sort_by_ref.clone();
+        let meta_filter_ref = meta_filter_ref.clone();
 
         let items = items.clone();
         let loading = loading.clone();
         let error = error.clone();
 
-        use_effect_with(((*query).clone(), (*sort_by).clone()), move |_| {
-            let query = (*query).clone();
-            let sort_by = (*sort_by).clone();
+        use_effect_with(
+            ((*query).clone(), (*sort_by).clone(), (*meta_filter).clone()),
+            move |_| {
+                let query = (*query).clone();
+                let sort_by = (*sort_by).clone();
+                let mf = (*meta_filter).clone();
 
-            // Keep refs current so the interval can read the latest values.
-            *query_ref.borrow_mut() = query.clone();
-            *sort_by_ref.borrow_mut() = sort_by.clone();
+                // Keep refs current so the interval can read the latest values.
+                *query_ref.borrow_mut() = query.clone();
+                *sort_by_ref.borrow_mut() = sort_by.clone();
+                *meta_filter_ref.borrow_mut() = mf.clone();
 
-            loading.set(true);
-            error.set(None);
+                loading.set(true);
+                error.set(None);
 
-            spawn_local(async move {
-                match api::fetch_elements(&query, sort_by).await {
-                    Ok(data) => items.set(data),
-                    Err(e) => error.set(Some(e)),
-                }
-                loading.set(false);
-            });
+                spawn_local(async move {
+                    match api::fetch_elements(&query, sort_by, &mf).await {
+                        Ok(data) => items.set(data),
+                        Err(e) => error.set(Some(e)),
+                    }
+                    loading.set(false);
+                });
 
-            || ()
-        });
+                || ()
+            },
+        );
     }
 
     // Auto-refresh: re-fetch the video list every 60 seconds.
     {
         let query_ref = query_ref.clone();
         let sort_by_ref = sort_by_ref.clone();
+        let meta_filter_ref = meta_filter_ref.clone();
         let items = items.clone();
         let scanning = scanning.clone();
 
@@ -252,23 +263,23 @@ fn app_inner() -> Html {
                 }
                 // Read the current filter values from the shared refs.
                 // These are always up-to-date because the fetch effect above
-                // writes to them on every query/sort change.  Using plain
-                // UseStateHandle clones here would capture the Rc from mount
-                // time and always see the initial empty-string query, which
-                // is what caused the visible "reset" every 60 seconds.
+                // writes to them on every query/sort/meta_filter change.  Using
+                // plain UseStateHandle clones here would capture the Rc from
+                // mount time and always see the initial empty-string query.
                 let query = query_ref.borrow().clone();
                 let sort_by = *sort_by_ref.borrow();
+                let mf = meta_filter_ref.borrow().clone();
 
-                // If the user has an active search or a non-default sort,
+                // If the user has an active search, sort, or metadata filter,
                 // skip the background refresh so their filtered results are
                 // not disturbed.
-                if !query.is_empty() || sort_by != SortBy::DateAddedNewest {
+                if !query.is_empty() || sort_by != SortBy::DateAddedNewest || mf.is_active() {
                     return;
                 }
 
                 let items = items.clone();
                 spawn_local(async move {
-                    if let Ok(data) = api::fetch_elements(&query, sort_by).await {
+                    if let Ok(data) = api::fetch_elements(&query, sort_by, &mf).await {
                         items.set(data);
                     }
                 });
@@ -351,6 +362,11 @@ fn app_inner() -> Html {
     let on_sort_change = {
         let sort_by = sort_by.clone();
         Callback::from(move |v: SortBy| sort_by.set(v))
+    };
+
+    let on_filter_change = {
+        let meta_filter = meta_filter.clone();
+        Callback::from(move |v: MetadataFilter| meta_filter.set(v))
     };
 
     let on_watch = {
@@ -474,6 +490,7 @@ fn app_inner() -> Html {
         let items = items.clone();
         let query = query.clone();
         let sort_by = sort_by.clone();
+        let meta_filter = meta_filter.clone();
         let scan_progress = scan_progress.clone();
         Callback::from(move |_: MouseEvent| {
             if *scanning {
@@ -483,6 +500,7 @@ fn app_inner() -> Html {
             let items = items.clone();
             let query = (*query).clone();
             let sort_by = (*sort_by).clone();
+            let mf = (*meta_filter).clone();
             let scan_progress = scan_progress.clone();
 
             scanning.set(true);
@@ -522,6 +540,7 @@ fn app_inner() -> Html {
                                         &accumulated,
                                         &query,
                                         sort_by,
+                                        &mf,
                                     ));
                                 }
                             }
@@ -534,7 +553,7 @@ fn app_inner() -> Html {
                 }
 
                 // Final authoritative refresh once the scan is fully committed.
-                if let Ok(data) = api::fetch_elements(&query, sort_by).await {
+                if let Ok(data) = api::fetch_elements(&query, sort_by, &mf).await {
                     items.set(data);
                 }
                 scan_progress.set(None);
@@ -665,8 +684,10 @@ fn app_inner() -> Html {
                     <FiltersBar
                         query={(*query).clone()}
                         sort_by={(*sort_by).clone()}
+                        meta_filter={(*meta_filter).clone()}
                         on_query_change={on_query_change}
                         on_sort_change={on_sort_change}
+                        on_filter_change={on_filter_change}
                     />
                 </header>
 

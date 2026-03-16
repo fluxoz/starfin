@@ -470,6 +470,23 @@ body{
   align-items: end;
 }
 
+.filters__row--meta{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: end;
+}
+
+.filters__row--meta .chip{
+  align-self: end;
+  white-space: nowrap;
+}
+
+.filters__row--meta .field{
+  flex: 1 1 140px;
+  min-width: 120px;
+}
+
 @media (min-width: 720px){
   .filters__row{
     grid-template-columns: 1.5fr .8fr;

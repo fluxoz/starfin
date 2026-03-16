@@ -1,4 +1,4 @@
-use crate::models::{Element, SortBy};
+use crate::models::{Element, MetadataFilter, SortBy};
 use gloo_net::http::Request;
 use serde::Deserialize;
 
@@ -166,6 +166,7 @@ pub async fn fetch_hwaccel() -> Result<HwAccelInfo, String> {
 pub async fn fetch_elements(
     query: &str,
     sort_by: SortBy,
+    meta_filter: &MetadataFilter,
 ) -> Result<Vec<Element>, String> {
     let resp = Request::get("/api/videos")
         .send()
@@ -181,7 +182,7 @@ pub async fn fetch_elements(
         .await
         .map_err(|e| format!("Invalid JSON: {e:?}"))?;
 
-    Ok(apply_filters(&parsed.items, query, sort_by))
+    Ok(apply_filters(&parsed.items, query, sort_by, meta_filter))
 }
 
 // ── Local filtering & sorting ────────────────────────────────────────────────
@@ -190,29 +191,77 @@ pub fn apply_filters(
     data: &[Element],
     query: &str,
     sort_by: SortBy,
+    meta_filter: &MetadataFilter,
 ) -> Vec<Element> {
     let q = query.trim().to_lowercase();
-    let mut result: Vec<Element> = if q.is_empty() {
-        data.to_vec()
-    } else {
-        data.iter()
-            .filter(|e| {
-                e.title.to_lowercase().contains(&q)
+    let tag_q = meta_filter.tag.trim().to_lowercase();
+    let actor_q = meta_filter.actor.trim().to_lowercase();
+    let category_q = meta_filter.category.trim().to_lowercase();
+
+    let mut result: Vec<Element> = data
+        .iter()
+        .filter(|e| {
+            // Text search across all fields including user-defined metadata.
+            if !q.is_empty() {
+                let matches = e.title.to_lowercase().contains(&q)
                     || e.description.to_lowercase().contains(&q)
                     || e.genre.to_lowercase().contains(&q)
                     || e.director.to_lowercase().contains(&q)
                     || e.tags.iter().any(|t| t.to_lowercase().contains(&q))
                     || e.actors.iter().any(|a| a.to_lowercase().contains(&q))
-                    || e.categories.iter().any(|c| c.to_lowercase().contains(&q))
-            })
-            .cloned()
-            .collect()
-    };
+                    || e.categories.iter().any(|c| c.to_lowercase().contains(&q));
+                if !matches {
+                    return false;
+                }
+            }
+            // Favorites-only filter.
+            if meta_filter.only_favorites && !e.favorite {
+                return false;
+            }
+            // Minimum rating filter.
+            if meta_filter.min_rating > 0 && (e.rating.floor() as u8) < meta_filter.min_rating {
+                return false;
+            }
+            // Tag substring filter.
+            if !tag_q.is_empty()
+                && !e.tags.iter().any(|t| t.to_lowercase().contains(&tag_q))
+            {
+                return false;
+            }
+            // Actor substring filter.
+            if !actor_q.is_empty()
+                && !e.actors.iter().any(|a| a.to_lowercase().contains(&actor_q))
+            {
+                return false;
+            }
+            // Category substring filter.
+            if !category_q.is_empty()
+                && !e.categories.iter().any(|c| c.to_lowercase().contains(&category_q))
+            {
+                return false;
+            }
+            true
+        })
+        .cloned()
+        .collect();
 
     match sort_by {
         SortBy::DateAddedNewest => result.sort_by(|a, b| b.date_added.cmp(&a.date_added)),
         SortBy::DateAddedOldest => result.sort_by(|a, b| a.date_added.cmp(&b.date_added)),
         SortBy::NameAsc => result.sort_by(|a, b| a.title.cmp(&b.title)),
+        SortBy::NameDesc => result.sort_by(|a, b| b.title.cmp(&a.title)),
+        SortBy::RatingHighest => result.sort_by(|a, b| {
+            b.rating
+                .partial_cmp(&a.rating)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        SortBy::FavoritesFirst => result.sort_by(|a, b| {
+            b.favorite
+                .cmp(&a.favorite)
+                .then_with(|| b.date_added.cmp(&a.date_added))
+        }),
+        SortBy::YearNewest => result.sort_by(|a, b| b.year.cmp(&a.year)),
+        SortBy::YearOldest => result.sort_by(|a, b| a.year.cmp(&b.year)),
     }
 
     result

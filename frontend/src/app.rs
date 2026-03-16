@@ -852,6 +852,9 @@ fn app_inner() -> Html {
                         item={edit_item.clone()}
                         on_close={on_close_edit.clone()}
                         on_saved={on_metadata_saved.clone()}
+                        all_tags={all_tags.clone()}
+                        all_actors={all_actors.clone()}
+                        all_categories={all_categories.clone()}
                     />
                 }
 

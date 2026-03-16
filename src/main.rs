@@ -3362,4 +3362,95 @@ async fn main() -> std::io::Result<()> {
     std::process::exit(result.map(|_| 0).unwrap_or(1));
 }
 
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jetson_theme_produces_empty_css() {
+        let theme = theme_jetson();
+        assert_eq!(theme.meta.name, "Jetson");
+        assert!(theme.to_css().is_empty(), "Jetson (default) should emit no CSS overrides");
+    }
+
+    #[test]
+    fn nord_theme_produces_css() {
+        let theme = theme_nord();
+        let css = theme.to_css();
+        assert!(css.contains("/* Theme: Nord */"));
+        assert!(css.contains(":root{"));
+        assert!(css.contains(".app.dark-mode{"));
+        assert!(css.contains("--accent: #5e81ac"));
+    }
+
+    #[test]
+    fn catppuccin_theme_produces_css() {
+        let theme = theme_catppuccin();
+        let css = theme.to_css();
+        assert!(css.contains("/* Theme: Catppuccin */"));
+        assert!(css.contains("--accent: #8839ef"));
+    }
+
+    #[test]
+    fn dracula_theme_produces_css() {
+        let theme = theme_dracula();
+        let css = theme.to_css();
+        assert!(css.contains("/* Theme: Dracula */"));
+        assert!(css.contains("--accent: #bd93f9"));
+    }
+
+    #[test]
+    fn toml_round_trip() {
+        let toml_str = r##"
+[meta]
+name = "Test Theme"
+
+[light]
+bg = "#ffffff"
+accent = "#ff0000"
+
+[dark]
+bg = "#000000"
+accent = "#00ff00"
+"##;
+        let config: ThemeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.meta.name, "Test Theme");
+        let css = config.to_css();
+        assert!(css.contains("--bg: #ffffff"));
+        assert!(css.contains("--accent: #ff0000"));
+        assert!(css.contains("--bg: #000000"));
+        assert!(css.contains("--accent: #00ff00"));
+    }
+
+    #[test]
+    fn partial_toml_works() {
+        let toml_str = r##"
+[meta]
+name = "Minimal"
+
+[light]
+accent = "#123456"
+"##;
+        let config: ThemeConfig = toml::from_str(toml_str).unwrap();
+        let css = config.to_css();
+        assert!(css.contains("--accent: #123456"));
+        // Dark section should be absent (no dark overrides).
+        assert!(!css.contains(".app.dark-mode"));
+    }
+
+    #[test]
+    fn example_toml_file_parses() {
+        let contents = std::fs::read_to_string("themes/example.toml")
+            .expect("themes/example.toml should exist");
+        let config: ThemeConfig = toml::from_str(&contents)
+            .expect("example.toml should be valid");
+        assert_eq!(config.meta.name, "My Custom Theme");
+        let css = config.to_css();
+        assert!(css.contains(":root{"));
+        assert!(css.contains(".app.dark-mode{"));
+    }
+}
+
 

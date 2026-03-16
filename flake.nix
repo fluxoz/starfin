@@ -34,8 +34,6 @@
     # evaluation time (always the host platform).  Setting CARGO_BUILD_TARGET
     # as an env var does NOT override that substitution, so we must supply our
     # own buildPhase to pass --target wasm32-unknown-unknown explicitly.
-    # The cargoSetupHook (added by buildRustPackage) still runs and wires up
-    # the offline vendor directory from importCargoLock before our buildPhase.
     starfinFrontendWasm = rustPlatform.buildRustPackage {
       pname = "starfin-frontend-wasm";
       inherit version;
@@ -120,7 +118,6 @@
         mkdir -p $out
         cp -r dist/.  $out/
         cp -r styles/. $out/styles/
-        cp -r vendor/. $out/vendor/
         cp -r fonts/.  $out/fonts/
         cp favicon.svg $out/favicon.svg
         # Transform index.html: replace data-trunk directives with standard

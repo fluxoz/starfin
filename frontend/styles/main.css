@@ -20,6 +20,18 @@
 
   --radius: 2px;
   --shadow: 0 2px 4px rgba(0,0,0,.2);
+
+  --sidebar-bg: #ff4500;
+  --topbar-bg: #b8b0a0;
+  --topbar-border: 2px solid rgba(0,0,0,.3);
+  --card-bg: rgba(255,255,255,.6);
+  --card-border: rgba(0,0,0,.3);
+  --card-top-bg: #2a2a2a;
+  --card-top-color: white;
+  --input-bg: rgba(255,255,255,.5);
+  --input-border: rgba(0,0,0,.3);
+  --notice-bg: rgba(255,255,255,.6);
+  --empty-bg: rgba(255,255,255,.4);
 }
 
 /* Dark mode theme */
@@ -34,49 +46,18 @@
   --accent-2: #2a2a2a;
   --danger: #ff5555;
   --shadow: 0 2px 8px rgba(0,0,0,.5);
-}
 
-.app.dark-mode .sidebar {
-  background: #ff6b35;
-}
-
-.app.dark-mode .topbar {
-  background: #2a2a2a;
-  border-bottom: 2px solid rgba(255,255,255,.2);
-}
-
-.app.dark-mode .topbar__inner {
-  color: var(--text);
-}
-
-.app.dark-mode .card {
-  background: rgba(255,255,255,.08);
-  border-color: rgba(255,255,255,.2);
-}
-
-.app.dark-mode .card__subtitle {
-  color: rgba(255,255,255,.7);
-}
-
-.app.dark-mode .input,
-.app.dark-mode .select {
-  background: rgba(255,255,255,.08);
-  border-color: rgba(255,255,255,.2);
-  color: var(--text);
-}
-
-.app.dark-mode .chip {
-  background: rgba(255,255,255,.08);
-  border-color: rgba(255,255,255,.2);
-}
-
-.app.dark-mode .notice {
-  background: rgba(255,255,255,.08);
-  border-color: rgba(255,255,255,.2);
-}
-
-.app.dark-mode .empty {
-  background: rgba(255,255,255,.05);
+  --sidebar-bg: #ff6b35;
+  --topbar-bg: #2a2a2a;
+  --topbar-border: 2px solid rgba(255,255,255,.2);
+  --card-bg: rgba(255,255,255,.08);
+  --card-border: rgba(255,255,255,.2);
+  --card-top-bg: #2a2a2a;
+  --card-top-color: white;
+  --input-bg: rgba(255,255,255,.08);
+  --input-border: rgba(255,255,255,.2);
+  --notice-bg: rgba(255,255,255,.08);
+  --empty-bg: rgba(255,255,255,.05);
 }
 
 *{ box-sizing: border-box; margin: 0; padding: 0; }
@@ -148,7 +129,7 @@ body{
 
 .sidebar{
   grid-area: sidebar;
-  background: var(--accent);
+  background: var(--sidebar-bg);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -197,8 +178,8 @@ body{
 
 .topbar{
   grid-area: header;
-  background: #b8b0a0;
-  border-bottom: 2px solid rgba(0,0,0,.3);
+  background: var(--topbar-bg);
+  border-bottom: var(--topbar-border);
   padding: 8px 20px;
 }
 
@@ -507,8 +488,8 @@ body{
   width: 100%;
   padding: 8px 10px;
   border-radius: var(--radius);
-  border: 2px solid var(--border);
-  background: rgba(255,255,255,.5);
+  border: 2px solid var(--input-border);
+  background: var(--input-bg);
   color: var(--text);
   outline: none;
   font-family: 'Courier New', 'Courier', monospace;
@@ -524,8 +505,8 @@ body{
 .chip{
   padding: 8px 12px;
   border-radius: var(--radius);
-  border: 2px solid var(--border);
-  background: rgba(255,255,255,.5);
+  border: 2px solid var(--input-border);
+  background: var(--input-bg);
   color: var(--text);
   cursor: pointer;
   font-size: 11px;
@@ -556,8 +537,8 @@ body{
 
 .card{
   border-radius: var(--radius);
-  border: 2px solid rgba(0,0,0,.3);
-  background: rgba(255,255,255,.6);
+  border: 2px solid var(--card-border);
+  background: var(--card-bg);
   box-shadow: var(--shadow);
   padding: 0;
   display: grid;
@@ -571,8 +552,8 @@ body{
   justify-content: space-between;
   gap: 10px;
   padding: 12px;
-  background: #2a2a2a;
-  color: white;
+  background: var(--card-top-bg);
+  color: var(--card-top-color);
 }
 .card__title{
   font-weight: 700;
@@ -715,7 +696,7 @@ body{
 /* Notices */
 .notice{
   border: 2px solid var(--border);
-  background: rgba(255,255,255,.6);
+  background: var(--notice-bg);
   border-radius: var(--radius);
   padding: 12px 14px;
   margin-top: 12px;
@@ -741,7 +722,7 @@ body{
   border-radius: var(--radius);
   padding: 18px 14px;
   color: var(--muted);
-  background: rgba(255,255,255,.4);
+  background: var(--empty-bg);
 }
 .empty__title{ 
   color: var(--text); 
@@ -1566,13 +1547,13 @@ body{
 
 /* Dark mode overrides for the password modal */
 .app.dark-mode .pw-modal{
-  background: #2a2a2a;
-  border-color: rgba(255,255,255,.2);
+  background: var(--card-top-bg);
+  border-color: var(--input-border);
 }
 
 .app.dark-mode .pw-modal__input{
-  background: rgba(255,255,255,.08);
-  border-color: rgba(255,255,255,.2);
+  background: var(--input-bg);
+  border-color: var(--input-border);
   color: var(--text);
 }
 

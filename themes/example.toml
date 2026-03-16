@@ -1,0 +1,64 @@
+# Starfin Theme File
+#
+# This file defines a custom colour palette for the Starfin UI.  Point the
+# THEME_FILE environment variable at this file (or use `themeFile` in the NixOS
+# module) to activate it.
+#
+# Every key under [light] and [dark] maps to a CSS custom property.  Underscores
+# in key names become hyphens in CSS (e.g. `panel_2` → `--panel-2`).  All keys
+# are optional — omitted values inherit the built-in Jetson defaults.
+#
+# Built-in presets: jetson, nord, catppuccin, dracula
+# Select a preset with  THEME=nord  (env var) or  theme = "nord"  (NixOS).
+
+[meta]
+name = "My Custom Theme"
+
+# ── Light mode ────────────────────────────────────────────────────────────────
+[light]
+bg            = "#f5f0eb"
+panel         = "rgba(0,0,0,.03)"
+panel_2       = "rgba(0,0,0,.06)"
+text          = "#1a1a1a"
+muted         = "#555555"
+border        = "rgba(0,0,0,.12)"
+accent        = "#e05020"
+accent_2      = "#333333"
+danger        = "#cc0000"
+radius        = "4px"
+shadow        = "0 2px 6px rgba(0,0,0,.15)"
+sidebar_bg    = "#e05020"
+topbar_bg     = "#e8e0d5"
+topbar_border = "2px solid rgba(0,0,0,.15)"
+card_bg       = "rgba(255,255,255,.65)"
+card_border   = "rgba(0,0,0,.20)"
+card_top_bg   = "#333333"
+card_top_color= "white"
+input_bg      = "rgba(255,255,255,.55)"
+input_border  = "rgba(0,0,0,.20)"
+notice_bg     = "rgba(255,255,255,.60)"
+empty_bg      = "rgba(255,255,255,.40)"
+
+# ── Dark mode ─────────────────────────────────────────────────────────────────
+[dark]
+bg            = "#1e1e1e"
+panel         = "rgba(255,255,255,.04)"
+panel_2       = "rgba(255,255,255,.07)"
+text          = "#e0e0e0"
+muted         = "#a0a0a0"
+border        = "rgba(255,255,255,.12)"
+accent        = "#ff7040"
+accent_2      = "#333333"
+danger        = "#ff5555"
+shadow        = "0 2px 8px rgba(0,0,0,.50)"
+sidebar_bg    = "#ff7040"
+topbar_bg     = "#2a2a2a"
+topbar_border = "2px solid rgba(255,255,255,.15)"
+card_bg       = "rgba(255,255,255,.07)"
+card_border   = "rgba(255,255,255,.15)"
+card_top_bg   = "#333333"
+card_top_color= "white"
+input_bg      = "rgba(255,255,255,.07)"
+input_border  = "rgba(255,255,255,.15)"
+notice_bg     = "rgba(255,255,255,.07)"
+empty_bg      = "rgba(255,255,255,.04)"

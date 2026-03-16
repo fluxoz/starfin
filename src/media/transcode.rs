@@ -1,11 +1,14 @@
 //! HLS segment creation — direct remux when possible, transcode as fallback.
 //!
-//! Each segment is a 6-second MPEG-TS chunk.  For **Original** quality with
-//! browser-compatible codecs (H.264 video + stereo AAC/MP3 audio) the segment
-//! is created by **remuxing** — copying compressed packets directly from the
-//! source file without decoding or re-encoding.  This is near-instant (pure
-//! I/O, like VLC playback) and gives performance parity with direct file
-//! access.
+//! Each segment is a 6-second **fragmented MP4** (fMP4) chunk.  fMP4 is
+//! supported by MSE in all major browsers (Chrome, Firefox, Safari via native
+//! HLS) and avoids the Firefox incompatibility with MPEG-TS in MSE.
+//!
+//! For **Original** quality with browser-compatible codecs (H.264 video +
+//! stereo AAC/MP3 audio) the segment is created by **remuxing** — copying
+//! compressed packets directly from the source file without decoding or
+//! re-encoding.  This is near-instant (pure I/O, like VLC playback) and gives
+//! performance parity with direct file access.
 //!
 //! When the video is H.264 but the audio isn't directly usable in browsers
 //! (e.g. multi-channel 5.1/7.1 AAC, or a non-AAC codec like FLAC/AC-3) the
@@ -37,7 +40,16 @@ pub const CANCELLED: &str = "cancelled";
 /// 256 kbps stereo AAC-LC is transparent quality for music and dialogue.
 const AAC_ENCODE_BITRATE: usize = 256_000;
 
-/// Create a single MPEG-TS segment — remux if possible, transcode otherwise.
+/// `AVCodecContext::flags` bit that instructs the encoder to store its
+/// configuration data (SPS/PPS for H.264, AudioSpecificConfig for AAC) in
+/// `extradata` rather than inlining it in every packet.  The MP4 container
+/// format sets `AVFMT_GLOBALHEADER`, which makes this flag mandatory for all
+/// encoders: without it the moov box is written without an `avcC`/`esds` atom
+/// and `av_write_trailer` fails when finalizing the last moof fragment.
+/// Value is `AV_CODEC_FLAG_GLOBAL_HEADER` = `1 << 22` from `libavcodec/codec.h`.
+const AV_CODEC_FLAG_GLOBAL_HEADER: i32 = 1 << 22;
+
+/// Create a single fMP4 segment — remux if possible, transcode otherwise.
 ///
 /// For **Original** quality with H.264 + stereo AAC/MP3 source, packets are
 /// copied directly (remux).  For H.264 video with multi-channel or
@@ -53,7 +65,7 @@ pub async fn transcode_segment(
     hwaccel: &HwAccel,
     quality: super::transcode::Quality,
 ) -> Result<(), String> {
-    let filename = format!("seg_{:05}.ts", seg_index);
+    let filename = format!("seg_{:05}.mp4", seg_index);
     let seg_path = hls_dir.join(&filename);
 
     if seg_path.exists() {
@@ -86,7 +98,7 @@ pub async fn transcode_segment_with_kill(
     quality: super::transcode::Quality,
     kill: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let filename = format!("seg_{:05}.ts", seg_index);
+    let filename = format!("seg_{:05}.mp4", seg_index);
     let seg_path = hls_dir.join(&filename);
 
     if seg_path.exists() {
@@ -162,11 +174,17 @@ fn video_is_remuxable(ictx: &ffmpeg_next::format::context::Input) -> bool {
         .unwrap_or(false)
 }
 
-/// Return `true` if the audio stream can be packet-copied into MPEG-TS and
-/// played by web browsers.  This requires:
+/// Return `true` if the audio stream can be packet-copied into an fMP4
+/// segment and played by web browsers.  This requires:
 ///   1. Codec is AAC or MP3 (browser-compatible).
 ///   2. Channel count ≤ 2 (stereo/mono).  Browsers cannot decode multi-channel
 ///      AAC (e.g. 5.1/7.1) in HLS/MPEG-TS — the audio track is simply dropped.
+///   3. For AAC, extradata must be present.  MPEG-TS carries AAC in ADTS
+///      framing (no extradata); the MP4 container requires raw AAC with an
+///      AudioSpecificConfig stored in the `esds` atom.  Without the
+///      `aac_adtstoasc` bitstream filter (not available in our bindings) the
+///      MP4 muxer rejects every packet.  Routing through the hybrid path
+///      (decode + re-encode) avoids this issue entirely.
 ///
 /// Returns `true` when there is no audio stream (video-only remux is fine).
 fn audio_is_remuxable(ictx: &ffmpeg_next::format::context::Input) -> bool {
@@ -175,16 +193,25 @@ fn audio_is_remuxable(ictx: &ffmpeg_next::format::context::Input) -> bool {
     ictx.streams()
         .best(ffmpeg_next::media::Type::Audio)
         .map(|s| {
-            let id = s.parameters().id();
+            let params = s.parameters();
+            let id = params.id();
             let codec_ok = id == Id::AAC || id == Id::MP3;
             // Read channel count from codec parameters.
             // SAFETY: `s.parameters().as_ptr()` returns a valid pointer to an
             // initialized `AVCodecParameters` owned by the stream.  We only
             // read the `ch_layout.nb_channels` field (a plain integer) through
             // the pointer — no mutation, no lifetime extension.
-            let channels = unsafe { (*s.parameters().as_ptr()).ch_layout.nb_channels };
+            let channels = unsafe { (*params.as_ptr()).ch_layout.nb_channels };
             let channels_ok = channels <= 2;
-            codec_ok && channels_ok
+            // AAC from MPEG-TS uses ADTS framing (extradata_size == 0) which
+            // is incompatible with the MP4 container.  Only allow remux when
+            // extradata is present (raw AAC from MKV/MP4 sources).
+            let extradata_ok = if id == Id::AAC {
+                unsafe { (*params.as_ptr()).extradata_size > 0 }
+            } else {
+                true
+            };
+            codec_ok && channels_ok && extradata_ok
         })
         // No audio stream is fine — video-only remux is valid.
         .unwrap_or(true)
@@ -193,6 +220,25 @@ fn audio_is_remuxable(ictx: &ffmpeg_next::format::context::Input) -> bool {
 /// Full remux: both video and audio can be packet-copied.
 fn source_is_remuxable(ictx: &ffmpeg_next::format::context::Input) -> bool {
     video_is_remuxable(ictx) && audio_is_remuxable(ictx)
+}
+
+/// Return the container's declared start time in seconds, used to normalise
+/// PTS comparisons.  Many containers (especially MPEG-TS) store PTS values
+/// relative to a non-zero clock origin (e.g. 87 s).  Without normalisation
+/// the segment time-range filter `pts_secs >= end_time` fires on the very
+/// first packet for segment 0 (end_time = 10 s), and fMP4 `write_trailer`
+/// then fails because no moof fragment was ever written.
+///
+/// `AVFormatContext::start_time` is in AV_TIME_BASE (µs) units.
+fn ctx_start_secs(ictx: &ffmpeg_next::format::context::Input) -> f64 {
+    let st = unsafe { (*ictx.as_ptr()).start_time };
+    // AV_NOPTS_VALUE = i64::MIN in the Rust bindings.  Negative values are
+    // treated as "unknown" so we return 0 to avoid a spurious negative offset.
+    if st < 0 {
+        0.0
+    } else {
+        st as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE)
+    }
 }
 
 /// Returns true if the channel layout is fully usable for the resampler —
@@ -443,9 +489,9 @@ fn create_segment(
     super::ensure_init();
 
     let start_time = seg_index as f64 * SEGMENT_DURATION;
-    let tmp_filename = format!(".seg_{:05}.ts.tmp", seg_index);
+    let tmp_filename = format!(".seg_{:05}.mp4.tmp", seg_index);
     let tmp_path = hls_dir.join(&tmp_filename);
-    let filename = format!("seg_{:05}.ts", seg_index);
+    let filename = format!("seg_{:05}.mp4", seg_index);
     let seg_path = hls_dir.join(&filename);
 
     // Open input.
@@ -476,9 +522,9 @@ fn create_segment(
 
 // ── Remux path (direct packet copy — near-instant) ──────────────────────────
 
-/// Copy compressed packets from the source into an MPEG-TS segment without
+/// Copy compressed packets from the source into an fMP4 segment without
 /// decoding or re-encoding.  This is the equivalent of
-/// `ffmpeg -ss <t> -i input -t 6 -c copy -f mpegts output.ts`
+/// `ffmpeg -ss <t> -i input -t 6 -c copy -f mp4 -movflags frag_keyframe+empty_moov+default_base_moof output.mp4`
 /// and gives VLC-like performance.
 fn remux_segment(
     ictx: &mut ffmpeg_next::format::context::Input,
@@ -503,7 +549,10 @@ fn remux_segment(
     }
 
     // Seek to the nearest keyframe at or before start_time.
-    let seek_ts = (start_time * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
+    // Many containers (especially MPEG-TS) have a non-zero start time that
+    // must be added so the seek lands at the right position in the file.
+    let cstart = ctx_start_secs(ictx);
+    let seek_ts = ((start_time + cstart) * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
     let _ = ictx.seek(seek_ts, ..seek_ts);
 
     // Collect input stream info we need (time_bases, codec params).
@@ -521,8 +570,8 @@ fn remux_segment(
         in_audio_params = None;
     }
 
-    // Create output muxer.
-    let mut octx = ffmpeg_next::format::output_as(tmp_path, "mpegts")
+    // Create output muxer (fragmented MP4 — supported by all MSE browsers).
+    let mut octx = ffmpeg_next::format::output_as(tmp_path, "mp4")
         .map_err(|e| format!("output context: {e}"))?;
 
     // Add output video stream, copying codec parameters from input.
@@ -533,6 +582,10 @@ fn remux_segment(
             out_video.parameters().as_mut_ptr(),
             in_video_params.as_ptr(),
         );
+        // Clear codec_tag so the MP4 muxer auto-selects the correct tag
+        // (e.g. avc1 for H.264).  Source containers like MPEG-TS use
+        // incompatible tags (0x1B) that the MP4 muxer rejects.
+        (*out_video.parameters().as_mut_ptr()).codec_tag = 0;
     }
     let out_video_idx = out_video.index();
 
@@ -550,6 +603,8 @@ fn remux_segment(
                         out_audio.parameters().as_mut_ptr(),
                         a_params.as_ptr(),
                     );
+                    // Clear codec_tag — same reason as video above.
+                    (*out_audio.parameters().as_mut_ptr()).codec_tag = 0;
                 }
                 out_audio_tb = out_audio.time_base();
                 out_audio_idx_val = Some(out_audio.index());
@@ -560,7 +615,13 @@ fn remux_segment(
         }
     }
 
-    octx.write_header()
+    // Write header with fMP4 fragmentation flags required for MSE streaming.
+    // frag_keyframe: start a new fragment at each keyframe (enables seeking).
+    // empty_moov: write a moov box without samples (MSE requires moov first).
+    // default_base_moof: required by the MSE byte-stream format specification.
+    let mut mux_opts = ffmpeg_next::Dictionary::new();
+    mux_opts.set("movflags", "frag_keyframe+empty_moov+default_base_moof");
+    octx.write_header_with(mux_opts)
         .map_err(|e| format!("write header: {e}"))?;
 
     // Re-read output time bases after write_header (muxer may adjust them).
@@ -589,9 +650,11 @@ fn remux_segment(
         }
 
         // Convert packet PTS to seconds for time-range filtering.
+        // Subtract the container's start_time so that comparisons are
+        // relative to the beginning of the content, not the clock origin.
         let in_tb = if is_video { in_video_tb } else { in_audio_tb.unwrap_or(in_video_tb) };
         let pts = packet.pts().unwrap_or(0);
-        let pts_secs = pts as f64 * f64::from(in_tb.0) / f64::from(in_tb.1);
+        let pts_secs = pts as f64 * f64::from(in_tb.0) / f64::from(in_tb.1) - cstart;
 
         // Past segment end → done.
         if pts_secs >= end_time {
@@ -654,8 +717,13 @@ fn remux_segment(
         let _ = packet.write_interleaved(&mut octx);
     }
 
-    octx.write_trailer()
-        .map_err(|e| format!("write trailer: {e}"))?;
+    // Use raw FFI for write_trailer: the fMP4 muxer returns a positive value
+    // (trailer size in bytes) on success, but the ffmpeg-next binding treats
+    // any non-zero return as an error.  Only negative values are real errors.
+    let trailer_ret = unsafe { ffmpeg_next::ffi::av_write_trailer(octx.as_mut_ptr()) };
+    if trailer_ret < 0 {
+        return Err(format!("write trailer: {}", ffmpeg_next::Error::from(trailer_ret)));
+    }
 
     Ok(())
 }
@@ -692,7 +760,10 @@ fn hybrid_segment(
     }
 
     // Seek to the nearest keyframe at or before start_time.
-    let seek_ts = (start_time * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
+    // Many containers (especially MPEG-TS) have a non-zero start time that
+    // must be added so the seek lands at the right position in the file.
+    let cstart = ctx_start_secs(ictx);
+    let seek_ts = ((start_time + cstart) * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
     let _ = ictx.seek(seek_ts, ..seek_ts);
 
     // Collect input video stream info.
@@ -710,8 +781,8 @@ fn hybrid_segment(
         in_audio_params = None;
     }
 
-    // Create output muxer.
-    let mut octx = ffmpeg_next::format::output_as(tmp_path, "mpegts")
+    // Create output muxer (fragmented MP4 — supported by all MSE browsers).
+    let mut octx = ffmpeg_next::format::output_as(tmp_path, "mp4")
         .map_err(|e| format!("output context: {e}"))?;
 
     // Add output video stream — parameters copied directly from input.
@@ -722,6 +793,10 @@ fn hybrid_segment(
             out_video.parameters().as_mut_ptr(),
             in_video_params.as_ptr(),
         );
+        // Clear codec_tag so the MP4 muxer auto-selects the correct tag
+        // (e.g. avc1 for H.264).  Source containers like MPEG-TS use
+        // incompatible tags (0x1B) that the MP4 muxer rejects.
+        (*out_video.parameters().as_mut_ptr()).codec_tag = 0;
     }
     let out_video_idx = out_video.index();
 
@@ -781,6 +856,10 @@ fn hybrid_segment(
                                 aac_enc.set_bit_rate(AAC_ENCODE_BITRATE);
                                 aac_enc.set_time_base(ffmpeg_next::Rational::new(1, dec.rate() as i32));
 
+                                // Required for fMP4: encoder must store AudioSpecificConfig
+                                // in extradata so the moov/esds box is populated correctly.
+                                unsafe { (*aac_enc.as_mut_ptr()).flags |= AV_CODEC_FLAG_GLOBAL_HEADER; }
+
                                 match aac_enc.open_as(aac) {
                                     Ok(opened) => {
                                         let mut out_aud_stream = octx.add_stream(aac)
@@ -818,7 +897,13 @@ fn hybrid_segment(
         }
     }
 
-    octx.write_header()
+    // Write header with fMP4 fragmentation flags required for MSE streaming.
+    // frag_keyframe: start a new fragment at each keyframe (enables seeking).
+    // empty_moov: write a moov box without samples (MSE requires moov first).
+    // default_base_moof: required by the MSE byte-stream format specification.
+    let mut mux_opts = ffmpeg_next::Dictionary::new();
+    mux_opts.set("movflags", "frag_keyframe+empty_moov+default_base_moof");
+    octx.write_header_with(mux_opts)
         .map_err(|e| format!("write header: {e}"))?;
 
     // Re-read output time bases after write_header (muxer may adjust them).
@@ -848,9 +933,11 @@ fn hybrid_segment(
         }
 
         // Convert packet PTS to seconds for time-range filtering.
+        // Subtract the container's start_time so that comparisons are
+        // relative to the beginning of the content, not the clock origin.
         let in_tb = if is_video { in_video_tb } else { in_audio_tb.unwrap_or(in_video_tb) };
         let pts = packet.pts().unwrap_or(0);
-        let pts_secs = pts as f64 * f64::from(in_tb.0) / f64::from(in_tb.1);
+        let pts_secs = pts as f64 * f64::from(in_tb.0) / f64::from(in_tb.1) - cstart;
 
         // Past segment end → done.
         if pts_secs >= end_time {
@@ -881,7 +968,9 @@ fn hybrid_segment(
             if let (Some(offset), Some(d)) = (video_pts_offset, packet.dts()) {
                 packet.set_dts(Some(d - offset));
             }
-            let _ = packet.write_interleaved(&mut octx);
+            if let Err(e) = packet.write_interleaved(&mut octx) {
+                eprintln!("[hybrid] video write_interleaved failed: {e}");
+            }
         } else if is_audio {
             // Skip audio before the video keyframe.
             if !got_video_keyframe {
@@ -901,11 +990,12 @@ fn hybrid_segment(
                 }
                 let mut audio_frame = ffmpeg_next::util::frame::Audio::empty();
                 while adec.receive_frame(&mut audio_frame).is_ok() {
-                    // Time-range filter.
+                    // Time-range filter (normalised against container start).
                     if let Some(apts) = audio_frame.pts() {
                         let apts_secs = apts as f64
                             * f64::from(audio_time_base.0)
-                            / f64::from(audio_time_base.1);
+                            / f64::from(audio_time_base.1)
+                            - cstart;
                         if apts_secs < start_time || apts_secs >= end_time {
                             continue;
                         }
@@ -991,8 +1081,13 @@ fn hybrid_segment(
         }
     }
 
-    octx.write_trailer()
-        .map_err(|e| format!("write trailer: {e}"))?;
+    // Use raw FFI for write_trailer: the fMP4 muxer returns a positive value
+    // (trailer size in bytes) on success, but the ffmpeg-next binding treats
+    // any non-zero return as an error.  Only negative values are real errors.
+    let trailer_ret = unsafe { ffmpeg_next::ffi::av_write_trailer(octx.as_mut_ptr()) };
+    if trailer_ret < 0 {
+        return Err(format!("write trailer: {}", ffmpeg_next::Error::from(trailer_ret)));
+    }
 
     Ok(())
 }
@@ -1008,7 +1103,10 @@ fn transcode_segment_inprocess(
     kill: Option<&AtomicBool>,
 ) -> Result<(), String> {
     // Seek to the segment start position.
-    let seek_ts = (start_time * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
+    // Many containers (especially MPEG-TS) have a non-zero start time that
+    // must be added so the seek lands at the right position in the file.
+    let cstart = ctx_start_secs(ictx);
+    let seek_ts = ((start_time + cstart) * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
     let _ = ictx.seek(seek_ts, ..seek_ts);
 
     // Find video and audio streams.
@@ -1193,10 +1291,19 @@ fn transcode_segment_body(
             opts.set("level", if matches!(quality, Quality::Original | Quality::High) { "4.2" } else { "4.1" });
         }
 
+        // fMP4 (mp4 container) sets AVFMT_GLOBALHEADER which requires every
+        // encoder to store its configuration in extradata (SPS/PPS for H.264,
+        // AudioSpecificConfig for AAC) rather than inlining it in each packet.
+        // Without this flag, `avcodec_parameters_from_context` copies NULL
+        // extradata to the stream, the moov box is written without an avcC/esds
+        // atom, and av_write_trailer fails when it tries to finalize the moof
+        // fragment.
+        unsafe { (*enc.as_mut_ptr()).flags |= AV_CODEC_FLAG_GLOBAL_HEADER; }
+
         let mut video_encoder = enc.open_with(opts).map_err(|e| format!("open video encoder: {e}"))?;
 
         // ── Output muxer ─────────────────────────────────────────────────
-        let mut octx = ffmpeg_next::format::output_as(tmp_path, "mpegts")
+        let mut octx = ffmpeg_next::format::output_as(tmp_path, "mp4")
             .map_err(|e| format!("output context: {e}"))?;
 
         let mut out_video_stream = octx.add_stream(video_encoder_codec)
@@ -1260,6 +1367,10 @@ fn transcode_segment_body(
                                     aac_enc.set_bit_rate(AAC_ENCODE_BITRATE);
                                     aac_enc.set_time_base(ffmpeg_next::Rational::new(1, dec.rate() as i32));
 
+                                    // Required for fMP4: encoder must store AudioSpecificConfig
+                                    // in extradata so the moov/esds box is populated correctly.
+                                    unsafe { (*aac_enc.as_mut_ptr()).flags |= AV_CODEC_FLAG_GLOBAL_HEADER; }
+
                                     match aac_enc.open_as(aac) {
                                         Ok(opened) => {
                                             let mut out_aud_stream = octx.add_stream(aac)
@@ -1298,7 +1409,13 @@ fn transcode_segment_body(
             }
         }
 
-        octx.write_header()
+        // Write header with fMP4 fragmentation flags required for MSE streaming.
+        // frag_keyframe: start a new fragment at each keyframe (enables seeking).
+        // empty_moov: write a moov box without samples (MSE requires moov first).
+        // default_base_moof: required by the MSE byte-stream format specification.
+        let mut mux_opts = ffmpeg_next::Dictionary::new();
+        mux_opts.set("movflags", "frag_keyframe+empty_moov+default_base_moof");
+        octx.write_header_with(mux_opts)
             .map_err(|e| format!("write header: {e}"))?;
 
         // Re-read output time bases after write_header.
@@ -1333,6 +1450,9 @@ fn transcode_segment_body(
         let mut audio_sample_count: i64 = 0;
         let audio_ts_offset = (start_time * audio_sample_rate as f64) as i64;
         let mut done = false;
+        // Normalise PTS comparisons against the container start_time so that
+        // videos with a non-zero clock origin (e.g. MPEG-TS) are handled correctly.
+        let cstart = ctx_start_secs(ictx);
 
         for (pkt_stream, packet) in ictx.packets() {
             if done { break; }
@@ -1351,7 +1471,7 @@ fn transcode_segment_body(
                 let mut decoded = ffmpeg_next::util::frame::Video::empty();
                 while video_decoder.receive_frame(&mut decoded).is_ok() {
                     let pts = decoded.pts().unwrap_or(0);
-                    let pts_secs = pts as f64 * f64::from(video_time_base.0) / f64::from(video_time_base.1);
+                    let pts_secs = pts as f64 * f64::from(video_time_base.0) / f64::from(video_time_base.1) - cstart;
 
                     if pts_secs >= end_time {
                         done = true;
@@ -1427,11 +1547,12 @@ fn transcode_segment_body(
                     if adec.send_packet(&packet).is_ok() {
                         let mut audio_frame = ffmpeg_next::util::frame::Audio::empty();
                         while adec.receive_frame(&mut audio_frame).is_ok() {
-                            // Time-range filter using input time base.
+                            // Time-range filter using input time base (normalised).
                             if let Some(apts) = audio_frame.pts() {
                                 let apts_secs = apts as f64
                                     * f64::from(audio_time_base.0)
-                                    / f64::from(audio_time_base.1);
+                                    / f64::from(audio_time_base.1)
+                                    - cstart;
                                 if apts_secs < start_time || apts_secs >= end_time {
                                     continue;
                                 }
@@ -1532,8 +1653,13 @@ fn transcode_segment_body(
             }
         }
 
-        octx.write_trailer()
-            .map_err(|e| format!("write trailer: {e}"))?;
+        // Use raw FFI for write_trailer: the fMP4 muxer returns a positive value
+        // (trailer size in bytes) on success, but the ffmpeg-next binding treats
+        // any non-zero return as an error.  Only negative values are real errors.
+        let trailer_ret = unsafe { ffmpeg_next::ffi::av_write_trailer(octx.as_mut_ptr()) };
+        if trailer_ret < 0 {
+            return Err(format!("write trailer: {}", ffmpeg_next::Error::from(trailer_ret)));
+        }
     }
 
     Ok(())
@@ -1567,7 +1693,7 @@ mod tests {
         assert!(video_is_remuxable(&ictx));
         assert!(!audio_is_remuxable(&ictx), "6ch audio should not be directly remuxable");
 
-        let out = Path::new("/tmp/test_media/test_hybrid_6ch.ts");
+        let out = Path::new("/tmp/test_media/test_hybrid_6ch.mp4");
         hybrid_segment(&mut ictx, 0.0, out, None).expect("hybrid segment failed");
         verify_segment(out, true);
     }
@@ -1579,7 +1705,7 @@ mod tests {
         super::super::ensure_init();
 
         let mut ictx = ffmpeg_next::format::input(&test_file).unwrap();
-        let out = Path::new("/tmp/test_media/test_hybrid_6ch_seg1.ts");
+        let out = Path::new("/tmp/test_media/test_hybrid_6ch_seg1.mp4");
         hybrid_segment(&mut ictx, 6.0, out, None).expect("hybrid segment at t=6s failed");
         verify_segment(out, true);
     }
@@ -1593,9 +1719,81 @@ mod tests {
         let mut ictx = ffmpeg_next::format::input(&test_file).unwrap();
         assert!(source_is_remuxable(&ictx));
 
-        let out = Path::new("/tmp/test_media/test_remux_stereo.ts");
+        let out = Path::new("/tmp/test_media/test_remux_stereo.mp4");
         remux_segment(&mut ictx, 0.0, out, None).expect("remux segment failed");
         verify_segment(out, true);
+    }
+
+    #[test]
+    fn test_remux_mpegts_stereo_aac() {
+        let test_file = "/tmp/test_media/test_mpegts_stereo.ts";
+        if !Path::new(test_file).exists() { return; }
+        super::super::ensure_init();
+
+        let mut ictx = ffmpeg_next::format::input(&test_file).unwrap();
+        // MPEG-TS AAC audio uses ADTS framing (no extradata) which is
+        // incompatible with the MP4 container.  The audio should NOT be
+        // flagged as remuxable, routing through the hybrid path instead.
+        assert!(video_is_remuxable(&ictx), "H.264 video should be remuxable");
+        assert!(!audio_is_remuxable(&ictx), "MPEG-TS ADTS AAC should not be remuxable into MP4");
+
+        // Hybrid path: copy video, transcode audio.
+        let out = Path::new("/tmp/test_media/test_hybrid_mpegts.mp4");
+        hybrid_segment(&mut ictx, 0.0, out, None).expect("hybrid segment from MPEG-TS failed");
+        verify_segment(out, true);
+    }
+
+    #[test]
+    fn test_remux_mpegts_video_only() {
+        let test_file = "/tmp/test_media/test_mpegts_video_only.ts";
+        if !Path::new(test_file).exists() { return; }
+        super::super::ensure_init();
+        let mut ictx = ffmpeg_next::format::input(&test_file).unwrap();
+        let out = Path::new("/tmp/test_media/test_remux_video_only.mp4");
+        remux_segment(&mut ictx, 0.0, out, None).expect("remux video-only MPEG-TS failed");
+        let octx = ffmpeg_next::format::input(out).unwrap();
+        assert!(octx.streams().best(ffmpeg_next::media::Type::Video).is_some());
+    }
+
+    /// Integration test: exercise `create_segment` (the main entry point) with
+    /// MPEG-TS sources which have non-zero start_time and ADTS-framed audio.
+    /// This simulates what the precache worker does on startup.
+    #[test]
+    fn test_create_segment_mpegts() {
+        let test_file = "/tmp/test_media/test_mpegts_stereo.ts";
+        if !Path::new(test_file).exists() { return; }
+        super::super::ensure_init();
+
+        let hls_dir = Path::new("/tmp/test_media/hls_mpegts");
+        std::fs::create_dir_all(hls_dir).unwrap();
+
+        // Segment 0 — exercises the start_time normalisation.
+        create_segment(
+            test_file,
+            hls_dir,
+            0,
+            &HwAccel::Software,
+            Quality::Original,
+            None,
+        ).expect("create_segment 0 failed");
+
+        let seg0 = hls_dir.join("seg_00000.mp4");
+        assert!(seg0.exists(), "segment 0 file must exist");
+        verify_segment(&seg0, true);
+
+        // Segment 1 — exercises non-zero start offset.
+        create_segment(
+            test_file,
+            hls_dir,
+            1,
+            &HwAccel::Software,
+            Quality::Original,
+            None,
+        ).expect("create_segment 1 failed");
+
+        let seg1 = hls_dir.join("seg_00001.mp4");
+        assert!(seg1.exists(), "segment 1 file must exist");
+        verify_segment(&seg1, true);
     }
 
     #[test]
@@ -1619,7 +1817,7 @@ mod tests {
         assert!(video_is_remuxable(&ictx));
         assert!(!audio_is_remuxable(&ictx), "FLAC is not browser-remuxable");
 
-        let out = Path::new("/tmp/test_media/test_hybrid_flac.ts");
+        let out = Path::new("/tmp/test_media/test_hybrid_flac.mp4");
         hybrid_segment(&mut ictx, 0.0, out, None).expect("hybrid segment with FLAC failed");
         verify_segment(out, true);
     }

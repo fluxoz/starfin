@@ -284,7 +284,7 @@ fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) 
         let bytes = match bytes_opt {
             Some(b) => b,
             None => {
-                log::error!("Failed to fetch segment after {} retries: {seg_url}", SEGMENT_FETCH_MAX_RETRIES + 1);
+                log::error!("Failed to fetch segment after {} retries: {seg_url}", SEGMENT_FETCH_MAX_RETRIES);
                 if let Some(s) = state_clone.borrow_mut().as_mut() {
                     s.is_appending = false;
                 }
@@ -1599,7 +1599,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 spawn_local(async move {
                     TimeoutFuture::new(300).await;
                     // Only trigger if no second tap occurred (§11.5)
-                    if last_tap_time.is_some() {
+                    if (*last_tap_time).is_some() {
                         if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
                             if video.paused() {
                                 let _ = video.play();

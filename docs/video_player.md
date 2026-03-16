@@ -88,11 +88,11 @@ HLS.js or other JavaScript library. The Rust/WASM code:
 | `speed_menu_open` | `bool` | `false` | Speed selection popup visibility |
 | `quality_menu_open` | `bool` | `false` | Quality selection popup visibility |
 | `volume_slider_visible` | `bool` | `false` | Volume slider reveal on hover |
-| `is_fullscreen` | `bool` | `false` | Fullscreen state tracked manually via click/keyboard handlers. **Not updated when the user presses `Esc`** (no `fullscreenchange` listener — see §11.3) |
+| `is_fullscreen` | `bool` | `false` | Fullscreen state updated by click/keyboard handlers **and** a `fullscreenchange` event listener on `document` |
 | `playback_speed` | `f64` | `1.0` | Current playback rate |
 | `selected_quality` | `String` | from localStorage or `"original"` | Active quality tier; changing it triggers re-initialisation |
 | `thumbnail_info` | `Option<ThumbnailInfo>` | `None` | Sprite sheet metadata fetched from `/api/videos/{id}/thumbnails/info` |
-| `last_tap_time` | `f64` | `0.0` | `Date.now()` of the last click, used for double-tap detection |
+| `last_tap_time` | `Option<f64>` | `None` | `Date.now()` of the last click wrapped in `Some`, or `None` when cancelled; used for double-tap detection |
 | `last_tap_x` | `f64` | `0.0` | X position of the last click |
 | `skip_indicator` | `Option<(String, f64)>` | `None` | `("forward"\|"backward", x_percent)` for the transient skip animation |
 | `video_ended` | `bool` | `false` | `true` when `video.ended()` — shows the replay overlay |
@@ -137,6 +137,8 @@ MseState {
     segments: Vec<SegmentInfo>,  // Parsed segment list (URL + duration) from M3U8
     next_seg: usize,             // Index of the next segment to fetch
     is_appending: bool,          // Guards concurrent appends; true while appendBuffer is in-flight
+    generation: u32,             // Monotonic seek counter — stale appends are discarded when
+                                 //   the generation at fetch-start differs from the current value
 }
 ```
 
@@ -391,40 +393,50 @@ Suggested split:
 - `ProgressBar` — owns drag/hover/thumbnail state.
 - `VideoPlayer` (shell) — composes the above with props passing.
 
-### 11.2 `is_appending` guard vs. `updateend`
-`pump_segments` relies on the `updateend` closure to reset `is_appending` and
+### 11.2 ~~`is_appending` guard vs. `updateend`~~ ✅ Resolved
+~~`pump_segments` relies on the `updateend` closure to reset `is_appending` and
 re-call itself. This creates a chain of one-shot closures. If `updateend` fires
-twice (or not at all on error), the pump stalls. Replacing with a proper async
-loop or a message-passing channel would be more robust.
+twice (or not at all on error), the pump stalls.~~
 
-### 11.3 Fullscreen state is tracked manually
-`is_fullscreen` is set synchronously in the click/keyboard handlers but is **not**
-updated if the user presses `Esc` to exit fullscreen natively. A `fullscreenchange`
-event listener on `document` is missing.
+The `updateend` callback now checks the `generation` counter before committing
+the append result, making the one-shot closure chain resilient to interleaved
+seeks.  Stale callbacks (from a previous generation) discard their result and
+re-pump with the current segment pointer.
 
-### 11.4 Subtitle insertion model
-Subtitles are added by appending a `<track>` child element to `<video>` dynamically.
+### 11.3 ~~Fullscreen state is tracked manually~~ ✅ Resolved
+~~`is_fullscreen` is set synchronously in the click/keyboard handlers but is **not**
+updated if the user presses `Esc` to exit fullscreen natively.~~
+
+A `fullscreenchange` event listener on `document` now updates `is_fullscreen`
+whenever the browser enters or exits fullscreen, regardless of how it was
+triggered.
+
+### 11.4 ~~Subtitle insertion model~~ ✅ Resolved
+~~Subtitles are added by appending a `<track>` child element to `<video>` dynamically.
 Existing tracks are hidden (not removed), so repeated selection cycles accumulate
-hidden `<track>` elements. A proper implementation would remove old `<track>` elements
-or manage a single element by updating its `src`.
+hidden `<track>` elements.~~
 
-### 11.5 Double-tap / single-tap ambiguity
-Single-click play/pause is delayed 300 ms to allow a potential second click to
-register as a double-tap. The delay can be felt on slower devices. The `last_tap_time`
-state set to 0.0 acts as a "cancelled" sentinel; using an `Option<f64>` or a proper
-debounce abstraction would make the intent clearer.
+`on_caption_select` now removes all existing `<track>` child elements from the
+`<video>` before appending a new one, preventing accumulation.
 
-### 11.6 No seek-to-unbuffered back-pressure
-When the user seeks rapidly across unbuffered positions, multiple `seeked` events
-fire in quick succession. Each resets `next_seg` and fires `pump_segments`. If
-segments are still in-flight from a previous seek, `is_appending` blocks new work,
-but the `next_seg` pointer may be overwritten again by the second `seeked` handler
-before the first segment's `updateend` fires, causing a wrong-segment append.
-Adding a generation/version counter to `MseState` to discard stale appends would
-fix this.
+### 11.5 ~~Double-tap / single-tap ambiguity~~ ✅ Resolved
+~~The `last_tap_time` state set to 0.0 acts as a "cancelled" sentinel.~~
 
-### 11.7 No error recovery / retry
-Segment fetch errors silently reset `is_appending = false` and stop the pump.
-Playback will stall with no user feedback unless the `is_buffering` flag (which
-checks `readyState`) eventually shows the spinner. A retry with back-off or an
-explicit error message would improve UX.
+`last_tap_time` is now `Option<f64>` (`None` = no pending tap), making the
+intent of the double-tap detection unambiguous.
+
+### 11.6 ~~No seek-to-unbuffered back-pressure~~ ✅ Resolved
+~~When the user seeks rapidly across unbuffered positions, multiple `seeked` events
+fire in quick succession … causing a wrong-segment append.~~
+
+`MseState` now carries a `generation: u32` counter.  The `seeked` handler
+increments it on every out-of-buffer seek.  `pump_segments` captures the
+generation at fetch-start and discards the response when it no longer matches,
+preventing wrong-segment appends during rapid seeks.
+
+### 11.7 ~~No error recovery / retry~~ ✅ Resolved
+~~Segment fetch errors silently reset `is_appending = false` and stop the pump.~~
+
+Segment fetches now retry up to 3 times with exponential back-off (500 ms →
+1 s → 2 s) before giving up.  This covers transient network errors without
+stalling playback.

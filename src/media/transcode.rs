@@ -1755,6 +1755,47 @@ mod tests {
         assert!(octx.streams().best(ffmpeg_next::media::Type::Video).is_some());
     }
 
+    /// Integration test: exercise `create_segment` (the main entry point) with
+    /// MPEG-TS sources which have non-zero start_time and ADTS-framed audio.
+    /// This simulates what the precache worker does on startup.
+    #[test]
+    fn test_create_segment_mpegts() {
+        let test_file = "/tmp/test_media/test_mpegts_stereo.ts";
+        if !Path::new(test_file).exists() { return; }
+        super::super::ensure_init();
+
+        let hls_dir = Path::new("/tmp/test_media/hls_mpegts");
+        std::fs::create_dir_all(hls_dir).unwrap();
+
+        // Segment 0 — exercises the start_time normalisation.
+        create_segment(
+            test_file,
+            hls_dir,
+            0,
+            &HwAccel::Software,
+            Quality::Original,
+            None,
+        ).expect("create_segment 0 failed");
+
+        let seg0 = hls_dir.join("seg_00000.mp4");
+        assert!(seg0.exists(), "segment 0 file must exist");
+        verify_segment(&seg0, true);
+
+        // Segment 1 — exercises non-zero start offset.
+        create_segment(
+            test_file,
+            hls_dir,
+            1,
+            &HwAccel::Software,
+            Quality::Original,
+            None,
+        ).expect("create_segment 1 failed");
+
+        let seg1 = hls_dir.join("seg_00001.mp4");
+        assert!(seg1.exists(), "segment 1 file must exist");
+        verify_segment(&seg1, true);
+    }
+
     #[test]
     fn test_hybrid_mono_aac() {
         let test_file = "/tmp/test_media/test_mono_aac.mkv";

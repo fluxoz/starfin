@@ -50,9 +50,10 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
                 .all_tags
                 .iter()
                 .filter(|t| {
-                    t.to_lowercase().starts_with(&q)
-                        && t.as_str() != (*tag_input).as_str()
-                        && !(*tags).contains(*t)
+                    let tl = t.to_lowercase();
+                    tl.starts_with(&q)
+                        && tl != q
+                        && !(*tags).iter().any(|x| x.to_lowercase() == tl)
                 })
                 .cloned()
                 .take(6)
@@ -68,9 +69,10 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
                 .all_actors
                 .iter()
                 .filter(|a| {
-                    a.to_lowercase().starts_with(&q)
-                        && a.as_str() != (*actor_input).as_str()
-                        && !(*actors).contains(*a)
+                    let al = a.to_lowercase();
+                    al.starts_with(&q)
+                        && al != q
+                        && !(*actors).iter().any(|x| x.to_lowercase() == al)
                 })
                 .cloned()
                 .take(6)
@@ -86,9 +88,10 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
                 .all_categories
                 .iter()
                 .filter(|c| {
-                    c.to_lowercase().starts_with(&q)
-                        && c.as_str() != (*category_input).as_str()
-                        && !(*categories).contains(*c)
+                    let cl = c.to_lowercase();
+                    cl.starts_with(&q)
+                        && cl != q
+                        && !(*categories).iter().any(|x| x.to_lowercase() == cl)
                 })
                 .cloned()
                 .take(6)
@@ -134,7 +137,7 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
             match e.key().as_str() {
                 "Enter" => {
                     e.prevent_default();
-                    let val = (*tag_input).trim().to_string();
+                    let val = (*tag_input).trim().to_lowercase();
                     if !val.is_empty() && !tags.contains(&val) {
                         let mut t = (*tags).clone();
                         t.push(val);
@@ -156,7 +159,7 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
         let tag_input = tag_input.clone();
         let tags = tags.clone();
         Callback::from(move |_: MouseEvent| {
-            let val = (*tag_input).trim().to_string();
+            let val = (*tag_input).trim().to_lowercase();
             if !val.is_empty() && !tags.contains(&val) {
                 let mut t = (*tags).clone();
                 t.push(val);
@@ -183,7 +186,7 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
             match e.key().as_str() {
                 "Enter" => {
                     e.prevent_default();
-                    let val = (*actor_input).trim().to_string();
+                    let val = (*actor_input).trim().to_lowercase();
                     if !val.is_empty() && !actors.contains(&val) {
                         let mut a = (*actors).clone();
                         a.push(val);
@@ -205,7 +208,7 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
         let actor_input = actor_input.clone();
         let actors = actors.clone();
         Callback::from(move |_: MouseEvent| {
-            let val = (*actor_input).trim().to_string();
+            let val = (*actor_input).trim().to_lowercase();
             if !val.is_empty() && !actors.contains(&val) {
                 let mut a = (*actors).clone();
                 a.push(val);
@@ -232,7 +235,7 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
             match e.key().as_str() {
                 "Enter" => {
                     e.prevent_default();
-                    let val = (*category_input).trim().to_string();
+                    let val = (*category_input).trim().to_lowercase();
                     if !val.is_empty() && !categories.contains(&val) {
                         let mut c = (*categories).clone();
                         c.push(val);
@@ -254,7 +257,7 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
         let category_input = category_input.clone();
         let categories = categories.clone();
         Callback::from(move |_: MouseEvent| {
-            let val = (*category_input).trim().to_string();
+            let val = (*category_input).trim().to_lowercase();
             if !val.is_empty() && !categories.contains(&val) {
                 let mut c = (*categories).clone();
                 c.push(val);

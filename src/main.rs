@@ -1244,13 +1244,22 @@ async fn update_metadata(
         item.rating = r.clamp(0.0, 5.0);
     }
     if let Some(ref tags) = body.tags {
-        item.tags = tags.clone();
+        item.tags = tags.iter()
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
     }
     if let Some(ref actors) = body.actors {
-        item.actors = actors.clone();
+        item.actors = actors.iter()
+            .map(|a| a.trim().to_lowercase())
+            .filter(|a| !a.is_empty())
+            .collect();
     }
     if let Some(ref categories) = body.categories {
-        item.categories = categories.clone();
+        item.categories = categories.iter()
+            .map(|c| c.trim().to_lowercase())
+            .filter(|c| !c.is_empty())
+            .collect();
     }
 
     let updated = item.clone();

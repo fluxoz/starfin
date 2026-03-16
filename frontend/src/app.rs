@@ -749,21 +749,21 @@ fn app_inner() -> Html {
     let all_tags = {
         let mut set = std::collections::BTreeSet::new();
         for item in (*raw_items).iter() {
-            for t in &item.tags { set.insert(t.clone()); }
+            for t in &item.tags { set.insert(t.to_lowercase()); }
         }
         set.into_iter().collect::<Vec<_>>()
     };
     let all_actors = {
         let mut set = std::collections::BTreeSet::new();
         for item in (*raw_items).iter() {
-            for a in &item.actors { set.insert(a.clone()); }
+            for a in &item.actors { set.insert(a.to_lowercase()); }
         }
         set.into_iter().collect::<Vec<_>>()
     };
     let all_categories = {
         let mut set = std::collections::BTreeSet::new();
         for item in (*raw_items).iter() {
-            for c in &item.categories { set.insert(c.clone()); }
+            for c in &item.categories { set.insert(c.to_lowercase()); }
         }
         set.into_iter().collect::<Vec<_>>()
     };

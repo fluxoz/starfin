@@ -29,6 +29,10 @@ use super::hwaccel::HwAccel;
 /// Duration of each HLS segment in seconds.
 pub const SEGMENT_DURATION: f64 = 6.0;
 
+/// Error message returned when a background operation is cancelled by a kill
+/// flag (e.g. playback started while a background worker was running).
+pub const CANCELLED: &str = "cancelled";
+
 /// Bitrate for AAC audio encoding in the transcode and hybrid paths.
 /// 256 kbps stereo AAC-LC is transparent quality for music and dialogue.
 const AAC_ENCODE_BITRATE: usize = 256_000;
@@ -573,7 +577,7 @@ fn remux_segment(
         if let Some(k) = kill {
             if k.load(Ordering::Relaxed) {
                 let _ = std::fs::remove_file(tmp_path);
-                return Err("cancelled".into());
+                return Err(CANCELLED.into());
             }
         }
         let si = stream.index();
@@ -827,7 +831,7 @@ fn hybrid_segment(
         if let Some(k) = kill {
             if k.load(Ordering::Relaxed) {
                 let _ = std::fs::remove_file(tmp_path);
-                return Err("cancelled".into());
+                return Err(CANCELLED.into());
             }
         }
         let si = stream.index();
@@ -1327,7 +1331,7 @@ fn transcode_segment_body(
             if let Some(k) = kill {
                 if k.load(Ordering::Relaxed) {
                     let _ = std::fs::remove_file(tmp_path);
-                    return Err("cancelled".into());
+                    return Err(CANCELLED.into());
                 }
             }
 

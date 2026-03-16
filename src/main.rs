@@ -2824,7 +2824,7 @@ async fn run_precache_worker(
                     _ = shutdown_rx.changed() => { return; }
                 };
                 if let Err(e) = result {
-                    if e == "cancelled" {
+                    if e == media::transcode::CANCELLED {
                         // Cancelled by playback — retry this segment later.
                         continue;
                     }

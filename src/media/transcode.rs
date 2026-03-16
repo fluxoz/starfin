@@ -606,36 +606,51 @@ fn hybrid_segment(
             if let (Some(adec), Some(aenc)) =
                 (&mut audio_decoder, &mut audio_encoder_handle)
             {
-                if adec.send_packet(&packet).is_ok() {
-                    let mut audio_frame = ffmpeg_next::util::frame::Audio::empty();
-                    while adec.receive_frame(&mut audio_frame).is_ok() {
-                        // Time-range filter.
-                        if let Some(apts) = audio_frame.pts() {
-                            let apts_secs = apts as f64
-                                * f64::from(audio_time_base.0)
-                                / f64::from(audio_time_base.1);
-                            if apts_secs < start_time || apts_secs >= end_time {
+                match adec.send_packet(&packet) {
+                    Ok(()) => {},
+                    Err(e) => {
+                        eprintln!("[hybrid] send_packet error: {e}");
+                        continue;
+                    }
+                }
+                let mut audio_frame = ffmpeg_next::util::frame::Audio::empty();
+                while adec.receive_frame(&mut audio_frame).is_ok() {
+                    // Time-range filter.
+                    if let Some(apts) = audio_frame.pts() {
+                        let apts_secs = apts as f64
+                            * f64::from(audio_time_base.0)
+                            / f64::from(audio_time_base.1);
+                        if apts_secs < start_time || apts_secs >= end_time {
+                            continue;
+                        }
+                    }
+
+                    let frame_to_encode = if let Some(ref mut resampler) = audio_resampler {
+                        let mut resampled = ffmpeg_next::frame::Audio::empty();
+                        match resampler.run(&audio_frame, &mut resampled) {
+                            Ok(_) => {},
+                            Err(e) => {
+                                eprintln!(
+                                    "[hybrid] resampler.run error: {e} (in: samples={} ch={} fmt={:?}, out: samples={} ch={} fmt={:?})",
+                                    audio_frame.samples(), audio_frame.channels(), audio_frame.format(),
+                                    resampled.samples(), resampled.channels(), resampled.format(),
+                                );
                                 continue;
                             }
                         }
+                        let new_pts = audio_sample_count + audio_ts_offset;
+                        resampled.set_pts(Some(new_pts));
+                        audio_sample_count += resampled.samples() as i64;
+                        resampled
+                    } else {
+                        let new_pts = audio_sample_count + audio_ts_offset;
+                        audio_frame.set_pts(Some(new_pts));
+                        audio_sample_count += audio_frame.samples() as i64;
+                        audio_frame.clone()
+                    };
 
-                        let frame_to_encode = if let Some(ref mut resampler) = audio_resampler {
-                            let mut resampled = ffmpeg_next::frame::Audio::empty();
-                            if resampler.run(&audio_frame, &mut resampled).is_err() {
-                                continue;
-                            }
-                            let new_pts = audio_sample_count + audio_ts_offset;
-                            resampled.set_pts(Some(new_pts));
-                            audio_sample_count += resampled.samples() as i64;
-                            resampled
-                        } else {
-                            let new_pts = audio_sample_count + audio_ts_offset;
-                            audio_frame.set_pts(Some(new_pts));
-                            audio_sample_count += audio_frame.samples() as i64;
-                            audio_frame.clone()
-                        };
-
-                        if aenc.send_frame(&frame_to_encode).is_ok() {
+                    match aenc.send_frame(&frame_to_encode) {
+                        Ok(()) => {
                             let mut encoded = ffmpeg_next::Packet::empty();
                             while aenc.receive_packet(&mut encoded).is_ok() {
                                 if let Some(aud_out_idx) = out_audio_idx {
@@ -647,6 +662,13 @@ fn hybrid_segment(
                                     let _ = encoded.write_interleaved(&mut octx);
                                 }
                             }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[hybrid] encoder.send_frame error: {e} (samples={} ch={} fmt={:?} pts={:?})",
+                                frame_to_encode.samples(), frame_to_encode.channels(),
+                                frame_to_encode.format(), frame_to_encode.pts(),
+                            );
                         }
                     }
                 }
@@ -1199,4 +1221,83 @@ fn transcode_segment_body(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_hybrid_6ch_aac() {
+        // Create a test 6ch AAC file first
+        let test_file = "/tmp/test_media/test_6ch_aac.mkv";
+        if !std::path::Path::new(test_file).exists() {
+            eprintln!("Skipping test - test file not found");
+            return;
+        }
+        
+        super::super::ensure_init();
+        
+        let mut ictx = ffmpeg_next::format::input(&test_file).unwrap();
+        
+        // Verify it should go through hybrid path
+        assert!(video_is_remuxable(&ictx), "Video should be remuxable (H.264)");
+        assert!(!audio_is_remuxable(&ictx), "Audio should NOT be remuxable (6ch)");
+        
+        // Try hybrid segment creation
+        let out_path = std::path::Path::new("/tmp/test_media/test_hybrid_seg.ts");
+        match hybrid_segment(&mut ictx, 0.0, out_path) {
+            Ok(()) => {
+                eprintln!("Hybrid segment created successfully");
+                // Verify the output
+                let octx = ffmpeg_next::format::input(&out_path).unwrap();
+                let has_video = octx.streams().best(ffmpeg_next::media::Type::Video).is_some();
+                let has_audio = octx.streams().best(ffmpeg_next::media::Type::Audio).is_some();
+                eprintln!("Output has video: {}, audio: {}", has_video, has_audio);
+                assert!(has_video, "Output must have video");
+                assert!(has_audio, "Output must have audio");
+                
+                // Check audio properties
+                let audio_stream = octx.streams().best(ffmpeg_next::media::Type::Audio).unwrap();
+                let channels = unsafe { (*audio_stream.parameters().as_ptr()).ch_layout.nb_channels };
+                eprintln!("Output audio channels: {}", channels);
+                assert!(channels <= 2, "Output audio should be mono or stereo, got {} channels", channels);
+            }
+            Err(e) => {
+                panic!("Hybrid segment creation failed: {}", e);
+            }
+        }
+    }
+    
+    #[test]
+    fn test_remux_stereo_aac() {
+        let test_file = "/tmp/test_media/test_stereo_aac.mkv";
+        if !std::path::Path::new(test_file).exists() {
+            eprintln!("Skipping test - test file not found");
+            return;
+        }
+        
+        super::super::ensure_init();
+        
+        let mut ictx = ffmpeg_next::format::input(&test_file).unwrap();
+        
+        // Verify it should go through remux path
+        assert!(video_is_remuxable(&ictx), "Video should be remuxable (H.264)");
+        assert!(audio_is_remuxable(&ictx), "Audio should be remuxable (stereo AAC)");
+        assert!(source_is_remuxable(&ictx), "Source should be fully remuxable");
+        
+        let out_path = std::path::Path::new("/tmp/test_media/test_remux_seg.ts");
+        match remux_segment(&mut ictx, 0.0, out_path) {
+            Ok(()) => {
+                let octx = ffmpeg_next::format::input(&out_path).unwrap();
+                let has_video = octx.streams().best(ffmpeg_next::media::Type::Video).is_some();
+                let has_audio = octx.streams().best(ffmpeg_next::media::Type::Audio).is_some();
+                assert!(has_video, "Remux output must have video");
+                assert!(has_audio, "Remux output must have audio");
+            }
+            Err(e) => {
+                panic!("Remux segment creation failed: {}", e);
+            }
+        }
+    }
 }

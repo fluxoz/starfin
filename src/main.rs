@@ -153,7 +153,7 @@ fn theme_jetson() -> ThemeConfig {
 }
 
 /// Built-in "Nord" theme — Arctic, cool-blue toned palette inspired by the
-/// popular Nord colour scheme.
+/// popular Nord color scheme.
 fn theme_nord() -> ThemeConfig {
     ThemeConfig {
         meta: ThemeMeta { name: "Nord".into() },

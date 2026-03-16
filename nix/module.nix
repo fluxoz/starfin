@@ -98,10 +98,10 @@ in
       default = "jetson";
       example = "nord";
       description = ''
-        UI colour theme.  Starfin ships with four built-in presets:
+        UI color theme.  Starfin ships with four built-in presets:
 
         - **jetson** – warm beige with orange accents (default)
-        - **nord** – Arctic, cool-blue toned (Nord colour scheme)
+        - **nord** – Arctic, cool-blue toned (Nord color scheme)
         - **catppuccin** – soothing pastels (Catppuccin Latte / Mocha)
         - **dracula** – purple / pink dark-first palette
 

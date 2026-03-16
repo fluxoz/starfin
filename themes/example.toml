@@ -1,6 +1,6 @@
 # Starfin Theme File
 #
-# This file defines a custom colour palette for the Starfin UI.  Point the
+# This file defines a custom color palette for the Starfin UI.  Point the
 # THEME_FILE environment variable at this file (or use `themeFile` in the NixOS
 # module) to activate it.
 #

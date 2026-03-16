@@ -114,6 +114,13 @@ fn app_inner() -> Html {
     /// Initial estimate for one card's rendered height plus the grid row-gap (16 px).
     /// Updated after the first real render by measuring an actual `.card` element.
     const CARD_ROW_HEIGHT_ESTIMATE: f64 = 440.0;
+    /// Duration (ms) of the content fade-out when returning to the top.
+    /// Must match the `transition: opacity` duration in `.content--fading` (main.css).
+    const SCROLL_TOP_FADE_MS: u32 = 200;
+    /// Extra delay (ms) after the virtual window reset to allow Yew to flush
+    /// the DOM update before fading back in, preventing a brief flash of
+    /// the wrong content at the top of the page.
+    const SCROLL_TOP_SETTLE_MS: u32 = 50;
     let query = use_state(|| "".to_string());
     let sort_by = use_state(|| SortBy::DateAddedNewest);
     let meta_filter = use_state(MetadataFilter::default);
@@ -177,6 +184,10 @@ fn app_inner() -> Html {
 
     // Scroll-to-top button visibility state
     let show_scroll_top = use_state(|| false);
+
+    // Tracks whether the scroll-to-top transition is in progress (fade-out
+    // phase before the virtual window is reset and the page jumps to the top).
+    let returning_to_top = use_state(|| false);
 
     // Virtual window: index of the first item currently rendered.  Only items
     // [window_start .. window_start + WINDOW_SIZE] are in the DOM; spacers
@@ -604,17 +615,35 @@ fn app_inner() -> Html {
     let on_scroll_top = {
         let window_start = window_start.clone();
         let window_start_ref = window_start_ref.clone();
+        let returning_to_top = returning_to_top.clone();
         Callback::from(move |_: MouseEvent| {
-            // Reset the virtual window to the first WINDOW_SIZE cards.
-            window_start.set(0);
-            *window_start_ref.borrow_mut() = 0;
-            // Scroll to the top of the page.
-            if let Some(window) = web_sys::window() {
-                let opts = web_sys::ScrollToOptions::new();
-                opts.set_top(0.0);
-                opts.set_behavior(web_sys::ScrollBehavior::Smooth);
-                window.scroll_to_with_scroll_to_options(&opts);
+            if *returning_to_top {
+                return;
             }
+            let window_start = window_start.clone();
+            let window_start_ref = window_start_ref.clone();
+            let returning_to_top = returning_to_top.clone();
+            // Fade out the content first, then jump to the top so the virtual
+            // window reset happens while the page is invisible (no tearing).
+            returning_to_top.set(true);
+            spawn_local(async move {
+                // Wait for the CSS fade-out to complete (matches the
+                // transition duration in .content--fading).
+                gloo_timers::future::TimeoutFuture::new(SCROLL_TOP_FADE_MS).await;
+                // Reset the virtual window to the first WINDOW_SIZE cards.
+                window_start.set(0);
+                *window_start_ref.borrow_mut() = 0;
+                // Jump instantly to the top — content is already invisible.
+                if let Some(window) = web_sys::window() {
+                    let opts = web_sys::ScrollToOptions::new();
+                    opts.set_top(0.0);
+                    opts.set_behavior(web_sys::ScrollBehavior::Auto);
+                    window.scroll_to_with_scroll_to_options(&opts);
+                }
+                // Allow Yew to apply the window reset before fading back in.
+                gloo_timers::future::TimeoutFuture::new(SCROLL_TOP_SETTLE_MS).await;
+                returning_to_top.set(false);
+            });
         })
     };
 
@@ -951,7 +980,7 @@ fn app_inner() -> Html {
                     </div>
                 }
 
-            <main class="content">
+            <main class={if *returning_to_top { "content content--fading" } else { "content" }}>
                 if let Some(err) = &*error {
                     <div class="notice notice--error">
                         <div class="notice__title">{ "Failed to load" }</div>

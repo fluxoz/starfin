@@ -8,7 +8,7 @@ use components::{
     password_modal::PasswordModal,
     video_player::VideoPlayer,
 };
-use crate::models::{Element, SortBy};
+use crate::models::{Element, MetadataFilter, SortBy};
 
 use futures::StreamExt;
 use gloo_net::websocket::{futures::WebSocket, Message};
@@ -116,14 +116,19 @@ fn app_inner() -> Html {
     const CARD_ROW_HEIGHT_ESTIMATE: f64 = 440.0;
     let query = use_state(|| "".to_string());
     let sort_by = use_state(|| SortBy::DateAddedNewest);
+    let meta_filter = use_state(MetadataFilter::default);
 
     // Mutable refs that always hold the *current* query and sort order so that
     // the auto-refresh interval (which is set up only once on mount) can read
     // the latest values without capturing stale UseStateHandle Rc pointers.
     let query_ref = use_mut_ref(|| "".to_string());
     let sort_by_ref = use_mut_ref(|| SortBy::DateAddedNewest);
+    let meta_filter_ref = use_mut_ref(MetadataFilter::default);
 
     let items = use_state(|| Vec::<Element>::new());
+    /// Unfiltered list of all items returned by the last API fetch.
+    /// Used to populate tag/actor/category dropdown options.
+    let raw_items = use_state(|| Vec::<Element>::new());
     let loading = use_state(|| false);
     let error = use_state(|| Option::<String>::None);
     let selected = use_state(|| Option::<Element>::None);
@@ -321,53 +326,68 @@ fn app_inner() -> Html {
         });
     }
 
-    // Fetch on load and whenever query/sort changes.
-    // Also keeps query_ref / sort_by_ref in sync so the auto-refresh interval
-    // can read the current filter values.
+    // Fetch on load and whenever query/sort/meta_filter changes.
+    // Also keeps query_ref / sort_by_ref / meta_filter_ref in sync so the
+    // auto-refresh interval (which is set up only once on mount) can read
+    // the latest values without capturing stale UseStateHandle Rc pointers.
     {
         let query = query.clone();
         let sort_by = sort_by.clone();
+        let meta_filter = meta_filter.clone();
         let query_ref = query_ref.clone();
         let sort_by_ref = sort_by_ref.clone();
+        let meta_filter_ref = meta_filter_ref.clone();
 
         let items = items.clone();
+        let raw_items = raw_items.clone();
         let loading = loading.clone();
         let error = error.clone();
         let window_start = window_start.clone();
         let window_start_ref = window_start_ref.clone();
 
-        use_effect_with(((*query).clone(), (*sort_by).clone()), move |_| {
-            let query = (*query).clone();
-            let sort_by = (*sort_by).clone();
+        use_effect_with(
+            ((*query).clone(), (*sort_by).clone(), (*meta_filter).clone()),
+            move |_| {
+                let query = (*query).clone();
+                let sort_by = (*sort_by).clone();
+                let mf = (*meta_filter).clone();
 
-            // Keep refs current so the interval can read the latest values.
-            *query_ref.borrow_mut() = query.clone();
-            *sort_by_ref.borrow_mut() = sort_by.clone();
+                // Keep refs current so the interval can read the latest values.
+                *query_ref.borrow_mut() = query.clone();
+                *sort_by_ref.borrow_mut() = sort_by.clone();
+                *meta_filter_ref.borrow_mut() = mf.clone();
 
-            // Reset the virtual window to the top on every filter/sort change.
-            window_start.set(0);
-            *window_start_ref.borrow_mut() = 0;
+                // Reset the virtual window to the top on every filter/sort change.
+                window_start.set(0);
+                *window_start_ref.borrow_mut() = 0;
 
-            loading.set(true);
-            error.set(None);
+                loading.set(true);
+                error.set(None);
 
-            spawn_local(async move {
-                match api::fetch_elements(&query, sort_by).await {
-                    Ok(data) => items.set(data),
-                    Err(e) => error.set(Some(e)),
-                }
-                loading.set(false);
-            });
+                spawn_local(async move {
+                    match api::fetch_all_videos().await {
+                        Ok(all) => {
+                            let filtered = api::apply_filters(&all, &query, sort_by, &mf);
+                            raw_items.set(all);
+                            items.set(filtered);
+                        }
+                        Err(e) => error.set(Some(e)),
+                    }
+                    loading.set(false);
+                });
 
-            || ()
-        });
+                || ()
+            },
+        );
     }
 
     // Auto-refresh: re-fetch the video list every 60 seconds.
     {
         let query_ref = query_ref.clone();
         let sort_by_ref = sort_by_ref.clone();
+        let meta_filter_ref = meta_filter_ref.clone();
         let items = items.clone();
+        let raw_items = raw_items.clone();
         let scanning = scanning.clone();
 
         use_effect_with((), move |_| {
@@ -378,24 +398,27 @@ fn app_inner() -> Html {
                 }
                 // Read the current filter values from the shared refs.
                 // These are always up-to-date because the fetch effect above
-                // writes to them on every query/sort change.  Using plain
-                // UseStateHandle clones here would capture the Rc from mount
-                // time and always see the initial empty-string query, which
-                // is what caused the visible "reset" every 60 seconds.
+                // writes to them on every query/sort/meta_filter change.  Using
+                // plain UseStateHandle clones here would capture the Rc from
+                // mount time and always see the initial empty-string query.
                 let query = query_ref.borrow().clone();
                 let sort_by = *sort_by_ref.borrow();
+                let mf = meta_filter_ref.borrow().clone();
 
-                // If the user has an active search or a non-default sort,
+                // If the user has an active search, sort, or metadata filter,
                 // skip the background refresh so their filtered results are
                 // not disturbed.
-                if !query.is_empty() || sort_by != SortBy::DateAddedNewest {
+                if !query.is_empty() || sort_by != SortBy::DateAddedNewest || mf.is_active() {
                     return;
                 }
 
                 let items = items.clone();
+                let raw_items = raw_items.clone();
                 spawn_local(async move {
-                    if let Ok(data) = api::fetch_elements(&query, sort_by).await {
-                        items.set(data);
+                    if let Ok(all) = api::fetch_all_videos().await {
+                        let filtered = api::apply_filters(&all, &query, sort_by, &mf);
+                        raw_items.set(all);
+                        items.set(filtered);
                     }
                 });
             });
@@ -477,6 +500,11 @@ fn app_inner() -> Html {
     let on_sort_change = {
         let sort_by = sort_by.clone();
         Callback::from(move |v: SortBy| sort_by.set(v))
+    };
+
+    let on_filter_change = {
+        let meta_filter = meta_filter.clone();
+        Callback::from(move |v: MetadataFilter| meta_filter.set(v))
     };
 
     let on_watch = {
@@ -606,8 +634,10 @@ fn app_inner() -> Html {
     let on_scan = {
         let scanning = scanning.clone();
         let items = items.clone();
+        let raw_items = raw_items.clone();
         let query = query.clone();
         let sort_by = sort_by.clone();
+        let meta_filter = meta_filter.clone();
         let scan_progress = scan_progress.clone();
         Callback::from(move |_: MouseEvent| {
             if *scanning {
@@ -615,8 +645,10 @@ fn app_inner() -> Html {
             }
             let scanning = scanning.clone();
             let items = items.clone();
+            let raw_items = raw_items.clone();
             let query = (*query).clone();
             let sort_by = (*sort_by).clone();
+            let mf = (*meta_filter).clone();
             let scan_progress = scan_progress.clone();
 
             scanning.set(true);
@@ -637,9 +669,9 @@ fn app_inner() -> Html {
                 if let Ok(ws) = WebSocket::open(&ws_url) {
                     let (_, mut read) = ws.split();
 
-                    // Start from what is currently displayed so existing cards
-                    // are preserved while newly-scanned ones stream in.
-                    let mut accumulated: Vec<crate::models::Element> = (*items).clone();
+                    // Start from the full unfiltered list so that items
+                    // hidden by active filters are preserved.
+                    let mut accumulated: Vec<crate::models::Element> = (*raw_items).clone();
 
                     while let Some(Ok(Message::Text(text))) = read.next().await {
                         match serde_json::from_str::<api::ScanProgressData>(&text) {
@@ -652,10 +684,12 @@ fn app_inner() -> Html {
                                     } else {
                                         accumulated.push(new_item);
                                     }
+                                    raw_items.set(accumulated.clone());
                                     items.set(api::apply_filters(
                                         &accumulated,
                                         &query,
                                         sort_by,
+                                        &mf,
                                     ));
                                 }
                             }
@@ -668,8 +702,10 @@ fn app_inner() -> Html {
                 }
 
                 // Final authoritative refresh once the scan is fully committed.
-                if let Ok(data) = api::fetch_elements(&query, sort_by).await {
-                    items.set(data);
+                if let Ok(all) = api::fetch_all_videos().await {
+                    let filtered = api::apply_filters(&all, &query, sort_by, &mf);
+                    raw_items.set(all);
+                    items.set(filtered);
                 }
                 scan_progress.set(None);
                 scanning.set(false);
@@ -679,12 +715,42 @@ fn app_inner() -> Html {
 
     let app_class = if *dark_mode { "app dark-mode" } else { "app" };
 
-    // Virtual windowing: when no search filter is active and the library is
-    // large enough, only render the WINDOW_SIZE cards around the current
-    // scroll position.  Spacer divs above and below preserve document height
-    // so the scrollbar stays proportional.  When a filter is active, all
-    // matching results are shown without any windowing.
-    let is_filtered = !(*query).is_empty();
+    // Derive the unique sorted tag/actor/category values from the full
+    // (unfiltered) library for populating the multi-select dropdowns.
+    let all_tags = {
+        let mut set = std::collections::BTreeSet::new();
+        for item in (*raw_items).iter() {
+            for t in &item.tags { set.insert(t.clone()); }
+        }
+        set.into_iter().collect::<Vec<_>>()
+    };
+    let all_actors = {
+        let mut set = std::collections::BTreeSet::new();
+        for item in (*raw_items).iter() {
+            for a in &item.actors { set.insert(a.clone()); }
+        }
+        set.into_iter().collect::<Vec<_>>()
+    };
+    let all_categories = {
+        let mut set = std::collections::BTreeSet::new();
+        for item in (*raw_items).iter() {
+            for c in &item.categories { set.insert(c.clone()); }
+        }
+        set.into_iter().collect::<Vec<_>>()
+    };
+
+    // Virtual windowing: when no search/metadata filter is active and the library
+    // is large enough, only render the WINDOW_SIZE cards around the current scroll
+    // position.  Spacer divs above and below preserve document height so the
+    // scrollbar stays proportional.  When any filter is active, all matching
+    // results are shown without windowing.
+    let mf = &*meta_filter;
+    let is_filtered = !(*query).is_empty()
+        || mf.only_favorites
+        || mf.min_rating > 0
+        || !mf.tag.is_empty()
+        || !mf.actor.is_empty()
+        || !mf.category.is_empty();
     let total = (*items).len();
     let (displayed_items, top_pad, bottom_pad) = if is_filtered || total <= WINDOW_SIZE {
         ((*items).clone(), 0.0_f64, 0.0_f64)
@@ -830,8 +896,13 @@ fn app_inner() -> Html {
                     <FiltersBar
                         query={(*query).clone()}
                         sort_by={(*sort_by).clone()}
+                        meta_filter={(*meta_filter).clone()}
+                        all_tags={all_tags}
+                        all_actors={all_actors}
+                        all_categories={all_categories}
                         on_query_change={on_query_change}
                         on_sort_change={on_sort_change}
+                        on_filter_change={on_filter_change}
                     />
                 </header>
 

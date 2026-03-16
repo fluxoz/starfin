@@ -470,6 +470,23 @@ body{
   align-items: end;
 }
 
+.filters__row--meta{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: end;
+}
+
+.filters__row--meta .chip{
+  align-self: end;
+  white-space: nowrap;
+}
+
+.filters__row--meta .field{
+  flex: 1 1 140px;
+  min-width: 120px;
+}
+
 @media (min-width: 720px){
   .filters__row{
     grid-template-columns: 1.5fr .8fr;
@@ -508,6 +525,128 @@ body{
 .input:focus, .select:focus{
   border-color: var(--accent);
   box-shadow: 0 0 0 2px rgba(255,69,0,.2);
+}
+
+/* ── MultiSelect chip-style dropdown ──────────────────────────────────────── */
+
+.multi-select{
+  position: relative;
+  width: 100%;
+}
+
+/* Pills row rendered ABOVE the trigger */
+.multi-select__pills{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+.multi-select__pill{
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--accent);
+  color: #fff;
+  border-radius: calc(var(--radius) / 2);
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.multi-select__pill-remove{
+  display: inline-flex;
+  align-items: center;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+  opacity: 0.75;
+  line-height: 0;
+}
+.multi-select__pill-remove:hover{ opacity: 1; }
+
+/* The trigger — fixed height, matches a normal .select field */
+.multi-select__trigger{
+  display: flex;
+  align-items: center;
+  height: 34px;              /* matches .select height */
+  padding: 0 28px 0 8px;    /* right padding for chevron */
+  border-radius: var(--radius);
+  border: var(--border-width) solid var(--input-border);
+  background: var(--input-bg);
+  color: var(--text);
+  cursor: pointer;
+  font-family: var(--font-body);
+  font-size: 12px;
+  position: relative;
+  user-select: none;
+  outline: none;
+  box-sizing: border-box;
+}
+.multi-select__trigger:focus,
+.multi-select__trigger--open{
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(255,69,0,.2);
+}
+
+.multi-select__placeholder{
+  color: var(--muted);
+  font-size: 12px;
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Chevron arrow */
+.multi-select__chevron{
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+  color: var(--muted);
+}
+
+/* Dropdown list */
+.multi-select__dropdown{
+  position: absolute;
+  top: calc(100% + 3px);
+  left: 0;
+  right: 0;
+  background: var(--input-bg);
+  border: var(--border-width) solid var(--input-border);
+  border-radius: var(--radius);
+  z-index: 201;
+  max-height: 200px;
+  overflow-y: auto;
+  box-shadow: 0 6px 20px rgba(0,0,0,.25);
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+}
+.multi-select__option{
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text);
+}
+.multi-select__option:hover{
+  background: rgba(255,69,0,.12);
+  color: var(--accent);
+}
+.multi-select__option--selected{
+  font-weight: 600;
+}
+.multi-select__option-check{
+  width: 12px;
+  font-size: 10px;
+  color: var(--accent);
+  flex-shrink: 0;
 }
 
 .chip{

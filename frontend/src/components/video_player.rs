@@ -1,7 +1,6 @@
 use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
 use gloo_timers::future::TimeoutFuture;
-use js_sys::Function;
 use serde::Deserialize;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -65,62 +64,11 @@ const CONTROL_HIDE_TIMEOUT_MS: f64 = 5000.0;
 /// controls/header are considered "near" and should not be hidden.
 const CONTROLS_VICINITY_PX: f64 = 80.0;
 
-// ── HLS.js configuration constants ───────────────────────────────────────────
-// These settings are optimized for VOD content across all quality tiers —
-// both direct remux (Original) where segments are served near-instantly, and
-// transcoded tiers where segments are generated on-demand.  Buffer values are
-// sized generously so the player never starves regardless of bitrate.
-
-/// Maximum buffer length in seconds (forward buffer).
-///
-/// Set to 60 seconds so HLS.js always has a comfortable runway of segments
-/// buffered ahead of the playback position.  For the Original (remux) quality
-/// level segments are served almost instantly (pure file I/O), so HLS.js can
-/// fill this buffer at network speed without any transcoding latency.  For
-/// transcoded tiers the backend semaphore limits concurrency, but a deeper
-/// buffer still helps absorb the variable encode latency per segment.  The
-/// larger value is particularly important for high-bitrate 4K remux content
-/// where each segment can be tens of megabytes.
-const HLS_MAX_BUFFER_LENGTH: f64 = 60.0;
-/// Maximum maximum buffer length in seconds (absolute cap).
-/// Set higher than maxBufferLength to allow the buffer to grow beyond the
-/// target when segments arrive quickly (e.g. served from cache).
-const HLS_MAX_MAX_BUFFER_LENGTH: f64 = 120.0;
-/// Maximum buffer size in bytes (200 MB).
-///
-/// The previous 60 MB cap was insufficient for high-bitrate remux content:
-/// a single 6-second segment from a 4K source at ~80 Mbps is already ~60 MB,
-/// which left no room for additional segments in the buffer and could cause
-/// HLS.js to stall.  200 MB allows several segments to be buffered even for
-/// very high bitrate sources.
-const HLS_MAX_BUFFER_SIZE: f64 = 200.0 * 1000.0 * 1000.0;
-/// Back buffer length in seconds (for backward seeking without refetch)
-const HLS_BACK_BUFFER_LENGTH: f64 = 30.0;
-
-/// Fragment loading timeout in milliseconds
-/// Higher than default to accommodate on-demand transcoding latency
-const HLS_FRAG_LOADING_TIMEOUT_MS: f64 = 20000.0;
-/// Maximum retries for fragment loading
-const HLS_FRAG_LOADING_MAX_RETRY: f64 = 4.0;
-/// Delay between fragment loading retries in milliseconds
-const HLS_FRAG_LOADING_RETRY_DELAY_MS: f64 = 1000.0;
-/// Maximum total retry timeout for fragment loading in milliseconds
-const HLS_FRAG_LOADING_MAX_RETRY_TIMEOUT_MS: f64 = 64000.0;
-
-/// Level loading timeout in milliseconds
-const HLS_LEVEL_LOADING_TIMEOUT_MS: f64 = 10000.0;
-/// Maximum retries for level loading
-const HLS_LEVEL_LOADING_MAX_RETRY: f64 = 4.0;
-
-/// Manifest loading timeout in milliseconds
-const HLS_MANIFEST_LOADING_TIMEOUT_MS: f64 = 10000.0;
-/// Maximum retries for manifest loading
-const HLS_MANIFEST_LOADING_MAX_RETRY: f64 = 2.0;
-
-/// Nudge offset in seconds (helps recover from small stream gaps)
-const HLS_NUDGE_OFFSET: f64 = 0.1;
-/// Maximum nudge retry count
-const HLS_NUDGE_MAX_RETRY: f64 = 5.0;
+// ── MSE player constants ─────────────────────────────────────────────────────
+/// Target seconds of video to keep buffered ahead of the playback position.
+const MSE_TARGET_BUFFER_S: f64 = 30.0;
+/// Seconds of back-buffer to retain behind the playback position when seeking.
+const MSE_BACK_BUFFER_S: f64 = 5.0;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -181,39 +129,180 @@ pub struct SubtitleTracksResponse {
     pub tracks: Vec<SubtitleTrack>,
 }
 
-// ── HLS.js bindings ──────────────────────────────────────────────────────────
+// ── MSE player types ─────────────────────────────────────────────────────────
 
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = Hls)]
-    fn isSupported() -> bool;
+struct SegmentInfo {
+    url: String,
+    #[allow(dead_code)]
+    duration: f64,
+}
 
-    #[wasm_bindgen(js_name = Hls)]
-    type HlsJs;
+struct MseState {
+    media_source: web_sys::MediaSource,
+    source_buffer: web_sys::SourceBuffer,
+    /// Blob URL created for this MediaSource; revoked on cleanup.
+    object_url: String,
+    /// Parsed segment list from the M3U8 playlist.
+    segments: Vec<SegmentInfo>,
+    /// Index of the next segment to fetch.
+    next_seg: usize,
+    /// True while `SourceBuffer.appendBuffer` is in progress.
+    is_appending: bool,
+}
 
-    #[wasm_bindgen(constructor, js_class = "Hls")]
-    fn new() -> HlsJs;
+/// Resolve a relative segment path against the playlist URL.
+///
+/// Strips the filename from `playlist_url`, keeps the query string, and
+/// prepends the base to `segment_path`.  Example:
+///   playlist:  /api/videos/42/playlist.m3u8?quality=original
+///   segment:   seg_00000.ts
+///   →          /api/videos/42/seg_00000.ts?quality=original
+fn resolve_segment_url(playlist_url: &str, segment_path: &str) -> String {
+    if segment_path.starts_with("http://")
+        || segment_path.starts_with("https://")
+        || segment_path.starts_with('/')
+    {
+        return segment_path.to_string();
+    }
+    let (path_part, query_part) = if let Some(q) = playlist_url.find('?') {
+        (&playlist_url[..q], &playlist_url[q..])
+    } else {
+        (playlist_url, "")
+    };
+    let base = if let Some(slash) = path_part.rfind('/') {
+        &path_part[..=slash]
+    } else {
+        "/"
+    };
+    format!("{base}{segment_path}{query_part}")
+}
 
-    #[wasm_bindgen(constructor, js_class = "Hls")]
-    fn new_with_config(config: &JsValue) -> HlsJs;
+/// Parse an HLS M3U8 playlist and return the list of segments.
+///
+/// Only handles `#EXTINF` + segment URL pairs (the format the server emits).
+/// Relative segment URLs are resolved against `playlist_url`.
+fn parse_m3u8(text: &str, playlist_url: &str) -> Vec<SegmentInfo> {
+    let mut segments = Vec::new();
+    let mut pending_duration: Option<f64> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            let duration = rest
+                .split(',')
+                .next()
+                .and_then(|d| d.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            pending_duration = Some(duration);
+        } else if !line.starts_with('#') && !line.is_empty() {
+            if let Some(duration) = pending_duration.take() {
+                segments.push(SegmentInfo {
+                    url: resolve_segment_url(playlist_url, line),
+                    duration,
+                });
+            }
+        }
+    }
+    segments
+}
 
-    #[wasm_bindgen(method, js_class = "Hls", js_name = loadSource)]
-    fn load_source(this: &HlsJs, url: &str);
+/// Pump the next HLS segment into the MSE SourceBuffer.
+///
+/// Returns immediately if:
+/// - `state` is `None` (not yet initialised),
+/// - a previous append is still in flight (`is_appending`), or
+/// - the forward buffer already exceeds `MSE_TARGET_BUFFER_S`.
+///
+/// When all segments have been fed, signals end-of-stream on the MediaSource.
+fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) {
+    let seg_url = {
+        let mut borrow = state.borrow_mut();
+        let mse = match borrow.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        if mse.is_appending {
+            return;
+        }
+        let buffered_ahead = get_buffer_end(&video) - video.current_time();
+        if buffered_ahead >= MSE_TARGET_BUFFER_S && mse.next_seg != 0 {
+            return;
+        }
+        if mse.next_seg >= mse.segments.len() {
+            let _ = mse.media_source.end_of_stream();
+            return;
+        }
+        let url = mse.segments[mse.next_seg].url.clone();
+        mse.is_appending = true;
+        url
+    };
 
-    #[wasm_bindgen(method, js_class = "Hls", js_name = attachMedia)]
-    fn attach_media(this: &HlsJs, video: &HtmlVideoElement);
+    let state_clone = state.clone();
+    let video_clone = video.clone();
+    spawn_local(async move {
+        let bytes = match Request::get(&seg_url).send().await {
+            Ok(r) => match r.binary().await {
+                Ok(b) => b,
+                Err(e) => {
+                    log::error!("Failed to read segment bytes: {e:?}");
+                    if let Some(s) = state_clone.borrow_mut().as_mut() {
+                        s.is_appending = false;
+                    }
+                    return;
+                }
+            },
+            Err(e) => {
+                log::error!("Failed to fetch segment: {e:?}");
+                if let Some(s) = state_clone.borrow_mut().as_mut() {
+                    s.is_appending = false;
+                }
+                return;
+            }
+        };
 
-    #[wasm_bindgen(method, js_class = "Hls")]
-    fn destroy(this: &HlsJs);
+        let source_buffer = {
+            let borrow = state_clone.borrow();
+            match borrow.as_ref() {
+                Some(s) => s.source_buffer.clone(),
+                None => return,
+            }
+        };
 
-    #[wasm_bindgen(method, js_class = "Hls")]
-    fn on(this: &HlsJs, event: &str, callback: &Function);
+        // One-shot updateend listener: advance segment pointer and re-pump.
+        let state_for_end = state_clone.clone();
+        let video_for_end = video_clone.clone();
+        let updateend_cb = Closure::once(Box::new(move || {
+            {
+                let mut borrow = state_for_end.borrow_mut();
+                if let Some(s) = borrow.as_mut() {
+                    s.is_appending = false;
+                    s.next_seg += 1;
+                }
+            }
+            let s = state_for_end;
+            let v = video_for_end;
+            spawn_local(async move {
+                pump_segments(s, v);
+            });
+        }) as Box<dyn FnOnce()>);
+        source_buffer
+            .add_event_listener_with_callback(
+                "updateend",
+                updateend_cb.as_ref().unchecked_ref(),
+            )
+            .ok();
+        updateend_cb.forget();
 
-    #[wasm_bindgen(method, js_class = "Hls", js_name = recoverMediaError)]
-    fn recover_media_error(this: &HlsJs);
-
-    #[wasm_bindgen(method, js_class = "Hls", js_name = startLoad)]
-    fn start_load(this: &HlsJs, start_position: f64);
+        let uint8_array = js_sys::Uint8Array::from(bytes.as_slice());
+        let array_buffer = uint8_array.buffer();
+        if source_buffer
+            .append_buffer_with_array_buffer(&array_buffer)
+            .is_err()
+        {
+            if let Some(s) = state_clone.borrow_mut().as_mut() {
+                s.is_appending = false;
+            }
+        }
+    });
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -308,22 +397,21 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let active_subtitle = use_state(|| Option::<u32>::None); // index of active subtitle, None = off
     let captions_menu_open = use_state(|| false);
 
-    // HLS.js instance storage.
+    // MSE player state storage.
     //
     // We use `use_mut_ref` (Rc<RefCell<…>>) rather than `use_state` here
-    // because the HLS instance is set *asynchronously* inside a `spawn_local`
-    // block (after a 50 ms delay).  In Yew 0.21, `use_state` clones a new
-    // `Rc<R>` on every state update, so a handle captured in a cleanup closure
-    // before the async write completes will always read the *initial* `None`
-    // value — meaning `hls.destroy()` is never called and stale HLS instances
-    // accumulate, each still loading segments at the old quality level.
+    // because the MSE state is set *asynchronously* inside a `spawn_local`
+    // block.  In Yew 0.21, `use_state` clones a new `Rc<R>` on every state
+    // update, so a handle captured in a cleanup closure before the async
+    // write completes will always read the *initial* `None` value — meaning
+    // cleanup is never called correctly.
     //
     // `use_mut_ref` wraps a single `Rc<RefCell<T>>` that is shared by all
     // clones, so any write made by the async task is immediately visible to
     // the cleanup closure captured earlier.
-    let hls_instance = use_mut_ref(|| Option::<JsValue>::None);
+    let mse_state = use_mut_ref(|| Option::<MseState>::None);
 
-    // Initialize HLS.js player (and re-initialise when video ID or quality changes).
+    // Initialize MSE player (and re-initialise when video ID or quality changes).
     {
         let video_ref = video_ref.clone();
         let status = status.clone();
@@ -331,7 +419,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let thumbnail_info = thumbnail_info.clone();
         let thumbnail_image = thumbnail_image.clone();
         let subtitle_tracks = subtitle_tracks.clone();
-        let hls_instance = hls_instance.clone();
+        let mse_state = mse_state.clone();
         let selected_quality = selected_quality.clone();
         let resume_position = resume_position.clone();
 
@@ -348,7 +436,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let video_id_clone = video_id.clone();
             let video_id_for_subs = video_id.clone();
             let subtitle_tracks_clone = subtitle_tracks.clone();
-            
+
             spawn_local(async move {
                 if let Ok(info) = fetch_thumbnail_info(&video_id_clone).await {
                     // Load the sprite image
@@ -356,7 +444,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         let url = info.url.clone();
                         img.set_cross_origin(Some("anonymous"));
                         img.set_src(&url);
-                        
+
                         // Store image after it loads
                         let thumbnail_image_onload = thumbnail_image_clone.clone();
                         let img_clone = img.clone();
@@ -383,17 +471,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let start_pos = *resume_position.borrow();
             *resume_position.borrow_mut() = 0.0;
 
-            // Initialize HLS.js
+            // Initialize MSE player
             let video_ref_clone = video_ref.clone();
             let status_clone = status.clone();
             let error_clone = error.clone();
-            let hls_instance_clone = hls_instance.clone();
-            // Clones needed for the automatic quality fallback inside the HLS
-            // error handler.  We intentionally do NOT persist the fallback
-            // quality to localStorage so the user's original preference is
-            // preserved for their next session.
-            let selected_quality_for_error = selected_quality.clone();
-            let resume_position_for_error = resume_position.clone();
+            let mse_state_clone = mse_state.clone();
 
             spawn_local(async move {
                 // Give time for video element to be created
@@ -429,171 +511,145 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     return;
                 }
 
-                // Check if HLS.js is supported
-                if !isSupported() {
-                    error_clone.set(Some(
-                        "Your browser does not support HLS playback. Please use a modern browser.".to_string()
-                    ));
-                    return;
-                }
+                // Create a MediaSource (also verifies MSE is available in this browser).
+                let media_source = match web_sys::MediaSource::new() {
+                    Ok(ms) => ms,
+                    Err(_) => {
+                        error_clone.set(Some(
+                            "Your browser does not support Media Source Extensions.".to_string(),
+                        ));
+                        return;
+                    }
+                };
 
-                // Create HLS.js instance with configuration optimized for VOD seeking
-                // Based on industry best practices (similar to Jellyfin/Plex approach)
-                // See HLS_* constants at the top of this file for value documentation
-                let config = js_sys::Object::new();
-                
-                // Enable debug logs only in development
-                js_sys::Reflect::set(&config, &JsValue::from_str("debug"), &JsValue::from_bool(false)).ok();
-                
-                // Enable web worker for better UI responsiveness during seeking
-                js_sys::Reflect::set(&config, &JsValue::from_str("enableWorker"), &JsValue::from_bool(true)).ok();
-                
-                // Buffer settings optimized for VOD with on-demand transcoding
-                js_sys::Reflect::set(&config, &JsValue::from_str("maxBufferLength"), &JsValue::from_f64(HLS_MAX_BUFFER_LENGTH)).ok();
-                js_sys::Reflect::set(&config, &JsValue::from_str("maxMaxBufferLength"), &JsValue::from_f64(HLS_MAX_MAX_BUFFER_LENGTH)).ok();
-                js_sys::Reflect::set(&config, &JsValue::from_str("maxBufferSize"), &JsValue::from_f64(HLS_MAX_BUFFER_SIZE)).ok();
-                
-                // Back buffer settings - keep some played content for backward seeking
-                js_sys::Reflect::set(&config, &JsValue::from_str("backBufferLength"), &JsValue::from_f64(HLS_BACK_BUFFER_LENGTH)).ok();
-                
-                // Start position: -1 means "from the beginning" for a fresh load;
-                // a positive value resumes at the position captured before a
-                // quality-switch reinitialisation.  Snap to the nearest seek anchor
-                // so the resume position is guaranteed to be cached.
-                let start_position = if start_pos > 0.0 { snap_to_cached_segment(start_pos) } else { -1.0 };
-                js_sys::Reflect::set(&config, &JsValue::from_str("startPosition"), &JsValue::from_f64(start_position)).ok();
-                
-                // Seek handling improvements - nudge settings help recover from small stream gaps
-                js_sys::Reflect::set(&config, &JsValue::from_str("nudgeOffset"), &JsValue::from_f64(HLS_NUDGE_OFFSET)).ok();
-                js_sys::Reflect::set(&config, &JsValue::from_str("nudgeMaxRetry"), &JsValue::from_f64(HLS_NUDGE_MAX_RETRY)).ok();
-                
-                // Fragment loading settings for on-demand transcoding
-                js_sys::Reflect::set(&config, &JsValue::from_str("fragLoadingTimeOut"), &JsValue::from_f64(HLS_FRAG_LOADING_TIMEOUT_MS)).ok();
-                js_sys::Reflect::set(&config, &JsValue::from_str("fragLoadingMaxRetry"), &JsValue::from_f64(HLS_FRAG_LOADING_MAX_RETRY)).ok();
-                js_sys::Reflect::set(&config, &JsValue::from_str("fragLoadingRetryDelay"), &JsValue::from_f64(HLS_FRAG_LOADING_RETRY_DELAY_MS)).ok();
-                js_sys::Reflect::set(&config, &JsValue::from_str("fragLoadingMaxRetryTimeout"), &JsValue::from_f64(HLS_FRAG_LOADING_MAX_RETRY_TIMEOUT_MS)).ok();
-                
-                // Level loading settings
-                js_sys::Reflect::set(&config, &JsValue::from_str("levelLoadingTimeOut"), &JsValue::from_f64(HLS_LEVEL_LOADING_TIMEOUT_MS)).ok();
-                js_sys::Reflect::set(&config, &JsValue::from_str("levelLoadingMaxRetry"), &JsValue::from_f64(HLS_LEVEL_LOADING_MAX_RETRY)).ok();
-                
-                // Manifest loading settings
-                js_sys::Reflect::set(&config, &JsValue::from_str("manifestLoadingTimeOut"), &JsValue::from_f64(HLS_MANIFEST_LOADING_TIMEOUT_MS)).ok();
-                js_sys::Reflect::set(&config, &JsValue::from_str("manifestLoadingMaxRetry"), &JsValue::from_f64(HLS_MANIFEST_LOADING_MAX_RETRY)).ok();
-
-                let hls = HlsJs::new_with_config(&config);
-                
-                // Set up event handlers
-                let status_for_manifest = status_clone.clone();
-                let video_for_play = video.clone();
-                let manifest_parsed_cb = Closure::once(Box::new(move || {
-                    status_for_manifest.set(String::new());
-                    let _ = video_for_play.play();
-                }) as Box<dyn FnOnce()>);
-                hls.on("hlsManifestParsed", manifest_parsed_cb.as_ref().unchecked_ref());
-                manifest_parsed_cb.forget();
-
-                let error_for_handler = error_clone.clone();
-                let status_for_fallback = status_clone.clone();
-                let selected_quality_for_fallback = selected_quality_for_error.clone();
-                let resume_position_for_fallback = resume_position_for_error.clone();
-                let video_ref_for_fallback = video_ref_clone.clone();
-                // Store hls as JsValue for use in closure
-                let hls_js_value: JsValue = hls.clone().into();
-                let error_cb = Closure::wrap(Box::new(move |_event: JsValue, data: JsValue| {
-                    // Get error details from data
-                    let fatal = js_sys::Reflect::get(&data, &JsValue::from_str("fatal"))
-                        .ok()
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    
-                    let error_type = js_sys::Reflect::get(&data, &JsValue::from_str("type"))
-                        .ok()
-                        .and_then(|v| v.as_string())
-                        .unwrap_or_else(|| "Unknown".to_string());
-                    
-                    let error_details = js_sys::Reflect::get(&data, &JsValue::from_str("details"))
-                        .ok()
-                        .and_then(|v| v.as_string())
-                        .unwrap_or_else(|| "Unknown".to_string());
-                    
-                    if fatal {
-                        // When "original" (direct remux) fails fatally, the source
-                        // codec is likely unsupported by the browser.  Automatically
-                        // fall back to the high-quality transcode so playback still
-                        // works, without requiring the user to manually switch.
-                        // The preference is NOT written to localStorage so the user's
-                        // "original" setting is preserved for their next session.
-                        if quality == "original" {
-                            log::warn!(
-                                "Fatal HLS error on original quality ({}), falling back to transcoded stream",
-                                error_details
-                            );
-                            // Preserve the current playback position so the transcode
-                            // stream starts from the same point.  Only save if > 0
-                            // because 0.0 already means "start from beginning" in the
-                            // resume logic (a start_pos of 0.0 would be treated as
-                            // -1.0 / "from start" by the HLS startPosition config).
-                            if let Some(video_el) = video_ref_for_fallback.cast::<HtmlVideoElement>() {
-                                let pos = video_el.current_time();
-                                if pos > 0.0 {
-                                    *resume_position_for_fallback.borrow_mut() = pos;
-                                }
-                            }
-                            status_for_fallback.set("Original stream unsupported - switching to transcoded playback...".to_string());
-                            selected_quality_for_fallback.set("high".to_string());
+                // Attach the MediaSource to the video element via a blob URL.
+                let object_url =
+                    match web_sys::Url::create_object_url_with_source(&media_source) {
+                        Ok(u) => u,
+                        Err(_) => {
+                            error_clone.set(Some(
+                                "Failed to create MediaSource URL.".to_string(),
+                            ));
                             return;
                         }
-                        // Try to recover from errors that can happen during seeking
-                        // especially with on-demand transcoding where segments may take time
-                        if error_type == "mediaError" {
-                            log::warn!("Fatal media error detected, attempting recovery: {}", error_details);
-                            if let Ok(hls_for_recovery) = hls_js_value.clone().dyn_into::<HlsJs>() {
-                                hls_for_recovery.recover_media_error();
-                            }
-                        } else if error_type == "networkError" {
-                            // Network errors during seeking can occur when segments are still
-                            // being transcoded. HLS.js will retry automatically based on config,
-                            // but for fatal network errors, we try to recover by restarting load.
-                            log::warn!("Fatal network error detected, attempting recovery: {}", error_details);
-                            if let Ok(hls_for_recovery) = hls_js_value.clone().dyn_into::<HlsJs>() {
-                                // Try to restart loading from current position
-                                hls_for_recovery.start_load(-1.0);
-                            }
-                        } else {
-                            error_for_handler.set(Some(format!(
-                                "HLS playback error: {}. Please try refreshing the page.",
-                                error_type
-                            )));
-                        }
-                    } else {
-                        // Log non-fatal errors for debugging (these are usually recoverable)
-                        log::debug!("Non-fatal HLS error: {} - {}", error_type, error_details);
-                    }
-                }) as Box<dyn Fn(JsValue, JsValue)>);
-                hls.on("hlsError", error_cb.as_ref().unchecked_ref());
-                error_cb.forget();
-
-                // Attach media and load source
+                    };
+                video.set_src(&object_url);
                 status_clone.set("Loading stream…".to_string());
-                hls.attach_media(&video);
-                hls.load_source(&playlist_url);
-                
-                // Store HLS instance so the cleanup closure can destroy it.
-                // Using borrow_mut() on the shared Rc<RefCell<…>> ensures the
-                // write is visible to any clone of the ref, even those captured
-                // in closures before this async block ran.
-                *hls_instance_clone.borrow_mut() = Some(hls.into());
+
+                // All SourceBuffer setup must happen inside the sourceopen callback.
+                let playlist_url_for_open = playlist_url.clone();
+                let video_for_open = video.clone();
+                let status_for_open = status_clone.clone();
+                let error_for_open = error_clone.clone();
+                let mse_state_for_open = mse_state_clone.clone();
+                let media_source_for_open = media_source.clone();
+                let object_url_for_open = object_url.clone();
+
+                let sourceopen_cb = Closure::once(Box::new(move || {
+                    let playlist_url = playlist_url_for_open;
+                    let video = video_for_open;
+                    let status = status_for_open;
+                    let error = error_for_open;
+                    let mse_state = mse_state_for_open;
+                    let media_source = media_source_for_open;
+                    let object_url = object_url_for_open;
+
+                    spawn_local(async move {
+                        // Fetch the M3U8 playlist.
+                        let resp = match Request::get(&playlist_url).send().await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                error.set(Some(format!("Failed to fetch playlist: {e:?}")));
+                                return;
+                            }
+                        };
+                        let text = match resp.text().await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                error.set(Some(format!("Failed to read playlist: {e:?}")));
+                                return;
+                            }
+                        };
+
+                        // Parse segment list.
+                        let segments = parse_m3u8(&text, &playlist_url);
+                        if segments.is_empty() {
+                            error.set(Some("Playlist contains no segments.".to_string()));
+                            return;
+                        }
+
+                        // Pick a MIME type. Chrome/Firefox do not support video/mp2t
+                        // via MSE, so we check first and fall back to video/mp4.
+                        // The codec string matches the server's output: H.264 Baseline
+                        // profile (avc1.42E01E) + AAC-LC (mp4a.40.2), which covers
+                        // all three server paths (remux, hybrid, transcode).
+                        let ts_mime = "video/mp2t; codecs=\"avc1.42E01E,mp4a.40.2\"";
+                        let mime = if segments[0].url.contains(".ts")
+                            && web_sys::MediaSource::is_type_supported(ts_mime)
+                        {
+                            ts_mime.to_string()
+                        } else {
+                            "video/mp4".to_string()
+                        };
+
+                        // Create the SourceBuffer.
+                        let source_buffer = match media_source.add_source_buffer(&mime) {
+                            Ok(sb) => sb,
+                            Err(e) => {
+                                error.set(Some(format!(
+                                    "Unsupported stream format. Try a different quality level. ({e:?})"
+                                )));
+                                return;
+                            }
+                        };
+
+                        // Calculate which segment to start from when resuming.
+                        let start_seg = if start_pos > 0.0 {
+                            let snapped = snap_to_cached_segment(start_pos);
+                            (snapped / SEGMENT_DURATION_F) as usize
+                        } else {
+                            0
+                        };
+
+                        // Store MSE state.
+                        *mse_state.borrow_mut() = Some(MseState {
+                            media_source,
+                            source_buffer,
+                            object_url,
+                            segments,
+                            next_seg: start_seg,
+                            is_appending: false,
+                        });
+
+                        status.set(String::new());
+                        if start_pos > 0.0 {
+                            video.set_current_time(snap_to_cached_segment(start_pos));
+                        }
+
+                        // Kick off the segment pump.
+                        pump_segments(mse_state, video);
+                    });
+                }) as Box<dyn FnOnce()>);
+
+                media_source
+                    .add_event_listener_with_callback(
+                        "sourceopen",
+                        sourceopen_cb.as_ref().unchecked_ref(),
+                    )
+                    .ok();
+                sourceopen_cb.forget();
             });
 
             // Cleanup function: called by Yew when the dep tuple changes (quality
-            // or video ID changes) or when the component unmounts.  We .take() the
-            // stored instance so it can never be double-destroyed.
-            let hls_instance_for_cleanup = hls_instance.clone();
+            // or video ID changes) or when the component unmounts.
+            let mse_state_for_cleanup = mse_state.clone();
+            let video_ref_for_cleanup = video_ref.clone();
             move || {
-                if let Some(hls_val) = hls_instance_for_cleanup.borrow_mut().take() {
-                    if let Ok(hls) = hls_val.dyn_into::<HlsJs>() {
-                        hls.destroy();
+                if let Some(state) = mse_state_for_cleanup.borrow_mut().take() {
+                    let _ = state.media_source.end_of_stream();
+                    let _ = web_sys::Url::revoke_object_url(&state.object_url);
+                    if let Some(video) = video_ref_for_cleanup.cast::<HtmlVideoElement>() {
+                        video.set_src("");
                     }
                 }
             }
@@ -653,7 +709,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         );
     }
 
-    // Update time/duration periodically
+    // Update time/duration periodically and pump MSE segments
     {
         let video_ref = video_ref.clone();
         let current_time = current_time.clone();
@@ -663,9 +719,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let is_dragging = is_dragging.clone();
         let is_buffering = is_buffering.clone();
         let video_ended = video_ended.clone();
+        let mse_state = mse_state.clone();
 
         use_effect_with(video_ref.clone(), move |video_ref| {
             let video_ref = video_ref.clone();
+            let mse_state_for_interval = mse_state.clone();
             let interval = Interval::new(150, move || {
                 if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
                     if !*is_dragging {
@@ -684,9 +742,71 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
                     // Check if video ended
                     video_ended.set(video.ended());
+
+                    // Top up the MSE buffer as playback advances
+                    pump_segments(mse_state_for_interval.clone(), video);
                 }
             });
             move || drop(interval)
+        });
+    }
+
+    // Handle seeks to unbuffered positions for the MSE player
+    {
+        let video_ref = video_ref.clone();
+        let mse_state = mse_state.clone();
+
+        use_effect_with(video_ref.clone(), move |video_ref| {
+            let video_opt = video_ref.cast::<HtmlVideoElement>();
+
+            let seeked_cb = video_opt.as_ref().map(|video| {
+                let mse_state_for_seeked = mse_state.clone();
+                let video_for_seeked = video.clone();
+
+                let cb = Closure::<dyn Fn()>::new(move || {
+                    let current_time = video_for_seeked.current_time();
+                    let buf_end = get_buffer_end(&video_for_seeked);
+
+                    // If the seek target is already buffered, nothing to do.
+                    if buf_end > current_time {
+                        return;
+                    }
+
+                    // Seeking to unbuffered territory — reset segment pointer and re-pump.
+                    {
+                        let mut borrow = mse_state_for_seeked.borrow_mut();
+                        if let Some(mse) = borrow.as_mut() {
+                            if !mse.source_buffer.updating() {
+                                let remove_end = (current_time - MSE_BACK_BUFFER_S).max(0.0);
+                                if remove_end > 0.0 {
+                                    let _ = mse.source_buffer.remove(0.0, remove_end);
+                                }
+                            }
+                            let snapped = snap_to_cached_segment(current_time);
+                            mse.next_seg = (snapped / SEGMENT_DURATION_F) as usize;
+                            mse.is_appending = false;
+                        }
+                    }
+                    pump_segments(mse_state_for_seeked.clone(), video_for_seeked.clone());
+                });
+
+                video
+                    .add_event_listener_with_callback("seeked", cb.as_ref().unchecked_ref())
+                    .ok();
+                cb
+            });
+
+            move || {
+                if let (Some(cb), Some(video)) = (seeked_cb, video_opt) {
+                    video
+                        .remove_event_listener_with_callback(
+                            "seeked",
+                            cb.as_ref().unchecked_ref(),
+                        )
+                        .ok();
+                    drop(cb);
+                }
+            }
         });
     }
 

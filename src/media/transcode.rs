@@ -1,6 +1,6 @@
 //! HLS segment creation — direct remux when possible, transcode as fallback.
 //!
-//! Each segment is a 6-second MPEG-TS chunk.  For **Original** quality with
+//! Each segment is a 10-second MPEG-TS chunk.  For **Original** quality with
 //! browser-compatible codecs (H.264 video + stereo AAC/MP3 audio) the segment
 //! is created by **remuxing** — copying compressed packets directly from the
 //! source file without decoding or re-encoding.  This is near-instant (pure
@@ -27,7 +27,12 @@ use std::sync::Arc;
 use super::hwaccel::HwAccel;
 
 /// Duration of each HLS segment in seconds.
-pub const SEGMENT_DURATION: f64 = 6.0;
+///
+/// Longer segments reduce the number of segment-boundary transitions during
+/// playback, which is the primary source of micro-stutter in HLS.  10 seconds
+/// is the upper end of the standard range (2–10 s) and provides noticeably
+/// smoother playback for VOD content compared to the 6 s default.
+pub const SEGMENT_DURATION: f64 = 10.0;
 
 /// Error message returned when a background operation is cancelled by a kill
 /// flag (e.g. playback started while a background worker was running).
@@ -604,7 +609,7 @@ fn remux_segment(
             // segment start so consecutive segments never share overlapping
             // content.  Accepting a keyframe from *before* start_time would
             // cause the player to replay already-seen frames at every segment
-            // boundary, producing the "stutter every 6 seconds" symptom.
+            // boundary, producing a "stutter every N seconds" symptom.
             if !got_video_keyframe {
                 if !packet.is_key() || pts_secs < start_time {
                     continue;

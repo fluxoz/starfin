@@ -17,7 +17,7 @@ const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3
 // ── Seek-anchor constants ────────────────────────────────────────────────────
 // These must stay in sync with SEGMENT_DURATION, PRECACHE_SEGMENTS, and
 // SPARSE_CACHE_STRIDE in `src/main.rs`.
-const SEGMENT_DURATION_F: f64 = 6.0;
+const SEGMENT_DURATION_F: f64 = 10.0;
 const PRECACHE_SEGMENTS_F: f64 = 20.0;
 const SPARSE_CACHE_STRIDE_F: f64 = 3.0;
 
@@ -32,7 +32,7 @@ fn snap_to_cached_segment(time: f64) -> f64 {
     if time <= 0.0 {
         return 0.0;
     }
-    let dense_window = PRECACHE_SEGMENTS_F * SEGMENT_DURATION_F; // 120 seconds
+    let dense_window = PRECACHE_SEGMENTS_F * SEGMENT_DURATION_F; // 200 seconds
     if time < dense_window {
         // Within the dense window — every segment is cached; snap to segment start.
         let seg_index = (time / SEGMENT_DURATION_F) as usize;
@@ -73,29 +73,28 @@ const CONTROLS_VICINITY_PX: f64 = 80.0;
 
 /// Maximum buffer length in seconds (forward buffer).
 ///
-/// Set to 60 seconds so HLS.js always has a comfortable runway of segments
-/// buffered ahead of the playback position.  For the Original (remux) quality
-/// level segments are served almost instantly (pure file I/O), so HLS.js can
-/// fill this buffer at network speed without any transcoding latency.  For
+/// Set to 120 seconds so HLS.js always has a deep runway of segments buffered
+/// ahead of the playback position.  For the Original (remux) quality level
+/// segments are served almost instantly (pure file I/O), so HLS.js can fill
+/// this buffer at network speed without any transcoding latency.  For
 /// transcoded tiers the backend semaphore limits concurrency, but a deeper
 /// buffer still helps absorb the variable encode latency per segment.  The
 /// larger value is particularly important for high-bitrate 4K remux content
 /// where each segment can be tens of megabytes.
-const HLS_MAX_BUFFER_LENGTH: f64 = 60.0;
+const HLS_MAX_BUFFER_LENGTH: f64 = 120.0;
 /// Maximum maximum buffer length in seconds (absolute cap).
 /// Set higher than maxBufferLength to allow the buffer to grow beyond the
 /// target when segments arrive quickly (e.g. served from cache).
-const HLS_MAX_MAX_BUFFER_LENGTH: f64 = 120.0;
-/// Maximum buffer size in bytes (200 MB).
+const HLS_MAX_MAX_BUFFER_LENGTH: f64 = 240.0;
+/// Maximum buffer size in bytes (400 MB).
 ///
-/// The previous 60 MB cap was insufficient for high-bitrate remux content:
-/// a single 6-second segment from a 4K source at ~80 Mbps is already ~60 MB,
-/// which left no room for additional segments in the buffer and could cause
-/// HLS.js to stall.  200 MB allows several segments to be buffered even for
-/// very high bitrate sources.
-const HLS_MAX_BUFFER_SIZE: f64 = 200.0 * 1000.0 * 1000.0;
-/// Back buffer length in seconds (for backward seeking without refetch)
-const HLS_BACK_BUFFER_LENGTH: f64 = 30.0;
+/// A single 10-second segment from a 4K source at ~80 Mbps is ~100 MB, so
+/// 400 MB leaves room for several segments in the buffer even for very high
+/// bitrate sources, preventing HLS.js from stalling.
+const HLS_MAX_BUFFER_SIZE: f64 = 400.0 * 1000.0 * 1000.0;
+/// Back buffer length in seconds (for backward seeking without refetch).
+/// 60 seconds lets the user scrub back a full minute without a refetch.
+const HLS_BACK_BUFFER_LENGTH: f64 = 60.0;
 
 /// Fragment loading timeout in milliseconds
 /// Higher than default to accommodate on-demand transcoding latency
@@ -447,6 +446,20 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 
                 // Enable web worker for better UI responsiveness during seeking
                 js_sys::Reflect::set(&config, &JsValue::from_str("enableWorker"), &JsValue::from_bool(true)).ok();
+                
+                // VOD-specific: disable low-latency mode (designed for live streams)
+                // to prevent aggressive buffer trimming that causes stutter in VOD.
+                js_sys::Reflect::set(&config, &JsValue::from_str("lowLatencyMode"), &JsValue::from_bool(false)).ok();
+                
+                // Pre-fetch the next fragment while the current one is still loading
+                // so the buffer is always being topped up, reducing stall risk.
+                js_sys::Reflect::set(&config, &JsValue::from_str("startFragPrefetch"), &JsValue::from_bool(true)).ok();
+                
+                // Use progressive segment loading so that playback can begin from
+                // the first bytes of a segment instead of waiting for it to fully
+                // download.  This significantly reduces startup and seek latency,
+                // especially for large 10-second high-bitrate segments.
+                js_sys::Reflect::set(&config, &JsValue::from_str("progressive"), &JsValue::from_bool(true)).ok();
                 
                 // Buffer settings optimized for VOD with on-demand transcoding
                 js_sys::Reflect::set(&config, &JsValue::from_str("maxBufferLength"), &JsValue::from_f64(HLS_MAX_BUFFER_LENGTH)).ok();

@@ -451,16 +451,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 // to prevent aggressive buffer trimming that causes stutter in VOD.
                 js_sys::Reflect::set(&config, &JsValue::from_str("lowLatencyMode"), &JsValue::from_bool(false)).ok();
                 
-                // Pre-fetch the next fragment while the current one is still loading
-                // so the buffer is always being topped up, reducing stall risk.
-                js_sys::Reflect::set(&config, &JsValue::from_str("startFragPrefetch"), &JsValue::from_bool(true)).ok();
-                
-                // Use progressive segment loading so that playback can begin from
-                // the first bytes of a segment instead of waiting for it to fully
-                // download.  This significantly reduces startup and seek latency,
-                // especially for large 10-second high-bitrate segments.
-                js_sys::Reflect::set(&config, &JsValue::from_str("progressive"), &JsValue::from_bool(true)).ok();
-                
                 // Buffer settings optimized for VOD with on-demand transcoding
                 js_sys::Reflect::set(&config, &JsValue::from_str("maxBufferLength"), &JsValue::from_f64(HLS_MAX_BUFFER_LENGTH)).ok();
                 js_sys::Reflect::set(&config, &JsValue::from_str("maxMaxBufferLength"), &JsValue::from_f64(HLS_MAX_MAX_BUFFER_LENGTH)).ok();

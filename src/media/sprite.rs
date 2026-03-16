@@ -15,6 +15,7 @@
 
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::warn;
 
 /// Thumbnail interval in seconds (one thumbnail every N seconds).
@@ -31,11 +32,15 @@ pub const THUMBNAILS_PER_ROW: u32 = 10;
 /// Creates `{sprite_dir}/sprite.jpg` by seeking to regular intervals and
 /// decoding only keyframes.  Writes to a temp file first for atomicity.
 ///
+/// When `kill` is `true` the function bails out early so that background
+/// work yields I/O and CPU to playback as quickly as possible.
+///
 /// Returns `true` on success.
 pub fn generate_sprite_sheet(
     video_path: &Path,
     duration_secs: u32,
     sprite_dir: &Path,
+    kill: &AtomicBool,
 ) -> bool {
     super::ensure_init();
 
@@ -113,6 +118,9 @@ pub fn generate_sprite_sheet(
     let mut thumb_index: u32 = 0;
 
     while thumb_index < num_thumbnails {
+        if kill.load(Ordering::Relaxed) {
+            return false;
+        }
         let target_secs = thumb_index as f64 * THUMBNAIL_INTERVAL;
 
         // Seek to the target position.

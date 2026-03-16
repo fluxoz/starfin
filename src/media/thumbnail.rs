@@ -9,6 +9,7 @@
 
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Decode a single video frame at `seek_secs` and write it as JPEG to `out_path`.
 ///
@@ -108,11 +109,15 @@ pub fn extract_frame_as_jpeg(video_path: &Path, seek_secs: f64, out_path: &Path)
 ///
 /// This replaces the old two-pass ffmpeg subprocess approach.  The signalstats
 /// data is obtained by running the filter graph in-process.
+///
+/// When `kill` is `true` the function returns `default_time` early so that
+/// background work yields I/O and CPU to playback as quickly as possible.
 pub fn find_best_frame_via_signalstats(
     video_path: &Path,
     start_secs: f64,
     length_secs: f64,
     default_time: f64,
+    kill: &AtomicBool,
 ) -> f64 {
     super::ensure_init();
 
@@ -167,6 +172,9 @@ pub fn find_best_frame_via_signalstats(
     let mut scaler: Option<ffmpeg_next::software::scaling::Context> = None;
 
     for (pkt_stream, packet) in ictx.packets() {
+        if kill.load(Ordering::Relaxed) {
+            return best_time.unwrap_or(default_time);
+        }
         if pkt_stream.index() != stream_idx {
             continue;
         }

@@ -1006,7 +1006,7 @@ fn video_index_path(cache_dir: &Path) -> PathBuf {
 ///
 /// The cache tree is at most two levels deep:
 ///   {cache_dir}/{video_id}_thumbs/sprite.tmp.jpg     (name contains ".tmp.")
-///   {cache_dir}/{video_id}/{quality}/.seg_XXXXX.ts.tmp  (extension == "tmp")
+///   {cache_dir}/{video_id}/{quality}/.seg_XXXXX.mp4.tmp  (extension == "tmp")
 /// so a two-level walk is sufficient.
 fn cleanup_orphaned_tmp_files(cache_dir: &Path) {
     fn is_tmp(path: &Path) -> bool {
@@ -1908,10 +1908,10 @@ async fn remove_non_precached_segments(cache_dir: &Path) -> std::io::Result<()> 
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        // Parse segment index from "seg_XXXXX.ts"
+        // Parse segment index from "seg_XXXXX.mp4"
         if let Some(idx) = name_str
             .strip_prefix("seg_")
-            .and_then(|s| s.strip_suffix(".ts"))
+            .and_then(|s| s.strip_suffix(".mp4"))
             .and_then(|s| s.parse::<usize>().ok())
         {
             // Keep segments that are either in the dense pre-cache window OR are sparse seek anchors.
@@ -1985,7 +1985,7 @@ async fn get_playlist(
     let num_segments = (duration / SEGMENT_DURATION).ceil() as usize;
 
     // Build the HLS VOD playlist with MPEG-TS segments.
-    // No init segment is needed — each .ts segment is self-contained with
+    // fMP4 segments are self-contained (ftyp+moov+moof+mdat) — each segment
     // embedded codec info and PTS timestamps, unlike fMP4 which requires a
     // separate init segment with moov atom and sequential baseMediaDecodeTime.
     let mut playlist = String::new();
@@ -2008,7 +2008,7 @@ async fn get_playlist(
         // Embed the quality token in every segment URL so that HLS.js requests
         // each segment at the correct quality level.
         playlist.push_str(&format!(
-            "/api/videos/{}/segments/seg_{:05}.ts?quality={}\n",
+            "/api/videos/{}/segments/seg_{:05}.mp4?quality={}\n",
             id, i, quality.as_str()
         ));
     }
@@ -2044,7 +2044,7 @@ async fn get_segment(
     if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
         return HttpResponse::BadRequest().body("invalid filename");
     }
-    if !filename.ends_with(".ts") {
+    if !filename.ends_with(".mp4") {
         return HttpResponse::BadRequest().body("invalid segment type");
     }
 
@@ -2068,7 +2068,7 @@ async fn get_segment(
     // If segment exists, serve it immediately from cache
     if let Ok(data) = tokio::fs::read(&seg_path).await {
         return HttpResponse::Ok()
-            .content_type("video/mp2t")
+            .content_type("video/mp4")
             .insert_header((
                 header::CACHE_CONTROL,
                 "public, max-age=31536000, immutable",
@@ -2076,10 +2076,10 @@ async fn get_segment(
             .body(data);
     }
 
-    // Parse segment index from filename (e.g., "seg_00042.ts" -> 42)
+    // Parse segment index from filename (e.g., "seg_00042.mp4" -> 42)
     let seg_index: usize = match filename
         .strip_prefix("seg_")
-        .and_then(|s| s.strip_suffix(".ts"))
+        .and_then(|s| s.strip_suffix(".mp4"))
         .and_then(|s| s.parse().ok())
     {
         Some(idx) => idx,
@@ -2188,7 +2188,7 @@ async fn get_segment(
         Ok(()) => {
             match tokio::fs::read(&seg_path).await {
                 Ok(data) => HttpResponse::Ok()
-                    .content_type("video/mp2t")
+                    .content_type("video/mp4")
                     .insert_header((
                         header::CACHE_CONTROL,
                         "public, max-age=31536000, immutable",
@@ -2344,7 +2344,7 @@ async fn get_sprite_status(
 /// Returns one of three states:
 /// - `{"status":"processed"}` — all operations complete: quick thumbnail
 ///   (`.jpg`), deep thumbnail (`.deep` marker), sprite sheet (`_thumbs/sprite.jpg`),
-///   and segment pre-cache (first [`PRECACHE_SEGMENTS`] `.ts` files)
+///   and segment pre-cache (first [`PRECACHE_SEGMENTS`] `.mp4` files)
 /// - `{"status":"processing"}` — a background worker is actively working on
 ///   this specific video right now
 /// - `{"status":"pending"}`   — not fully processed and no worker is currently
@@ -2367,7 +2367,7 @@ async fn get_processing_status(
         .join("sprite.jpg");
 
     // Check whether the pre-cached segments exist.  We only check for
-    // seg_00000.ts as a lightweight proxy — if the pre-cache worker
+    // seg_00000.mp4 as a lightweight proxy — if the pre-cache worker
     // finished, all PRECACHE_SEGMENTS files will be present.
     // Segments are now stored in quality-specific subdirectories; the
     // precache worker always operates on the `original` quality level
@@ -2376,7 +2376,7 @@ async fn get_processing_status(
         .cache_dir
         .join(id.as_str())
         .join(Quality::Original.as_str())
-        .join("seg_00000.ts");
+        .join("seg_00000.mp4");
 
     let all_done = quick_marker.exists()
         && deep_marker.exists()
@@ -2654,7 +2654,7 @@ async fn run_precache_worker(
             .collect();
 
         // Partition into already-cached and needs-work.  A video counts as
-        // "done" when seg_00000.ts already exists in the high-quality
+        // "done" when seg_00000.mp4 already exists in the high-quality
         // subdirectory AND the last expected sparse anchor also exists
         // (so sparse anchors are added on re-runs if they were missing from
         // a previous precache pass).  We probe the duration here so that we
@@ -2671,7 +2671,7 @@ async fn run_precache_worker(
             // Precache always uses the Original quality subdirectory.
             let hls_dir = cache_dir.join(&id).join(Quality::Original.as_str());
 
-            let is_done = if !hls_dir.join("seg_00000.ts").exists() {
+            let is_done = if !hls_dir.join("seg_00000.mp4").exists() {
                 false
             } else {
                 // First segment exists; check whether the last expected sparse
@@ -2686,7 +2686,7 @@ async fn run_precache_worker(
                         let last_anchor =
                             ((total_segs - 1) / SPARSE_CACHE_STRIDE) * SPARSE_CACHE_STRIDE;
                         if last_anchor >= PRECACHE_SEGMENTS {
-                            hls_dir.join(format!("seg_{:05}.ts", last_anchor)).exists()
+                            hls_dir.join(format!("seg_{:05}.mp4", last_anchor)).exists()
                         } else {
                             true
                         }
@@ -2754,7 +2754,7 @@ async fn run_precache_worker(
             // Collect only the segments that are missing.
             let missing: Vec<usize> = segments_to_cache.iter()
                 .copied()
-                .filter(|i| !hls_dir.join(format!("seg_{:05}.ts", i)).exists())
+                .filter(|i| !hls_dir.join(format!("seg_{:05}.mp4", i)).exists())
                 .collect();
             if missing.is_empty() {
                 progress.write().advance();

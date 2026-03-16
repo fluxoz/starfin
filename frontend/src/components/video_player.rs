@@ -578,19 +578,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             return;
                         }
 
-                        // Pick a MIME type. Chrome/Firefox do not support video/mp2t
-                        // via MSE, so we check first and fall back to video/mp4.
-                        // The codec string matches the server's output: H.264 Baseline
-                        // profile (avc1.42E01E) + AAC-LC (mp4a.40.2), which covers
-                        // all three server paths (remux, hybrid, transcode).
-                        let ts_mime = "video/mp2t; codecs=\"avc1.42E01E,mp4a.40.2\"";
-                        let mime = if segments[0].url.contains(".ts")
-                            && web_sys::MediaSource::is_type_supported(ts_mime)
-                        {
-                            ts_mime.to_string()
-                        } else {
-                            "video/mp4".to_string()
-                        };
+                        // The server produces fragmented MP4 (fMP4) segments which are
+                        // supported by MSE in all major browsers (Chrome, Firefox, Safari
+                        // uses native HLS above). The codec string covers all three server
+                        // paths (remux, hybrid, transcode): H.264 (avc1.42E01E) + AAC-LC
+                        // (mp4a.40.2).
+                        let mime = "video/mp4; codecs=\"avc1.42E01E,mp4a.40.2\"".to_string();
 
                         // Create the SourceBuffer.
                         let source_buffer = match media_source.add_source_buffer(&mime) {

@@ -302,9 +302,11 @@ fn remux_segment(
         if is_video {
             packet.set_stream(out_video_idx);
             packet.rescale_ts(in_video_tb, out_video_tb);
-            // Record the first video PTS as the offset to rebase to zero.
+            // Record the first video DTS (or PTS) as the offset to rebase to
+            // zero.  Using DTS prevents negative DTS values for B-frame
+            // content where DTS < PTS on the first packet.
             if video_pts_offset.is_none() {
-                video_pts_offset = packet.pts();
+                video_pts_offset = packet.dts().or(packet.pts());
             }
             if let (Some(offset), Some(p)) = (video_pts_offset, packet.pts()) {
                 packet.set_pts(Some(p - offset));
@@ -315,9 +317,9 @@ fn remux_segment(
         } else if let Some(out_ai) = out_audio_idx_val {
             packet.set_stream(out_ai);
             packet.rescale_ts(in_audio_tb.unwrap(), out_audio_tb);
-            // Record the first audio PTS as the offset to rebase to zero.
+            // Record the first audio DTS (or PTS) as the offset to rebase to zero.
             if audio_pts_offset.is_none() {
-                audio_pts_offset = packet.pts();
+                audio_pts_offset = packet.dts().or(packet.pts());
             }
             if let (Some(offset), Some(p)) = (audio_pts_offset, packet.pts()) {
                 packet.set_pts(Some(p - offset));
@@ -560,14 +562,36 @@ fn transcode_segment_body(
                     Ok(dec) => {
                         audio_sample_rate = dec.rate();
                         let dec_format = dec.format();
-                        let dec_layout = dec.channel_layout();
+                        let raw_dec_layout = dec.channel_layout();
+
+                        // Many containers don't store channel layout metadata,
+                        // only the channel count.  When the layout is empty
+                        // (channels() == 0 in the bitflags representation) the
+                        // resampler and AAC encoder will fail.  Derive a
+                        // concrete native-order layout from the decoder's
+                        // channel count so both always get valid input.
+                        let dec_layout = if raw_dec_layout.channels() > 0 {
+                            raw_dec_layout
+                        } else {
+                            let ch = dec.channels() as i32;
+                            // Fall back to stereo if the decoder also reports 0 channels
+                            // (e.g. before the first frame is decoded).
+                            let ch = if ch > 0 { ch } else { 2 /* stereo */ };
+                            eprintln!(
+                                "[transcode] audio stream has no channel layout, \
+                                 defaulting to standard layout for {ch} channel(s)"
+                            );
+                            ffmpeg_next::channel_layout::ChannelLayout::default(ch)
+                        };
 
                         // Downmix to stereo if source is multi-channel because
                         // the native AAC encoder only reliably supports mono and stereo.
                         let enc_layout = if dec_layout.channels() > 2 {
                             ffmpeg_next::channel_layout::ChannelLayout::STEREO
+                        } else if dec_layout.channels() == 1 {
+                            ffmpeg_next::channel_layout::ChannelLayout::MONO
                         } else {
-                            dec_layout
+                            ffmpeg_next::channel_layout::ChannelLayout::STEREO
                         };
 
                         let aac_codec = ffmpeg_next::encoder::find_by_name("aac");
@@ -581,7 +605,7 @@ fn transcode_segment_body(
                                     aac_enc.set_rate(dec.rate() as i32);
                                     aac_enc.set_channel_layout(enc_layout);
                                     aac_enc.set_format(enc_format);
-                                    aac_enc.set_bit_rate(128_000);
+                                    aac_enc.set_bit_rate(256_000);
                                     aac_enc.set_time_base(ffmpeg_next::Rational::new(1, dec.rate() as i32));
 
                                     match aac_enc.open_as(aac) {

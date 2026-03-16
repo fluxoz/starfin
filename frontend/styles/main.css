@@ -32,6 +32,14 @@
   --input-border: rgba(0,0,0,.3);
   --notice-bg: rgba(255,255,255,.6);
   --empty-bg: rgba(255,255,255,.4);
+
+  /* Design tokens – structural UX properties */
+  --font-body: 'Courier New', 'Courier', monospace;
+  --font-heading: 'Courier New', 'Courier', monospace;
+  --border-width: 2px;
+  --heading-transform: uppercase;
+  --heading-spacing: 3px;
+  --heading-weight: 900;
 }
 
 /* Dark mode theme */
@@ -64,7 +72,7 @@
 html, body { height: 100%; }
 body{
   margin: 0;
-  font-family: 'Courier New', 'Courier', monospace;
+  font-family: var(--font-body);
   background: var(--bg);
   color: var(--text);
   line-height: 1.6;
@@ -237,7 +245,7 @@ body{
   letter-spacing: .08em;
   color: var(--text);
   background: transparent;
-  border: 1.5px solid var(--text);
+  border: var(--border-width) solid var(--text);
   border-radius: var(--radius);
   padding: 4px 10px;
   cursor: pointer;
@@ -258,7 +266,7 @@ body{
   font-weight: 700;
   color: var(--text);
   background: transparent;
-  border: 1.5px solid var(--text);
+  border: var(--border-width) solid var(--text);
   border-radius: 50%;
   width: 28px;
   height: 28px;
@@ -431,12 +439,12 @@ body{
 
 .section-header{
   font-size: 24px;
-  font-weight: 900;
-  text-transform: uppercase;
-  letter-spacing: 3px;
+  font-weight: var(--heading-weight);
+  text-transform: var(--heading-transform);
+  letter-spacing: var(--heading-spacing);
   margin-bottom: 20px;
   padding-bottom: 12px;
-  border-bottom: 4px solid rgba(0,0,0,.3);
+  border-bottom: var(--border-width) solid rgba(0,0,0,.3);
 }
 
 /* Filters */
@@ -447,7 +455,7 @@ body{
   margin-top: 12px;
   padding: 16px;
   background: rgba(0,0,0,.06);
-  border: 2px solid rgba(0,0,0,.15);
+  border: var(--border-width) solid rgba(0,0,0,.15);
   border-radius: var(--radius);
 }
 
@@ -488,11 +496,11 @@ body{
   width: 100%;
   padding: 8px 10px;
   border-radius: var(--radius);
-  border: 2px solid var(--input-border);
+  border: var(--border-width) solid var(--input-border);
   background: var(--input-bg);
   color: var(--text);
   outline: none;
-  font-family: 'Courier New', 'Courier', monospace;
+  font-family: var(--font-body);
   font-size: 12px;
 }
 .input::placeholder{ color: rgba(0,0,0,.4); }
@@ -505,7 +513,7 @@ body{
 .chip{
   padding: 8px 12px;
   border-radius: var(--radius);
-  border: 2px solid var(--input-border);
+  border: var(--border-width) solid var(--input-border);
   background: var(--input-bg);
   color: var(--text);
   cursor: pointer;
@@ -537,7 +545,7 @@ body{
 
 .card{
   border-radius: var(--radius);
-  border: 2px solid var(--card-border);
+  border: var(--border-width) solid var(--card-border);
   background: var(--card-bg);
   box-shadow: var(--shadow);
   padding: 0;
@@ -665,7 +673,7 @@ body{
   align-items: center;
   gap: 12px;
   padding: 12px;
-  border-top: 2px solid rgba(0,0,0,.15);
+  border-top: var(--border-width) solid rgba(0,0,0,.15);
   background: rgba(0,0,0,.03);
 }
 
@@ -678,7 +686,7 @@ body{
 .btn{
   padding: 8px 12px;
   border-radius: var(--radius);
-  border: 2px solid var(--accent);
+  border: var(--border-width) solid var(--accent);
   background: var(--accent);
   color: white;
   cursor: pointer;
@@ -686,7 +694,7 @@ body{
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 1px;
-  font-family: 'Courier New', 'Courier', monospace;
+  font-family: var(--font-body);
 }
 .btn:hover{
   background: #cc3700;
@@ -695,7 +703,7 @@ body{
 
 /* Notices */
 .notice{
-  border: 2px solid var(--border);
+  border: var(--border-width) solid var(--border);
   background: var(--notice-bg);
   border-radius: var(--radius);
   padding: 12px 14px;
@@ -718,7 +726,7 @@ body{
 }
 .empty{
   margin-top: 18px;
-  border: 2px dashed var(--border);
+  border: var(--border-width) dashed var(--border);
   border-radius: var(--radius);
   padding: 18px 14px;
   color: var(--muted);
@@ -743,7 +751,7 @@ body{
   background-position: center;
   overflow: hidden;
   position: relative;
-  border-bottom: 2px solid rgba(0,0,0,.3);
+  border-bottom: var(--border-width) solid rgba(0,0,0,.3);
 }
 
 @media (max-width: 640px){
@@ -1367,7 +1375,7 @@ body{
   z-index: 100;
   width: 44px;
   height: 44px;
-  border: 1.5px solid var(--text);
+  border: var(--border-width) solid var(--text);
   border-radius: var(--radius);
   background: var(--bg);
   color: var(--text);
@@ -1416,13 +1424,13 @@ body{
 
 .pw-modal{
   background: var(--bg, #c8bfb0);
-  border: 2px solid rgba(0,0,0,.3);
+  border: var(--border-width) solid rgba(0,0,0,.3);
   border-radius: var(--radius, 2px);
   padding: 48px 40px 40px;
   width: 360px;
   max-width: 90vw;
   text-align: center;
-  font-family: 'Courier New', 'Courier', monospace;
+  font-family: var(--font-body);
   box-shadow: 0 8px 32px rgba(0,0,0,.4);
 }
 

@@ -1,18 +1,36 @@
 # Starfin Theme File
 #
-# This file defines a custom color palette for the Starfin UI.  Point the
-# THEME_FILE environment variable at this file (or use `themeFile` in the NixOS
-# module) to activate it.
+# This file defines a custom color palette and UX design for the Starfin UI.
+# Point the THEME_FILE environment variable at this file (or use `themeFile` in
+# the NixOS module) to activate it.
 #
 # Every key under [light] and [dark] maps to a CSS custom property.  Underscores
 # in key names become hyphens in CSS (e.g. `panel_2` → `--panel-2`).  All keys
 # are optional — omitted values inherit the built-in Jetson defaults.
 #
-# Built-in presets: jetson, nord, catppuccin, dracula
-# Select a preset with  THEME=nord  (env var) or  theme = "nord"  (NixOS).
+# Built-in color themes: jetson, nord, catppuccin, dracula
+# Select a theme with  THEME=nord  (env var) or  theme = "nord"  (NixOS).
+#
+# Built-in UX designs: editorial, neubrutalist, aero
+# Select a design with  DESIGN=aero  (env var) or  design = "aero"  in [meta].
+# Designs control typography, geometry, and visual effects.  They are composable
+# with any color theme.
 
 [meta]
 name = "My Custom Theme"
+# design = "editorial"           # optional: editorial (default), neubrutalist, aero
+
+# ── Design tokens (optional) ─────────────────────────────────────────────────
+# Override individual design properties.  These are merged on top of the
+# selected design preset.  Omitted values keep the preset defaults.
+#
+# [design]
+# font_body         = "'Courier New', 'Courier', monospace"
+# font_heading      = "'Courier New', 'Courier', monospace"
+# border_width      = "2px"
+# heading_transform = "uppercase"
+# heading_spacing   = "3px"
+# heading_weight    = "900"
 
 # ── Light mode ────────────────────────────────────────────────────────────────
 [light]

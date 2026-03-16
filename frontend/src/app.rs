@@ -596,7 +596,9 @@ fn app_inner() -> Html {
             <div class={app_class}>
                 // Left sidebar with Starfin branding
                 <aside class="sidebar">
-                    <div class="sidebar__logo">{ "STARFIN" }</div>
+                    <div class="sidebar__logo">
+                        <img src="logo.svg" alt="Starfin" class="sidebar__logo-img" />
+                    </div>
                     <div class="sidebar__text">{ "MEDIA COLLECTION" }</div>
                     <div class="sidebar__arrow">
                         <svg class="sidebar__arrow-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-hidden="true">

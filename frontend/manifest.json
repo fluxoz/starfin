@@ -1,0 +1,17 @@
+{
+  "name": "Starfin",
+  "short_name": "Starfin",
+  "description": "Starfin Media Server",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#c8bfb0",
+  "theme_color": "#FF4500",
+  "icons": [
+    {
+      "src": "logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

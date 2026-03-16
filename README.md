@@ -95,6 +95,9 @@ The server starts at **`http://127.0.0.1:8089`** by default.
 | `THEME` | `jetson` | Built-in color theme preset: `jetson`, `nord`, `catppuccin`, or `dracula` |
 | `THEME_FILE` | *(unset)* | Path to a custom TOML theme file (overrides `THEME` if both are set) |
 | `DESIGN` | `editorial` | Built-in UX design preset: `editorial`, `neubrutalist`, or `aero` |
+| `HTTP_WORKERS` | `2` | Number of actix-web HTTP server worker threads. The default is sufficient for a local media server since CPU-intensive work (transcoding, thumbnailing) runs on separate blocking threads |
+| `TRANSCODE_CONCURRENCY` | *(num CPUs)* | Maximum number of simultaneous on-demand segment transcode operations |
+| `WORKER_CONCURRENCY` | `1` | Number of concurrent background tasks for thumbnail and sprite generation |
 
 **Example:**
 ```bash

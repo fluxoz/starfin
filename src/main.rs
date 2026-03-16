@@ -3329,6 +3329,21 @@ async fn main() -> std::io::Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let shutdown_tx = Arc::new(shutdown_tx);
 
+    // ── HTTP server worker threads ────────────────────────────────────────
+    // Each actix-web worker is a dedicated OS thread.  The default (num_cpus)
+    // is far more than needed for a local media server because the actual
+    // CPU-intensive work (transcoding, sprite generation, thumbnailing) runs
+    // on tokio `spawn_blocking` threads, not on the HTTP workers themselves.
+    // Keeping this small dramatically reduces the visible "starfin" thread
+    // count reported by tools like `ps`.
+    //
+    // Override with the HTTP_WORKERS environment variable.
+    let http_workers = std::env::var("HTTP_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok().filter(|&n| n > 0))
+        .unwrap_or(2);
+    info!(workers = http_workers, "HTTP server worker threads (set HTTP_WORKERS to override)");
+
     // ── On-demand playback transcode semaphore ───────────────────────────
     // Limits the number of simultaneous on-demand segment transcode operations
     // so that concurrent HLS.js requests don't overload the system.  Used
@@ -3668,6 +3683,7 @@ async fn main() -> std::io::Result<()> {
             )
             .route("/{tail:.*}", web::get().to(frontend))
     })
+    .workers(http_workers)
     .bind((bind_addr.as_str(), port))?
     .run();
 

@@ -9,9 +9,10 @@
 //! The key optimisation is **`AVDISCARD_NONKEY`**: by telling the decoder to
 //! discard all non-keyframes we skip ~95 % of decode work.  Each seek lands
 //! on the nearest I-frame, and the decoder only needs to decompress that
-//! single frame.  Combined with multi-threaded decoding this makes sprite
-//! generation extremely fast — typically **5–30 seconds** for a 2-hour
-//! 1080p movie.
+//! single frame.  Thread count is capped at 4 (FF_THREAD_SLICE) — enough for
+//! near-maximum throughput on a single keyframe while keeping the number of
+//! OS threads spawned by libavcodec low.  Typically **5–30 seconds** for a
+//! 2-hour 1080p movie.
 
 use std::io::Cursor;
 use std::path::Path;
@@ -101,8 +102,16 @@ pub fn generate_sprite_sheet(
                 ffmpeg_next::ffi::AVDiscard::AVDISCARD_ALL;
             (*ptr).skip_idct =
                 ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONKEY;
-            // Multi-threaded decoding (frame + slice).
-            (*ptr).thread_count = 0; // 0 = auto-detect optimal thread count
+            // Multi-threaded slice decoding.  Cap at 4 threads — each seek
+            // only decodes a single keyframe (FF_THREAD_FRAME doesn't help
+            // here), so FF_THREAD_SLICE with 4 threads is already near the
+            // point of diminishing returns for H.264/HEVC, and avoids
+            // spawning one OS thread per CPU core which inflates the process
+            // count visible in `ps`.
+            let cpu_count = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2); // fall back to 2 when OS cannot report parallelism
+            (*ptr).thread_count = cpu_count.min(4) as i32;
             (*ptr).thread_type =
                 ffmpeg_next::ffi::FF_THREAD_FRAME | ffmpeg_next::ffi::FF_THREAD_SLICE;
         }

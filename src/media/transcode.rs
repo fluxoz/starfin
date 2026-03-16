@@ -207,6 +207,25 @@ fn source_is_remuxable(ictx: &ffmpeg_next::format::context::Input) -> bool {
     video_is_remuxable(ictx) && audio_is_remuxable(ictx)
 }
 
+/// Return the container's declared start time in seconds, used to normalise
+/// PTS comparisons.  Many containers (especially MPEG-TS) store PTS values
+/// relative to a non-zero clock origin (e.g. 87 s).  Without normalisation
+/// the segment time-range filter `pts_secs >= end_time` fires on the very
+/// first packet for segment 0 (end_time = 10 s), and fMP4 `write_trailer`
+/// then fails because no moof fragment was ever written.
+///
+/// `AVFormatContext::start_time` is in AV_TIME_BASE (µs) units.
+fn ctx_start_secs(ictx: &ffmpeg_next::format::context::Input) -> f64 {
+    let st = unsafe { (*ictx.as_ptr()).start_time };
+    // AV_NOPTS_VALUE = i64::MIN in the Rust bindings.  Negative values are
+    // treated as "unknown" so we return 0 to avoid a spurious negative offset.
+    if st < 0 {
+        0.0
+    } else {
+        st as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE)
+    }
+}
+
 /// Returns true if the channel layout is fully usable for the resampler —
 /// meaning it passes `av_channel_layout_check` AND has a non-UNSPEC order.
 ///
@@ -515,7 +534,10 @@ fn remux_segment(
     }
 
     // Seek to the nearest keyframe at or before start_time.
-    let seek_ts = (start_time * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
+    // Many containers (especially MPEG-TS) have a non-zero start time that
+    // must be added so the seek lands at the right position in the file.
+    let cstart = ctx_start_secs(ictx);
+    let seek_ts = ((start_time + cstart) * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
     let _ = ictx.seek(seek_ts, ..seek_ts);
 
     // Collect input stream info we need (time_bases, codec params).
@@ -607,9 +629,11 @@ fn remux_segment(
         }
 
         // Convert packet PTS to seconds for time-range filtering.
+        // Subtract the container's start_time so that comparisons are
+        // relative to the beginning of the content, not the clock origin.
         let in_tb = if is_video { in_video_tb } else { in_audio_tb.unwrap_or(in_video_tb) };
         let pts = packet.pts().unwrap_or(0);
-        let pts_secs = pts as f64 * f64::from(in_tb.0) / f64::from(in_tb.1);
+        let pts_secs = pts as f64 * f64::from(in_tb.0) / f64::from(in_tb.1) - cstart;
 
         // Past segment end → done.
         if pts_secs >= end_time {
@@ -710,7 +734,10 @@ fn hybrid_segment(
     }
 
     // Seek to the nearest keyframe at or before start_time.
-    let seek_ts = (start_time * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
+    // Many containers (especially MPEG-TS) have a non-zero start time that
+    // must be added so the seek lands at the right position in the file.
+    let cstart = ctx_start_secs(ictx);
+    let seek_ts = ((start_time + cstart) * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
     let _ = ictx.seek(seek_ts, ..seek_ts);
 
     // Collect input video stream info.
@@ -876,9 +903,11 @@ fn hybrid_segment(
         }
 
         // Convert packet PTS to seconds for time-range filtering.
+        // Subtract the container's start_time so that comparisons are
+        // relative to the beginning of the content, not the clock origin.
         let in_tb = if is_video { in_video_tb } else { in_audio_tb.unwrap_or(in_video_tb) };
         let pts = packet.pts().unwrap_or(0);
-        let pts_secs = pts as f64 * f64::from(in_tb.0) / f64::from(in_tb.1);
+        let pts_secs = pts as f64 * f64::from(in_tb.0) / f64::from(in_tb.1) - cstart;
 
         // Past segment end → done.
         if pts_secs >= end_time {
@@ -929,11 +958,12 @@ fn hybrid_segment(
                 }
                 let mut audio_frame = ffmpeg_next::util::frame::Audio::empty();
                 while adec.receive_frame(&mut audio_frame).is_ok() {
-                    // Time-range filter.
+                    // Time-range filter (normalised against container start).
                     if let Some(apts) = audio_frame.pts() {
                         let apts_secs = apts as f64
                             * f64::from(audio_time_base.0)
-                            / f64::from(audio_time_base.1);
+                            / f64::from(audio_time_base.1)
+                            - cstart;
                         if apts_secs < start_time || apts_secs >= end_time {
                             continue;
                         }
@@ -1036,7 +1066,10 @@ fn transcode_segment_inprocess(
     kill: Option<&AtomicBool>,
 ) -> Result<(), String> {
     // Seek to the segment start position.
-    let seek_ts = (start_time * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
+    // Many containers (especially MPEG-TS) have a non-zero start time that
+    // must be added so the seek lands at the right position in the file.
+    let cstart = ctx_start_secs(ictx);
+    let seek_ts = ((start_time + cstart) * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
     let _ = ictx.seek(seek_ts, ..seek_ts);
 
     // Find video and audio streams.
@@ -1380,6 +1413,9 @@ fn transcode_segment_body(
         let mut audio_sample_count: i64 = 0;
         let audio_ts_offset = (start_time * audio_sample_rate as f64) as i64;
         let mut done = false;
+        // Normalise PTS comparisons against the container start_time so that
+        // videos with a non-zero clock origin (e.g. MPEG-TS) are handled correctly.
+        let cstart = ctx_start_secs(ictx);
 
         for (pkt_stream, packet) in ictx.packets() {
             if done { break; }
@@ -1398,7 +1434,7 @@ fn transcode_segment_body(
                 let mut decoded = ffmpeg_next::util::frame::Video::empty();
                 while video_decoder.receive_frame(&mut decoded).is_ok() {
                     let pts = decoded.pts().unwrap_or(0);
-                    let pts_secs = pts as f64 * f64::from(video_time_base.0) / f64::from(video_time_base.1);
+                    let pts_secs = pts as f64 * f64::from(video_time_base.0) / f64::from(video_time_base.1) - cstart;
 
                     if pts_secs >= end_time {
                         done = true;
@@ -1474,11 +1510,12 @@ fn transcode_segment_body(
                     if adec.send_packet(&packet).is_ok() {
                         let mut audio_frame = ffmpeg_next::util::frame::Audio::empty();
                         while adec.receive_frame(&mut audio_frame).is_ok() {
-                            // Time-range filter using input time base.
+                            // Time-range filter using input time base (normalised).
                             if let Some(apts) = audio_frame.pts() {
                                 let apts_secs = apts as f64
                                     * f64::from(audio_time_base.0)
-                                    / f64::from(audio_time_base.1);
+                                    / f64::from(audio_time_base.1)
+                                    - cstart;
                                 if apts_secs < start_time || apts_secs >= end_time {
                                     continue;
                                 }

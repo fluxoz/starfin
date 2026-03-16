@@ -3395,7 +3395,10 @@ async fn main() -> std::io::Result<()> {
             }
             if *bg_shutdown_rx.borrow() { return; }
             let (mut items, index) = scan_library(&bg_library_path).await;
-            merge_user_metadata(&mut items, &bg_cache.read());
+            {
+                let previous = bg_cache.read();
+                merge_user_metadata(&mut items, &previous);
+            }
             save_video_cache(&items, &bg_cache_dir);
             *bg_cache.write() = items;
             *bg_index.write() = index;

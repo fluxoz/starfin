@@ -1,14 +1,19 @@
-/// A custom multi-select dropdown component that shows selected values as
-/// removable chips and opens a dropdown list when clicked.
+/// A custom multi-select dropdown component.
 ///
-/// # Behaviour
-/// - Same height as a normal `<select>` when nothing is selected.
-/// - Selected values appear as pills (chips) inside the trigger field.
-///   Each chip has a ✕ button that removes the value.
-/// - Clicking the trigger opens a dropdown list of all available options.
-///   Already-selected options show a check mark.
-/// - Clicking the backdrop (or re-clicking the trigger) closes the dropdown.
-/// - If `values` is empty the field is disabled and shows `placeholder`.
+/// # Layout
+/// ```text
+/// [tag-a ×] [tag-b ×]          ← removable pill row (only shown when selections exist)
+/// ┌─ Choose… ──────────────── ▾ ┐  ← trigger — constant height, opens dropdown on click
+/// └─────────────────────────────┘
+///   ○ option-a
+///   ● option-b  (checked)
+///   ○ option-c
+/// ```
+///
+/// Selected values appear as pill buttons **above** the trigger.  Clicking a
+/// pill's × button removes it.  The trigger always shows placeholder text so
+/// its height never changes.  Clicking outside (or pressing Escape) closes the
+/// dropdown.
 use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
@@ -19,7 +24,7 @@ pub struct Props {
     pub selected: Vec<String>,
     /// Emitted whenever the selection changes.
     pub onchange: Callback<Vec<String>>,
-    /// Shown inside the trigger when nothing is selected and values is empty.
+    /// Shown inside the trigger when `values` is empty.
     pub placeholder: &'static str,
     /// Label used for the aria-label attribute (accessibility).
     pub label: &'static str,
@@ -47,7 +52,7 @@ pub fn multi_select(props: &Props) -> Html {
         })
     };
 
-    // Toggle an individual option in the selection list.
+    // Toggle an individual option in the dropdown list.
     let make_toggle = |value: String| {
         let cb = props.onchange.clone();
         let current = props.selected.clone();
@@ -63,7 +68,7 @@ pub fn multi_select(props: &Props) -> Html {
         })
     };
 
-    // Remove a chip by value (fired from the × button inside a pill).
+    // Remove a specific pill (fired from the × button).
     let make_remove = |value: String| {
         let cb = props.onchange.clone();
         let current = props.selected.clone();
@@ -101,14 +106,45 @@ pub fn multi_select(props: &Props) -> Html {
         })
     };
 
+    // Placeholder text shown inside the trigger at all times.
+    let trigger_label = if props.values.is_empty() {
+        props.placeholder
+    } else {
+        "Any"
+    };
+
     html! {
         <div class="multi-select" aria-label={props.label}>
-            // ── Invisible backdrop to catch outside clicks ────────────────────
+            // ── Invisible backdrop to catch outside clicks ─────────────────────
             if *open {
                 <div class="multi-select__backdrop" onclick={on_close} />
             }
 
-            // ── Trigger: shows chips + placeholder + chevron ──────────────────
+            // ── Selected pills row (rendered ABOVE the trigger) ────────────────
+            if !props.selected.is_empty() {
+                <div class="multi-select__pills">
+                    { for props.selected.iter().map(|v| {
+                        let remove = make_remove(v.clone());
+                        html! {
+                            <span class="multi-select__pill" key={v.clone()}>
+                                { v }
+                                <button
+                                    class="multi-select__pill-remove"
+                                    type="button"
+                                    aria-label={format!("Remove {v}")}
+                                    onclick={remove}
+                                >
+                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" width="8" height="8" aria-hidden="true">
+                                        <path d="M1 1l8 8M9 1l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                                    </svg>
+                                </button>
+                            </span>
+                        }
+                    })}
+                </div>
+            }
+
+            // ── Trigger — constant height, just placeholder + chevron ──────────
             <div
                 class={trigger_class}
                 onclick={on_trigger}
@@ -118,36 +154,7 @@ pub fn multi_select(props: &Props) -> Html {
                 aria-expanded={open.to_string()}
                 aria-haspopup="listbox"
             >
-                if props.selected.is_empty() {
-                    if props.values.is_empty() {
-                        <span class="multi-select__placeholder">{ props.placeholder }</span>
-                    } else {
-                        <span class="multi-select__placeholder">{ "Any" }</span>
-                    }
-                } else {
-                    <span class="multi-select__pills">
-                        { for props.selected.iter().map(|v| {
-                            let remove = make_remove(v.clone());
-                            html! {
-                                <span class="multi-select__pill" key={v.clone()}>
-                                    { v }
-                                    <button
-                                        class="multi-select__pill-remove"
-                                        type="button"
-                                        aria-label={format!("Remove {v}")}
-                                        onclick={remove}
-                                    >
-                                        // ✕ icon as inline SVG
-                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" width="8" height="8" fill="currentColor">
-                                            <path d="M1 1l8 8M9 1l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-                                        </svg>
-                                    </button>
-                                </span>
-                            }
-                        })}
-                    </span>
-                }
-                // Chevron
+                <span class="multi-select__placeholder">{ trigger_label }</span>
                 <svg class="multi-select__chevron" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 6" width="10" height="6" fill="none">
                     <path d="M1 1l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>
@@ -172,7 +179,7 @@ pub fn multi_select(props: &Props) -> Html {
                                 aria-selected={is_sel.to_string()}
                                 onclick={toggle}
                             >
-                                <span class="multi-select__option-check">
+                                <span class="multi-select__option-check" aria-hidden="true">
                                     if is_sel { { "✓" } }
                                 </span>
                                 { v }

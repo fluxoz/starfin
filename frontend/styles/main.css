@@ -534,14 +534,44 @@ body{
   width: 100%;
 }
 
-/* The trigger looks exactly like a normal .select field */
+/* Pills row rendered ABOVE the trigger */
+.multi-select__pills{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+.multi-select__pill{
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--accent);
+  color: #fff;
+  border-radius: calc(var(--radius) / 2);
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.multi-select__pill-remove{
+  display: inline-flex;
+  align-items: center;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+  opacity: 0.75;
+  line-height: 0;
+}
+.multi-select__pill-remove:hover{ opacity: 1; }
+
+/* The trigger — fixed height, matches a normal .select field */
 .multi-select__trigger{
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 4px;
-  min-height: 34px;          /* matches .select height */
-  padding: 4px 28px 4px 8px; /* right padding leaves room for chevron */
+  height: 34px;              /* matches .select height */
+  padding: 0 28px 0 8px;    /* right padding for chevron */
   border-radius: var(--radius);
   border: var(--border-width) solid var(--input-border);
   background: var(--input-bg);
@@ -563,40 +593,11 @@ body{
 .multi-select__placeholder{
   color: var(--muted);
   font-size: 12px;
-  line-height: 1;
-  padding: 3px 0;
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
-
-/* Pills row */
-.multi-select__pills{
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-.multi-select__pill{
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  background: var(--accent);
-  color: #fff;
-  border-radius: calc(var(--radius) / 2);
-  padding: 2px 6px;
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 1.3;
-}
-.multi-select__pill-remove{
-  display: inline-flex;
-  align-items: center;
-  background: none;
-  border: none;
-  color: inherit;
-  cursor: pointer;
-  padding: 0 0 0 2px;
-  opacity: 0.75;
-  line-height: 0;
-}
-.multi-select__pill-remove:hover{ opacity: 1; }
 
 /* Chevron arrow */
 .multi-select__chevron{
@@ -606,7 +607,6 @@ body{
   transform: translateY(-50%);
   pointer-events: none;
   color: var(--muted);
-  flex-shrink: 0;
 }
 
 /* Invisible full-viewport backdrop to close the dropdown on outside click */

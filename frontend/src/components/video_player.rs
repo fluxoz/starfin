@@ -251,7 +251,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let controls_visible = use_state(|| true);
     let last_mouse_move = use_mut_ref(|| js_sys::Date::now());
     let is_near_controls = use_mut_ref(|| false);
-    let settings_open = use_state(|| false);
     let speed_menu_open = use_state(|| false);
     let quality_menu_open = use_state(|| false);
     let volume_slider_visible = use_state(|| false);
@@ -688,21 +687,19 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let last_mouse_move = last_mouse_move.clone();
         let is_near_controls = is_near_controls.clone();
         let is_playing = is_playing.clone();
-        let settings_open = settings_open.clone();
         let quality_menu_open = quality_menu_open.clone();
 
         use_effect_with(
-            ((*is_playing).clone(), (*settings_open).clone(), (*quality_menu_open).clone()),
+            ((*is_playing).clone(), (*quality_menu_open).clone()),
             move |_| {
                 let controls_visible = controls_visible.clone();
                 let last_mouse_move = last_mouse_move.clone();
                 let is_near_controls = is_near_controls.clone();
                 let is_playing = is_playing.clone();
-                let settings_open = settings_open.clone();
                 let quality_menu_open = quality_menu_open.clone();
 
                 let interval = Interval::new(1000, move || {
-                    if *is_playing && !*settings_open && !*quality_menu_open && !*is_near_controls.borrow() {
+                    if *is_playing && !*quality_menu_open && !*is_near_controls.borrow() {
                         let now = js_sys::Date::now();
                         if now - *last_mouse_move.borrow() > CONTROL_HIDE_TIMEOUT_MS {
                             controls_visible.set(false);
@@ -1071,12 +1068,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // Speed menu toggle
     let on_speed_toggle = {
         let speed_menu_open = speed_menu_open.clone();
-        let settings_open = settings_open.clone();
         let quality_menu_open = quality_menu_open.clone();
         Callback::from(move |e: MouseEvent| {
             e.stop_propagation();
             speed_menu_open.set(!*speed_menu_open);
-            settings_open.set(false);
             quality_menu_open.set(false);
         })
     };
@@ -1095,28 +1090,15 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
-    // Settings toggle
-    let on_settings_toggle = {
-        let settings_open = settings_open.clone();
-        let speed_menu_open = speed_menu_open.clone();
-        let quality_menu_open = quality_menu_open.clone();
-        Callback::from(move |e: MouseEvent| {
-            e.stop_propagation();
-            settings_open.set(!*settings_open);
-            speed_menu_open.set(false);
-            quality_menu_open.set(false);
-        })
-    };
+    // Settings toggle removed - gear icon had no functional purpose
 
     // Quality menu toggle
     let on_quality_toggle = {
         let quality_menu_open = quality_menu_open.clone();
-        let settings_open = settings_open.clone();
         let speed_menu_open = speed_menu_open.clone();
         Callback::from(move |e: MouseEvent| {
             e.stop_propagation();
             quality_menu_open.set(!*quality_menu_open);
-            settings_open.set(false);
             speed_menu_open.set(false);
         })
     };
@@ -1147,11 +1129,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
     // Close menus when clicking outside
     let on_container_click = {
-        let settings_open = settings_open.clone();
         let speed_menu_open = speed_menu_open.clone();
         let quality_menu_open = quality_menu_open.clone();
         Callback::from(move |_: MouseEvent| {
-            settings_open.set(false);
             speed_menu_open.set(false);
             quality_menu_open.set(false);
         })
@@ -1475,13 +1455,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // Captions menu toggle
     let on_captions_toggle = {
         let captions_menu_open = captions_menu_open.clone();
-        let settings_open = settings_open.clone();
         let speed_menu_open = speed_menu_open.clone();
         let quality_menu_open = quality_menu_open.clone();
         Callback::from(move |e: MouseEvent| {
             e.stop_propagation();
             captions_menu_open.set(!*captions_menu_open);
-            settings_open.set(false);
             speed_menu_open.set(false);
             quality_menu_open.set(false);
         })
@@ -1873,34 +1851,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             </div>
                         }
 
-                        // Settings button
-                        <div class="player-settings">
-                            <button
-                                class="player-controls__btn"
-                                onclick={on_settings_toggle}
-                                title="Settings"
-                            >
-                                { icon_settings() }
-                            </button>
-                            if *settings_open {
-                                <div class="player-settings__menu">
-                                    <div class="player-settings__item">
-                                        <span>{ "Quality" }</span>
-                                        <span class="player-settings__value">
-                                            { QUALITY_OPTIONS.iter()
-                                                .find(|(v, _)| *v == selected_quality.as_str())
-                                                .map(|(_, label)| *label)
-                                            .unwrap_or("Original (Direct)") }
-                                        </span>
-                                    </div>
-                                    <div class="player-settings__item">
-                                        <span>{ "Speed" }</span>
-                                        <span class="player-settings__value">{ format!("{}x", *playback_speed) }</span>
-                                    </div>
-                                </div>
-                            }
-                        </div>
-
                         // Picture-in-Picture button
                         <button class="player-controls__btn" onclick={on_pip_toggle} title="Picture-in-Picture (p)">
                             { icon_pip() }
@@ -2039,14 +1989,6 @@ fn icon_fullscreen_exit() -> Html {
     html! {
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="1em" height="1em" aria-hidden="true">
             <path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"/>
-        </svg>
-    }
-}
-
-fn icon_settings() -> Html {
-    html! {
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="1em" height="1em" aria-hidden="true">
-            <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
         </svg>
     }
 }

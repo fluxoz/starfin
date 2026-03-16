@@ -101,6 +101,7 @@ fn video_card(props: &CardProps) -> Html {
             <div class="card__thumb-wrap">
                 <VideoCardThumb
                     video_id={item.id.clone()}
+                    title={item.title.clone()}
                     processing_version={*local_version}
                 />
                 <button

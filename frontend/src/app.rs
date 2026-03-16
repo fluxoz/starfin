@@ -108,7 +108,9 @@ fn col_count_for_width(win_width: f64) -> usize {
 #[function_component(AppInner)]
 fn app_inner() -> Html {
     /// Number of cards kept in the DOM at any one time (the virtual window).
-    const WINDOW_SIZE: usize = 100;
+    /// 30 items = 10 rows (3 cols) keeps the DOM very lean: only visible cards
+    /// plus a small buffer above/below are ever present.
+    const WINDOW_SIZE: usize = 30;
     /// Initial estimate for one card's rendered height plus the grid row-gap (16 px).
     /// Updated after the first real render by measuring an actual `.card` element.
     const CARD_ROW_HEIGHT_ESTIMATE: f64 = 440.0;

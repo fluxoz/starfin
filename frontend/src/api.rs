@@ -202,6 +202,8 @@ pub fn apply_filters(
                     || e.genre.to_lowercase().contains(&q)
                     || e.director.to_lowercase().contains(&q)
                     || e.tags.iter().any(|t| t.to_lowercase().contains(&q))
+                    || e.actors.iter().any(|a| a.to_lowercase().contains(&q))
+                    || e.categories.iter().any(|c| c.to_lowercase().contains(&q))
             })
             .cloned()
             .collect()
@@ -214,4 +216,43 @@ pub fn apply_filters(
     }
 
     result
+}
+
+/// Update user-defined metadata for a video via `PATCH /api/videos/{id}/metadata`.
+pub async fn update_metadata(
+    video_id: &str,
+    favorite: Option<bool>,
+    tags: Option<Vec<String>>,
+    actors: Option<Vec<String>>,
+    categories: Option<Vec<String>>,
+) -> Result<Element, String> {
+    let mut body = serde_json::Map::new();
+    if let Some(fav) = favorite {
+        body.insert("favorite".into(), serde_json::Value::Bool(fav));
+    }
+    if let Some(t) = tags {
+        body.insert("tags".into(), serde_json::json!(t));
+    }
+    if let Some(a) = actors {
+        body.insert("actors".into(), serde_json::json!(a));
+    }
+    if let Some(c) = categories {
+        body.insert("categories".into(), serde_json::json!(c));
+    }
+
+    let resp = Request::patch(&format!("/api/videos/{video_id}/metadata"))
+        .header("Content-Type", "application/json")
+        .body(serde_json::Value::Object(body).to_string())
+        .map_err(|e| format!("Request error: {e:?}"))?
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e:?}"))?;
+
+    if !resp.ok() {
+        return Err(format!("HTTP error: {}", resp.status()));
+    }
+
+    resp.json()
+        .await
+        .map_err(|e| format!("Invalid JSON: {e:?}"))
 }

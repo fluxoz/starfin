@@ -252,7 +252,10 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
                         onclick={Callback::from(move |_| on_close.emit(()))}
                         aria-label="Close"
                     >
-                        { "✕" }
+                        <svg class="meta-modal__close-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                            <line x1="6" y1="6" x2="18" y2="18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                            <line x1="18" y1="6" x2="6" y2="18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        </svg>
                     </button>
                 </div>
 
@@ -290,7 +293,12 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
                                             class="meta-chip__remove"
                                             onclick={Callback::from(move |_| remove.emit(idx))}
                                             aria-label={format!("Remove tag {}", t)}
-                                        >{ "✕" }</button>
+                                        >
+                                            <svg class="meta-chip__remove-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                                <line x1="6" y1="6" x2="18" y2="18" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+                                                <line x1="18" y1="6" x2="6" y2="18" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+                                            </svg>
+                                        </button>
                                     </span>
                                 }
                             }) }
@@ -304,7 +312,12 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
                                 oninput={on_tag_input}
                                 onkeydown={on_tag_keydown}
                             />
-                            <button type="button" class="meta-field__add" onclick={on_add_tag}>{ "+" }</button>
+                            <button type="button" class="meta-field__add" onclick={on_add_tag}>
+                                <svg class="meta-field__add-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                    <line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+                                    <line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+                                </svg>
+                            </button>
                         </div>
                     </div>
 
@@ -322,7 +335,12 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
                                             class="meta-chip__remove"
                                             onclick={Callback::from(move |_| remove.emit(idx))}
                                             aria-label={format!("Remove actor {}", a)}
-                                        >{ "✕" }</button>
+                                        >
+                                            <svg class="meta-chip__remove-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                                <line x1="6" y1="6" x2="18" y2="18" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+                                                <line x1="18" y1="6" x2="6" y2="18" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+                                            </svg>
+                                        </button>
                                     </span>
                                 }
                             }) }
@@ -336,7 +354,12 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
                                 oninput={on_actor_input}
                                 onkeydown={on_actor_keydown}
                             />
-                            <button type="button" class="meta-field__add" onclick={on_add_actor}>{ "+" }</button>
+                            <button type="button" class="meta-field__add" onclick={on_add_actor}>
+                                <svg class="meta-field__add-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                    <line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+                                    <line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+                                </svg>
+                            </button>
                         </div>
                     </div>
 
@@ -354,7 +377,12 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
                                             class="meta-chip__remove"
                                             onclick={Callback::from(move |_| remove.emit(idx))}
                                             aria-label={format!("Remove category {}", c)}
-                                        >{ "✕" }</button>
+                                        >
+                                            <svg class="meta-chip__remove-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                                <line x1="6" y1="6" x2="18" y2="18" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+                                                <line x1="18" y1="6" x2="6" y2="18" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+                                            </svg>
+                                        </button>
                                     </span>
                                 }
                             }) }
@@ -368,7 +396,12 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
                                 oninput={on_category_input}
                                 onkeydown={on_category_keydown}
                             />
-                            <button type="button" class="meta-field__add" onclick={on_add_category}>{ "+" }</button>
+                            <button type="button" class="meta-field__add" onclick={on_add_category}>
+                                <svg class="meta-field__add-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                    <line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+                                    <line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+                                </svg>
+                            </button>
                         </div>
                     </div>
 

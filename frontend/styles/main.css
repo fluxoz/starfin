@@ -683,6 +683,18 @@ body{
   font-weight: 700;
 }
 
+.card__rating{
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.card__rating-icon{
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
 .btn{
   padding: 8px 12px;
   border-radius: var(--radius);
@@ -695,10 +707,19 @@ body{
   text-transform: uppercase;
   letter-spacing: 1px;
   font-family: var(--font-body);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 .btn:hover{
   background: #cc3700;
   border-color: #cc3700;
+}
+.btn__icon{
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+  flex-shrink: 0;
 }
 
 /* Notices */
@@ -913,13 +934,19 @@ body{
   background: none;
   border: none;
   color: var(--muted);
-  font-size: 18px;
   cursor: pointer;
-  padding: 0 4px;
+  padding: 4px;
   line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 .meta-modal__close:hover{
   color: var(--text);
+}
+.meta-modal__close-icon{
+  width: 16px;
+  height: 16px;
 }
 .meta-modal__media-title{
   font-size: 14px;
@@ -977,8 +1004,6 @@ body{
   border: none;
   border-radius: var(--radius, 2px);
   width: 34px;
-  font-size: 18px;
-  font-weight: 700;
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -988,6 +1013,10 @@ body{
 }
 .meta-field__add:hover{
   opacity: .85;
+}
+.meta-field__add-icon{
+  width: 18px;
+  height: 18px;
 }
 
 /* ── Metadata chip list ──────────────────────────────────────────────────── */
@@ -1014,13 +1043,18 @@ body{
   background: none;
   border: none;
   color: var(--muted);
-  font-size: 12px;
   cursor: pointer;
-  padding: 0 2px;
+  padding: 0;
   line-height: 1;
+  display: flex;
+  align-items: center;
 }
 .meta-chip__remove:hover{
   color: var(--danger, #cc0000);
+}
+.meta-chip__remove-icon{
+  width: 12px;
+  height: 12px;
 }
 
 /* ── Favorite toggle button in modal ─────────────────────────────────────── */

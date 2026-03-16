@@ -9,6 +9,15 @@ pub struct MediaEditModalProps {
     pub item: Element,
     pub on_close: Callback<()>,
     pub on_saved: Callback<Element>,
+    /// All unique tag values across the library, for autocomplete suggestions.
+    #[prop_or_default]
+    pub all_tags: Vec<String>,
+    /// All unique actor values across the library, for autocomplete suggestions.
+    #[prop_or_default]
+    pub all_actors: Vec<String>,
+    /// All unique category values across the library, for autocomplete suggestions.
+    #[prop_or_default]
+    pub all_categories: Vec<String>,
 }
 
 #[function_component(MediaEditModal)]
@@ -28,6 +37,64 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
 
     let saving = use_state(|| false);
     let error = use_state(|| Option::<String>::None);
+
+    // ── Autocomplete suggestions ─────────────────────────────────────────────
+    // Derive filtered suggestions from the library-wide lists, filtered by the
+    // current input prefix (case-insensitive) and excluding already-added items.
+    let tag_suggestions: Vec<String> = {
+        let q = (*tag_input).to_lowercase();
+        if q.is_empty() {
+            vec![]
+        } else {
+            props
+                .all_tags
+                .iter()
+                .filter(|t| {
+                    t.to_lowercase().starts_with(&q)
+                        && t.as_str() != (*tag_input).as_str()
+                        && !(*tags).contains(*t)
+                })
+                .cloned()
+                .take(6)
+                .collect()
+        }
+    };
+    let actor_suggestions: Vec<String> = {
+        let q = (*actor_input).to_lowercase();
+        if q.is_empty() {
+            vec![]
+        } else {
+            props
+                .all_actors
+                .iter()
+                .filter(|a| {
+                    a.to_lowercase().starts_with(&q)
+                        && a.as_str() != (*actor_input).as_str()
+                        && !(*actors).contains(*a)
+                })
+                .cloned()
+                .take(6)
+                .collect()
+        }
+    };
+    let category_suggestions: Vec<String> = {
+        let q = (*category_input).to_lowercase();
+        if q.is_empty() {
+            vec![]
+        } else {
+            props
+                .all_categories
+                .iter()
+                .filter(|c| {
+                    c.to_lowercase().starts_with(&q)
+                        && c.as_str() != (*category_input).as_str()
+                        && !(*categories).contains(*c)
+                })
+                .cloned()
+                .take(6)
+                .collect()
+        }
+    };
 
     // ── Favorite toggle ──────────────────────────────────────────────────────
     let on_toggle_favorite = {
@@ -62,16 +129,26 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
     let on_tag_keydown = {
         let tag_input = tag_input.clone();
         let tags = tags.clone();
+        let first_tag = tag_suggestions.first().cloned();
         Callback::from(move |e: KeyboardEvent| {
-            if e.key() == "Enter" {
-                e.prevent_default();
-                let val = (*tag_input).trim().to_string();
-                if !val.is_empty() && !tags.contains(&val) {
-                    let mut t = (*tags).clone();
-                    t.push(val);
-                    tags.set(t);
+            match e.key().as_str() {
+                "Enter" => {
+                    e.prevent_default();
+                    let val = (*tag_input).trim().to_string();
+                    if !val.is_empty() && !tags.contains(&val) {
+                        let mut t = (*tags).clone();
+                        t.push(val);
+                        tags.set(t);
+                    }
+                    tag_input.set(String::new());
                 }
-                tag_input.set(String::new());
+                "Tab" => {
+                    if let Some(ref suggestion) = first_tag {
+                        e.prevent_default();
+                        tag_input.set(suggestion.clone());
+                    }
+                }
+                _ => {}
             }
         })
     };
@@ -101,16 +178,26 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
     let on_actor_keydown = {
         let actor_input = actor_input.clone();
         let actors = actors.clone();
+        let first_actor = actor_suggestions.first().cloned();
         Callback::from(move |e: KeyboardEvent| {
-            if e.key() == "Enter" {
-                e.prevent_default();
-                let val = (*actor_input).trim().to_string();
-                if !val.is_empty() && !actors.contains(&val) {
-                    let mut a = (*actors).clone();
-                    a.push(val);
-                    actors.set(a);
+            match e.key().as_str() {
+                "Enter" => {
+                    e.prevent_default();
+                    let val = (*actor_input).trim().to_string();
+                    if !val.is_empty() && !actors.contains(&val) {
+                        let mut a = (*actors).clone();
+                        a.push(val);
+                        actors.set(a);
+                    }
+                    actor_input.set(String::new());
                 }
-                actor_input.set(String::new());
+                "Tab" => {
+                    if let Some(ref suggestion) = first_actor {
+                        e.prevent_default();
+                        actor_input.set(suggestion.clone());
+                    }
+                }
+                _ => {}
             }
         })
     };
@@ -140,16 +227,26 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
     let on_category_keydown = {
         let category_input = category_input.clone();
         let categories = categories.clone();
+        let first_category = category_suggestions.first().cloned();
         Callback::from(move |e: KeyboardEvent| {
-            if e.key() == "Enter" {
-                e.prevent_default();
-                let val = (*category_input).trim().to_string();
-                if !val.is_empty() && !categories.contains(&val) {
-                    let mut c = (*categories).clone();
-                    c.push(val);
-                    categories.set(c);
+            match e.key().as_str() {
+                "Enter" => {
+                    e.prevent_default();
+                    let val = (*category_input).trim().to_string();
+                    if !val.is_empty() && !categories.contains(&val) {
+                        let mut c = (*categories).clone();
+                        c.push(val);
+                        categories.set(c);
+                    }
+                    category_input.set(String::new());
                 }
-                category_input.set(String::new());
+                "Tab" => {
+                    if let Some(ref suggestion) = first_category {
+                        e.prevent_default();
+                        category_input.set(suggestion.clone());
+                    }
+                }
+                _ => {}
             }
         })
     };
@@ -351,14 +448,34 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
                             }) }
                         </div>
                         <div class="meta-field__row">
-                            <input
-                                type="text"
-                                class="meta-field__input"
-                                placeholder="Add a tag…"
-                                value={(*tag_input).clone()}
-                                oninput={on_tag_input}
-                                onkeydown={on_tag_keydown}
-                            />
+                            <div class="meta-field__input-wrap">
+                                <input
+                                    type="text"
+                                    class="meta-field__input"
+                                    placeholder="Add a tag…"
+                                    value={(*tag_input).clone()}
+                                    oninput={on_tag_input}
+                                    onkeydown={on_tag_keydown}
+                                    autocomplete="off"
+                                />
+                                if !tag_suggestions.is_empty() {
+                                    <ul class="meta-suggestions" role="listbox" aria-label="Tag suggestions">
+                                        { for tag_suggestions.iter().map(|s| {
+                                            let tag_input = tag_input.clone();
+                                            let val = s.clone();
+                                            html! {
+                                                <li class="meta-suggestions__item"
+                                                    role="option"
+                                                    onmousedown={Callback::from(move |e: MouseEvent| {
+                                                        e.prevent_default();
+                                                        tag_input.set(val.clone());
+                                                    })}
+                                                >{ s.clone() }</li>
+                                            }
+                                        }) }
+                                    </ul>
+                                }
+                            </div>
                             <button type="button" class="meta-field__add" onclick={on_add_tag}>
                                 <svg class="meta-field__add-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
                                     <line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
@@ -393,14 +510,34 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
                             }) }
                         </div>
                         <div class="meta-field__row">
-                            <input
-                                type="text"
-                                class="meta-field__input"
-                                placeholder="Add a name…"
-                                value={(*actor_input).clone()}
-                                oninput={on_actor_input}
-                                onkeydown={on_actor_keydown}
-                            />
+                            <div class="meta-field__input-wrap">
+                                <input
+                                    type="text"
+                                    class="meta-field__input"
+                                    placeholder="Add a name…"
+                                    value={(*actor_input).clone()}
+                                    oninput={on_actor_input}
+                                    onkeydown={on_actor_keydown}
+                                    autocomplete="off"
+                                />
+                                if !actor_suggestions.is_empty() {
+                                    <ul class="meta-suggestions" role="listbox" aria-label="Actor suggestions">
+                                        { for actor_suggestions.iter().map(|s| {
+                                            let actor_input = actor_input.clone();
+                                            let val = s.clone();
+                                            html! {
+                                                <li class="meta-suggestions__item"
+                                                    role="option"
+                                                    onmousedown={Callback::from(move |e: MouseEvent| {
+                                                        e.prevent_default();
+                                                        actor_input.set(val.clone());
+                                                    })}
+                                                >{ s.clone() }</li>
+                                            }
+                                        }) }
+                                    </ul>
+                                }
+                            </div>
                             <button type="button" class="meta-field__add" onclick={on_add_actor}>
                                 <svg class="meta-field__add-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
                                     <line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
@@ -435,14 +572,34 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
                             }) }
                         </div>
                         <div class="meta-field__row">
-                            <input
-                                type="text"
-                                class="meta-field__input"
-                                placeholder="Add a category…"
-                                value={(*category_input).clone()}
-                                oninput={on_category_input}
-                                onkeydown={on_category_keydown}
-                            />
+                            <div class="meta-field__input-wrap">
+                                <input
+                                    type="text"
+                                    class="meta-field__input"
+                                    placeholder="Add a category…"
+                                    value={(*category_input).clone()}
+                                    oninput={on_category_input}
+                                    onkeydown={on_category_keydown}
+                                    autocomplete="off"
+                                />
+                                if !category_suggestions.is_empty() {
+                                    <ul class="meta-suggestions" role="listbox" aria-label="Category suggestions">
+                                        { for category_suggestions.iter().map(|s| {
+                                            let category_input = category_input.clone();
+                                            let val = s.clone();
+                                            html! {
+                                                <li class="meta-suggestions__item"
+                                                    role="option"
+                                                    onmousedown={Callback::from(move |e: MouseEvent| {
+                                                        e.prevent_default();
+                                                        category_input.set(val.clone());
+                                                    })}
+                                                >{ s.clone() }</li>
+                                            }
+                                        }) }
+                                    </ul>
+                                }
+                            </div>
                             <button type="button" class="meta-field__add" onclick={on_add_category}>
                                 <svg class="meta-field__add-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
                                     <line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>

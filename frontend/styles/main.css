@@ -1190,6 +1190,44 @@ body{
   height: 18px;
 }
 
+/* ── Autocomplete suggestions dropdown ───────────────────────────────────── */
+.meta-field__input-wrap{
+  position: relative;
+  flex: 1;
+}
+.meta-field__input-wrap .meta-field__input{
+  width: 100%;
+}
+.meta-suggestions{
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  margin: 2px 0 0;
+  padding: 4px 0;
+  list-style: none;
+  background: var(--card-bg, #fff);
+  border: 1.5px solid rgba(0,0,0,.2);
+  border-radius: var(--radius, 2px);
+  box-shadow: 0 4px 12px rgba(0,0,0,.12);
+  max-height: 180px;
+  overflow-y: auto;
+}
+.meta-suggestions__item{
+  padding: 6px 10px;
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--text, #1a1a1a);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.meta-suggestions__item:hover{
+  background: var(--accent, #ff4500);
+  color: #fff;
+}
+
 /* ── Metadata chip list ──────────────────────────────────────────────────── */
 .meta-chips{
   display: flex;
@@ -1343,6 +1381,18 @@ body{
 .app.dark-mode .meta-chip{
   background: rgba(255,255,255,.06);
   border-color: var(--border);
+}
+.app.dark-mode .meta-suggestions{
+  background: var(--card-bg, #1e1e1e);
+  border-color: var(--input-border);
+  box-shadow: 0 4px 14px rgba(0,0,0,.4);
+}
+.app.dark-mode .meta-suggestions__item{
+  color: var(--text);
+}
+.app.dark-mode .meta-suggestions__item:hover{
+  background: var(--accent, #ff4500);
+  color: #fff;
 }
 
 /* ── Video player overlay ────────────────────────────────────────────────── */

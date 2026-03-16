@@ -19,9 +19,12 @@ pub struct Props {
     /// The video ID the pre-cache worker is currently processing (from WS).
     #[prop_or_default]
     pub precache_current_id: Option<String>,
-    /// Whether there are more items to load via lazy scrolling.
+    /// Height in pixels of the virtual spacer above the rendered window.
     #[prop_or_default]
-    pub has_more: bool,
+    pub top_pad: f64,
+    /// Height in pixels of the virtual spacer below the rendered window.
+    #[prop_or_default]
+    pub bottom_pad: f64,
 }
 
 #[derive(Properties, PartialEq)]
@@ -202,6 +205,10 @@ pub fn elements_grid(props: &Props) -> Html {
 
     html! {
         <>
+            // Top spacer maintains document height for items scrolled above the window.
+            if props.top_pad > 0.0 {
+                <div aria-hidden="true" style={format!("height:{}px", props.top_pad as u32)} />
+            }
             <section class="grid" aria-label="Videos grid">
                 { for props.items.iter().map(|item| {
                     let is_thumb_processing =
@@ -225,8 +232,9 @@ pub fn elements_grid(props: &Props) -> Html {
                     }
                 }) }
             </section>
-            if props.has_more {
-                <div class="grid-load-more">{ "Loading more…" }</div>
+            // Bottom spacer maintains document height for items below the window.
+            if props.bottom_pad > 0.0 {
+                <div aria-hidden="true" style={format!("height:{}px", props.bottom_pad as u32)} />
             }
         </>
     }

@@ -543,17 +543,6 @@ body{
   .grid{ grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 
-.grid-load-more{
-  margin-top: 24px;
-  padding: 14px;
-  text-align: center;
-  color: var(--muted);
-  font-size: 11px;
-  text-transform: var(--heading-transform);
-  letter-spacing: var(--heading-spacing);
-  border: var(--border-width) dashed var(--border);
-  border-radius: var(--radius);
-}
 
 .card{
   border-radius: var(--radius);

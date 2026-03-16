@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::{Mutex, RwLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use uuid::Uuid;
@@ -1478,10 +1479,14 @@ async fn generate_quick_thumbnail(
 /// Pass 2 — extract and encode that specific frame as JPEG.
 ///
 /// A side-car marker file `{id}.deep` is created on success.
+///
+/// When `kill` is set to `true`, pass 1 bails out early and pass 2 is skipped
+/// entirely so that background work yields I/O and CPU to playback.
 async fn generate_deep_thumbnail(
     id: &str,
     video_path: &Path,
     cache_dir: &Path,
+    kill: Arc<AtomicBool>,
 ) -> bool {
     let deep_marker = cache_dir.join(format!("{}.deep", id));
     if deep_marker.exists() {
@@ -1501,19 +1506,24 @@ async fn generate_deep_thumbnail(
     let default_time = start + length * 0.5;
 
     // Pass 1: find the best frame time via in-process signal analysis.
-    // Both passes are awaited to completion so that their results are saved
-    // and don't need to be repeated when workers resume after playback ends.
     let video_path_for_analysis = video_path_owned.clone();
+    let kill_for_analysis = kill.clone();
     let best_time = tokio::task::spawn_blocking(move || {
         media::thumbnail::find_best_frame_via_signalstats(
             &video_path_for_analysis,
             start,
             length,
             default_time,
+            &kill_for_analysis,
         )
     })
     .await
     .unwrap_or(default_time);
+
+    // Bail before pass 2 if playback has started.
+    if kill.load(Ordering::Relaxed) {
+        return false;
+    }
 
     // Pass 2: extract the chosen frame.
     let thumb_path = cache_dir.join(format!("{}.jpg", id));
@@ -1653,11 +1663,12 @@ async fn run_thumb_worker(
             if join_set.is_empty() {
                 break;
             }
-            // Collect the next completed task.  Use select! so a shutdown
-            // signal wakes us immediately rather than waiting for the
-            // in-flight spawn_blocking to finish.
+            // Collect the next completed task.  React immediately to
+            // playback or shutdown rather than waiting for the in-flight
+            // spawn_blocking to finish.
             let next = tokio::select! {
                 r = join_set.join_next() => r,
+                _ = playback_rx.changed() => { continue; }
                 _ = shutdown_rx.changed() => { return; }
             };
             if let Some(Ok((id, _ok))) = next {
@@ -1698,13 +1709,19 @@ async fn run_thumb_worker(
             p.phase = "deep";
         }
 
+        let kill = Arc::new(AtomicBool::new(false));
         let mut join_set: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
         let mut iter = deep_entries.into_iter().peekable();
         loop {
-            // Suspend while a video is being streamed: wait here until
-            // playback goes idle, then fill the next batch of tasks.
-            while *playback_rx.borrow() {
-                let _ = playback_rx.changed().await;
+            // Suspend while a video is being streamed: signal in-flight
+            // tasks to bail out, drain them, then wait for playback to end.
+            if *playback_rx.borrow() {
+                kill.store(true, Ordering::SeqCst);
+                while join_set.join_next().await.is_some() {}
+                while *playback_rx.borrow() {
+                    let _ = playback_rx.changed().await;
+                }
+                kill.store(false, Ordering::SeqCst);
             }
             if *shutdown_rx.borrow() {
                 return;
@@ -1727,19 +1744,20 @@ async fn run_thumb_worker(
                     p.current_ids.insert(id.clone());
                 }
                 let cache_dir = cache_dir.clone();
+                let k = Arc::clone(&kill);
                 join_set.spawn(async move {
-                    let ok = generate_deep_thumbnail(&id, &abs, &cache_dir).await;
+                    let ok = generate_deep_thumbnail(&id, &abs, &cache_dir, k).await;
                     (id, ok)
                 });
             }
             if join_set.is_empty() {
                 break;
             }
-            // Collect the next completed task.  Use select! so a shutdown
-            // signal wakes us immediately rather than waiting for the
-            // in-flight spawn_blocking to finish.
+            // Collect the next completed task.  React immediately to
+            // playback or shutdown so in-flight work is cancelled promptly.
             let next = tokio::select! {
                 r = join_set.join_next() => r,
+                _ = playback_rx.changed() => { continue; }
                 _ = shutdown_rx.changed() => { return; }
             };
             if let Some(Ok((id, _ok))) = next {
@@ -2421,8 +2439,9 @@ async fn get_thumbnail_sprite(
     }
 
     // Generate the sprite using the shared helper (creates dir, runs ffmpeg).
-    // The task is always awaited to completion so its result is saved.
-    if generate_sprite(&id, &abs_path, &state.cache_dir).await {
+    // For on-demand requests, we never cancel — pass an inert kill flag.
+    let no_kill = Arc::new(AtomicBool::new(false));
+    if generate_sprite(&id, &abs_path, &state.cache_dir, no_kill).await {
         match tokio::fs::read(&sprite_path).await {
             Ok(data) => HttpResponse::Ok()
                 .content_type("image/jpeg")
@@ -2441,13 +2460,13 @@ async fn get_thumbnail_sprite(
 ///
 /// Creates `{cache_dir}/{id}_thumbs/sprite.jpg`.  Returns `true` on success.
 ///
-/// Always runs to completion — the outer worker loop suspends *between*
-/// tasks while playback is active, which is the correct granularity for
-/// deferring to playback without risking zombie `spawn_blocking` threads.
+/// When `kill` is set to `true`, the in-progress keyframe decoding bails out
+/// early so that background work yields I/O and CPU to playback.
 async fn generate_sprite(
     id: &str,
     abs_path: &Path,
     cache_dir: &Path,
+    kill: Arc<AtomicBool>,
 ) -> bool {
     let sprite_dir = cache_dir.join(format!("{}_thumbs", id));
     let sprite_path = sprite_dir.join("sprite.jpg");
@@ -2471,11 +2490,8 @@ async fn generate_sprite(
     };
 
     let sprite_dir_owned = sprite_dir.clone();
-    // Await the task to completion so the generated sprite is saved and won't
-    // need to be re-done when the background worker resumes after playback.
-    // The outer worker loop suspends between tasks while playback is active.
     tokio::task::spawn_blocking(move || {
-        media::sprite::generate_sprite_sheet(&resolved_path, duration_secs, &sprite_dir_owned)
+        media::sprite::generate_sprite_sheet(&resolved_path, duration_secs, &sprite_dir_owned, &kill)
     })
     .await
     .unwrap_or(false)
@@ -2534,13 +2550,19 @@ async fn run_sprite_worker(
             p.active = !entries.is_empty();
         }
 
+        let kill = Arc::new(AtomicBool::new(false));
         let mut join_set: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
         let mut iter = entries.into_iter().peekable();
         loop {
-            // Suspend while a video is being streamed: wait here until
-            // playback goes idle, then fill the next batch of tasks.
-            while *playback_rx.borrow() {
-                let _ = playback_rx.changed().await;
+            // Suspend while a video is being streamed: signal in-flight
+            // tasks to bail out, drain them, then wait for playback to end.
+            if *playback_rx.borrow() {
+                kill.store(true, Ordering::SeqCst);
+                while join_set.join_next().await.is_some() {}
+                while *playback_rx.borrow() {
+                    let _ = playback_rx.changed().await;
+                }
+                kill.store(false, Ordering::SeqCst);
             }
             if *shutdown_rx.borrow() {
                 return;
@@ -2563,19 +2585,20 @@ async fn run_sprite_worker(
                     p.current_ids.insert(id.clone());
                 }
                 let cache_dir = cache_dir.clone();
+                let k = Arc::clone(&kill);
                 join_set.spawn(async move {
-                    let ok = generate_sprite(&id, &abs, &cache_dir).await;
+                    let ok = generate_sprite(&id, &abs, &cache_dir, k).await;
                     (id, ok)
                 });
             }
             if join_set.is_empty() {
                 break;
             }
-            // Collect the next completed task.  Use select! so a shutdown
-            // signal wakes us immediately rather than waiting for the
-            // in-flight spawn_blocking to finish.
+            // Collect the next completed task.  React immediately to
+            // playback or shutdown so in-flight work is cancelled promptly.
             let next = tokio::select! {
                 r = join_set.join_next() => r,
+                _ = playback_rx.changed() => { continue; }
                 _ = shutdown_rx.changed() => { return; }
             };
             if let Some(Ok((id, _ok))) = next {
@@ -2767,29 +2790,44 @@ async fn run_precache_worker(
                 "pre-caching segments"
             );
 
+            let kill = Arc::new(AtomicBool::new(false));
             for i in missing {
                 if *shutdown_rx.borrow() {
                     return;
                 }
-                // Suspend between individual segments while playback is active.
-                // Matches the pattern used by run_thumb_worker / run_sprite_worker:
-                // finish the current unit of work, save it, then pause before
-                // starting the next one.
-                while *playback_rx.borrow() {
-                    let _ = playback_rx.changed().await;
+                // Suspend between individual segments while playback is
+                // active: signal the in-flight transcode to bail out, then
+                // wait for playback to end before starting the next one.
+                if *playback_rx.borrow() {
+                    kill.store(true, Ordering::SeqCst);
+                    while *playback_rx.borrow() {
+                        let _ = playback_rx.changed().await;
+                    }
+                    kill.store(false, Ordering::SeqCst);
                 }
                 if *shutdown_rx.borrow() {
                     return;
                 }
 
                 // Run the segment creation inside a select! so a shutdown
-                // signal wakes us immediately rather than waiting for the
-                // full operation to finish.
+                // or playback signal wakes us immediately rather than
+                // waiting for the full operation to finish.  The kill flag
+                // ensures the spawn_blocking task also bails out quickly.
                 let result = tokio::select! {
-                    r = transcode_segment(&abs_str, &hls_dir, i, &hwaccel, Quality::Original) => r,
+                    r = media::transcode::transcode_segment_with_kill(&abs_str, &hls_dir, i, &hwaccel, Quality::Original, Arc::clone(&kill)) => r,
+                    _ = playback_rx.changed() => {
+                        if *playback_rx.borrow() {
+                            kill.store(true, Ordering::SeqCst);
+                        }
+                        continue;
+                    }
                     _ = shutdown_rx.changed() => { return; }
                 };
                 if let Err(e) = result {
+                    if e == "cancelled" {
+                        // Cancelled by playback — retry this segment later.
+                        continue;
+                    }
                     error!(video_id = %id, segment = i, error = %e, "precache: segment transcode failed");
                     break; // Stop for this video on error.
                 }

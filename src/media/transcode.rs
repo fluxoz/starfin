@@ -21,6 +21,8 @@
 //! the transcode fallback path via the raw FFI bindings.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use super::hwaccel::HwAccel;
 
@@ -63,7 +65,38 @@ pub async fn transcode_segment(
     let hls_dir = hls_dir.to_owned();
     let hwaccel = hwaccel.clone();
     tokio::task::spawn_blocking(move || {
-        create_segment(&abs_path, &hls_dir, seg_index, &hwaccel, quality)
+        create_segment(&abs_path, &hls_dir, seg_index, &hwaccel, quality, None)
+    })
+    .await
+    .map_err(|e| format!("transcode task panicked: {e}"))?
+}
+
+/// Like [`transcode_segment`] but accepts a shared kill flag.  When the flag
+/// is set to `true`, the in-progress I/O work bails out early so that
+/// background pre-caching yields CPU and disk to on-demand playback.
+pub async fn transcode_segment_with_kill(
+    abs_path: &str,
+    hls_dir: &Path,
+    seg_index: usize,
+    hwaccel: &HwAccel,
+    quality: super::transcode::Quality,
+    kill: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let filename = format!("seg_{:05}.ts", seg_index);
+    let seg_path = hls_dir.join(&filename);
+
+    if seg_path.exists() {
+        return Ok(());
+    }
+
+    let start_time = seg_index as f64 * SEGMENT_DURATION;
+    debug_assert!(start_time >= 0.0 && start_time.is_finite());
+
+    let abs_path = abs_path.to_owned();
+    let hls_dir = hls_dir.to_owned();
+    let hwaccel = hwaccel.clone();
+    tokio::task::spawn_blocking(move || {
+        create_segment(&abs_path, &hls_dir, seg_index, &hwaccel, quality, Some(&kill))
     })
     .await
     .map_err(|e| format!("transcode task panicked: {e}"))?
@@ -401,6 +434,7 @@ fn create_segment(
     seg_index: usize,
     hwaccel: &HwAccel,
     quality: Quality,
+    kill: Option<&AtomicBool>,
 ) -> Result<(), String> {
     super::ensure_init();
 
@@ -417,16 +451,16 @@ fn create_segment(
     // Decide: remux (fast copy) or transcode (re-encode).
     if quality.can_remux() && source_is_remuxable(&ictx) {
         // Pure remux — both video and audio packets copied directly.
-        remux_segment(&mut ictx, start_time, &tmp_path)?;
+        remux_segment(&mut ictx, start_time, &tmp_path, kill)?;
     } else if quality.can_remux() && video_is_remuxable(&ictx) {
         // Hybrid — video packets copied, audio transcoded to stereo AAC.
         // This handles multi-channel AAC, non-AAC/MP3 codecs, etc.
-        hybrid_segment(&mut ictx, start_time, &tmp_path)?;
+        hybrid_segment(&mut ictx, start_time, &tmp_path, kill)?;
     } else {
         // For Original quality with incompatible codecs, fall back to the
         // same settings as High (native resolution, best quality).
         let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
-        transcode_segment_inprocess(&mut ictx, start_time, hwaccel, effective_quality, &tmp_path)?;
+        transcode_segment_inprocess(&mut ictx, start_time, hwaccel, effective_quality, &tmp_path, kill)?;
     }
 
     // Atomic rename.
@@ -446,6 +480,7 @@ fn remux_segment(
     ictx: &mut ffmpeg_next::format::context::Input,
     start_time: f64,
     tmp_path: &Path,
+    kill: Option<&AtomicBool>,
 ) -> Result<(), String> {
     let end_time = start_time + SEGMENT_DURATION;
 
@@ -535,6 +570,12 @@ fn remux_segment(
     let mut audio_pts_offset: Option<i64> = None;
 
     for (stream, mut packet) in ictx.packets() {
+        if let Some(k) = kill {
+            if k.load(Ordering::Relaxed) {
+                let _ = std::fs::remove_file(tmp_path);
+                return Err("cancelled".into());
+            }
+        }
         let si = stream.index();
         let is_video = Some(si) == video_idx;
         let is_audio = Some(si) == audio_idx;
@@ -623,6 +664,7 @@ fn hybrid_segment(
     ictx: &mut ffmpeg_next::format::context::Input,
     start_time: f64,
     tmp_path: &Path,
+    kill: Option<&AtomicBool>,
 ) -> Result<(), String> {
     let end_time = start_time + SEGMENT_DURATION;
 
@@ -782,6 +824,12 @@ fn hybrid_segment(
     let audio_ts_offset = (start_time * audio_sample_rate as f64) as i64;
 
     for (stream, mut packet) in ictx.packets() {
+        if let Some(k) = kill {
+            if k.load(Ordering::Relaxed) {
+                let _ = std::fs::remove_file(tmp_path);
+                return Err("cancelled".into());
+            }
+        }
         let si = stream.index();
         let is_video = Some(si) == video_idx;
         let is_audio = Some(si) == audio_idx;
@@ -945,6 +993,7 @@ fn transcode_segment_inprocess(
     hwaccel: &HwAccel,
     quality: Quality,
     tmp_path: &Path,
+    kill: Option<&AtomicBool>,
 ) -> Result<(), String> {
     // Seek to the segment start position.
     let seek_ts = (start_time * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
@@ -1051,6 +1100,7 @@ fn transcode_segment_inprocess(
         quality,
         preset, crf,
         tmp_path,
+        kill,
     );
 
     unsafe {
@@ -1089,6 +1139,7 @@ fn transcode_segment_body(
     quality: Quality,
     preset: &str, crf: &str,
     tmp_path: &Path,
+    kill: Option<&AtomicBool>,
 ) -> Result<(), String> {
     // ── Video encoder setup ──────────────────────────────────────────────
     let video_encoder_codec = ffmpeg_next::encoder::find_by_name(encoder_name)
@@ -1273,6 +1324,12 @@ fn transcode_segment_body(
 
         for (pkt_stream, packet) in ictx.packets() {
             if done { break; }
+            if let Some(k) = kill {
+                if k.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(tmp_path);
+                    return Err("cancelled".into());
+                }
+            }
 
             if pkt_stream.index() == video_idx {
                 if video_decoder.send_packet(&packet).is_err() {
@@ -1499,7 +1556,7 @@ mod tests {
         assert!(!audio_is_remuxable(&ictx), "6ch audio should not be directly remuxable");
 
         let out = Path::new("/tmp/test_media/test_hybrid_6ch.ts");
-        hybrid_segment(&mut ictx, 0.0, out).expect("hybrid segment failed");
+        hybrid_segment(&mut ictx, 0.0, out, None).expect("hybrid segment failed");
         verify_segment(out, true);
     }
 
@@ -1511,7 +1568,7 @@ mod tests {
 
         let mut ictx = ffmpeg_next::format::input(&test_file).unwrap();
         let out = Path::new("/tmp/test_media/test_hybrid_6ch_seg1.ts");
-        hybrid_segment(&mut ictx, 6.0, out).expect("hybrid segment at t=6s failed");
+        hybrid_segment(&mut ictx, 6.0, out, None).expect("hybrid segment at t=6s failed");
         verify_segment(out, true);
     }
 
@@ -1525,7 +1582,7 @@ mod tests {
         assert!(source_is_remuxable(&ictx));
 
         let out = Path::new("/tmp/test_media/test_remux_stereo.ts");
-        remux_segment(&mut ictx, 0.0, out).expect("remux segment failed");
+        remux_segment(&mut ictx, 0.0, out, None).expect("remux segment failed");
         verify_segment(out, true);
     }
 
@@ -1551,7 +1608,7 @@ mod tests {
         assert!(!audio_is_remuxable(&ictx), "FLAC is not browser-remuxable");
 
         let out = Path::new("/tmp/test_media/test_hybrid_flac.ts");
-        hybrid_segment(&mut ictx, 0.0, out).expect("hybrid segment with FLAC failed");
+        hybrid_segment(&mut ictx, 0.0, out, None).expect("hybrid segment with FLAC failed");
         verify_segment(out, true);
     }
 

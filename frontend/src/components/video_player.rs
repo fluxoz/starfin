@@ -16,7 +16,7 @@ const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3
 // ── Seek-anchor constants ────────────────────────────────────────────────────
 // These must stay in sync with SEGMENT_DURATION, PRECACHE_SEGMENTS, and
 // SPARSE_CACHE_STRIDE in `src/main.rs`.
-const SEGMENT_DURATION_F: f64 = 6.0;
+const SEGMENT_DURATION_F: f64 = 10.0;
 const PRECACHE_SEGMENTS_F: f64 = 20.0;
 const SPARSE_CACHE_STRIDE_F: f64 = 3.0;
 
@@ -66,7 +66,7 @@ const CONTROLS_VICINITY_PX: f64 = 80.0;
 
 // ── MSE player constants ─────────────────────────────────────────────────────
 /// Target seconds of video to keep buffered ahead of the playback position.
-const MSE_TARGET_BUFFER_S: f64 = 30.0;
+const MSE_TARGET_BUFFER_S: f64 = 60.0;
 /// Seconds of back-buffer to retain behind the playback position when seeking.
 const MSE_BACK_BUFFER_S: f64 = 5.0;
 
@@ -214,7 +214,7 @@ fn parse_m3u8(text: &str, playlist_url: &str) -> Vec<SegmentInfo> {
 ///
 /// When all segments have been fed, signals end-of-stream on the MediaSource.
 fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) {
-    let seg_url = {
+    let (seg_url, seg_index) = {
         let mut borrow = state.borrow_mut();
         let mse = match borrow.as_mut() {
             Some(s) => s,
@@ -232,8 +232,9 @@ fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) 
             return;
         }
         let url = mse.segments[mse.next_seg].url.clone();
+        let idx = mse.next_seg;
         mse.is_appending = true;
-        url
+        (url, idx)
     };
 
     let state_clone = state.clone();
@@ -266,6 +267,12 @@ fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) 
                 None => return,
             }
         };
+
+        // Each fMP4 segment has its PTS rebased to start near zero, so we must
+        // tell the MSE SourceBuffer at which point in the media timeline to
+        // place the segment.  Without this, every segment overwrites the same
+        // 0-based range, producing the "stutter/reset every N seconds" symptom.
+        source_buffer.set_timestamp_offset(seg_index as f64 * SEGMENT_DURATION_F);
 
         // One-shot updateend listener: advance segment pointer and re-pump.
         let state_for_end = state_clone.clone();

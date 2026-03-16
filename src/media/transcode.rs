@@ -30,7 +30,7 @@ use std::sync::Arc;
 use super::hwaccel::HwAccel;
 
 /// Duration of each HLS segment in seconds.
-pub const SEGMENT_DURATION: f64 = 6.0;
+pub const SEGMENT_DURATION: f64 = 10.0;
 
 /// Error message returned when a background operation is cancelled by a kill
 /// flag (e.g. playback started while a background worker was running).
@@ -524,7 +524,7 @@ fn create_segment(
 
 /// Copy compressed packets from the source into an fMP4 segment without
 /// decoding or re-encoding.  This is the equivalent of
-/// `ffmpeg -ss <t> -i input -t 6 -c copy -f mp4 -movflags frag_keyframe+empty_moov+default_base_moof output.mp4`
+/// `ffmpeg -ss <t> -i input -t 10 -c copy -f mp4 -movflags frag_keyframe+empty_moov+default_base_moof output.mp4`
 /// and gives VLC-like performance.
 fn remux_segment(
     ictx: &mut ffmpeg_next::format::context::Input,

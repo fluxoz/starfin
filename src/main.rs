@@ -1858,18 +1858,19 @@ async fn progress_ws(
 
 /// Segment duration in seconds for on-demand HLS generation.
 /// Apple recommends 6 seconds; common range is 2–10 seconds.
-/// Jellyfin/Plex default to 6 second segments.
+/// 10 second segments reduce stitching overhead and MSE re-initialisation
+/// events compared to shorter segments.
 const SEGMENT_DURATION: f64 = media::transcode::SEGMENT_DURATION;
 
 /// Number of segments at the start of each video to pre-cache so that
 /// playback can begin immediately without waiting for on-demand transcoding.
-/// At 6 seconds per segment, 20 segments ≈ 2 minutes of video.
+/// At 10 seconds per segment, 20 segments ≈ 3 minutes of video.
 const PRECACHE_SEGMENTS: usize = 20;
 
 /// Stride for sparse seek-anchor caching beyond the initial dense pre-cache window.
 /// Every Nth segment index (where `idx % SPARSE_CACHE_STRIDE == 0`) will be
 /// pre-transcoded as a seek anchor across the full video duration.
-/// At 6 seconds per segment and a stride of 3, anchors are placed every 18 seconds.
+/// At 10 seconds per segment and a stride of 3, anchors are placed every 30 seconds.
 ///
 /// NOTE: This value must stay in sync with `SPARSE_CACHE_STRIDE_F` in
 /// `frontend/src/components/video_player.rs`.

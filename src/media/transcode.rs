@@ -722,7 +722,7 @@ fn remux_segment(
     // any non-zero return as an error.  Only negative values are real errors.
     let trailer_ret = unsafe { ffmpeg_next::ffi::av_write_trailer(octx.as_mut_ptr()) };
     if trailer_ret < 0 {
-        return Err(format!("write trailer: error code {trailer_ret}"));
+        return Err(format!("write trailer: {}", ffmpeg_next::Error::from(trailer_ret)));
     }
 
     Ok(())
@@ -1086,7 +1086,7 @@ fn hybrid_segment(
     // any non-zero return as an error.  Only negative values are real errors.
     let trailer_ret = unsafe { ffmpeg_next::ffi::av_write_trailer(octx.as_mut_ptr()) };
     if trailer_ret < 0 {
-        return Err(format!("write trailer: error code {trailer_ret}"));
+        return Err(format!("write trailer: {}", ffmpeg_next::Error::from(trailer_ret)));
     }
 
     Ok(())
@@ -1658,7 +1658,7 @@ fn transcode_segment_body(
         // any non-zero return as an error.  Only negative values are real errors.
         let trailer_ret = unsafe { ffmpeg_next::ffi::av_write_trailer(octx.as_mut_ptr()) };
         if trailer_ret < 0 {
-            return Err(format!("write trailer: error code {trailer_ret}"));
+            return Err(format!("write trailer: {}", ffmpeg_next::Error::from(trailer_ret)));
         }
     }
 

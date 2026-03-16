@@ -27,14 +27,14 @@ pub fn filters_bar(props: &Props) -> Html {
             let select: web_sys::HtmlSelectElement = e.target_unchecked_into();
             let v = select.value();
             let s = match v.as_str() {
-                "date_oldest"    => SortBy::DateAddedOldest,
-                "name_asc"       => SortBy::NameAsc,
-                "name_desc"      => SortBy::NameDesc,
-                "rating_highest" => SortBy::RatingHighest,
-                "favorites_first"=> SortBy::FavoritesFirst,
-                "year_newest"    => SortBy::YearNewest,
-                "year_oldest"    => SortBy::YearOldest,
-                _                => SortBy::DateAddedNewest,
+                "date_oldest"     => SortBy::DateAddedOldest,
+                "name_asc"        => SortBy::NameAsc,
+                "name_desc"       => SortBy::NameDesc,
+                "rating_highest"  => SortBy::RatingHighest,
+                "favorites_first" => SortBy::FavoritesFirst,
+                "year_newest"     => SortBy::YearNewest,
+                "year_oldest"     => SortBy::YearOldest,
+                _                 => SortBy::DateAddedNewest,
             };
             cb.emit(s);
         })

@@ -219,7 +219,7 @@ pub fn apply_filters(
                 return false;
             }
             // Minimum rating filter.
-            if meta_filter.min_rating > 0 && (e.rating.floor() as u8) < meta_filter.min_rating {
+            if meta_filter.min_rating > 0 && (e.rating.round() as u8) < meta_filter.min_rating {
                 return false;
             }
             // Tag substring filter.

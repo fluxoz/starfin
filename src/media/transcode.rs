@@ -40,6 +40,15 @@ pub const CANCELLED: &str = "cancelled";
 /// 256 kbps stereo AAC-LC is transparent quality for music and dialogue.
 const AAC_ENCODE_BITRATE: usize = 256_000;
 
+/// `AVCodecContext::flags` bit that instructs the encoder to store its
+/// configuration data (SPS/PPS for H.264, AudioSpecificConfig for AAC) in
+/// `extradata` rather than inlining it in every packet.  The MP4 container
+/// format sets `AVFMT_GLOBALHEADER`, which makes this flag mandatory for all
+/// encoders: without it the moov box is written without an `avcC`/`esds` atom
+/// and `av_write_trailer` fails when finalizing the last moof fragment.
+/// Value is `AV_CODEC_FLAG_GLOBAL_HEADER` = `1 << 22` from `libavcodec/codec.h`.
+const AV_CODEC_FLAG_GLOBAL_HEADER: i32 = 1 << 22;
+
 /// Create a single fMP4 segment — remux if possible, transcode otherwise.
 ///
 /// For **Original** quality with H.264 + stereo AAC/MP3 source, packets are
@@ -790,6 +799,10 @@ fn hybrid_segment(
                                 aac_enc.set_bit_rate(AAC_ENCODE_BITRATE);
                                 aac_enc.set_time_base(ffmpeg_next::Rational::new(1, dec.rate() as i32));
 
+                                // Required for fMP4: encoder must store AudioSpecificConfig
+                                // in extradata so the moov/esds box is populated correctly.
+                                unsafe { (*aac_enc.as_mut_ptr()).flags |= AV_CODEC_FLAG_GLOBAL_HEADER; }
+
                                 match aac_enc.open_as(aac) {
                                     Ok(opened) => {
                                         let mut out_aud_stream = octx.add_stream(aac)
@@ -1208,6 +1221,15 @@ fn transcode_segment_body(
             opts.set("level", if matches!(quality, Quality::Original | Quality::High) { "4.2" } else { "4.1" });
         }
 
+        // fMP4 (mp4 container) sets AVFMT_GLOBALHEADER which requires every
+        // encoder to store its configuration in extradata (SPS/PPS for H.264,
+        // AudioSpecificConfig for AAC) rather than inlining it in each packet.
+        // Without this flag, `avcodec_parameters_from_context` copies NULL
+        // extradata to the stream, the moov box is written without an avcC/esds
+        // atom, and av_write_trailer fails when it tries to finalize the moof
+        // fragment.
+        unsafe { (*enc.as_mut_ptr()).flags |= AV_CODEC_FLAG_GLOBAL_HEADER; }
+
         let mut video_encoder = enc.open_with(opts).map_err(|e| format!("open video encoder: {e}"))?;
 
         // ── Output muxer ─────────────────────────────────────────────────
@@ -1274,6 +1296,10 @@ fn transcode_segment_body(
                                     aac_enc.set_format(enc_format);
                                     aac_enc.set_bit_rate(AAC_ENCODE_BITRATE);
                                     aac_enc.set_time_base(ffmpeg_next::Rational::new(1, dec.rate() as i32));
+
+                                    // Required for fMP4: encoder must store AudioSpecificConfig
+                                    // in extradata so the moov/esds box is populated correctly.
+                                    unsafe { (*aac_enc.as_mut_ptr()).flags |= AV_CODEC_FLAG_GLOBAL_HEADER; }
 
                                     match aac_enc.open_as(aac) {
                                         Ok(opened) => {

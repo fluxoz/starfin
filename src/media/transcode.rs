@@ -555,8 +555,13 @@ fn remux_segment(
 
         if is_video {
             // Wait for the first keyframe at or after start_time.
+            // Only accept keyframes whose PTS is at or after the declared
+            // segment start so consecutive segments never share overlapping
+            // content.  Accepting a keyframe from *before* start_time would
+            // cause the player to replay already-seen frames at every segment
+            // boundary, producing the "stutter every 6 seconds" symptom.
             if !got_video_keyframe {
-                if !packet.is_key() || pts_secs < start_time - SEGMENT_DURATION {
+                if !packet.is_key() || pts_secs < start_time {
                     continue;
                 }
                 got_video_keyframe = true;
@@ -802,8 +807,11 @@ fn hybrid_segment(
 
         if is_video {
             // Wait for the first keyframe at or after start_time.
+            // See the same comment in remux_segment — accepting a keyframe
+            // from before start_time causes content overlap between segments
+            // and the resulting duplicate frames appear as stuttering.
             if !got_video_keyframe {
-                if !packet.is_key() || pts_secs < start_time - SEGMENT_DURATION {
+                if !packet.is_key() || pts_secs < start_time {
                     continue;
                 }
                 got_video_keyframe = true;

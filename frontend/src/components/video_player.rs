@@ -66,25 +66,34 @@ const CONTROL_HIDE_TIMEOUT_MS: f64 = 5000.0;
 const CONTROLS_VICINITY_PX: f64 = 80.0;
 
 // ── HLS.js configuration constants ───────────────────────────────────────────
-// These settings are optimized for VOD content with on-demand transcoding.
-// The timeouts and retry values are tuned for the latency introduced by
-// transcoding segments on the fly (similar to Jellyfin/Plex approach).
+// These settings are optimized for VOD content across all quality tiers —
+// both direct remux (Original) where segments are served near-instantly, and
+// transcoded tiers where segments are generated on-demand.  Buffer values are
+// sized generously so the player never starves regardless of bitrate.
 
 /// Maximum buffer length in seconds (forward buffer).
 ///
-/// Set to 30 seconds so HLS.js buffers several segments ahead of the playback
-/// position.  This is critical for smooth playback when segments are transcoded
-/// on-demand: each 6-second segment can take a few seconds to encode, so the
-/// player needs enough buffer runway to absorb that latency.  The
-/// `transcode_semaphore` in the backend already limits concurrent transcode
-/// operations, so a larger buffer won't overload the system on seek.
-const HLS_MAX_BUFFER_LENGTH: f64 = 30.0;
+/// Set to 60 seconds so HLS.js always has a comfortable runway of segments
+/// buffered ahead of the playback position.  For the Original (remux) quality
+/// level segments are served almost instantly (pure file I/O), so HLS.js can
+/// fill this buffer at network speed without any transcoding latency.  For
+/// transcoded tiers the backend semaphore limits concurrency, but a deeper
+/// buffer still helps absorb the variable encode latency per segment.  The
+/// larger value is particularly important for high-bitrate 4K remux content
+/// where each segment can be tens of megabytes.
+const HLS_MAX_BUFFER_LENGTH: f64 = 60.0;
 /// Maximum maximum buffer length in seconds (absolute cap).
 /// Set higher than maxBufferLength to allow the buffer to grow beyond the
 /// target when segments arrive quickly (e.g. served from cache).
-const HLS_MAX_MAX_BUFFER_LENGTH: f64 = 60.0;
-/// Maximum buffer size in bytes (60 MB)
-const HLS_MAX_BUFFER_SIZE: f64 = 60.0 * 1000.0 * 1000.0;
+const HLS_MAX_MAX_BUFFER_LENGTH: f64 = 120.0;
+/// Maximum buffer size in bytes (200 MB).
+///
+/// The previous 60 MB cap was insufficient for high-bitrate remux content:
+/// a single 6-second segment from a 4K source at ~80 Mbps is already ~60 MB,
+/// which left no room for additional segments in the buffer and could cause
+/// HLS.js to stall.  200 MB allows several segments to be buffered even for
+/// very high bitrate sources.
+const HLS_MAX_BUFFER_SIZE: f64 = 200.0 * 1000.0 * 1000.0;
 /// Back buffer length in seconds (for backward seeking without refetch)
 const HLS_BACK_BUFFER_LENGTH: f64 = 30.0;
 

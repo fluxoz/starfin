@@ -158,51 +158,106 @@ fn source_is_remuxable(ictx: &ffmpeg_next::format::context::Input) -> bool {
     video_is_remuxable(ictx) && audio_is_remuxable(ictx)
 }
 
-/// Get a valid channel layout for an audio frame.
+/// Returns true if the channel layout is fully usable for the resampler —
+/// meaning it passes `av_channel_layout_check` AND has a non-UNSPEC order.
 ///
-/// Many containers and decoders leave the channel layout unset even when the
-/// channel count is known.  `frame.channel_layout()` then returns an empty
-/// layout (0 channels) which the resampler and encoder reject.  This helper
-/// falls back to `ChannelLayout::default(channels)` when needed, giving the
-/// standard native-order layout for the frame's actual channel count.
-fn frame_channel_layout(frame: &ffmpeg_next::frame::Audio) -> ffmpeg_next::channel_layout::ChannelLayout {
-    let layout = frame.channel_layout();
-    if layout.channels() > 0 {
-        return layout;
+/// `av_channel_layout_check` returns 1 (valid) even for UNSPEC layouts when
+/// `nb_channels > 0`, because they describe a channel *count* even without
+/// positional labels.  However, SWR uses a poor generic mixing matrix for
+/// UNSPEC inputs (all channels weighted equally) rather than the proper
+/// 5.1→stereo downmix matrix.  More critically, some versions of
+/// `swr_alloc_set_opts2` internally convert UNSPEC→default_layout during
+/// `swr_init`; when the frame then arrives still UNSPEC, SWR's
+/// `av_channel_layout_compare` detects a mismatch and returns
+/// AVERROR_INPUT_CHANGED.  Requiring non-UNSPEC order in both the resampler
+/// config and the frame prevents this mismatch and enables proper mixing.
+#[inline]
+unsafe fn layout_is_fully_specified(raw: *const ffmpeg_next::ffi::AVFrame) -> bool {
+    use ffmpeg_next::ffi::AVChannelOrder;
+    unsafe {
+        let cl = &(*raw).ch_layout;
+        ffmpeg_next::ffi::av_channel_layout_check(cl) != 0
+            && cl.order != AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC
     }
-    // The frame data has channels but no layout metadata.  Use the channel
-    // count from the frame.  `Audio::channels()` reads from the high-level
-    // wrapper; if that also returns 0 (e.g. the wrapper reads from
-    // ch_layout.nb_channels before the layout is fully initialised), fall
-    // through to the raw AVFrame field.
+}
+
+/// Get a valid, non-UNSPEC channel layout for an audio frame.
+///
+/// On FFmpeg ≤6 (old bitflags API), an "empty" layout means `channels() == 0`.
+/// On FFmpeg 7+ (AVChannelLayout struct API), the decoder may set
+/// `ch_layout.nb_channels = N` but leave `ch_layout.order = UNSPEC`.
+/// Both cases need to be fixed — `av_channel_layout_check` alone is
+/// insufficient because it returns 1 (valid) for `{UNSPEC, nb_channels=N}`.
+fn frame_channel_layout(frame: &ffmpeg_next::frame::Audio) -> ffmpeg_next::channel_layout::ChannelLayout {
+    if unsafe { layout_is_fully_specified(frame.as_ptr()) } {
+        // Layout already has a proper NATIVE/CUSTOM/AMBISONIC order —
+        // return via the high-level wrapper (reads from the correct field
+        // for each FFmpeg API version).
+        return frame.channel_layout();
+    }
+
+    // Layout is UNSPEC, empty, or otherwise not fully specified.
+    // Derive a proper native-order layout from the best available channel count.
+    //
+    // With FFmpeg 7+ (ffmpeg_7_0 feature), channels() reads ch_layout.nb_channels
+    // which may be non-zero even when order == UNSPEC.
+    // With FFmpeg ≤6 (no ffmpeg_7_0), channels() reads the deprecated channels
+    // field which is set by the decoder even when ch_layout is not.
     let ch = frame.channels() as i32;
     let ch = if ch > 0 { ch } else {
-        // FFI fallback: read nb_channels directly from the raw AVFrame.
-        // This can differ from the wrapper when ch_layout.order is
-        // AV_CHANNEL_ORDER_UNSPEC but nb_channels is still set.
+        // Last resort: read nb_channels directly from the raw AVFrame struct.
         let raw_ch = unsafe { (*frame.as_ptr()).ch_layout.nb_channels };
-        if raw_ch > 0 { raw_ch } else {
-            // All detection methods failed — default to stereo as a safe
-            // baseline since virtually all media players handle stereo.
-            2
-        }
+        if raw_ch > 0 { raw_ch } else { 2 }
     };
+
     ffmpeg_next::channel_layout::ChannelLayout::default(ch)
 }
 
-/// Ensure the audio frame has a valid channel layout set.
+/// Ensure the audio frame has a valid, non-UNSPEC channel layout set.
+/// Works correctly on both FFmpeg ≤6 (old bitflags) and FFmpeg 7+
+/// (AVChannelLayout struct).
 ///
-/// Many containers and decoders leave the channel layout unset even when
-/// the channel count is known.  The resampler (`swr_convert_frame`) checks
-/// the frame's layout against its configured input and returns "Input
-/// changed" on mismatch.  By stamping a concrete layout (derived from the
-/// actual channel count) onto the frame before resampling, we prevent this.
+/// Scenarios that need fixing:
+///  • FFmpeg ≤6 decoders that only set the deprecated `channel_layout`
+///    bitflags and leave `ch_layout.order == UNSPEC, nb_channels == 0`.
+///  • FFmpeg 7/8 (Lavc62) decoders that set `ch_layout.nb_channels` but
+///    leave `ch_layout.order == UNSPEC`.  `av_channel_layout_check` returns
+///    1 (valid) for this case, but `swr_alloc_set_opts2` internally converts
+///    UNSPEC to a default layout; if the frame still has UNSPEC when
+///    `swr_convert_frame` is called, `av_channel_layout_compare` detects a
+///    mismatch and returns AVERROR_INPUT_CHANGED ("Input changed").
+///
+/// Writes a NATIVE-order layout to BOTH `ch_layout` (via
+/// `av_channel_layout_default`, checked by FFmpeg 7+ SWR) AND the deprecated
+/// `channel_layout` bitflags field (via `frame.set_channel_layout`, checked
+/// by FFmpeg ≤6 SWR), ensuring compatibility with every supported version.
 fn ensure_frame_channel_layout(frame: &mut ffmpeg_next::frame::Audio) {
-    let layout = frame.channel_layout();
-    if layout.channels() > 0 {
+    if unsafe { layout_is_fully_specified(frame.as_ptr()) } {
         return;
     }
-    let derived = frame_channel_layout(frame);
+
+    // Derive a proper layout from the best available channel count.
+    let ch = frame.channels() as i32;
+    let ch = if ch > 0 { ch } else {
+        let raw_ch = unsafe { (*frame.as_ptr()).ch_layout.nb_channels };
+        if raw_ch > 0 { raw_ch } else { 2 }
+    };
+
+    // 1. Write to ch_layout via av_channel_layout_default.  This sets
+    //    order = AV_CHANNEL_ORDER_NATIVE, nb_channels = ch, and the
+    //    appropriate channel bitmask.  This is what FFmpeg 7+ SWR checks.
+    unsafe {
+        ffmpeg_next::ffi::av_channel_layout_default(
+            &mut (*frame.as_mut_ptr()).ch_layout,
+            ch,
+        );
+    }
+
+    // 2. Also update via the high-level set_channel_layout wrapper.
+    //    On FFmpeg ≤6 this writes to the deprecated channel_layout bitflags
+    //    field (what the old SWR checks).  On FFmpeg 7+ it writes to ch_layout
+    //    again (redundant but harmless).
+    let derived = ffmpeg_next::channel_layout::ChannelLayout::default(ch);
     frame.set_channel_layout(derived);
 }
 
@@ -1498,5 +1553,58 @@ mod tests {
         let out = Path::new("/tmp/test_media/test_hybrid_flac.ts");
         hybrid_segment(&mut ictx, 0.0, out).expect("hybrid segment with FLAC failed");
         verify_segment(out, true);
+    }
+
+    /// Test that ensure_frame_channel_layout correctly handles a frame where
+    /// ch_layout.order == UNSPEC but ch_layout.nb_channels > 0.  This is the
+    /// exact scenario seen with Lavc62 (FFmpeg 8.x) encoded AAC files when
+    /// decoded on a system with the ffmpeg_7_0 feature active — `channels()`
+    /// returns 6 (from nb_channels) but the layout is still UNSPEC.
+    ///
+    /// Note: av_channel_layout_check returns 1 (valid) for UNSPEC with
+    /// nb_channels>0, because FFmpeg considers it sufficient to know the
+    /// channel count.  However, some versions of swr_alloc_set_opts2
+    /// internally convert UNSPEC to a default layout during swr_init; when
+    /// frames then arrive still UNSPEC, av_channel_layout_compare detects a
+    /// mismatch and returns AVERROR_INPUT_CHANGED.  Our fix explicitly upgrades
+    /// UNSPEC→NATIVE to prevent this and enable proper mixing matrices.
+    #[test]
+    fn test_ensure_frame_channel_layout_unspec_with_nb_channels() {
+        super::super::ensure_init();
+
+        // Build a minimal audio frame that has nb_channels=6 but order=UNSPEC.
+        let mut frame = ffmpeg_next::frame::Audio::empty();
+        unsafe {
+            use ffmpeg_next::ffi::*;
+            let raw = frame.as_mut_ptr();
+            (*raw).format = AVSampleFormat::AV_SAMPLE_FMT_FLTP as i32;
+            (*raw).sample_rate = 48000;
+            (*raw).nb_samples = 1024;
+            // Simulate Lavc62 style: UNSPEC order but nb_channels set.
+            (*raw).ch_layout.order = AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC;
+            (*raw).ch_layout.nb_channels = 6;
+            (*raw).ch_layout.u.mask = 0;
+            av_frame_get_buffer(raw, 0);
+        }
+
+        // Before fix: order should be UNSPEC (= 0).
+        let before_order = unsafe { (*frame.as_ptr()).ch_layout.order as u32 };
+        assert_eq!(before_order, 0, "order should be UNSPEC (0) before fix");
+
+        ensure_frame_channel_layout(&mut frame);
+
+        // After fix: order should be non-UNSPEC (NATIVE = 1 or similar).
+        let after_order = unsafe { (*frame.as_ptr()).ch_layout.order as u32 };
+        assert_ne!(after_order, 0, "order should be non-UNSPEC after fix");
+
+        // nb_channels should still be 6 (not collapsed to stereo).
+        let nb = unsafe { (*frame.as_ptr()).ch_layout.nb_channels };
+        assert_eq!(nb, 6, "nb_channels should remain 6 after fix");
+
+        // The layout should now pass av_channel_layout_check.
+        let check = unsafe {
+            ffmpeg_next::ffi::av_channel_layout_check(&(*frame.as_ptr()).ch_layout)
+        };
+        assert_ne!(check, 0, "layout should pass av_channel_layout_check after fix");
     }
 }

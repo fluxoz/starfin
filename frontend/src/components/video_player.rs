@@ -122,6 +122,17 @@ const HLS_NUDGE_OFFSET: f64 = 0.1;
 /// Maximum nudge retry count
 const HLS_NUDGE_MAX_RETRY: f64 = 5.0;
 
+/// Disable low-latency mode for VOD content.
+///
+/// HLS.js 1.x defaults `lowLatencyMode` to `true`, which enables LL-HLS
+/// features (partial segments, push, etc.).  Starfin serves standard VOD
+/// playlists without any LL-HLS extensions.  When `lowLatencyMode` is `true`
+/// HLS.js aggressively polls for non-existent partial segments and can issue
+/// many duplicate requests for the same segment — exactly the "zillion 200s"
+/// symptom reported in the playback regression.  Forcing this to `false`
+/// puts HLS.js into normal VOD mode and eliminates the duplicate fetches.
+const HLS_LOW_LATENCY_MODE: bool = false;
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn format_time(seconds: f64) -> String {
@@ -444,6 +455,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 
                 // Enable debug logs only in development
                 js_sys::Reflect::set(&config, &JsValue::from_str("debug"), &JsValue::from_bool(false)).ok();
+                
+                // Disable low-latency mode: Starfin serves standard VOD playlists without
+                // LL-HLS extensions.  The HLS.js 1.x default of true causes it to poll for
+                // partial segments that never exist, producing duplicate segment requests.
+                js_sys::Reflect::set(&config, &JsValue::from_str("lowLatencyMode"), &JsValue::from_bool(HLS_LOW_LATENCY_MODE)).ok();
                 
                 // Enable web worker for better UI responsiveness during seeking
                 js_sys::Reflect::set(&config, &JsValue::from_str("enableWorker"), &JsValue::from_bool(true)).ok();

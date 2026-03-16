@@ -232,7 +232,14 @@ pub fn multi_select(props: &Props) -> Html {
                                 onclick={toggle}
                             >
                                 <span class="multi-select__option-check" aria-hidden="true">
-                                    if is_sel { { "✓" } }
+                                    if is_sel {
+                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 8"
+                                            width="10" height="8" fill="none">
+                                            <path d="M1 4l3 3 5-6" stroke="currentColor"
+                                                stroke-width="1.5" stroke-linecap="round"
+                                                stroke-linejoin="round"/>
+                                        </svg>
+                                    }
                                 </span>
                                 { v }
                             </li>

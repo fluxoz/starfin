@@ -141,7 +141,12 @@ pub fn filters_bar(props: &Props) -> Html {
                     onclick={on_favorites_toggle}
                     title="Show favorites only"
                 >
-                    { "★ Favorites" }
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 15"
+                        width="12" height="12" fill="currentColor" aria-hidden="true"
+                        style="vertical-align: -1px; margin-right: 4px;">
+                        <path d="M8 0l2.2 4.6 5 .7-3.6 3.5.9 5L8 11.5l-4.5 2.3.9-5L.8 5.3l5-.7z"/>
+                    </svg>
+                    { "Favorites" }
                 </button>
 
                 <label class="field">

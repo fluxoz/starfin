@@ -162,12 +162,8 @@ pub async fn fetch_hwaccel() -> Result<HwAccelInfo, String> {
         .map_err(|e| format!("Invalid JSON: {e:?}"))
 }
 
-/// Fetch all videos from the API, then apply filtering and sorting locally.
-pub async fn fetch_elements(
-    query: &str,
-    sort_by: SortBy,
-    meta_filter: &MetadataFilter,
-) -> Result<Vec<Element>, String> {
+/// Fetch the raw (unfiltered) video list from the API.
+pub async fn fetch_all_videos() -> Result<Vec<Element>, String> {
     let resp = Request::get("/api/videos")
         .send()
         .await
@@ -182,7 +178,7 @@ pub async fn fetch_elements(
         .await
         .map_err(|e| format!("Invalid JSON: {e:?}"))?;
 
-    Ok(apply_filters(&parsed.items, query, sort_by, meta_filter))
+    Ok(parsed.items)
 }
 
 // ── Local filtering & sorting ────────────────────────────────────────────────
@@ -194,9 +190,6 @@ pub fn apply_filters(
     meta_filter: &MetadataFilter,
 ) -> Vec<Element> {
     let q = query.trim().to_lowercase();
-    let tag_q = meta_filter.tag.trim().to_lowercase();
-    let actor_q = meta_filter.actor.trim().to_lowercase();
-    let category_q = meta_filter.category.trim().to_lowercase();
 
     let mut result: Vec<Element> = data
         .iter()
@@ -222,21 +215,21 @@ pub fn apply_filters(
             if meta_filter.min_rating > 0 && (e.rating.round() as u8) < meta_filter.min_rating {
                 return false;
             }
-            // Tag substring filter.
-            if !tag_q.is_empty()
-                && !e.tags.iter().any(|t| t.to_lowercase().contains(&tag_q))
+            // Tag multi-select filter (OR): item must have at least one selected tag.
+            if !meta_filter.tag.is_empty()
+                && !meta_filter.tag.iter().any(|sel| e.tags.contains(sel))
             {
                 return false;
             }
-            // Actor substring filter.
-            if !actor_q.is_empty()
-                && !e.actors.iter().any(|a| a.to_lowercase().contains(&actor_q))
+            // Actor multi-select filter (OR): item must have at least one selected actor.
+            if !meta_filter.actor.is_empty()
+                && !meta_filter.actor.iter().any(|sel| e.actors.contains(sel))
             {
                 return false;
             }
-            // Category substring filter.
-            if !category_q.is_empty()
-                && !e.categories.iter().any(|c| c.to_lowercase().contains(&category_q))
+            // Category multi-select filter (OR): item must have at least one selected category.
+            if !meta_filter.category.is_empty()
+                && !meta_filter.category.iter().any(|sel| e.categories.contains(sel))
             {
                 return false;
             }

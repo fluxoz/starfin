@@ -527,6 +527,37 @@ body{
   box-shadow: 0 0 0 2px rgba(255,69,0,.2);
 }
 
+/* Multi-select listbox shown in the metadata filter row */
+.select--multi{
+  height: 80px;
+  padding: 4px 0;
+  overflow-y: auto;
+}
+.select--multi option{
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.select--multi option:checked{
+  background: var(--accent);
+  color: #fff;
+}
+
+/* Small badge showing count of selected options in multi-select label */
+.filter-badge{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+
 .chip{
   padding: 8px 12px;
   border-radius: var(--radius);

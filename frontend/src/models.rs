@@ -57,12 +57,13 @@ pub struct MetadataFilter {
     pub only_favorites: bool,
     /// Minimum star rating (0 = disabled, 1–5 = minimum stars required).
     pub min_rating: u8,
-    /// Substring to match against tags (empty = disabled).
-    pub tag: String,
-    /// Substring to match against actors (empty = disabled).
-    pub actor: String,
-    /// Substring to match against categories (empty = disabled).
-    pub category: String,
+    /// Selected tag values to filter by (empty = show all).  OR logic: item
+    /// must have at least one of the selected tags.
+    pub tag: Vec<String>,
+    /// Selected actor values to filter by (empty = show all).  OR logic.
+    pub actor: Vec<String>,
+    /// Selected category values to filter by (empty = show all).  OR logic.
+    pub category: Vec<String>,
 }
 
 impl MetadataFilter {

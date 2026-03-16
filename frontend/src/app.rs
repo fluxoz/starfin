@@ -112,6 +112,9 @@ fn app_inner() -> Html {
     let meta_filter_ref = use_mut_ref(MetadataFilter::default);
 
     let items = use_state(|| Vec::<Element>::new());
+    /// Unfiltered list of all items returned by the last API fetch.
+    /// Used to populate tag/actor/category dropdown options.
+    let raw_items = use_state(|| Vec::<Element>::new());
     let loading = use_state(|| false);
     let error = use_state(|| Option::<String>::None);
     let selected = use_state(|| Option::<Element>::None);
@@ -216,6 +219,7 @@ fn app_inner() -> Html {
         let meta_filter_ref = meta_filter_ref.clone();
 
         let items = items.clone();
+        let raw_items = raw_items.clone();
         let loading = loading.clone();
         let error = error.clone();
 
@@ -235,8 +239,12 @@ fn app_inner() -> Html {
                 error.set(None);
 
                 spawn_local(async move {
-                    match api::fetch_elements(&query, sort_by, &mf).await {
-                        Ok(data) => items.set(data),
+                    match api::fetch_all_videos().await {
+                        Ok(all) => {
+                            let filtered = api::apply_filters(&all, &query, sort_by, &mf);
+                            raw_items.set(all);
+                            items.set(filtered);
+                        }
                         Err(e) => error.set(Some(e)),
                     }
                     loading.set(false);
@@ -253,6 +261,7 @@ fn app_inner() -> Html {
         let sort_by_ref = sort_by_ref.clone();
         let meta_filter_ref = meta_filter_ref.clone();
         let items = items.clone();
+        let raw_items = raw_items.clone();
         let scanning = scanning.clone();
 
         use_effect_with((), move |_| {
@@ -278,9 +287,12 @@ fn app_inner() -> Html {
                 }
 
                 let items = items.clone();
+                let raw_items = raw_items.clone();
                 spawn_local(async move {
-                    if let Ok(data) = api::fetch_elements(&query, sort_by, &mf).await {
-                        items.set(data);
+                    if let Ok(all) = api::fetch_all_videos().await {
+                        let filtered = api::apply_filters(&all, &query, sort_by, &mf);
+                        raw_items.set(all);
+                        items.set(filtered);
                     }
                 });
             });
@@ -488,6 +500,7 @@ fn app_inner() -> Html {
     let on_scan = {
         let scanning = scanning.clone();
         let items = items.clone();
+        let raw_items = raw_items.clone();
         let query = query.clone();
         let sort_by = sort_by.clone();
         let meta_filter = meta_filter.clone();
@@ -498,6 +511,7 @@ fn app_inner() -> Html {
             }
             let scanning = scanning.clone();
             let items = items.clone();
+            let raw_items = raw_items.clone();
             let query = (*query).clone();
             let sort_by = (*sort_by).clone();
             let mf = (*meta_filter).clone();
@@ -521,9 +535,9 @@ fn app_inner() -> Html {
                 if let Ok(ws) = WebSocket::open(&ws_url) {
                     let (_, mut read) = ws.split();
 
-                    // Start from what is currently displayed so existing cards
-                    // are preserved while newly-scanned ones stream in.
-                    let mut accumulated: Vec<crate::models::Element> = (*items).clone();
+                    // Start from the full unfiltered list so that items
+                    // hidden by active filters are preserved.
+                    let mut accumulated: Vec<crate::models::Element> = (*raw_items).clone();
 
                     while let Some(Ok(Message::Text(text))) = read.next().await {
                         match serde_json::from_str::<api::ScanProgressData>(&text) {
@@ -536,6 +550,7 @@ fn app_inner() -> Html {
                                     } else {
                                         accumulated.push(new_item);
                                     }
+                                    raw_items.set(accumulated.clone());
                                     items.set(api::apply_filters(
                                         &accumulated,
                                         &query,
@@ -553,8 +568,10 @@ fn app_inner() -> Html {
                 }
 
                 // Final authoritative refresh once the scan is fully committed.
-                if let Ok(data) = api::fetch_elements(&query, sort_by, &mf).await {
-                    items.set(data);
+                if let Ok(all) = api::fetch_all_videos().await {
+                    let filtered = api::apply_filters(&all, &query, sort_by, &mf);
+                    raw_items.set(all);
+                    items.set(filtered);
                 }
                 scan_progress.set(None);
                 scanning.set(false);
@@ -563,6 +580,30 @@ fn app_inner() -> Html {
     };
 
     let app_class = if *dark_mode { "app dark-mode" } else { "app" };
+
+    // Derive the unique sorted tag/actor/category values from the full
+    // (unfiltered) library for populating the multi-select dropdowns.
+    let all_tags = {
+        let mut set = std::collections::BTreeSet::new();
+        for item in (*raw_items).iter() {
+            for t in &item.tags { set.insert(t.clone()); }
+        }
+        set.into_iter().collect::<Vec<_>>()
+    };
+    let all_actors = {
+        let mut set = std::collections::BTreeSet::new();
+        for item in (*raw_items).iter() {
+            for a in &item.actors { set.insert(a.clone()); }
+        }
+        set.into_iter().collect::<Vec<_>>()
+    };
+    let all_categories = {
+        let mut set = std::collections::BTreeSet::new();
+        for item in (*raw_items).iter() {
+            for c in &item.categories { set.insert(c.clone()); }
+        }
+        set.into_iter().collect::<Vec<_>>()
+    };
 
     // Compute progress percentage and label for the scan progress bar.
     let (scan_pct, scan_label) = match *scan_progress {
@@ -685,6 +726,9 @@ fn app_inner() -> Html {
                         query={(*query).clone()}
                         sort_by={(*sort_by).clone()}
                         meta_filter={(*meta_filter).clone()}
+                        all_tags={all_tags}
+                        all_actors={all_actors}
+                        all_categories={all_categories}
                         on_query_change={on_query_change}
                         on_sort_change={on_sort_change}
                         on_filter_change={on_filter_change}

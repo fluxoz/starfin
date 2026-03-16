@@ -1,4 +1,5 @@
 use crate::models::{MetadataFilter, SortBy};
+use wasm_bindgen::JsCast;
 use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
@@ -6,9 +7,29 @@ pub struct Props {
     pub query: String,
     pub sort_by: SortBy,
     pub meta_filter: MetadataFilter,
+    /// All unique tag values present in the library.
+    pub all_tags: Vec<String>,
+    /// All unique actor values present in the library.
+    pub all_actors: Vec<String>,
+    /// All unique category values present in the library.
+    pub all_categories: Vec<String>,
     pub on_query_change: Callback<String>,
     pub on_sort_change: Callback<SortBy>,
     pub on_filter_change: Callback<MetadataFilter>,
+}
+
+/// Read the currently selected values from a `<select multiple>` element.
+fn selected_options(select: &web_sys::HtmlSelectElement) -> Vec<String> {
+    let opts = select.selected_options();
+    let mut selected = Vec::new();
+    for i in 0..opts.length() {
+        if let Some(item) = opts.item(i) {
+            if let Ok(opt) = item.dyn_into::<web_sys::HtmlOptionElement>() {
+                selected.push(opt.value());
+            }
+        }
+    }
+    selected
 }
 
 #[function_component(FiltersBar)]
@@ -63,41 +84,66 @@ pub fn filters_bar(props: &Props) -> Html {
         })
     };
 
-    let on_tag_input = {
+    let on_tag_change = {
         let cb = props.on_filter_change.clone();
         let mf = props.meta_filter.clone();
-        Callback::from(move |e: InputEvent| {
-            let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+        Callback::from(move |e: Event| {
+            let select: web_sys::HtmlSelectElement = e.target_unchecked_into();
             let mut updated = mf.clone();
-            updated.tag = input.value();
+            updated.tag = selected_options(&select);
             cb.emit(updated);
         })
     };
 
-    let on_actor_input = {
+    let on_actor_change = {
         let cb = props.on_filter_change.clone();
         let mf = props.meta_filter.clone();
-        Callback::from(move |e: InputEvent| {
-            let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+        Callback::from(move |e: Event| {
+            let select: web_sys::HtmlSelectElement = e.target_unchecked_into();
             let mut updated = mf.clone();
-            updated.actor = input.value();
+            updated.actor = selected_options(&select);
             cb.emit(updated);
         })
     };
 
-    let on_category_input = {
+    let on_category_change = {
         let cb = props.on_filter_change.clone();
         let mf = props.meta_filter.clone();
-        Callback::from(move |e: InputEvent| {
-            let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+        Callback::from(move |e: Event| {
+            let select: web_sys::HtmlSelectElement = e.target_unchecked_into();
             let mut updated = mf.clone();
-            updated.category = input.value();
+            updated.category = selected_options(&select);
             cb.emit(updated);
         })
     };
 
     let fav_pressed = props.meta_filter.only_favorites.to_string();
     let min_rating_val = props.meta_filter.min_rating.to_string();
+
+    // Render a <select multiple> for a list of values.  Options that are
+    // currently selected in `active` are pre-marked as selected.
+    let render_multi = |values: &[String],
+                        active: &[String],
+                        onchange: Callback<Event>,
+                        placeholder: &'static str|
+     -> Html {
+        if values.is_empty() {
+            return html! {
+                <select class="select select--multi" disabled={true} onchange={onchange}>
+                    <option value="">{ placeholder }</option>
+                </select>
+            };
+        }
+        let options = values.iter().map(|v| {
+            let sel = active.contains(v);
+            html! { <option value={v.clone()} selected={sel}>{ v }</option> }
+        });
+        html! {
+            <select class="select select--multi" multiple={true} onchange={onchange}>
+                { for options }
+            </select>
+        }
+    };
 
     html! {
         <section class="filters">
@@ -153,36 +199,33 @@ pub fn filters_bar(props: &Props) -> Html {
                 </label>
 
                 <label class="field">
-                    <span class="field__label">{ "Tag" }</span>
-                    <input
-                        class="input"
-                        type="search"
-                        placeholder="Filter by tag…"
-                        value={props.meta_filter.tag.clone()}
-                        oninput={on_tag_input}
-                    />
+                    <span class="field__label">
+                        { "Tags" }
+                        if !props.meta_filter.tag.is_empty() {
+                            <span class="filter-badge">{ props.meta_filter.tag.len() }</span>
+                        }
+                    </span>
+                    { render_multi(&props.all_tags, &props.meta_filter.tag, on_tag_change, "No tags defined") }
                 </label>
 
                 <label class="field">
-                    <span class="field__label">{ "Actor" }</span>
-                    <input
-                        class="input"
-                        type="search"
-                        placeholder="Filter by actor…"
-                        value={props.meta_filter.actor.clone()}
-                        oninput={on_actor_input}
-                    />
+                    <span class="field__label">
+                        { "Actors" }
+                        if !props.meta_filter.actor.is_empty() {
+                            <span class="filter-badge">{ props.meta_filter.actor.len() }</span>
+                        }
+                    </span>
+                    { render_multi(&props.all_actors, &props.meta_filter.actor, on_actor_change, "No actors defined") }
                 </label>
 
                 <label class="field">
-                    <span class="field__label">{ "Category" }</span>
-                    <input
-                        class="input"
-                        type="search"
-                        placeholder="Filter by category…"
-                        value={props.meta_filter.category.clone()}
-                        oninput={on_category_input}
-                    />
+                    <span class="field__label">
+                        { "Categories" }
+                        if !props.meta_filter.category.is_empty() {
+                            <span class="filter-badge">{ props.meta_filter.category.len() }</span>
+                        }
+                    </span>
+                    { render_multi(&props.all_categories, &props.meta_filter.category, on_category_change, "No categories defined") }
                 </label>
             </div>
         </section>

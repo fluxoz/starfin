@@ -222,6 +222,7 @@ pub fn apply_filters(
 pub async fn update_metadata(
     video_id: &str,
     favorite: Option<bool>,
+    rating: Option<f64>,
     tags: Option<Vec<String>>,
     actors: Option<Vec<String>>,
     categories: Option<Vec<String>>,
@@ -229,6 +230,9 @@ pub async fn update_metadata(
     let mut body = serde_json::Map::new();
     if let Some(fav) = favorite {
         body.insert("favorite".into(), serde_json::Value::Bool(fav));
+    }
+    if let Some(r) = rating {
+        body.insert("rating".into(), serde_json::json!(r));
     }
     if let Some(t) = tags {
         body.insert("tags".into(), serde_json::json!(t));

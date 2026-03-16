@@ -16,6 +16,8 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
     let item = &props.item;
 
     let favorite = use_state(|| item.favorite);
+    // rating is stored as 0–5 integer steps (0 = unrated)
+    let rating = use_state(|| item.rating.clamp(0.0, 5.0).round() as u8);
     let tags = use_state(|| item.tags.clone());
     let actors = use_state(|| item.actors.clone());
     let categories = use_state(|| item.categories.clone());
@@ -32,6 +34,19 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
         let favorite = favorite.clone();
         Callback::from(move |_: MouseEvent| {
             favorite.set(!*favorite);
+        })
+    };
+
+    // ── Star rating ──────────────────────────────────────────────────────────
+    // Clicking a filled star again clears the rating; clicking an empty star sets it.
+    let on_set_rating = {
+        let rating = rating.clone();
+        Callback::from(move |stars: u8| {
+            if *rating == stars {
+                rating.set(0); // clear
+            } else {
+                rating.set(stars);
+            }
         })
     };
 
@@ -156,6 +171,7 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
     let on_save = {
         let video_id = item.id.clone();
         let favorite = favorite.clone();
+        let rating = rating.clone();
         let tags = tags.clone();
         let actors = actors.clone();
         let categories = categories.clone();
@@ -166,6 +182,7 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
             e.prevent_default();
             let video_id = video_id.clone();
             let fav = *favorite;
+            let stars = *rating;
             let t = (*tags).clone();
             let a = (*actors).clone();
             let c = (*categories).clone();
@@ -180,6 +197,7 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
                 match api::update_metadata(
                     &video_id,
                     Some(fav),
+                    Some(f64::from(stars)),
                     Some(t),
                     Some(a),
                     Some(c),
@@ -241,6 +259,8 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
         })
     };
 
+    let current_rating = *rating;
+
     html! {
         <div class="meta-backdrop" onclick={on_backdrop_click}>
             <div class="meta-modal">
@@ -277,6 +297,33 @@ pub fn media_edit_modal(props: &MediaEditModalProps) -> Html {
                             </svg>
                             { if *favorite { "FAVORITED" } else { "NOT FAVORITED" } }
                         </button>
+                    </div>
+
+                    // ── Star rating ──────────────────────────────────────
+                    <div class="meta-field">
+                        <label class="meta-field__label">{ "RATING" }</label>
+                        <div class="meta-rating" role="group" aria-label="Star rating">
+                            { for (1u8..=5).map(|star| {
+                                let cb = on_set_rating.clone();
+                                let filled = star <= current_rating;
+                                html! {
+                                    <button
+                                        type="button"
+                                        class={if filled { "meta-rating__star meta-rating__star--filled" } else { "meta-rating__star" }}
+                                        onclick={Callback::from(move |_: MouseEvent| cb.emit(star))}
+                                        aria-label={format!("{} star{}", star, if star == 1 { "" } else { "s" })}
+                                        aria-pressed={filled.to_string()}
+                                    >
+                                        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                            <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
+                                        </svg>
+                                    </button>
+                                }
+                            }) }
+                            if current_rating > 0 {
+                                <span class="meta-rating__label">{ format!("{}/5", current_rating) }</span>
+                            }
+                        </div>
                     </div>
 
                     // ── Tags ─────────────────────────────────────────────

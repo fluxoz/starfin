@@ -1183,6 +1183,7 @@ fn merge_user_metadata(items: &mut [VideoItem], previous: &[VideoItem]) {
     for item in items.iter_mut() {
         if let Some(prev) = prev_map.get(item.id.as_str()) {
             item.favorite = prev.favorite;
+            item.rating = prev.rating;
             item.tags.clone_from(&prev.tags);
             item.actors.clone_from(&prev.actors);
             item.categories.clone_from(&prev.categories);
@@ -1214,6 +1215,8 @@ struct UpdateMetadataRequest {
     #[serde(default)]
     favorite: Option<bool>,
     #[serde(default)]
+    rating: Option<f64>,
+    #[serde(default)]
     tags: Option<Vec<String>>,
     #[serde(default)]
     actors: Option<Vec<String>>,
@@ -1236,6 +1239,9 @@ async fn update_metadata(
 
     if let Some(fav) = body.favorite {
         item.favorite = fav;
+    }
+    if let Some(r) = body.rating {
+        item.rating = r.clamp(0.0, 5.0);
     }
     if let Some(ref tags) = body.tags {
         item.tags = tags.clone();

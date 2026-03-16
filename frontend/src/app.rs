@@ -392,19 +392,41 @@ fn app_inner() -> Html {
             let new_fav = !item.favorite;
             let vid = item.id.clone();
             let items = items.clone();
+
+            // Optimistic update: flip immediately so the UI feels instant.
+            {
+                let mut list = (*items).clone();
+                if let Some(pos) = list.iter().position(|e| e.id == vid) {
+                    list[pos].favorite = new_fav;
+                }
+                items.set(list);
+            }
+
             spawn_local(async move {
-                if let Ok(updated) = api::update_metadata(
+                match api::update_metadata(
                     &vid,
                     Some(new_fav),
                     None,
                     None,
                     None,
+                    None,
                 ).await {
-                    let mut list = (*items).clone();
-                    if let Some(pos) = list.iter().position(|e| e.id == updated.id) {
-                        list[pos] = updated;
+                    Ok(updated) => {
+                        // Reconcile with the server response.
+                        let mut list = (*items).clone();
+                        if let Some(pos) = list.iter().position(|e| e.id == updated.id) {
+                            list[pos] = updated;
+                        }
+                        items.set(list);
                     }
-                    items.set(list);
+                    Err(_) => {
+                        // Roll back the optimistic update on error.
+                        let mut list = (*items).clone();
+                        if let Some(pos) = list.iter().position(|e| e.id == vid) {
+                            list[pos].favorite = !new_fav;
+                        }
+                        items.set(list);
+                    }
                 }
             });
         })

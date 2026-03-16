@@ -855,12 +855,25 @@ body{
   align-items: center;
 }
 
+/* Right group inside the footer: rating + watch button */
+.card__footer-right{
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
 /* ── Thumbnail wrapper with favorite overlay ─────────────────────────────── */
 .card__thumb-wrap{
   position: relative;
 }
 
 /* ── Favorite heart button on card ───────────────────────────────────────── */
+@keyframes fav-pop{
+  0%{ transform: scale(1); }
+  40%{ transform: scale(1.4); }
+  70%{ transform: scale(.9); }
+  100%{ transform: scale(1); }
+}
 .card__fav{
   position: absolute;
   top: 8px;
@@ -875,25 +888,33 @@ body{
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: background .15s, transform .15s;
+  transition: background .12s;
   padding: 0;
 }
 .card__fav:hover{
   background: rgba(0,0,0,.65);
-  transform: scale(1.1);
 }
 .card__fav-icon{
   width: 18px;
   height: 18px;
   fill: rgba(255,255,255,.7);
   stroke: none;
-  transition: fill .15s;
+  transition: fill .12s, transform .12s;
 }
 .card__fav--active .card__fav-icon{
   fill: #ff2d55;
+  animation: fav-pop .32s ease;
 }
 
 /* ── Metadata edit modal ─────────────────────────────────────────────────── */
+@keyframes meta-backdrop-in{
+  from{ opacity: 0; }
+  to{ opacity: 1; }
+}
+@keyframes meta-modal-in{
+  from{ opacity: 0; transform: scale(.96) translateY(-10px); }
+  to{ opacity: 1; transform: scale(1) translateY(0); }
+}
 .meta-backdrop{
   position: fixed;
   inset: 0;
@@ -904,6 +925,7 @@ body{
   background: rgba(0,0,0,.35);
   backdrop-filter: blur(24px);
   -webkit-backdrop-filter: blur(24px);
+  animation: meta-backdrop-in .18s ease;
 }
 .meta-modal{
   background: var(--bg, #c8bfb0);
@@ -916,6 +938,7 @@ body{
   overflow-y: auto;
   font-family: var(--font-body);
   box-shadow: 0 8px 32px rgba(0,0,0,.4);
+  animation: meta-modal-in .18s ease;
 }
 .meta-modal__header{
   display: flex;
@@ -1087,6 +1110,43 @@ body{
   width: 16px;
   height: 16px;
   fill: currentColor;
+}
+
+/* ── Star rating widget ──────────────────────────────────────────────────── */
+.meta-rating{
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.meta-rating__star{
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px;
+  color: var(--muted);
+  line-height: 1;
+  transition: color .12s, transform .12s;
+}
+.meta-rating__star svg{
+  width: 22px;
+  height: 22px;
+  fill: currentColor;
+  stroke: none;
+  display: block;
+}
+.meta-rating__star:hover{
+  color: #f5c518;
+  transform: scale(1.15);
+}
+.meta-rating__star--filled{
+  color: #f5c518;
+}
+.meta-rating__label{
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  margin-left: 4px;
+  letter-spacing: 1px;
 }
 
 /* ── Modal save button ───────────────────────────────────────────────────── */

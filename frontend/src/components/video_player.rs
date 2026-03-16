@@ -148,6 +148,12 @@ struct MseState {
     next_seg: usize,
     /// True while `SourceBuffer.appendBuffer` is in progress.
     is_appending: bool,
+    /// Monotonically increasing counter incremented on every seek to
+    /// unbuffered territory.  Stale `updateend` callbacks compare their
+    /// captured generation against the current value and discard the
+    /// append result when they differ, preventing wrong-segment appends
+    /// during rapid seeks (§11.6).
+    generation: u32,
 }
 
 /// Resolve a relative segment path against the playlist URL.
@@ -205,6 +211,11 @@ fn parse_m3u8(text: &str, playlist_url: &str) -> Vec<SegmentInfo> {
     segments
 }
 
+/// Maximum number of retry attempts for a failed segment fetch (§11.7).
+const SEGMENT_FETCH_MAX_RETRIES: u32 = 3;
+/// Initial retry delay in milliseconds; doubled on each subsequent attempt.
+const SEGMENT_FETCH_RETRY_BASE_MS: u32 = 500;
+
 /// Pump the next HLS segment into the MSE SourceBuffer.
 ///
 /// Returns immediately if:
@@ -213,8 +224,16 @@ fn parse_m3u8(text: &str, playlist_url: &str) -> Vec<SegmentInfo> {
 /// - the forward buffer already exceeds `MSE_TARGET_BUFFER_S`.
 ///
 /// When all segments have been fed, signals end-of-stream on the MediaSource.
+///
+/// The function captures the current `generation` before starting the async
+/// fetch.  If a seek occurs while the fetch is in-flight the generation will
+/// have been incremented, and the stale response is discarded instead of
+/// appended to the SourceBuffer (§11.6).
+///
+/// On fetch failure the request is retried up to `SEGMENT_FETCH_MAX_RETRIES`
+/// times with exponential back-off (§11.7).
 fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) {
-    let seg_url = {
+    let (seg_url, pump_gen) = {
         let mut borrow = state.borrow_mut();
         let mse = match borrow.as_mut() {
             Some(s) => s,
@@ -233,31 +252,64 @@ fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) 
         }
         let url = mse.segments[mse.next_seg].url.clone();
         mse.is_appending = true;
-        url
+        (url, mse.generation)
     };
 
     let state_clone = state.clone();
     let video_clone = video.clone();
     spawn_local(async move {
-        let bytes = match Request::get(&seg_url).send().await {
-            Ok(r) => match r.binary().await {
-                Ok(b) => b,
-                Err(e) => {
-                    log::error!("Failed to read segment bytes: {e:?}");
-                    if let Some(s) = state_clone.borrow_mut().as_mut() {
-                        s.is_appending = false;
+        // Fetch with retry (§11.7).
+        let mut bytes_opt: Option<Vec<u8>> = None;
+        for attempt in 0..=SEGMENT_FETCH_MAX_RETRIES {
+            match Request::get(&seg_url).send().await {
+                Ok(r) => match r.binary().await {
+                    Ok(b) => {
+                        bytes_opt = Some(b);
+                        break;
                     }
-                    return;
+                    Err(e) => {
+                        log::warn!("Segment read error (attempt {}): {e:?}", attempt + 1);
+                    }
+                },
+                Err(e) => {
+                    log::warn!("Segment fetch error (attempt {}): {e:?}", attempt + 1);
                 }
-            },
-            Err(e) => {
-                log::error!("Failed to fetch segment: {e:?}");
+            }
+            if attempt < SEGMENT_FETCH_MAX_RETRIES {
+                let delay = SEGMENT_FETCH_RETRY_BASE_MS * (1 << attempt);
+                TimeoutFuture::new(delay).await;
+            }
+        }
+
+        let bytes = match bytes_opt {
+            Some(b) => b,
+            None => {
+                log::error!("Failed to fetch segment after {} retries: {seg_url}", SEGMENT_FETCH_MAX_RETRIES + 1);
                 if let Some(s) = state_clone.borrow_mut().as_mut() {
                     s.is_appending = false;
                 }
                 return;
             }
         };
+
+        // Check generation — discard stale result if a seek occurred (§11.6).
+        {
+            let borrow = state_clone.borrow();
+            match borrow.as_ref() {
+                Some(s) if s.generation != pump_gen => {
+                    // A seek happened while we were fetching; drop this response.
+                    drop(borrow);
+                    if let Some(s) = state_clone.borrow_mut().as_mut() {
+                        s.is_appending = false;
+                    }
+                    // Re-pump with the new generation's segment pointer.
+                    pump_segments(state_clone, video_clone);
+                    return;
+                }
+                None => return,
+                _ => {}
+            }
+        }
 
         let source_buffer = {
             let borrow = state_clone.borrow();
@@ -268,12 +320,20 @@ fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) 
         };
 
         // One-shot updateend listener: advance segment pointer and re-pump.
+        // Captures the generation so stale callbacks are ignored (§11.2/§11.6).
         let state_for_end = state_clone.clone();
         let video_for_end = video_clone.clone();
         let updateend_cb = Closure::once(Box::new(move || {
             {
                 let mut borrow = state_for_end.borrow_mut();
                 if let Some(s) = borrow.as_mut() {
+                    // Discard if a seek has since invalidated this append.
+                    if s.generation != pump_gen {
+                        s.is_appending = false;
+                        drop(borrow);
+                        pump_segments(state_for_end, video_for_end);
+                        return;
+                    }
                     s.is_appending = false;
                     s.next_seg += 1;
                 }
@@ -379,8 +439,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // Thumbnail sprite info
     let thumbnail_info = use_state(|| Option::<ThumbnailInfo>::None);
 
-    // Double-tap tracking for mobile
-    let last_tap_time = use_state(|| 0.0_f64);
+    // Double-tap tracking for mobile (§11.5 — Option<f64> instead of sentinel 0.0)
+    let last_tap_time = use_state(|| Option::<f64>::None);
     let last_tap_x = use_state(|| 0.0_f64);
 
     // Skip indicator state
@@ -612,6 +672,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             segments,
                             next_seg: start_seg,
                             is_appending: false,
+                            generation: 0,
                         });
 
                         status.set(String::new());
@@ -765,10 +826,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         return;
                     }
 
-                    // Seeking to unbuffered territory — reset segment pointer and re-pump.
+                    // Seeking to unbuffered territory — increment the generation
+                    // counter to invalidate any in-flight fetches from the previous
+                    // position, then reset the segment pointer and re-pump (§11.6).
                     {
                         let mut borrow = mse_state_for_seeked.borrow_mut();
                         if let Some(mse) = borrow.as_mut() {
+                            mse.generation = mse.generation.wrapping_add(1);
                             if !mse.source_buffer.updating() {
                                 let remove_end = (current_time - MSE_BACK_BUFFER_S).max(0.0);
                                 if remove_end > 0.0 {
@@ -831,6 +895,38 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 move || drop(interval)
             },
         );
+    }
+
+    // Track fullscreen changes via the document event so that pressing Esc
+    // (which exits fullscreen without going through our toggle handler)
+    // correctly updates `is_fullscreen` (§11.3).
+    {
+        let is_fullscreen = is_fullscreen.clone();
+
+        use_effect_with((), move |_| {
+            let is_fullscreen = is_fullscreen.clone();
+            let closure = Closure::<dyn Fn()>::new(move || {
+                let doc = web_sys::window().unwrap().document().unwrap();
+                is_fullscreen.set(doc.fullscreen_element().is_some());
+            });
+
+            if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                let _ = doc.add_event_listener_with_callback(
+                    "fullscreenchange",
+                    closure.as_ref().unchecked_ref(),
+                );
+            }
+
+            move || {
+                if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                    let _ = doc.remove_event_listener_with_callback(
+                        "fullscreenchange",
+                        closure.as_ref().unchecked_ref(),
+                    );
+                }
+                drop(closure);
+            }
+        });
     }
 
     // Keyboard shortcuts
@@ -1457,8 +1553,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let now = js_sys::Date::now();
             let x = e.client_x() as f64;
 
-            // Check for double-tap (within 300ms and same general area)
-            if now - *last_tap_time < 300.0 {
+            // Check for double-tap (within 300ms) (§11.5 — Option-based sentinel)
+            let is_double_tap = matches!(*last_tap_time, Some(prev) if now - prev < 300.0);
+
+            if is_double_tap {
                 // Double tap detected - check which side
                 if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
                     let rect = video.get_bounding_client_rect();
@@ -1489,10 +1587,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         });
                     }
                 }
-                last_tap_time.set(0.0);
+                last_tap_time.set(None);
             } else {
                 // Single tap - store time and position for potential double tap
-                last_tap_time.set(now);
+                last_tap_time.set(Some(now));
                 last_tap_x.set(x);
 
                 // Delayed play/pause (will be cancelled if double tap occurs)
@@ -1500,8 +1598,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 let last_tap_time = last_tap_time.clone();
                 spawn_local(async move {
                     TimeoutFuture::new(300).await;
-                    // Only trigger if no second tap occurred
-                    if *last_tap_time != 0.0 {
+                    // Only trigger if no second tap occurred (§11.5)
+                    if last_tap_time.is_some() {
                         if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
                             if video.paused() {
                                 let _ = video.play();
@@ -1539,7 +1637,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
-    // Caption track selection
+    // Caption track selection (§11.4 — remove old <track> elements instead of
+    // accumulating hidden ones)
     let on_caption_select = {
         let video_ref = video_ref.clone();
         let active_subtitle = active_subtitle.clone();
@@ -1549,31 +1648,33 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             captions_menu_open.set(false);
             active_subtitle.set(track_index);
             
-            // Add or remove text track from video element
             if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-                // Remove all existing text tracks
-                let text_tracks = video.text_tracks();
-                if let Some(tracks) = text_tracks {
-                    for i in 0..tracks.length() {
-                        if let Some(track) = tracks.get(i) {
-                            // Hide all tracks
-                            track.set_mode(web_sys::TextTrackMode::Hidden);
+                // Remove all existing <track> child elements to avoid
+                // accumulating hidden tracks on repeated selections.
+                let children = video.children();
+                let mut to_remove = Vec::new();
+                for i in 0..children.length() {
+                    if let Some(child) = children.item(i) {
+                        if child.tag_name().eq_ignore_ascii_case("TRACK") {
+                            to_remove.push(child);
                         }
                     }
                 }
+                for el in to_remove {
+                    video.remove_child(&el).ok();
+                }
                 
                 if let Some(index) = track_index {
-                    // Create a track element and add it
+                    // Create a single new <track> element.
                     let doc = web_sys::window().unwrap().document().unwrap();
                     if let Ok(track_el) = doc.create_element("track") {
                         track_el.set_attribute("kind", "captions").ok();
                         track_el.set_attribute("src", &format!("/api/videos/{}/subtitles/{}.vtt", video_id, index)).ok();
                         track_el.set_attribute("default", "").ok();
                         
-                        // Append to video element
                         video.append_child(&track_el).ok();
                         
-                        // Enable the track after appending
+                        // Enable the newly added track.
                         let text_tracks = video.text_tracks();
                         if let Some(tracks) = text_tracks {
                             if let Some(track) = tracks.get(tracks.length() - 1) {

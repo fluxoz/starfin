@@ -1,5 +1,5 @@
+use crate::components::multi_select::MultiSelect;
 use crate::models::{MetadataFilter, SortBy};
-use wasm_bindgen::JsCast;
 use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
@@ -16,20 +16,6 @@ pub struct Props {
     pub on_query_change: Callback<String>,
     pub on_sort_change: Callback<SortBy>,
     pub on_filter_change: Callback<MetadataFilter>,
-}
-
-/// Read the currently selected values from a `<select multiple>` element.
-fn selected_options(select: &web_sys::HtmlSelectElement) -> Vec<String> {
-    let opts = select.selected_options();
-    let mut selected = Vec::new();
-    for i in 0..opts.length() {
-        if let Some(item) = opts.item(i) {
-            if let Ok(opt) = item.dyn_into::<web_sys::HtmlOptionElement>() {
-                selected.push(opt.value());
-            }
-        }
-    }
-    selected
 }
 
 #[function_component(FiltersBar)]
@@ -87,10 +73,9 @@ pub fn filters_bar(props: &Props) -> Html {
     let on_tag_change = {
         let cb = props.on_filter_change.clone();
         let mf = props.meta_filter.clone();
-        Callback::from(move |e: Event| {
-            let select: web_sys::HtmlSelectElement = e.target_unchecked_into();
+        Callback::from(move |vals: Vec<String>| {
             let mut updated = mf.clone();
-            updated.tag = selected_options(&select);
+            updated.tag = vals;
             cb.emit(updated);
         })
     };
@@ -98,10 +83,9 @@ pub fn filters_bar(props: &Props) -> Html {
     let on_actor_change = {
         let cb = props.on_filter_change.clone();
         let mf = props.meta_filter.clone();
-        Callback::from(move |e: Event| {
-            let select: web_sys::HtmlSelectElement = e.target_unchecked_into();
+        Callback::from(move |vals: Vec<String>| {
             let mut updated = mf.clone();
-            updated.actor = selected_options(&select);
+            updated.actor = vals;
             cb.emit(updated);
         })
     };
@@ -109,41 +93,15 @@ pub fn filters_bar(props: &Props) -> Html {
     let on_category_change = {
         let cb = props.on_filter_change.clone();
         let mf = props.meta_filter.clone();
-        Callback::from(move |e: Event| {
-            let select: web_sys::HtmlSelectElement = e.target_unchecked_into();
+        Callback::from(move |vals: Vec<String>| {
             let mut updated = mf.clone();
-            updated.category = selected_options(&select);
+            updated.category = vals;
             cb.emit(updated);
         })
     };
 
     let fav_pressed = props.meta_filter.only_favorites.to_string();
     let min_rating_val = props.meta_filter.min_rating.to_string();
-
-    // Render a <select multiple> for a list of values.  Options that are
-    // currently selected in `active` are pre-marked as selected.
-    let render_multi = |values: &[String],
-                        active: &[String],
-                        onchange: Callback<Event>,
-                        placeholder: &'static str|
-     -> Html {
-        if values.is_empty() {
-            return html! {
-                <select class="select select--multi" disabled={true} onchange={onchange}>
-                    <option value="">{ placeholder }</option>
-                </select>
-            };
-        }
-        let options = values.iter().map(|v| {
-            let sel = active.contains(v);
-            html! { <option value={v.clone()} selected={sel}>{ v }</option> }
-        });
-        html! {
-            <select class="select select--multi" multiple={true} onchange={onchange}>
-                { for options }
-            </select>
-        }
-    };
 
     html! {
         <section class="filters">
@@ -199,35 +157,39 @@ pub fn filters_bar(props: &Props) -> Html {
                 </label>
 
                 <label class="field">
-                    <span class="field__label">
-                        { "Tags" }
-                        if !props.meta_filter.tag.is_empty() {
-                            <span class="filter-badge">{ props.meta_filter.tag.len() }</span>
-                        }
-                    </span>
-                    { render_multi(&props.all_tags, &props.meta_filter.tag, on_tag_change, "No tags defined") }
+                    <span class="field__label">{ "Tags" }</span>
+                    <MultiSelect
+                        values={props.all_tags.clone()}
+                        selected={props.meta_filter.tag.clone()}
+                        onchange={on_tag_change}
+                        placeholder="No tags defined"
+                        label="Filter by tags"
+                    />
                 </label>
 
                 <label class="field">
-                    <span class="field__label">
-                        { "Actors" }
-                        if !props.meta_filter.actor.is_empty() {
-                            <span class="filter-badge">{ props.meta_filter.actor.len() }</span>
-                        }
-                    </span>
-                    { render_multi(&props.all_actors, &props.meta_filter.actor, on_actor_change, "No actors defined") }
+                    <span class="field__label">{ "Actors" }</span>
+                    <MultiSelect
+                        values={props.all_actors.clone()}
+                        selected={props.meta_filter.actor.clone()}
+                        onchange={on_actor_change}
+                        placeholder="No actors defined"
+                        label="Filter by actors"
+                    />
                 </label>
 
                 <label class="field">
-                    <span class="field__label">
-                        { "Categories" }
-                        if !props.meta_filter.category.is_empty() {
-                            <span class="filter-badge">{ props.meta_filter.category.len() }</span>
-                        }
-                    </span>
-                    { render_multi(&props.all_categories, &props.meta_filter.category, on_category_change, "No categories defined") }
+                    <span class="field__label">{ "Categories" }</span>
+                    <MultiSelect
+                        values={props.all_categories.clone()}
+                        selected={props.meta_filter.category.clone()}
+                        onchange={on_category_change}
+                        placeholder="No categories defined"
+                        label="Filter by categories"
+                    />
                 </label>
             </div>
         </section>
     }
 }
+

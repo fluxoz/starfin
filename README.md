@@ -92,10 +92,217 @@ The server starts at **`http://127.0.0.1:8089`** by default.
 | `VIDEO_LIBRARY_PATH` | `./test_videos` | Path to your video library directory |
 | `CACHE_DIR` | `./starfin_cache` | Directory used to store thumbnails and sprite sheet cache |
 | `PASSWORD_PROTECTION` | *(unset)* | Set to `true` to enable password protection. A login modal will gate access to the library |
+| `THEME` | `jetson` | Built-in color theme preset: `jetson`, `nord`, `catppuccin`, or `dracula` |
+| `THEME_FILE` | *(unset)* | Path to a custom TOML theme file (overrides `THEME` if both are set) |
+| `DESIGN` | `editorial` | Built-in UX design preset: `editorial`, `neubrutalist`, or `aero` |
 
 **Example:**
 ```bash
-PORT=8080 BIND_ADDR=0.0.0.0 VIDEO_LIBRARY_PATH=/media/videos CACHE_DIR=/var/cache/starfin cargo run --release
+PORT=8080 BIND_ADDR=0.0.0.0 VIDEO_LIBRARY_PATH=/media/videos CACHE_DIR=/var/cache/starfin \
+  THEME=nord DESIGN=neubrutalist cargo run --release
+```
+
+---
+
+## Theming & Design
+
+Starfin has a two-layer appearance system:
+
+- **Color theme** — controls the palette (backgrounds, text, accents, borders).
+- **UX design** — controls typography, geometry, and visual effects (fonts, border radius, shadows, letter-spacing).
+
+The two layers are independent and fully composable. For example you can pair the **Nord** color theme with the **Aero** glass-morphism design, or write a completely custom theme TOML and use it with any built-in design preset.
+
+### Built-in color themes
+
+| Name | Description |
+|---|---|
+| `jetson` *(default)* | Warm beige with burnt-orange accents |
+| `nord` | Cool arctic palette (Nord color scheme) |
+| `catppuccin` | Soothing pastels — Catppuccin Latte (light) / Mocha (dark) |
+| `dracula` | Purple/pink dark-first palette |
+
+Select a preset with the `THEME` environment variable:
+
+```bash
+THEME=nord ./starfin-backend
+THEME=catppuccin ./starfin-backend
+THEME=dracula ./starfin-backend
+```
+
+### Built-in UX designs
+
+| Name | Description |
+|---|---|
+| `editorial` *(default)* | Monospace font, uppercase headings, thick borders — a technical/editorial look |
+| `neubrutalist` | System sans-serif font, zero border-radius, hard drop-shadows |
+| `aero` | Glass morphism — rounded corners, `backdrop-filter` blur, translucent surfaces (Y2K aesthetic) |
+
+Aliases: `brutalist` → `neubrutalist`; `glass` or `y2k` → `aero`.
+
+Select a preset with the `DESIGN` environment variable:
+
+```bash
+DESIGN=neubrutalist ./starfin-backend
+DESIGN=aero ./starfin-backend
+```
+
+Combine theme and design freely:
+
+```bash
+THEME=nord DESIGN=aero ./starfin-backend
+THEME=catppuccin DESIGN=neubrutalist ./starfin-backend
+```
+
+### Custom TOML themes
+
+For full control, create a TOML file and point `THEME_FILE` at it. `THEME_FILE` takes precedence over `THEME`.
+
+```bash
+THEME_FILE=/etc/starfin/my-theme.toml ./starfin-backend
+```
+
+The file format (all keys optional — omitted values fall back to Jetson defaults):
+
+```toml
+[meta]
+name = "My Custom Theme"
+# Optionally pin a design preset for this theme file.
+# The DESIGN env var always overrides this.
+# design = "aero"
+
+# ── Design token overrides (optional) ────────────────────────────────────────
+# Merged on top of the selected design preset. Omit any key to keep the
+# preset default.
+#
+# [design]
+# font_body      = "'Helvetica Neue', Helvetica, Arial, sans-serif"
+# font_heading   = "'Helvetica Neue', Helvetica, Arial, sans-serif"
+# border_width   = "1px"
+# heading_transform = "none"
+# heading_spacing   = "0px"
+# heading_weight    = "700"
+
+# ── Light mode ────────────────────────────────────────────────────────────────
+[light]
+bg            = "#f5f0eb"
+panel         = "rgba(0,0,0,.03)"
+panel_2       = "rgba(0,0,0,.06)"
+text          = "#1a1a1a"
+muted         = "#555555"
+border        = "rgba(0,0,0,.12)"
+accent        = "#e05020"
+accent_2      = "#333333"
+danger        = "#cc0000"
+radius        = "4px"
+shadow        = "0 2px 6px rgba(0,0,0,.15)"
+sidebar_bg    = "#e05020"
+topbar_bg     = "#e8e0d5"
+topbar_border = "2px solid rgba(0,0,0,.15)"
+card_bg       = "rgba(255,255,255,.65)"
+card_border   = "rgba(0,0,0,.20)"
+card_top_bg   = "#333333"
+card_top_color = "white"
+input_bg      = "rgba(255,255,255,.55)"
+input_border  = "rgba(0,0,0,.20)"
+notice_bg     = "rgba(255,255,255,.60)"
+empty_bg      = "rgba(255,255,255,.40)"
+
+# ── Dark mode ─────────────────────────────────────────────────────────────────
+[dark]
+bg            = "#1e1e1e"
+panel         = "rgba(255,255,255,.04)"
+panel_2       = "rgba(255,255,255,.07)"
+text          = "#e0e0e0"
+muted         = "#a0a0a0"
+border        = "rgba(255,255,255,.12)"
+accent        = "#ff7040"
+accent_2      = "#333333"
+danger        = "#ff5555"
+shadow        = "0 2px 8px rgba(0,0,0,.50)"
+sidebar_bg    = "#ff7040"
+topbar_bg     = "#2a2a2a"
+topbar_border = "2px solid rgba(255,255,255,.15)"
+card_bg       = "rgba(255,255,255,.07)"
+card_border   = "rgba(255,255,255,.15)"
+card_top_bg   = "#333333"
+card_top_color = "white"
+input_bg      = "rgba(255,255,255,.07)"
+input_border  = "rgba(255,255,255,.15)"
+notice_bg     = "rgba(255,255,255,.07)"
+empty_bg      = "rgba(255,255,255,.04)"
+```
+
+A complete annotated example is available in [`themes/example.toml`](themes/example.toml).
+
+### CSS variable reference
+
+The active theme/design is served as a CSS stylesheet at `GET /api/theme.css` and injected into `index.html` automatically. The following CSS custom properties are available in your browser's dev tools:
+
+#### Color tokens (set by `[light]` / `[dark]` in TOML, or by a theme preset)
+
+| CSS variable | Description |
+|---|---|
+| `--bg` | Page background |
+| `--panel` | Subtle panel overlay |
+| `--panel-2` | Stronger panel overlay |
+| `--text` | Primary text color |
+| `--muted` | Secondary/muted text |
+| `--border` | Default border color |
+| `--accent` | Primary accent (buttons, links, sidebar) |
+| `--accent-2` | Secondary accent |
+| `--danger` | Danger/error color |
+| `--radius` | Default border-radius |
+| `--shadow` | Default box-shadow |
+| `--sidebar-bg` | Sidebar background |
+| `--topbar-bg` | Top bar background |
+| `--topbar-border` | Top bar bottom border |
+| `--card-bg` | Video card background |
+| `--card-border` | Video card border |
+| `--card-top-bg` | Video card header background |
+| `--card-top-color` | Video card header text color |
+| `--input-bg` | Input/search field background |
+| `--input-border` | Input/search field border |
+| `--notice-bg` | Notice/toast background |
+| `--empty-bg` | Empty-state placeholder background |
+
+#### Design tokens (set by `[design]` in TOML, or by a design preset)
+
+| CSS variable | Description |
+|---|---|
+| `--font-body` | Body text font stack |
+| `--font-heading` | Heading font stack |
+| `--border-width` | Default border thickness |
+| `--heading-transform` | CSS `text-transform` applied to headings |
+| `--heading-spacing` | CSS `letter-spacing` applied to headings |
+| `--heading-weight` | CSS `font-weight` applied to headings |
+
+### NixOS
+
+The NixOS module exposes `theme`, `design`, and `themeFile` options:
+
+```nix
+services.starfin = {
+  enable           = true;
+  videoLibraryPath = "/mnt/videos";
+
+  # Built-in color theme: "jetson" | "nord" | "catppuccin" | "dracula"
+  theme  = "nord";
+
+  # Built-in UX design: "editorial" | "neubrutalist" | "aero"
+  design = "aero";
+};
+```
+
+To use a custom TOML file:
+
+```nix
+services.starfin = {
+  enable           = true;
+  videoLibraryPath = "/mnt/videos";
+  themeFile        = ./my-theme.toml;  # takes precedence over `theme`
+  design           = "neubrutalist";   # still applies on top of custom file
+};
 ```
 
 ---
@@ -202,6 +409,9 @@ services.starfin = {
 | `bindAddr` | `str` | `"127.0.0.1"` | Address to bind (`"0.0.0.0"` for all interfaces) |
 | `videoLibraryPath` | `path` | *(required)* | Directory scanned for video files |
 | `cacheDir` | `path` | `"/var/cache/starfin"` | Directory for HLS segments and thumbnail cache |
+| `theme` | `str` | `"jetson"` | Color theme preset: `jetson`, `nord`, `catppuccin`, `dracula` |
+| `design` | `str` | `"editorial"` | UX design preset: `editorial`, `neubrutalist`, `aero` |
+| `themeFile` | `path or null` | `null` | Path to a custom TOML theme file (overrides `theme`) |
 | `openFirewall` | `bool` | `false` | Open the configured `port` in the NixOS firewall |
 | `user` | `str` | `"starfin"` | System user that runs the service |
 | `group` | `str` | `"starfin"` | System group that runs the service |
@@ -272,6 +482,7 @@ services.nginx = {
 |---|---|---|
 | `/api/health` | GET | Health check |
 | `/api/hwaccel` | GET | Detected hardware acceleration info |
+| `/api/theme.css` | GET | Active theme + design as a CSS stylesheet |
 | `/api/scan/ws` | GET | WebSocket: library scan progress |
 | `/api/progress/ws` | GET | WebSocket: thumbnail/sprite generation progress |
 | `/api/videos` | GET | List all videos with metadata |

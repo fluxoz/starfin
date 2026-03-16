@@ -120,6 +120,8 @@
         cp -r styles/. $out/styles/
         cp -r fonts/.  $out/fonts/
         cp favicon.svg $out/favicon.svg
+        cp logo.svg $out/logo.svg
+        cp manifest.json $out/manifest.json
         # Transform index.html: replace data-trunk directives with standard
         # HTML and inject the WASM module initialisation script.
         sed \

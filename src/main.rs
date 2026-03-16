@@ -82,6 +82,7 @@ struct ThemeConfig {
 
 impl ThemeMode {
     /// Emit CSS custom property declarations for every field that is `Some`.
+    /// Values are sanitized to prevent CSS injection.
     fn to_css_declarations(&self) -> String {
         let mut out = String::new();
         let fields: &[(&str, &Option<String>)] = &[
@@ -110,11 +111,31 @@ impl ThemeMode {
         ];
         for (prop, value) in fields {
             if let Some(v) = value {
-                out.push_str(&format!("  {}: {};\n", prop, v));
+                let sanitized = sanitize_css_value(v);
+                out.push_str(&format!("  {}: {};\n", prop, sanitized));
             }
         }
         out
     }
+}
+
+/// Sanitize a CSS custom property value to prevent injection.
+///
+/// Strips characters that could break out of a CSS declaration (`{`, `}`, `;`,
+/// `<`, `>`) and removes `url(` / `expression(` function calls.  This is a
+/// defense-in-depth measure — theme files are operator-controlled, not
+/// user-supplied, but we sanitize anyway.
+fn sanitize_css_value(value: &str) -> String {
+    let stripped: String = value
+        .chars()
+        .filter(|c| !matches!(c, '{' | '}' | ';' | '<' | '>' | '\\'))
+        .collect();
+    // Reject url() and expression() to prevent resource loading / script execution.
+    let lower = stripped.to_lowercase();
+    if lower.contains("url(") || lower.contains("expression(") || lower.contains("javascript:") {
+        return String::new();
+    }
+    stripped
 }
 
 impl ThemeConfig {
@@ -325,20 +346,35 @@ fn theme_dracula() -> ThemeConfig {
 /// * `THEME_FILE` — path to a user-supplied TOML file (takes precedence over
 ///   `THEME` if both are set).
 fn resolve_theme() -> ThemeConfig {
+    /// Maximum theme file size (100 KiB) — prevents DoS via oversized files.
+    const MAX_THEME_FILE_SIZE: u64 = 100 * 1024;
+
     // A custom TOML file takes highest precedence.
     if let Ok(path) = std::env::var("THEME_FILE") {
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => match toml::from_str::<ThemeConfig>(&contents) {
-                Ok(cfg) => {
-                    info!(path = %path, name = %cfg.meta.name, "loaded custom theme");
-                    return cfg;
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.len() > MAX_THEME_FILE_SIZE => {
+                warn!(
+                    path = %path,
+                    size = meta.len(),
+                    limit = MAX_THEME_FILE_SIZE,
+                    "THEME_FILE exceeds size limit; falling back to preset"
+                );
+            }
+            _ => {
+                match std::fs::read_to_string(&path) {
+                    Ok(contents) => match toml::from_str::<ThemeConfig>(&contents) {
+                        Ok(cfg) => {
+                            info!(path = %path, name = %cfg.meta.name, "loaded custom theme");
+                            return cfg;
+                        }
+                        Err(e) => {
+                            warn!(path = %path, error = %e, "failed to parse THEME_FILE; falling back to preset");
+                        }
+                    },
+                    Err(e) => {
+                        warn!(path = %path, error = %e, "failed to read THEME_FILE; falling back to preset");
+                    }
                 }
-                Err(e) => {
-                    warn!(path = %path, error = %e, "failed to parse THEME_FILE; falling back to preset");
-                }
-            },
-            Err(e) => {
-                warn!(path = %path, error = %e, "failed to read THEME_FILE; falling back to preset");
             }
         }
     }
@@ -3450,6 +3486,28 @@ accent = "#123456"
         let css = config.to_css();
         assert!(css.contains(":root{"));
         assert!(css.contains(".app.dark-mode{"));
+    }
+
+    #[test]
+    fn css_values_are_sanitized() {
+        // Braces, semicolons, and angle brackets are stripped.
+        assert_eq!(sanitize_css_value("red; } .x { color: blue"), "red  .x  color: blue");
+        // url() is rejected.
+        assert_eq!(sanitize_css_value("url(http://evil.com)"), "");
+        // expression() is rejected.
+        assert_eq!(sanitize_css_value("expression(alert(1))"), "");
+        // javascript: is rejected.
+        assert_eq!(sanitize_css_value("javascript:alert(1)"), "");
+        // Normal values pass through unchanged.
+        assert_eq!(sanitize_css_value("#ff4500"), "#ff4500");
+        assert_eq!(
+            sanitize_css_value("rgba(255,255,255,.6)"),
+            "rgba(255,255,255,.6)"
+        );
+        assert_eq!(
+            sanitize_css_value("2px solid rgba(0,0,0,.3)"),
+            "2px solid rgba(0,0,0,.3)"
+        );
     }
 }
 

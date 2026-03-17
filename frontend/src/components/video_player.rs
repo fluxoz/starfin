@@ -134,7 +134,6 @@ pub struct SubtitleTracksResponse {
 
 struct SegmentInfo {
     url: String,
-    #[allow(dead_code)]
     duration: f64,
 }
 
@@ -311,6 +310,10 @@ async fn pump_loop(
 
     // Incremented on every seek so stale fetch results can be cheaply discarded.
     let mut pump_gen: u64 = 0;
+    // Tracks the segment index of the most recent appendBuffer call.
+    // Compared against next_seg in UpdateEnd so that a seek arriving mid-append
+    // does not cause UpdateEnd to advance next_seg past the seek target.
+    let mut appending_seg: usize = 0;
 
     // ── Inline helper: start a fetch when the pump is Idle ─────────────────
     macro_rules! maybe_fetch {
@@ -401,7 +404,14 @@ async fn pump_loop(
                 match state {
                     State::Appending => {
                         state = State::Idle;
-                        next_seg += 1;
+                        // Only advance if no seek changed next_seg while this
+                        // append was in flight.  If a seek arrived mid-append,
+                        // next_seg was already updated to the seek target by
+                        // the Seek handler; incrementing it again would skip
+                        // the sought segment and cause the video to stall.
+                        if next_seg == appending_seg {
+                            next_seg += 1;
+                        }
                         maybe_fetch!();
                     }
                     State::Removing => {
@@ -414,11 +424,15 @@ async fn pump_loop(
 
             PumpMsg::FetchDone { fetch_gen, seg, bytes } => {
                 if fetch_gen != pump_gen {
-                    // Stale result from before a seek — discard.
-                    if state == State::Fetching {
-                        state = State::Idle;
-                        maybe_fetch!();
-                    }
+                    // Stale result from before a seek — drop silently.
+                    //
+                    // Do NOT reset state or start a new fetch here.  A fresh
+                    // fetch for the current generation is already in flight
+                    // (started immediately by the Seek handler, or scheduled
+                    // by the next UpdateEnd after a seek-interrupted
+                    // append/remove).  Touching state here would race with
+                    // that valid in-flight fetch and could launch a duplicate
+                    // request for the same segment.
                 } else {
                     debug_assert_eq!(seg, next_seg);
                     // Each fMP4 segment produced by the backend has its PTS
@@ -431,6 +445,7 @@ async fn pump_loop(
                     // is always set immediately before appendBuffer, never
                     // speculatively — this is the single write point for the
                     // SourceBuffer timeline position.
+                    appending_seg = seg;
                     source_buffer
                         .set_timestamp_offset(seg as f64 * SEGMENT_DURATION_F);
                     let arr = js_sys::Uint8Array::from(bytes.as_slice());
@@ -772,6 +787,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             return;
                         }
 
+                        // Advertise the total duration so video.duration() is
+                        // finite and the progress bar / time display works
+                        // immediately.  Without this the MediaSource duration
+                        // stays at Infinity and format_time shows "0:00".
+                        let total_duration: f64 =
+                            segments.iter().map(|s| s.duration).sum();
+                        media_source.set_duration(total_duration);
+
                         // The server produces fragmented MP4 (fMP4) segments which are
                         // supported by MSE in all major browsers (Chrome, Firefox, Safari
                         // uses native HLS above). The codec string covers all three server
@@ -817,6 +840,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         ));
 
                         status.set(String::new());
+                        // Start playback immediately.  The MSE path requires an
+                        // explicit play() call; the Safari native-HLS path above
+                        // already calls play() itself.
+                        let _ = video.play();
                         if start_pos > 0.0 {
                             video.set_current_time(snap_to_cached_segment(start_pos));
                         }

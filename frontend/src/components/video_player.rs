@@ -273,23 +273,20 @@ const SEGMENT_FETCH_RETRY_BASE_MS: u32 = 500;
 /// pipeline with redundant segment requests.
 async fn pump_loop(
     mut rx: mpsc::UnboundedReceiver<PumpMsg>,
+    pump_tx: mpsc::UnboundedSender<PumpMsg>,
     state: Rc<RefCell<Option<MseState>>>,
     video: HtmlVideoElement,
 ) {
     // Create a self-contained timer for periodic buffer top-up.
     // This timer lives inside the pump loop and is dropped when
     // the loop exits (on Shutdown), so it cannot outlive the pump.
-    let _topup_interval = {
-        let tx = state
-            .borrow()
-            .as_ref()
-            .map(|s| s.pump_tx.clone());
-        tx.map(|tx| {
-            Interval::new(500, move || {
-                let _ = tx.unbounded_send(PumpMsg::TopUp);
-            })
-        })
-    };
+    // 500ms strikes a balance between buffer responsiveness and
+    // avoiding unnecessary wake-ups; the previous approach sent
+    // TopUp every 150ms from the UI interval timer which coupled
+    // buffer management to the render cycle.
+    let _topup_interval = Interval::new(500, move || {
+        let _ = pump_tx.unbounded_send(PumpMsg::TopUp);
+    });
 
     let mut pump_state = PumpState::Idle;
 
@@ -1280,7 +1277,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         // Start the pump loop as a spawned task.
                         let mse_state_for_pump = mse_state.clone();
                         let video_for_pump = video.clone();
-                        spawn_local(pump_loop(pump_rx, mse_state_for_pump, video_for_pump));
+                        let pump_tx_for_loop = pump_tx.clone();
+                        spawn_local(pump_loop(pump_rx, pump_tx_for_loop, mse_state_for_pump, video_for_pump));
 
                         // Kick off the initial segment fetch.
                         let _ = pump_tx.unbounded_send(PumpMsg::TopUp);
@@ -1396,6 +1394,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // Each `.set()` is guarded by an equality check to avoid triggering
     // unnecessary Yew re-renders — Yew 0.21's `UseStateHandle::set`
     // unconditionally schedules a re-render even if the value is the same.
+    //
+    // 250ms gives smooth progress bar updates (~4 FPS) while keeping the
+    // re-render rate well below the threshold where it would visually
+    // interfere with CSS animations or cause layout thrashing.
     {
         let video_ref = video_ref.clone();
         let current_time = current_time.clone();

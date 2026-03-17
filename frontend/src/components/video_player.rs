@@ -148,6 +148,9 @@ struct MseState {
     next_seg: usize,
     /// True while `SourceBuffer.appendBuffer` is in progress.
     is_appending: bool,
+    /// Currently-registered `updateend` closure.  Kept alive so the listener
+    /// remains valid; replaced (old listener removed first) on each append.
+    updateend_closure: Option<Closure<dyn FnMut()>>,
 }
 
 /// Resolve a relative segment path against the playlist URL.
@@ -259,18 +262,36 @@ fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) 
             }
         };
 
-        let source_buffer = {
-            let borrow = state_clone.borrow();
-            match borrow.as_ref() {
-                Some(s) => s.source_buffer.clone(),
+        // Get the source_buffer and remove any existing updateend listener so
+        // that listeners never accumulate on the SourceBuffer.
+        let (source_buffer, old_updateend_cb) = {
+            let mut borrow = state_clone.borrow_mut();
+            match borrow.as_mut() {
+                Some(s) => (s.source_buffer.clone(), s.updateend_closure.take()),
                 None => return,
             }
         };
+        if let Some(old) = &old_updateend_cb {
+            source_buffer
+                .remove_event_listener_with_callback("updateend", old.as_ref().unchecked_ref())
+                .ok();
+        }
+        drop(old_updateend_cb);
 
-        // One-shot updateend listener: advance segment pointer and re-pump.
+        // Register a new updateend listener.  Using FnMut (not FnOnce) so the
+        // Closure can be stored and later removed via remove_event_listener.
+        // Because we always remove the previous listener above before adding a
+        // new one, this listener will only ever fire once per append.
+        // The `fired` guard makes that one-shot guarantee explicit at the Rust
+        // level as well, in case the cleanup logic is ever changed.
         let state_for_end = state_clone.clone();
         let video_for_end = video_clone.clone();
-        let updateend_cb = Closure::once(Box::new(move || {
+        let mut fired = false;
+        let updateend_cb = Closure::<dyn FnMut()>::new(move || {
+            if fired {
+                return;
+            }
+            fired = true;
             {
                 let mut borrow = state_for_end.borrow_mut();
                 if let Some(s) = borrow.as_mut() {
@@ -278,19 +299,34 @@ fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) 
                     s.next_seg += 1;
                 }
             }
-            let s = state_for_end;
-            let v = video_for_end;
+            let s = state_for_end.clone();
+            let v = video_for_end.clone();
             spawn_local(async move {
                 pump_segments(s, v);
             });
-        }) as Box<dyn FnOnce()>);
+        });
         source_buffer
             .add_event_listener_with_callback(
                 "updateend",
                 updateend_cb.as_ref().unchecked_ref(),
             )
             .ok();
-        updateend_cb.forget();
+        // Keep the closure alive in MseState so the listener remains valid.
+        {
+            let mut borrow = state_clone.borrow_mut();
+            if let Some(s) = borrow.as_mut() {
+                s.updateend_closure = Some(updateend_cb);
+            } else {
+                // State was cleared while we were async; remove the listener.
+                source_buffer
+                    .remove_event_listener_with_callback(
+                        "updateend",
+                        updateend_cb.as_ref().unchecked_ref(),
+                    )
+                    .ok();
+                return;
+            }
+        }
 
         let uint8_array = js_sys::Uint8Array::from(bytes.as_slice());
         let array_buffer = uint8_array.buffer();
@@ -298,8 +334,21 @@ fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) 
             .append_buffer_with_array_buffer(&array_buffer)
             .is_err()
         {
-            if let Some(s) = state_clone.borrow_mut().as_mut() {
-                s.is_appending = false;
+            // appendBuffer failed: remove the listener we just added and clear
+            // is_appending so the polling interval can retry.
+            let failed_cb = {
+                let mut borrow = state_clone.borrow_mut();
+                if let Some(s) = borrow.as_mut() {
+                    s.is_appending = false;
+                    s.updateend_closure.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(cb) = &failed_cb {
+                source_buffer
+                    .remove_event_listener_with_callback("updateend", cb.as_ref().unchecked_ref())
+                    .ok();
             }
         }
     });
@@ -612,6 +661,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             segments,
                             next_seg: start_seg,
                             is_appending: false,
+                            updateend_closure: None,
                         });
 
                         status.set(String::new());
@@ -766,7 +816,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     }
 
                     // Seeking to unbuffered territory — reset segment pointer and re-pump.
-                    {
+                    let should_pump = {
                         let mut borrow = mse_state_for_seeked.borrow_mut();
                         if let Some(mse) = borrow.as_mut() {
                             if !mse.source_buffer.updating() {
@@ -777,10 +827,18 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
                             let snapped = snap_to_cached_segment(current_time);
                             mse.next_seg = (snapped / SEGMENT_DURATION_F) as usize;
-                            mse.is_appending = false;
+                            // Do not force is_appending = false here.  If an append is
+                            // already in flight its updateend listener will call
+                            // pump_segments using the updated next_seg once it finishes.
+                            // Forcing false would allow two concurrent pump chains.
+                            !mse.is_appending
+                        } else {
+                            false
                         }
+                    };
+                    if should_pump {
+                        pump_segments(mse_state_for_seeked.clone(), video_for_seeked.clone());
                     }
-                    pump_segments(mse_state_for_seeked.clone(), video_for_seeked.clone());
                 });
 
                 video

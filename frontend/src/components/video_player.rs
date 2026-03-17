@@ -9,6 +9,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{window, HtmlVideoElement, KeyboardEvent, MouseEvent};
 use yew::prelude::*;
+use log::info;
 
 // ── Playback speed options ───────────────────────────────────────────────────
 const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
@@ -365,6 +366,7 @@ pub struct VideoPlayerProps {
 
 #[function_component(VideoPlayer)]
 pub fn video_player(props: &VideoPlayerProps) -> Html {
+    info!("video player loaded!");
     let video_ref = use_node_ref();
     let progress_ref = use_node_ref();
     let container_ref = use_node_ref();
@@ -462,6 +464,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
     // Initialize MSE player (and re-initialise when video ID or quality changes).
     {
+        info!("initializing MSE state");
         let video_ref = video_ref.clone();
         let status = status.clone();
         let error = error.clone();

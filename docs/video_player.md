@@ -182,6 +182,21 @@ video/mp4; codecs="avc1.42E01E,mp4a.40.2"
 
 (H.264 Baseline + AAC-LC — covers all three server transcode paths.)
 
+### 3.5 SourceBuffer mode & timestampOffset
+
+The SourceBuffer is set to **`"sequence"` mode** immediately after creation.
+This is critical for cross-browser compatibility (especially Firefox):
+
+- The backend rebases video/audio PTS to ~0 in each fMP4 segment (remux/hybrid
+  paths). Without sequence mode, Firefox strictly follows the MSE spec and
+  places every segment at time 0, causing playback to stutter/reset.
+- In sequence mode, MSE automatically places each appended segment after the
+  end of the previous one.
+- On seek, `abort()` is called to reset the parser state, then `timestampOffset`
+  is set to the snapped seek time so the next append is placed correctly.
+- On initial resume from a non-zero position, `timestampOffset` is set to
+  `start_seg * SEGMENT_DURATION_F`.
+
 ---
 
 ## 4. Initialization & Lifecycle

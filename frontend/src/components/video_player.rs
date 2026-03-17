@@ -320,8 +320,13 @@ async fn pump_loop(
     }
 }
 
-/// Handle a seek to unbuffered territory: increment generation, trim
-/// back-buffer (if the source buffer is not busy), and reset next_seg.
+/// Handle a seek to unbuffered territory: increment generation, abort any
+/// in-progress append, set `timestampOffset` for the new position, trim
+/// back-buffer, and reset `next_seg`.
+///
+/// In "sequence" mode, calling `abort()` resets the SourceBuffer's append
+/// state to WAITING_FOR_SEGMENT, allowing us to set `timestampOffset` to
+/// redirect where the next append will be placed on the MSE timeline.
 fn handle_pump_seek(
     state: &Rc<RefCell<Option<MseState>>>,
     time: f64,
@@ -329,13 +334,29 @@ fn handle_pump_seek(
     let mut borrow = state.borrow_mut();
     if let Some(mse) = borrow.as_mut() {
         mse.generation = mse.generation.wrapping_add(1);
+
+        // abort() resets the parser state so we can set timestampOffset.
+        // Only valid when MediaSource readyState is "open".
+        if mse.media_source.ready_state() == web_sys::MediaSourceReadyState::Open {
+            let _ = mse.source_buffer.abort();
+        }
+
+        let snapped = snap_to_cached_segment(time);
+
+        // Set timestampOffset so the next append is placed at the correct
+        // position on the MSE timeline (critical for Firefox).
         if !mse.source_buffer.updating() {
-            let remove_end = (time - MSE_BACK_BUFFER_S).max(0.0);
+            mse.source_buffer.set_timestamp_offset(snapped);
+        }
+
+        // Trim stale back-buffer.
+        if !mse.source_buffer.updating() {
+            let remove_end = (snapped - MSE_BACK_BUFFER_S).max(0.0);
             if remove_end > 0.0 {
                 let _ = mse.source_buffer.remove(0.0, remove_end);
             }
         }
-        let snapped = snap_to_cached_segment(time);
+
         mse.next_seg = (snapped / SEGMENT_DURATION_F) as usize;
     }
 }
@@ -360,7 +381,13 @@ fn try_start_fetch(
             return false;
         }
         if mse.next_seg >= mse.segments.len() {
-            let _ = mse.media_source.end_of_stream();
+            // Only signal end-of-stream when the MediaSource is "open";
+            // Firefox throws InvalidStateError otherwise.
+            if mse.media_source.ready_state() == web_sys::MediaSourceReadyState::Open
+                && !mse.source_buffer.updating()
+            {
+                let _ = mse.media_source.end_of_stream();
+            }
             return false;
         }
         let url = mse.segments[mse.next_seg].url.clone();
@@ -418,12 +445,19 @@ async fn fetch_segment_with_retry(
 }
 
 /// Try to append raw bytes to the SourceBuffer.  Returns `true` on success.
+///
+/// Defensively checks `updating()` — Firefox throws if an append is
+/// attempted while the source buffer is still processing a previous
+/// `appendBuffer` or `remove` call.
 fn try_append_bytes(state: &Rc<RefCell<Option<MseState>>>, bytes: &[u8]) -> bool {
     let borrow = state.borrow();
     let mse = match borrow.as_ref() {
         Some(s) => s,
         None => return false,
     };
+    if mse.source_buffer.updating() {
+        return false;
+    }
     let uint8_array = js_sys::Uint8Array::from(bytes);
     let array_buffer = uint8_array.buffer();
     mse.source_buffer
@@ -1112,6 +1146,19 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
                         };
 
+                        // Use "sequence" mode so the MSE pipeline places each appended
+                        // segment after the previous one automatically.  This is critical
+                        // for Firefox which strictly follows the MSE spec: without it,
+                        // each fMP4 segment (whose PTS is rebased to 0 by the backend)
+                        // would overwrite the 0-based timeline range and playback would
+                        // stutter/reset every segment.
+                        //
+                        // In sequence mode, we control placement via timestampOffset:
+                        //   • Initial load: timestampOffset = start_seg * SEGMENT_DURATION_F
+                        //   • After seek:   abort() + timestampOffset = snapped_time
+                        //   • Sequential:   MSE auto-advances from previous segment end
+                        source_buffer.set_mode(web_sys::SourceBufferAppendMode::Sequence);
+
                         // Calculate which segment to start from when resuming.
                         let start_seg = if start_pos > 0.0 {
                             let snapped = snap_to_cached_segment(start_pos);
@@ -1119,6 +1166,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         } else {
                             0
                         };
+
+                        // Set initial timestampOffset for resume position.
+                        if start_seg > 0 {
+                            source_buffer
+                                .set_timestamp_offset(start_seg as f64 * SEGMENT_DURATION_F);
+                        }
 
                         // §11.2: Create channel for the pump loop.
                         let (pump_tx, pump_rx) = mpsc::unbounded();
@@ -1135,6 +1188,18 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 updateend_closure.as_ref().unchecked_ref(),
                             )
                             .ok();
+
+                        // Log SourceBuffer errors (helps diagnose Firefox-specific issues).
+                        let onerror_closure = Closure::<dyn Fn()>::new(move || {
+                            log::error!("SourceBuffer error event fired");
+                        });
+                        source_buffer
+                            .add_event_listener_with_callback(
+                                "error",
+                                onerror_closure.as_ref().unchecked_ref(),
+                            )
+                            .ok();
+                        onerror_closure.forget();
 
                         // Store MSE state.
                         *mse_state.borrow_mut() = Some(MseState {
@@ -1190,7 +1255,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         "updateend",
                         state._updateend_closure.as_ref().unchecked_ref(),
                     );
-                    let _ = state.media_source.end_of_stream();
+                    // Firefox requires readyState == "open" before end_of_stream().
+                    if state.media_source.ready_state() == web_sys::MediaSourceReadyState::Open
+                        && !state.source_buffer.updating()
+                    {
+                        let _ = state.media_source.end_of_stream();
+                    }
                     let _ = web_sys::Url::revoke_object_url(&state.object_url);
                     if let Some(video) = video_ref_for_cleanup.cast::<HtmlVideoElement>() {
                         video.set_src("");

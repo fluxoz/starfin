@@ -265,11 +265,32 @@ const SEGMENT_FETCH_MAX_RETRIES: u32 = 3;
 const SEGMENT_FETCH_RETRY_BASE_MS: u32 = 500;
 
 /// The main pump loop — a single async task driven by channel messages.
+///
+/// The loop owns a self-contained `Interval` that periodically sends
+/// `PumpMsg::TopUp` to itself.  This keeps the buffer-top-up cadence
+/// completely independent of the Yew render cycle, which is the key
+/// decoupling that prevents re-render storms from hammering the MSE
+/// pipeline with redundant segment requests.
 async fn pump_loop(
     mut rx: mpsc::UnboundedReceiver<PumpMsg>,
     state: Rc<RefCell<Option<MseState>>>,
     video: HtmlVideoElement,
 ) {
+    // Create a self-contained timer for periodic buffer top-up.
+    // This timer lives inside the pump loop and is dropped when
+    // the loop exits (on Shutdown), so it cannot outlive the pump.
+    let _topup_interval = {
+        let tx = state
+            .borrow()
+            .as_ref()
+            .map(|s| s.pump_tx.clone());
+        tx.map(|tx| {
+            Interval::new(500, move || {
+                let _ = tx.unbounded_send(PumpMsg::TopUp);
+            })
+        })
+    };
+
     let mut pump_state = PumpState::Idle;
 
     while let Some(msg) = rx.next().await {
@@ -448,15 +469,19 @@ async fn fetch_segment_with_retry(
 
 /// Try to append raw bytes to the SourceBuffer.  Returns `true` on success.
 ///
-/// Defensively checks `updating()` — Firefox throws if an append is
-/// attempted while the source buffer is still processing a previous
-/// `appendBuffer` or `remove` call.
+/// Defensively checks `updating()` and `readyState` — Firefox throws if an
+/// append is attempted while the source buffer is still processing a previous
+/// `appendBuffer` or `remove` call, or if the MediaSource is not "open".
 fn try_append_bytes(state: &Rc<RefCell<Option<MseState>>>, bytes: &[u8]) -> bool {
     let borrow = state.borrow();
     let mse = match borrow.as_ref() {
         Some(s) => s,
         None => return false,
     };
+    // MediaSource must be "open" for appendBuffer to succeed.
+    if mse.media_source.ready_state() != web_sys::MediaSourceReadyState::Open {
+        return false;
+    }
     if mse.source_buffer.updating() {
         return false;
     }
@@ -1249,6 +1274,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         if start_pos > 0.0 {
                             video.set_current_time(snap_to_cached_segment(start_pos));
                         }
+                        // Auto-start playback (mirrors the Safari native HLS path).
+                        let _ = video.play();
 
                         // Start the pump loop as a spawned task.
                         let mse_state_for_pump = mse_state.clone();
@@ -1362,7 +1389,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         );
     }
 
-    // Update time/duration periodically and send TopUp to pump loop
+    // Update time/duration periodically (UI state only).
+    //
+    // The pump loop owns its own TopUp timer, so this interval is purely
+    // for refreshing the UI controls (progress bar, time display, etc.).
+    // Each `.set()` is guarded by an equality check to avoid triggering
+    // unnecessary Yew re-renders — Yew 0.21's `UseStateHandle::set`
+    // unconditionally schedules a re-render even if the value is the same.
     {
         let video_ref = video_ref.clone();
         let current_time = current_time.clone();
@@ -1372,37 +1405,46 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let is_dragging = is_dragging.clone();
         let is_buffering = is_buffering.clone();
         let video_ended = video_ended.clone();
-        let mse_state = mse_state.clone();
 
         use_effect_with(video_ref.clone(), move |video_ref| {
             let video_ref = video_ref.clone();
-            let mse_state_for_interval = mse_state.clone();
-            let interval = Interval::new(150, move || {
+            let interval = Interval::new(250, move || {
                 if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
+                    // Only update current_time when not dragging, and only when
+                    // the value has meaningfully changed (>50ms drift).
                     if !*is_dragging {
-                        current_time.set(video.current_time());
+                        let new_time = video.current_time();
+                        if (*current_time - new_time).abs() > 0.05 {
+                            current_time.set(new_time);
+                        }
                     }
+
                     let dur = video.duration();
-                    if dur.is_finite() && dur > 0.0 {
+                    if dur.is_finite() && dur > 0.0 && (*duration - dur).abs() > 0.5 {
                         duration.set(dur);
                     }
-                    buffered_end.set(get_buffer_end(&video));
-                    is_playing.set(!video.paused());
+
+                    let new_buf = get_buffer_end(&video);
+                    if (*buffered_end - new_buf).abs() > 0.5 {
+                        buffered_end.set(new_buf);
+                    }
+
+                    let playing = !video.paused();
+                    if *is_playing != playing {
+                        is_playing.set(playing);
+                    }
 
                     // Check buffering state
                     let ready_state = video.ready_state();
-                    is_buffering.set(ready_state < 3 && !video.paused());
+                    let buffering = ready_state < 3 && !video.paused();
+                    if *is_buffering != buffering {
+                        is_buffering.set(buffering);
+                    }
 
                     // Check if video ended
-                    video_ended.set(video.ended());
-
-                    // Send TopUp to the pump loop
-                    let tx = {
-                        let borrow = mse_state_for_interval.borrow();
-                        borrow.as_ref().map(|s| s.pump_tx.clone())
-                    };
-                    if let Some(tx) = tx {
-                        let _ = tx.unbounded_send(PumpMsg::TopUp);
+                    let ended = video.ended();
+                    if *video_ended != ended {
+                        video_ended.set(ended);
                     }
                 }
             });

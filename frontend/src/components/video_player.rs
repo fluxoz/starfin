@@ -138,20 +138,38 @@ struct SegmentInfo {
     duration: f64,
 }
 
-struct MseState {
+/// Events that flow through the pump loop's single unbounded channel.
+///
+/// All signals — external commands from the Yew component **and** internal
+/// timer ticks, SourceBuffer events, and fetch completions — are multiplexed
+/// through one `UnboundedReceiver<PumpMsg>` so the loop body is a plain
+/// `while let`, with no `select!` machinery and no extra executor primitives.
+enum PumpMsg {
+    // ── External commands from the Yew component ──────────────────────────
+    /// Seek to this timestamp (snapped to a cached-segment boundary inside the loop).
+    Seek(f64),
+    /// Tear down the pump loop (component unmounting or quality change).
+    Quit,
+    // ── Internal signals — sent only within pump_loop ─────────────────────
+    /// 500 ms top-up tick: keep the forward buffer full as playback advances.
+    TopUp,
+    /// `SourceBuffer.updateend` fired — the last operation (append or remove) completed.
+    UpdateEnd,
+    /// A segment HTTP fetch succeeded.  `fetch_gen` is the pump generation counter
+    /// at the time the fetch started; stale results (after a seek) are discarded.
+    FetchDone { fetch_gen: u64, seg: usize, bytes: Vec<u8> },
+    /// A segment HTTP fetch failed.  The pump retries on the next `TopUp`.
+    FetchFailed { fetch_gen: u64 },
+}
+
+/// Handle returned to the Yew component once the background pump loop is running.
+struct PumpHandle {
+    /// Sends [`PumpMsg::Seek`] / [`PumpMsg::Quit`] to the pump loop.
+    tx: futures::channel::mpsc::UnboundedSender<PumpMsg>,
+    /// MediaSource kept alive for cleanup (end_of_stream + revoke_object_url).
     media_source: web_sys::MediaSource,
-    source_buffer: web_sys::SourceBuffer,
-    /// Blob URL created for this MediaSource; revoked on cleanup.
+    /// Blob URL to revoke on cleanup.
     object_url: String,
-    /// Parsed segment list from the M3U8 playlist.
-    segments: Vec<SegmentInfo>,
-    /// Index of the next segment to fetch.
-    next_seg: usize,
-    /// True while `SourceBuffer.appendBuffer` is in progress.
-    is_appending: bool,
-    /// Currently-registered `updateend` closure.  Kept alive so the listener
-    /// remains valid; replaced (old listener removed first) on each append.
-    updateend_closure: Option<Closure<dyn FnMut()>>,
 }
 
 /// Resolve a relative segment path against the playlist URL.
@@ -209,150 +227,206 @@ fn parse_m3u8(text: &str, playlist_url: &str) -> Vec<SegmentInfo> {
     segments
 }
 
-/// Pump the next HLS segment into the MSE SourceBuffer.
+/// Background async task that feeds MSE segments, completely decoupled from
+/// the Yew render cycle.
 ///
-/// Returns immediately if:
-/// - `state` is `None` (not yet initialised),
-/// - a previous append is still in flight (`is_appending`), or
-/// - the forward buffer already exceeds `MSE_TARGET_BUFFER_S`.
+/// The loop owns:
+/// - A **single** persistent `updateend` listener registered once on entry and
+///   removed once on exit — it never accumulates.
+/// - A 500 ms `Interval` for top-up ticks (dropped/cancelled on exit).
+/// - Fetch tasks that run as independent `spawn_local` futures and report back
+///   via the shared channel.
 ///
-/// When all segments have been fed, signals end-of-stream on the MediaSource.
-fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) {
-    let seg_url = {
-        let mut borrow = state.borrow_mut();
-        let mse = match borrow.as_mut() {
-            Some(s) => s,
-            None => return,
-        };
-        if mse.is_appending {
-            return;
-        }
-        let buffered_ahead = get_buffer_end(&video) - video.current_time();
-        if buffered_ahead >= MSE_TARGET_BUFFER_S && mse.next_seg != 0 {
-            return;
-        }
-        if mse.next_seg >= mse.segments.len() {
-            let _ = mse.media_source.end_of_stream();
-            return;
-        }
-        let url = mse.segments[mse.next_seg].url.clone();
-        mse.is_appending = true;
-        url
+/// All signals flow through one `UnboundedReceiver<PumpMsg>` so the loop body
+/// is a plain `while let` — no `select!`, no pinning gymnastics.
+async fn pump_loop(
+    start_seg: usize,
+    event_rx: futures::channel::mpsc::UnboundedReceiver<PumpMsg>,
+    event_tx: futures::channel::mpsc::UnboundedSender<PumpMsg>,
+    source_buffer: web_sys::SourceBuffer,
+    video: HtmlVideoElement,
+    segments: Vec<SegmentInfo>,
+    media_source: web_sys::MediaSource,
+) {
+    use futures::StreamExt as _;
+
+    // ── Persistent updateend listener ──────────────────────────────────────
+    // Registered once; removed once when the loop exits.
+    let updateend_cb = {
+        let tx = event_tx.clone();
+        Closure::<dyn FnMut()>::new(move || {
+            tx.unbounded_send(PumpMsg::UpdateEnd).ok();
+        })
+    };
+    source_buffer
+        .add_event_listener_with_callback("updateend", updateend_cb.as_ref().unchecked_ref())
+        .ok();
+
+    // ── Top-up timer ───────────────────────────────────────────────────────
+    // Dropped (i.e. cancelled) when the loop exits.
+    let _topup_interval = {
+        let tx = event_tx.clone();
+        Interval::new(500, move || {
+            tx.unbounded_send(PumpMsg::TopUp).ok();
+        })
     };
 
-    let state_clone = state.clone();
-    let video_clone = video.clone();
-    spawn_local(async move {
-        let bytes = match Request::get(&seg_url).send().await {
-            Ok(r) => match r.binary().await {
-                Ok(b) => b,
-                Err(e) => {
-                    log::error!("Failed to read segment bytes: {e:?}");
-                    if let Some(s) = state_clone.borrow_mut().as_mut() {
-                        s.is_appending = false;
+    // ── Loop state ─────────────────────────────────────────────────────────
+    let mut next_seg = start_seg;
+
+    /// Which kind of async operation is currently in-flight on the SourceBuffer.
+    #[derive(PartialEq, Eq)]
+    enum State {
+        /// No operation in-flight; ready to fetch the next segment.
+        Idle,
+        /// A `spawn_local` fetch is running; waiting for `FetchDone`/`FetchFailed`.
+        Fetching,
+        /// `appendBuffer` was called; waiting for `UpdateEnd`.
+        Appending,
+        /// `remove()` was called for back-buffer trimming; waiting for `UpdateEnd`.
+        Removing,
+    }
+    let mut state = State::Idle;
+
+    // Incremented on every seek so stale fetch results can be cheaply discarded.
+    let mut pump_gen: u64 = 0;
+
+    // ── Inline helper: start a fetch when the pump is Idle ─────────────────
+    macro_rules! maybe_fetch {
+        () => {
+            if state == State::Idle {
+                let buffered_ahead = get_buffer_end(&video) - video.current_time();
+                if buffered_ahead < MSE_TARGET_BUFFER_S || next_seg == 0 {
+                    if next_seg >= segments.len() {
+                        let _ = media_source.end_of_stream();
+                    } else {
+                        let url = segments[next_seg].url.clone();
+                        let cur_gen = pump_gen;
+                        let cur_seg = next_seg;
+                        let tx = event_tx.clone();
+                        spawn_local(async move {
+                            match Request::get(&url).send().await {
+                                Ok(r) => match r.binary().await {
+                                    Ok(bytes) => {
+                                        tx.unbounded_send(PumpMsg::FetchDone {
+                                            fetch_gen: cur_gen,
+                                            seg: cur_seg,
+                                            bytes,
+                                        })
+                                        .ok();
+                                    }
+                                    Err(e) => {
+                                        log::error!("pump: segment read: {e:?}");
+                                        tx.unbounded_send(PumpMsg::FetchFailed { fetch_gen: cur_gen })
+                                            .ok();
+                                    }
+                                },
+                                Err(e) => {
+                                    log::error!("pump: segment fetch: {e:?}");
+                                    tx.unbounded_send(PumpMsg::FetchFailed { fetch_gen: cur_gen })
+                                        .ok();
+                                }
+                            }
+                        });
+                        state = State::Fetching;
                     }
-                    return;
                 }
-            },
-            Err(e) => {
-                log::error!("Failed to fetch segment: {e:?}");
-                if let Some(s) = state_clone.borrow_mut().as_mut() {
-                    s.is_appending = false;
-                }
-                return;
             }
         };
+    }
 
-        // Get the source_buffer and remove any existing updateend listener so
-        // that listeners never accumulate on the SourceBuffer.
-        let (source_buffer, old_updateend_cb) = {
-            let mut borrow = state_clone.borrow_mut();
-            match borrow.as_mut() {
-                Some(s) => (s.source_buffer.clone(), s.updateend_closure.take()),
-                None => return,
-            }
-        };
-        if let Some(old) = &old_updateend_cb {
-            source_buffer
-                .remove_event_listener_with_callback("updateend", old.as_ref().unchecked_ref())
-                .ok();
-        }
-        drop(old_updateend_cb);
+    // Kick off the first fetch immediately.
+    maybe_fetch!();
 
-        // Register a new updateend listener.  Using FnMut (not FnOnce) so the
-        // Closure can be stored and later removed via remove_event_listener.
-        // Because we always remove the previous listener above before adding a
-        // new one, this listener will only ever fire once per append.
-        // The `fired` guard makes that one-shot guarantee explicit at the Rust
-        // level as well, in case the cleanup logic is ever changed.
-        let state_for_end = state_clone.clone();
-        let video_for_end = video_clone.clone();
-        let mut fired = false;
-        let updateend_cb = Closure::<dyn FnMut()>::new(move || {
-            if fired {
-                return;
-            }
-            fired = true;
-            {
-                let mut borrow = state_for_end.borrow_mut();
-                if let Some(s) = borrow.as_mut() {
-                    s.is_appending = false;
-                    s.next_seg += 1;
+    let mut event_rx = event_rx;
+    while let Some(msg) = event_rx.next().await {
+        match msg {
+            // ── External commands ──────────────────────────────────────────
+            PumpMsg::Quit => break,
+
+            PumpMsg::Seek(t) => {
+                let snapped = snap_to_cached_segment(t);
+                next_seg = (snapped / SEGMENT_DURATION_F) as usize;
+                pump_gen = pump_gen.wrapping_add(1);
+                match state {
+                    // In-flight append: let it finish; UpdateEnd will pick up
+                    // the updated next_seg automatically.
+                    State::Appending | State::Removing => {}
+                    // Idle or Fetching (stale fetch will be discarded on arrival).
+                    _ => {
+                        state = State::Idle;
+                        // Trim the back-buffer if the SourceBuffer is free.
+                        if !source_buffer.updating() {
+                            let remove_end = (t - MSE_BACK_BUFFER_S).max(0.0);
+                            if remove_end > 0.0 {
+                                if source_buffer.remove(0.0, remove_end).is_ok() {
+                                    state = State::Removing;
+                                }
+                            }
+                        }
+                        if state == State::Idle {
+                            maybe_fetch!();
+                        }
+                    }
                 }
             }
-            let s = state_for_end.clone();
-            let v = video_for_end.clone();
-            spawn_local(async move {
-                pump_segments(s, v);
-            });
-        });
-        source_buffer
-            .add_event_listener_with_callback(
-                "updateend",
-                updateend_cb.as_ref().unchecked_ref(),
-            )
-            .ok();
-        // Keep the closure alive in MseState so the listener remains valid.
-        {
-            let mut borrow = state_clone.borrow_mut();
-            if let Some(s) = borrow.as_mut() {
-                s.updateend_closure = Some(updateend_cb);
-            } else {
-                // State was cleared while we were async; remove the listener.
-                source_buffer
-                    .remove_event_listener_with_callback(
-                        "updateend",
-                        updateend_cb.as_ref().unchecked_ref(),
-                    )
-                    .ok();
-                return;
-            }
-        }
 
-        let uint8_array = js_sys::Uint8Array::from(bytes.as_slice());
-        let array_buffer = uint8_array.buffer();
-        if source_buffer
-            .append_buffer_with_array_buffer(&array_buffer)
-            .is_err()
-        {
-            // appendBuffer failed: remove the listener we just added and clear
-            // is_appending so the polling interval can retry.
-            let failed_cb = {
-                let mut borrow = state_clone.borrow_mut();
-                if let Some(s) = borrow.as_mut() {
-                    s.is_appending = false;
-                    s.updateend_closure.take()
+            // ── Internal signals ───────────────────────────────────────────
+            PumpMsg::TopUp => {
+                maybe_fetch!();
+            }
+
+            PumpMsg::UpdateEnd => {
+                match state {
+                    State::Appending => {
+                        state = State::Idle;
+                        next_seg += 1;
+                        maybe_fetch!();
+                    }
+                    State::Removing => {
+                        state = State::Idle;
+                        maybe_fetch!();
+                    }
+                    _ => {} // spurious updateend, ignore
+                }
+            }
+
+            PumpMsg::FetchDone { fetch_gen, seg, bytes } => {
+                if fetch_gen != pump_gen {
+                    // Stale result from before a seek — discard.
+                    if state == State::Fetching {
+                        state = State::Idle;
+                        maybe_fetch!();
+                    }
                 } else {
-                    None
+                    debug_assert_eq!(seg, next_seg);
+                    let arr = js_sys::Uint8Array::from(bytes.as_slice());
+                    if source_buffer
+                        .append_buffer_with_array_buffer(&arr.buffer())
+                        .is_ok()
+                    {
+                        state = State::Appending;
+                    } else {
+                        // appendBuffer failed (e.g. source still updating); TopUp will retry.
+                        state = State::Idle;
+                    }
                 }
-            };
-            if let Some(cb) = &failed_cb {
-                source_buffer
-                    .remove_event_listener_with_callback("updateend", cb.as_ref().unchecked_ref())
-                    .ok();
+            }
+
+            PumpMsg::FetchFailed { fetch_gen } => {
+                if fetch_gen == pump_gen && state == State::Fetching {
+                    state = State::Idle;
+                    // TopUp will retry.
+                }
             }
         }
-    });
+    }
+
+    // ── Cleanup ────────────────────────────────────────────────────────────
+    // Remove the updateend listener; _topup_interval is dropped here (cancelled).
+    source_buffer
+        .remove_event_listener_with_callback("updateend", updateend_cb.as_ref().unchecked_ref())
+        .ok();
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -448,19 +522,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let active_subtitle = use_state(|| Option::<u32>::None); // index of active subtitle, None = off
     let captions_menu_open = use_state(|| false);
 
-    // MSE player state storage.
-    //
-    // We use `use_mut_ref` (Rc<RefCell<…>>) rather than `use_state` here
-    // because the MSE state is set *asynchronously* inside a `spawn_local`
-    // block.  In Yew 0.21, `use_state` clones a new `Rc<R>` on every state
-    // update, so a handle captured in a cleanup closure before the async
-    // write completes will always read the *initial* `None` value — meaning
-    // cleanup is never called correctly.
-    //
-    // `use_mut_ref` wraps a single `Rc<RefCell<T>>` that is shared by all
-    // clones, so any write made by the async task is immediately visible to
-    // the cleanup closure captured earlier.
-    let mse_state = use_mut_ref(|| Option::<MseState>::None);
+    // MSE pump handle — holds the channel sender used to communicate with the
+    // background pump_loop task.  Using use_mut_ref so async writes from the
+    // setup task are immediately visible to the cleanup closure.
+    let pump_handle = use_mut_ref(|| Option::<PumpHandle>::None);
 
     // Initialize MSE player (and re-initialise when video ID or quality changes).
     {
@@ -471,7 +536,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let thumbnail_info = thumbnail_info.clone();
         let thumbnail_image = thumbnail_image.clone();
         let subtitle_tracks = subtitle_tracks.clone();
-        let mse_state = mse_state.clone();
+        let pump_handle = pump_handle.clone();
         let selected_quality = selected_quality.clone();
         let resume_position = resume_position.clone();
 
@@ -527,7 +592,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let video_ref_clone = video_ref.clone();
             let status_clone = status.clone();
             let error_clone = error.clone();
-            let mse_state_clone = mse_state.clone();
+            let pump_handle_clone = pump_handle.clone();
 
             spawn_local(async move {
                 // Give time for video element to be created
@@ -593,7 +658,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 let video_for_open = video.clone();
                 let status_for_open = status_clone.clone();
                 let error_for_open = error_clone.clone();
-                let mse_state_for_open = mse_state_clone.clone();
+                let pump_handle_for_open = pump_handle_clone.clone();
                 let media_source_for_open = media_source.clone();
                 let object_url_for_open = object_url.clone();
 
@@ -602,7 +667,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     let video = video_for_open;
                     let status = status_for_open;
                     let error = error_for_open;
-                    let mse_state = mse_state_for_open;
+                    let pump_handle = pump_handle_for_open;
                     let media_source = media_source_for_open;
                     let object_url = object_url_for_open;
 
@@ -656,24 +721,28 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             0
                         };
 
-                        // Store MSE state.
-                        *mse_state.borrow_mut() = Some(MseState {
-                            media_source,
-                            source_buffer,
+                        // Create the pump channel and start the background loop.
+                        let (pump_tx, pump_rx) =
+                            futures::channel::mpsc::unbounded::<PumpMsg>();
+                        *pump_handle.borrow_mut() = Some(PumpHandle {
+                            tx: pump_tx.clone(),
+                            media_source: media_source.clone(),
                             object_url,
-                            segments,
-                            next_seg: start_seg,
-                            is_appending: false,
-                            updateend_closure: None,
                         });
+                        spawn_local(pump_loop(
+                            start_seg,
+                            pump_rx,
+                            pump_tx,
+                            source_buffer,
+                            video.clone(),
+                            segments,
+                            media_source,
+                        ));
 
                         status.set(String::new());
                         if start_pos > 0.0 {
                             video.set_current_time(snap_to_cached_segment(start_pos));
                         }
-
-                        // Kick off the segment pump.
-                        pump_segments(mse_state, video);
                     });
                 }) as Box<dyn FnOnce()>);
 
@@ -686,14 +755,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 sourceopen_cb.forget();
             });
 
-            // Cleanup function: called by Yew when the dep tuple changes (quality
-            // or video ID changes) or when the component unmounts.
-            let mse_state_for_cleanup = mse_state.clone();
+            // Cleanup: send Quit to the background loop, then tear down the MediaSource.
+            let pump_handle_for_cleanup = pump_handle.clone();
             let video_ref_for_cleanup = video_ref.clone();
             move || {
-                if let Some(state) = mse_state_for_cleanup.borrow_mut().take() {
-                    let _ = state.media_source.end_of_stream();
-                    let _ = web_sys::Url::revoke_object_url(&state.object_url);
+                if let Some(handle) = pump_handle_for_cleanup.borrow_mut().take() {
+                    handle.tx.unbounded_send(PumpMsg::Quit).ok();
+                    let _ = handle.media_source.end_of_stream();
+                    let _ = web_sys::Url::revoke_object_url(&handle.object_url);
                     if let Some(video) = video_ref_for_cleanup.cast::<HtmlVideoElement>() {
                         video.set_src("");
                     }
@@ -755,7 +824,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         );
     }
 
-    // Update time/duration periodically and pump MSE segments
+    // Update time/duration periodically for the UI (pure display — does NOT
+    // touch MSE state; the pump_loop manages its own top-up timer).
     {
         let video_ref = video_ref.clone();
         let current_time = current_time.clone();
@@ -765,48 +835,53 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let is_dragging = is_dragging.clone();
         let is_buffering = is_buffering.clone();
         let video_ended = video_ended.clone();
-        let mse_state = mse_state.clone();
 
         use_effect_with(video_ref.clone(), move |video_ref| {
             let video_ref = video_ref.clone();
-            let mse_state_for_interval = mse_state.clone();
             let interval = Interval::new(150, move || {
                 if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
                     if !*is_dragging {
-                        current_time.set(video.current_time());
+                        let t = video.current_time();
+                        if (*current_time - t).abs() > 0.05 {
+                            current_time.set(t);
+                        }
                     }
                     let dur = video.duration();
-                    if dur.is_finite() && dur > 0.0 {
+                    if dur.is_finite() && dur > 0.0 && (*duration - dur).abs() > 0.05 {
                         duration.set(dur);
                     }
-                    buffered_end.set(get_buffer_end(&video));
-                    is_playing.set(!video.paused());
-
-                    // Check buffering state
-                    let ready_state = video.ready_state();
-                    is_buffering.set(ready_state < 3 && !video.paused());
-
-                    // Check if video ended
-                    video_ended.set(video.ended());
-
-                    // Top up the MSE buffer as playback advances
-                    pump_segments(mse_state_for_interval.clone(), video);
+                    let buf = get_buffer_end(&video);
+                    if (*buffered_end - buf).abs() > 0.05 {
+                        buffered_end.set(buf);
+                    }
+                    let playing = !video.paused();
+                    if *is_playing != playing {
+                        is_playing.set(playing);
+                    }
+                    let buffering = video.ready_state() < 3 && !video.paused();
+                    if *is_buffering != buffering {
+                        is_buffering.set(buffering);
+                    }
+                    let ended = video.ended();
+                    if *video_ended != ended {
+                        video_ended.set(ended);
+                    }
                 }
             });
             move || drop(interval)
         });
     }
 
-    // Handle seeks to unbuffered positions for the MSE player
+    // Handle seeks to unbuffered positions: notify the pump loop via channel.
     {
         let video_ref = video_ref.clone();
-        let mse_state = mse_state.clone();
+        let pump_handle = pump_handle.clone();
 
         use_effect_with(video_ref.clone(), move |video_ref| {
             let video_opt = video_ref.cast::<HtmlVideoElement>();
 
             let seeked_cb = video_opt.as_ref().map(|video| {
-                let mse_state_for_seeked = mse_state.clone();
+                let pump_handle_for_seeked = pump_handle.clone();
                 let video_for_seeked = video.clone();
 
                 let cb = Closure::<dyn Fn()>::new(move || {
@@ -818,29 +893,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         return;
                     }
 
-                    // Seeking to unbuffered territory — reset segment pointer and re-pump.
-                    let should_pump = {
-                        let mut borrow = mse_state_for_seeked.borrow_mut();
-                        if let Some(mse) = borrow.as_mut() {
-                            if !mse.source_buffer.updating() {
-                                let remove_end = (current_time - MSE_BACK_BUFFER_S).max(0.0);
-                                if remove_end > 0.0 {
-                                    let _ = mse.source_buffer.remove(0.0, remove_end);
-                                }
-                            }
-                            let snapped = snap_to_cached_segment(current_time);
-                            mse.next_seg = (snapped / SEGMENT_DURATION_F) as usize;
-                            // Do not force is_appending = false here.  If an append is
-                            // already in flight its updateend listener will call
-                            // pump_segments using the updated next_seg once it finishes.
-                            // Forcing false would allow two concurrent pump chains.
-                            !mse.is_appending
-                        } else {
-                            false
-                        }
-                    };
-                    if should_pump {
-                        pump_segments(mse_state_for_seeked.clone(), video_for_seeked.clone());
+                    // Notify the background pump loop of the new position.
+                    if let Some(handle) = pump_handle_for_seeked.borrow().as_ref() {
+                        handle.tx.unbounded_send(PumpMsg::Seek(current_time)).ok();
                     }
                 });
 

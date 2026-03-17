@@ -140,10 +140,22 @@ struct SegmentInfo {
 
 /// Events that flow through the pump loop's single unbounded channel.
 ///
-/// All signals — external commands from the Yew component **and** internal
-/// timer ticks, SourceBuffer events, and fetch completions — are multiplexed
-/// through one `UnboundedReceiver<PumpMsg>` so the loop body is a plain
-/// `while let`, with no `select!` machinery and no extra executor primitives.
+/// # Design: TigerBeetle-style single-writer event loop
+///
+/// This follows the same principle used by [TigerBeetle]: **all state
+/// mutations — whether they originate inside the loop (timer ticks, fetch
+/// completions, SourceBuffer callbacks) or outside it (seeks, shutdown) —
+/// flow through one MPSC channel and are processed sequentially by a single
+/// consumer.**  There is no shared mutable state, no locking, and no
+/// concurrent access to the SourceBuffer.  Every message is cheap (≤ 3
+/// words) so the channel itself is never a bottleneck on the hot path.
+///
+/// The result is a deterministic, race-free state machine that is easy to
+/// reason about: at any point in time the loop is in exactly one of
+/// `{Idle, Fetching, Appending, Removing}` and advances only when it
+/// receives the next message.
+///
+/// [TigerBeetle]: https://github.com/tigerbeetle/tigerbeetle
 enum PumpMsg {
     // ── External commands from the Yew component ──────────────────────────
     /// Seek to this timestamp (snapped to a cached-segment boundary inside the loop).
@@ -227,18 +239,27 @@ fn parse_m3u8(text: &str, playlist_url: &str) -> Vec<SegmentInfo> {
     segments
 }
 
-/// Background async task that feeds MSE segments, completely decoupled from
-/// the Yew render cycle.
+/// Background async task that feeds MSE segments.
 ///
-/// The loop owns:
-/// - A **single** persistent `updateend` listener registered once on entry and
-///   removed once on exit — it never accumulates.
-/// - A 500 ms `Interval` for top-up ticks (dropped/cancelled on exit).
-/// - Fetch tasks that run as independent `spawn_local` futures and report back
-///   via the shared channel.
+/// # Hot-path design
 ///
-/// All signals flow through one `UnboundedReceiver<PumpMsg>` so the loop body
-/// is a plain `while let` — no `select!`, no pinning gymnastics.
+/// Inspired by [TigerBeetle]'s single-writer event loop: **all I/O and all
+/// state transitions are serialised through one `UnboundedReceiver<PumpMsg>`.**
+/// The loop body is a plain `while let` — no `select!`, no shared `RefCell`,
+/// no locking.  The SourceBuffer is only ever touched from inside this loop,
+/// so there is exactly one writer at a time and no concurrency hazards.
+///
+/// Hot-path invariants that must hold at all times:
+/// - At most one in-flight `appendBuffer` or `remove` on the SourceBuffer.
+/// - At most one in-flight HTTP fetch for the segment at `next_seg`.
+/// - `pump_gen` is bumped on every seek; any `FetchDone` carrying a stale
+///   generation is dropped without touching the SourceBuffer.
+///
+/// Everything else — Yew re-renders, UI timers, user seeks — runs outside
+/// this loop and communicates exclusively by sending a `PumpMsg` into the
+/// channel.  The loop is completely decoupled from the Yew render cycle.
+///
+/// [TigerBeetle]: https://github.com/tigerbeetle/tigerbeetle
 async fn pump_loop(
     start_seg: usize,
     event_rx: futures::channel::mpsc::UnboundedReceiver<PumpMsg>,

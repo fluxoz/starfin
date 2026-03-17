@@ -421,6 +421,18 @@ async fn pump_loop(
                     }
                 } else {
                     debug_assert_eq!(seg, next_seg);
+                    // Each fMP4 segment produced by the backend has its PTS
+                    // rebased to 0.  Without setting timestamp_offset every
+                    // segment would land at [0, SEGMENT_DURATION_F] in the
+                    // MSE timeline, overwriting the previous one and causing
+                    // playback to jump back to the start on every segment.
+                    //
+                    // Hot-path invariant (TigerBeetle-style): timestamp_offset
+                    // is always set immediately before appendBuffer, never
+                    // speculatively — this is the single write point for the
+                    // SourceBuffer timeline position.
+                    source_buffer
+                        .set_timestamp_offset(seg as f64 * SEGMENT_DURATION_F);
                     let arr = js_sys::Uint8Array::from(bytes.as_slice());
                     if source_buffer
                         .append_buffer_with_array_buffer(&arr.buffer())

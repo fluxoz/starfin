@@ -196,6 +196,8 @@ struct MseState {
     /// Persistent `updateend` closure — stored here so it is properly
     /// dropped on cleanup instead of being `.forget()`-ed (§11.2).
     _updateend_closure: Closure<dyn Fn()>,
+    /// Persistent `error` closure on the SourceBuffer for diagnostics.
+    _onerror_closure: Closure<dyn Fn()>,
 }
 
 // ── URL / playlist helpers ───────────────────────────────────────────────────
@@ -1199,7 +1201,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 onerror_closure.as_ref().unchecked_ref(),
                             )
                             .ok();
-                        onerror_closure.forget();
 
                         // Store MSE state.
                         *mse_state.borrow_mut() = Some(MseState {
@@ -1211,6 +1212,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             generation: 0,
                             pump_tx: pump_tx.clone(),
                             _updateend_closure: updateend_closure,
+                            _onerror_closure: onerror_closure,
                         });
 
                         status.set(String::new());
@@ -1250,10 +1252,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     }
                 }
                 if let Some(state) = mse_state_for_cleanup.borrow_mut().take() {
-                    // Remove the persistent updateend listener.
+                    // Remove persistent event listeners.
                     let _ = state.source_buffer.remove_event_listener_with_callback(
                         "updateend",
                         state._updateend_closure.as_ref().unchecked_ref(),
+                    );
+                    let _ = state.source_buffer.remove_event_listener_with_callback(
+                        "error",
+                        state._onerror_closure.as_ref().unchecked_ref(),
                     );
                     // Firefox requires readyState == "open" before end_of_stream().
                     if state.media_source.ready_state() == web_sys::MediaSourceReadyState::Open

@@ -981,6 +981,17 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let video_id = video_id.clone();
             let quality = quality.clone();
 
+            // ── Cancellation flag ────────────────────────────────────────
+            //
+            // Shared between the async setup task and the cleanup closure.
+            // When the effect re-fires (or the component unmounts), the
+            // cleanup sets this to `true` so that any in-flight async work
+            // (e.g. the 50 ms wait, playlist fetch, sourceopen callback)
+            // bails out instead of touching stale handles or creating a
+            // second MediaSource.
+            let cancelled = Rc::new(Cell::new(false));
+            let cancelled_for_cleanup = cancelled.clone();
+
             // Fetch thumbnail info and load sprite (only on first load per video,
             // but harmless to re-fetch on quality change).
             let thumbnail_info_clone = thumbnail_info.clone();
@@ -1028,10 +1039,17 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let status_clone = status.clone();
             let error_clone = error.clone();
             let mse_state_clone = mse_state.clone();
+            let cancelled_for_setup = cancelled.clone();
 
             spawn_local(async move {
                 // Give time for video element to be created
                 TimeoutFuture::new(50).await;
+
+                // Bail out if the effect has already been cleaned up (e.g.
+                // a very fast quality switch or unmount during the 50 ms wait).
+                if cancelled_for_setup.get() {
+                    return;
+                }
 
                 let video = match video_ref_clone.cast::<HtmlVideoElement>() {
                     Some(v) => v,
@@ -1096,6 +1114,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 let mse_state_for_open = mse_state_clone.clone();
                 let media_source_for_open = media_source.clone();
                 let object_url_for_open = object_url.clone();
+                let cancelled_for_open = cancelled_for_setup.clone();
 
                 let sourceopen_cb = Closure::once(Box::new(move || {
                     let playlist_url = playlist_url_for_open;
@@ -1105,8 +1124,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     let mse_state = mse_state_for_open;
                     let media_source = media_source_for_open;
                     let object_url = object_url_for_open;
+                    let cancelled = cancelled_for_open;
 
                     spawn_local(async move {
+                        // Guard: bail out if the effect has been cleaned up.
+                        if cancelled.get() {
+                            return;
+                        }
+
                         // Fetch the M3U8 playlist.
                         let resp = match Request::get(&playlist_url).send().await {
                             Ok(r) => r,
@@ -1127,6 +1152,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         let segments = parse_m3u8(&text, &playlist_url);
                         if segments.is_empty() {
                             error.set(Some("Playlist contains no segments.".to_string()));
+                            return;
+                        }
+
+                        // Guard: check cancellation again after the network round-trip.
+                        if cancelled.get() {
                             return;
                         }
 
@@ -1244,6 +1274,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let mse_state_for_cleanup = mse_state.clone();
             let video_ref_for_cleanup = video_ref.clone();
             move || {
+                // Signal all in-flight async tasks to bail out.
+                cancelled_for_cleanup.set(true);
+
                 // §11.2: Send Shutdown before dropping MseState.
                 {
                     let borrow = mse_state_for_cleanup.borrow();
@@ -2251,6 +2284,34 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         "player-overlay"
     };
 
+    // ── Derived overlay visibility ───────────────────────────────────────
+    //
+    // All overlay elements are **always** present in the VDOM to keep the
+    // child list stable.  Yew's VDOM diff compares children by position;
+    // if conditional `if` blocks insert/remove elements before the
+    // `<video>` tag, the video element shifts position and Yew recreates
+    // the DOM node — destroying the attached MediaSource and causing an
+    // infinite reload loop.
+    //
+    // Instead, visibility is controlled via CSS classes (`hidden` =
+    // `display:none`) so the `<video>` element always occupies the same
+    // slot in the child list.
+    let error_shown = (*error).is_some();
+    let status_shown = !(*status).is_empty() && !error_shown;
+    let buffering_shown = *is_buffering && !error_shown && !status_shown;
+    let (skip_class, skip_style, skip_fwd) = match &*skip_indicator {
+        Some((direction, x_pos)) => (
+            format!("skip-indicator skip-indicator--{}", direction),
+            format!("left: {}%;", x_pos),
+            direction == "forward",
+        ),
+        None => (
+            "skip-indicator hidden".to_string(),
+            String::new(),
+            true,
+        ),
+    };
+
     html! {
         <div
             ref={container_ref}
@@ -2259,7 +2320,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             onmousemove={on_mouse_move}
             onmouseleave={on_mouse_leave}
         >
-            // Header
+            // Header — always rendered, toggled via CSS
             <div class={if *controls_visible { "player-header" } else { "player-header player-header--hidden" }}>
                 <button
                     class="btn btn--back"
@@ -2277,43 +2338,34 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 <span class="player-title">{ title }</span>
             </div>
 
-            // Error display
-            if let Some(err) = &*error {
-                <div class="notice notice--error">
-                    <div class="notice__title">{ "Playback error" }</div>
-                    <div class="notice__body">{ err }</div>
-                </div>
-            }
+            // Error display — always in VDOM, hidden via CSS when inactive
+            <div class={if error_shown { "notice notice--error" } else { "notice notice--error hidden" }}>
+                <div class="notice__title">{ "Playback error" }</div>
+                <div class="notice__body">{ (*error).as_deref().unwrap_or("") }</div>
+            </div>
 
-            // Loading status
-            if !(*status).is_empty() && (*error).is_none() {
-                <div class="player-status">{ &*status }</div>
-            }
+            // Loading status — always in VDOM
+            <div class={if status_shown { "player-status" } else { "player-status hidden" }}>
+                { &*status }
+            </div>
 
-            // Buffering indicator
-            if *is_buffering && (*error).is_none() && (*status).is_empty() {
-                <div class="player-buffering">
-                    <div class="player-buffering__spinner"></div>
-                </div>
-            }
+            // Buffering indicator — always in VDOM
+            <div class={if buffering_shown { "player-buffering" } else { "player-buffering hidden" }}>
+                <div class="player-buffering__spinner"></div>
+            </div>
 
-            // Skip indicator (for double-tap/keyboard skip)
-            if let Some((direction, x_pos)) = &*skip_indicator {
-                <div
-                    class={format!("skip-indicator skip-indicator--{}", direction)}
-                    style={format!("left: {}%;", x_pos)}
-                >
-                    if direction == "forward" {
-                        <span class="skip-indicator__icon">{ icon_skip_forward() }</span>
-                        <span class="skip-indicator__text">{ "10s" }</span>
-                    } else {
-                        <span class="skip-indicator__icon">{ icon_skip_backward() }</span>
-                        <span class="skip-indicator__text">{ "10s" }</span>
-                    }
-                </div>
-            }
+            // Skip indicator — always in VDOM
+            <div class={skip_class} style={skip_style}>
+                if skip_fwd {
+                    <span class="skip-indicator__icon">{ icon_skip_forward() }</span>
+                    <span class="skip-indicator__text">{ "10s" }</span>
+                } else {
+                    <span class="skip-indicator__icon">{ icon_skip_backward() }</span>
+                    <span class="skip-indicator__text">{ "10s" }</span>
+                }
+            </div>
 
-            // Video element
+            // Video element — position is now STABLE in the child list
             <video
                 ref={video_ref}
                 class="video-el"
@@ -2321,15 +2373,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 ondblclick={on_video_dblclick}
             />
 
-            // Video end overlay
-            if *video_ended {
-                <div class="video-end-overlay">
-                    <button class="video-end-overlay__replay" onclick={on_replay}>
-                        <span class="replay-icon">{ icon_replay() }</span>
-                        <span>{ "Replay" }</span>
-                    </button>
-                </div>
-            }
+            // Video end overlay — always in VDOM
+            <div class={if *video_ended { "video-end-overlay" } else { "video-end-overlay hidden" }}>
+                <button class="video-end-overlay__replay" onclick={on_replay}>
+                    <span class="replay-icon">{ icon_replay() }</span>
+                    <span>{ "Replay" }</span>
+                </button>
+            </div>
 
             // Controls bar (§11.1 — ControlBar sub-component)
             <ControlBar

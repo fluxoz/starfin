@@ -78,6 +78,10 @@ body{
   line-height: 1.6;
 }
 
+/* Utility: hide elements while keeping them in the VDOM so Yew's position-
+   based VDOM diff doesn't shift sibling elements and recreate DOM nodes. */
+.hidden { display: none !important; }
+
 .app{
   min-height: 100%;
   display: grid;

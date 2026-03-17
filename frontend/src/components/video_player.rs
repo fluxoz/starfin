@@ -609,6 +609,24 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let start_pos = *resume_position.borrow();
             *resume_position.borrow_mut() = 0.0;
 
+            // ── Cancellation token ─────────────────────────────────────────
+            // Shared between the async setup task and the cleanup closure.
+            // Cleanup sets this to `true` so that any in-flight setup
+            // step — still suspended at an `await` — silently aborts
+            // rather than committing its result to a now-stale lifecycle.
+            //
+            // This gives the MSE initialisation a synchronously
+            // deterministic lifecycle: the cleanup closure *always* wins
+            // over a concurrently executing setup task.  The pump_loop
+            // either starts completely (cleanup hasn't fired yet) or not
+            // at all (cleanup fired first).  There is never an orphaned
+            // pump loop running in the background.
+            //
+            // Pattern inspired by TigerBeetle's "no in-flight I/O
+            // survives a lifecycle transition" invariant.
+            let cancelled = Rc::new(Cell::new(false));
+            let cancelled_for_init = cancelled.clone();
+
             // Initialize MSE player
             let video_ref_clone = video_ref.clone();
             let status_clone = status.clone();
@@ -616,8 +634,17 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let pump_handle_clone = pump_handle.clone();
 
             spawn_local(async move {
-                // Give time for video element to be created
+                // Macro to abort this task whenever the cleanup closure has
+                // already fired.  Each invocation corresponds to one `await`
+                // point where control briefly returns to the WASM scheduler,
+                // giving cleanup a window to run between checks.
+                macro_rules! bail_if_cancelled {
+                    ($tok:expr) => { if $tok.get() { return; } };
+                }
+
+                // Give time for video element to be created.
                 TimeoutFuture::new(50).await;
+                bail_if_cancelled!(cancelled_for_init); // ①
 
                 let video = match video_ref_clone.cast::<HtmlVideoElement>() {
                     Some(v) => v,
@@ -682,8 +709,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 let pump_handle_for_open = pump_handle_clone.clone();
                 let media_source_for_open = media_source.clone();
                 let object_url_for_open = object_url.clone();
+                // Clone so the sourceopen callback can check cancellation too.
+                let cancelled_for_open = cancelled_for_init.clone();
 
                 let sourceopen_cb = Closure::once(Box::new(move || {
+                    bail_if_cancelled!(cancelled_for_open); // ②
+
                     let playlist_url = playlist_url_for_open;
                     let video = video_for_open;
                     let status = status_for_open;
@@ -691,8 +722,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     let pump_handle = pump_handle_for_open;
                     let media_source = media_source_for_open;
                     let object_url = object_url_for_open;
+                    let cancelled = cancelled_for_open;
 
                     spawn_local(async move {
+                        macro_rules! bail_if_cancelled {
+                            ($tok:expr) => { if $tok.get() { return; } };
+                        }
+
                         // Fetch the M3U8 playlist.
                         let resp = match Request::get(&playlist_url).send().await {
                             Ok(r) => r,
@@ -701,6 +737,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 return;
                             }
                         };
+                        bail_if_cancelled!(cancelled); // ③
+
                         let text = match resp.text().await {
                             Ok(t) => t,
                             Err(e) => {
@@ -708,6 +746,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 return;
                             }
                         };
+                        // ④ Final check — last chance before we commit:
+                        //    create the SourceBuffer and hand ownership to
+                        //    pump_loop.  After this point the loop owns the
+                        //    SourceBuffer; cleanup sends PumpMsg::Quit to
+                        //    stop it gracefully.
+                        bail_if_cancelled!(cancelled); // ④
 
                         // Parse segment list.
                         let segments = parse_m3u8(&text, &playlist_url);
@@ -776,10 +820,17 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 sourceopen_cb.forget();
             });
 
-            // Cleanup: send Quit to the background loop, then tear down the MediaSource.
+            // Cleanup: abort any in-flight setup, then gracefully stop the
+            // pump loop (if it has already started).
+            let cancelled_for_cleanup = cancelled.clone();
             let pump_handle_for_cleanup = pump_handle.clone();
             let video_ref_for_cleanup = video_ref.clone();
             move || {
+                // Signal every pending cancellation check in the setup task.
+                // This is the "synchronous" side of the async/sync boundary:
+                // the flag flip is instantaneous and checked at every await
+                // point in the setup path.
+                cancelled_for_cleanup.set(true);
                 if let Some(handle) = pump_handle_for_cleanup.borrow_mut().take() {
                     handle.tx.unbounded_send(PumpMsg::Quit).ok();
                     let _ = handle.media_source.end_of_stream();

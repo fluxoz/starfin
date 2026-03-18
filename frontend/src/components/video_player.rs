@@ -984,6 +984,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     }
 
     // Handle seeks to unbuffered positions: notify the pump loop via channel.
+    //
+    // We listen for `seeking` (not `seeked`) because MSE does NOT fire
+    // `seeked` until data is available at the seek position.  If the
+    // position is unbuffered, `seeked` never fires, creating a deadlock:
+    // the video waits for data → pump never learns about the seek → pump
+    // never fetches the right segment.  `seeking` fires immediately when
+    // `currentTime` is set, so the pump is notified right away.
     {
         let video_ref = video_ref.clone();
         let pump_handle = pump_handle.clone();
@@ -991,13 +998,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         use_effect_with(video_ref.clone(), move |video_ref| {
             let video_opt = video_ref.cast::<HtmlVideoElement>();
 
-            let seeked_cb = video_opt.as_ref().map(|video| {
-                let pump_handle_for_seeked = pump_handle.clone();
-                let video_for_seeked = video.clone();
+            let seeking_cb = video_opt.as_ref().map(|video| {
+                let pump_handle_for_seeking = pump_handle.clone();
+                let video_for_seeking = video.clone();
 
                 let cb = Closure::<dyn Fn()>::new(move || {
-                    let current_time = video_for_seeked.current_time();
-                    let buf_end = get_buffer_end(&video_for_seeked);
+                    let current_time = video_for_seeking.current_time();
+                    let buf_end = get_buffer_end(&video_for_seeking);
 
                     // If the seek target is already buffered, nothing to do.
                     if buf_end > current_time {
@@ -1005,22 +1012,22 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     }
 
                     // Notify the background pump loop of the new position.
-                    if let Some(handle) = pump_handle_for_seeked.borrow().as_ref() {
+                    if let Some(handle) = pump_handle_for_seeking.borrow().as_ref() {
                         handle.tx.unbounded_send(PumpMsg::Seek(current_time)).ok();
                     }
                 });
 
                 video
-                    .add_event_listener_with_callback("seeked", cb.as_ref().unchecked_ref())
+                    .add_event_listener_with_callback("seeking", cb.as_ref().unchecked_ref())
                     .ok();
                 cb
             });
 
             move || {
-                if let (Some(cb), Some(video)) = (seeked_cb, video_opt) {
+                if let (Some(cb), Some(video)) = (seeking_cb, video_opt) {
                     video
                         .remove_event_listener_with_callback(
-                            "seeked",
+                            "seeking",
                             cb.as_ref().unchecked_ref(),
                         )
                         .ok();

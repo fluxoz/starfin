@@ -118,6 +118,80 @@ pub async fn transcode_segment_with_kill(
     .map_err(|e| format!("transcode task panicked: {e}"))?
 }
 
+/// Create an fMP4 init segment (`ftyp+moov` only, no media data) for the
+/// given video and quality.  The init segment contains codec configuration
+/// (SPS/PPS for H.264, AudioSpecificConfig for AAC) that MSE SourceBuffer
+/// needs before any media segments can be appended.
+///
+/// If the init segment already exists on disk it is returned immediately.
+/// Otherwise segment 0 is generated first (if missing), then its `ftyp` and
+/// `moov` boxes are extracted and cached as `init.mp4`.
+pub async fn create_init_segment(
+    abs_path: &str,
+    hls_dir: &Path,
+    hwaccel: &HwAccel,
+    quality: super::transcode::Quality,
+) -> Result<Vec<u8>, String> {
+    let init_path = hls_dir.join("init.mp4");
+
+    // Return cached init segment if it exists.
+    if let Ok(data) = tokio::fs::read(&init_path).await {
+        return Ok(data);
+    }
+
+    // Ensure segment 0 exists (the init boxes are extracted from it).
+    transcode_segment(abs_path, hls_dir, 0, hwaccel, quality).await?;
+
+    let seg0_path = hls_dir.join("seg_00000.mp4");
+
+    let seg_data = tokio::fs::read(&seg0_path)
+        .await
+        .map_err(|e| format!("read seg 0: {e}"))?;
+
+    let init_data = extract_ftyp_moov(&seg_data)?;
+
+    tokio::fs::write(&init_path, &init_data)
+        .await
+        .map_err(|e| format!("write init.mp4: {e}"))?;
+
+    Ok(init_data)
+}
+
+/// Extract the leading `ftyp` + `moov` boxes from an fMP4 segment.
+///
+/// An fMP4 file produced with `empty_moov` has the structure:
+///   `[ftyp] [moov] [moof] [mdat] …`
+///
+/// This function returns the byte range covering `ftyp` and `moov` — the
+/// initialisation segment that MSE needs before appending media fragments.
+fn extract_ftyp_moov(data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut pos: usize = 0;
+    let mut end: usize = 0;
+
+    while pos + 8 <= data.len() {
+        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        if size < 8 || pos + size > data.len() {
+            break;
+        }
+        let box_type = &data[pos + 4..pos + 8];
+
+        if box_type == b"ftyp" || box_type == b"moov" {
+            end = pos + size;
+        } else {
+            // Reached moof/mdat — stop.
+            break;
+        }
+
+        pos += size;
+    }
+
+    if end == 0 {
+        return Err("no ftyp/moov boxes found in segment".into());
+    }
+
+    Ok(data[..end].to_vec())
+}
+
 /// Quality / mode for on-demand segment creation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -630,9 +704,14 @@ fn remux_segment(
 
     let mut got_video_keyframe = false;
     // PTS offsets (in output time base) used to rebase timestamps so each
-    // segment starts near PTS 0, preventing A/V desync in HLS players.
+    // segment starts at its real position in the video timeline.  MSE
+    // requires strictly increasing, non-overlapping PTS across segments
+    // (seg 0 = 0–6 s, seg 1 = 6–12 s, …).  We subtract the first
+    // packet's DTS and add back the segment's start_time offset.
     let mut video_pts_offset: Option<i64> = None;
     let mut audio_pts_offset: Option<i64> = None;
+    let seg_start_video = (start_time * f64::from(out_video_tb.1) / f64::from(out_video_tb.0)) as i64;
+    let seg_start_audio = (start_time * f64::from(out_audio_tb.1) / f64::from(out_audio_tb.0)) as i64;
 
     for (stream, mut packet) in ictx.packets() {
         if let Some(k) = kill {
@@ -685,30 +764,30 @@ fn remux_segment(
         if is_video {
             packet.set_stream(out_video_idx);
             packet.rescale_ts(in_video_tb, out_video_tb);
-            // Record the first video DTS (or PTS) as the offset to rebase to
-            // zero.  Using DTS prevents negative DTS values for B-frame
-            // content where DTS < PTS on the first packet.
+            // Record the first video DTS (or PTS) as the base offset.  We
+            // subtract it and add back the segment's start-time so PTS begins
+            // at the real position in the video timeline (not at zero).
             if video_pts_offset.is_none() {
                 video_pts_offset = packet.dts().or(packet.pts());
             }
             if let (Some(offset), Some(p)) = (video_pts_offset, packet.pts()) {
-                packet.set_pts(Some(p - offset));
+                packet.set_pts(Some(p - offset + seg_start_video));
             }
             if let (Some(offset), Some(d)) = (video_pts_offset, packet.dts()) {
-                packet.set_dts(Some(d - offset));
+                packet.set_dts(Some(d - offset + seg_start_video));
             }
         } else if let Some(out_ai) = out_audio_idx_val {
             packet.set_stream(out_ai);
             packet.rescale_ts(in_audio_tb.unwrap(), out_audio_tb);
-            // Record the first audio DTS (or PTS) as the offset to rebase to zero.
+            // Same rebase for audio — keep PTS continuous across segments.
             if audio_pts_offset.is_none() {
                 audio_pts_offset = packet.dts().or(packet.pts());
             }
             if let (Some(offset), Some(p)) = (audio_pts_offset, packet.pts()) {
-                packet.set_pts(Some(p - offset));
+                packet.set_pts(Some(p - offset + seg_start_audio));
             }
             if let (Some(offset), Some(d)) = (audio_pts_offset, packet.dts()) {
-                packet.set_dts(Some(d - offset));
+                packet.set_dts(Some(d - offset + seg_start_audio));
             }
         } else {
             continue;
@@ -912,6 +991,9 @@ fn hybrid_segment(
 
     let mut got_video_keyframe = false;
     let mut video_pts_offset: Option<i64> = None;
+    // Segment-start offset in output video time base so PTS is continuous
+    // across segments (matches the remux_segment fix).
+    let seg_start_video = (start_time * f64::from(out_video_tb.1) / f64::from(out_video_tb.0)) as i64;
 
     // Audio synthetic PTS (in 1/sample_rate time base).
     let mut audio_sample_count: i64 = 0;
@@ -963,10 +1045,10 @@ fn hybrid_segment(
                 video_pts_offset = packet.dts().or(packet.pts());
             }
             if let (Some(offset), Some(p)) = (video_pts_offset, packet.pts()) {
-                packet.set_pts(Some(p - offset));
+                packet.set_pts(Some(p - offset + seg_start_video));
             }
             if let (Some(offset), Some(d)) = (video_pts_offset, packet.dts()) {
-                packet.set_dts(Some(d - offset));
+                packet.set_dts(Some(d - offset + seg_start_video));
             }
             if let Err(e) = packet.write_interleaved(&mut octx) {
                 eprintln!("[hybrid] video write_interleaved failed: {e}");

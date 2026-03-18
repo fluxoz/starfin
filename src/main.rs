@@ -1944,16 +1944,12 @@ async fn remove_non_precached_segments_all_qualities(video_cache_dir: &Path) {
 
 /// `GET /api/videos/{id}/playlist.m3u8`
 ///
-/// Generates an HLS VOD playlist using MPEG-TS segments.
+/// Generates an HLS VOD playlist with fMP4 segments and a separate init
+/// segment (`#EXT-X-MAP`).
 ///
 /// Accepts an optional `?quality=high|medium|low` query parameter (default:
 /// `high`).  Segment URLs embed the same quality token so that HLS.js fetches
 /// segments at the correct quality level.
-///
-/// This follows the Jellyfin/Plex approach:
-/// - MPEG-TS segment format (self-contained, no init segment required)
-/// - HLS version 3 for maximum compatibility
-/// - Segments are transcoded on-demand when first requested
 async fn get_playlist(
     id: web::Path<String>,
     query: web::Query<QualityQuery>,
@@ -1984,16 +1980,19 @@ async fn get_playlist(
     let duration = duration_secs as f64;
     let num_segments = (duration / SEGMENT_DURATION).ceil() as usize;
 
-    // Build the HLS VOD playlist with MPEG-TS segments.
-    // fMP4 segments are self-contained (ftyp+moov+moof+mdat) — each segment
-    // embedded codec info and PTS timestamps, unlike fMP4 which requires a
-    // separate init segment with moov atom and sequential baseMediaDecodeTime.
+    // Build HLS VOD playlist (version 6 for EXT-X-MAP / fMP4 init segment).
     let mut playlist = String::new();
     playlist.push_str("#EXTM3U\n");
-    playlist.push_str("#EXT-X-VERSION:3\n");
+    playlist.push_str("#EXT-X-VERSION:6\n");
     playlist.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", SEGMENT_DURATION.ceil() as u32));
     playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
     playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+    // Point to the fMP4 init segment (ftyp+moov) so MSE gets codec config
+    // before any media fragments are appended.
+    playlist.push_str(&format!(
+        "#EXT-X-MAP:URI=\"/api/videos/{}/init.mp4?quality={}\"\n",
+        id, quality.as_str()
+    ));
 
     for i in 0..num_segments {
         let seg_start = i as f64 * SEGMENT_DURATION;
@@ -2021,7 +2020,62 @@ async fn get_playlist(
         .body(playlist)
 }
 
-/// `GET /api/videos/{id}/segments/{filename}` — serve an MPEG-TS segment on-demand.
+/// `GET /api/videos/{id}/init.mp4` — serve the fMP4 initialisation segment.
+///
+/// The init segment contains only `ftyp` and `moov` boxes (codec
+/// configuration — SPS/PPS for H.264, AudioSpecificConfig for AAC).  MSE
+/// SourceBuffer needs this before any media fragments can be appended.
+///
+/// Accepts an optional `?quality=original|high|medium|low` query parameter
+/// (default: `original`).  The init segment is extracted from segment 0 and
+/// cached as `init.mp4` in the quality-specific subdirectory.
+async fn get_init_segment(
+    id: web::Path<String>,
+    query: web::Query<QualityQuery>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let quality = query.quality;
+
+    let (abs_path, _) = match find_video(&state, &id) {
+        Some(v) => v,
+        None => return HttpResponse::NotFound().body("video not found"),
+    };
+
+    let resolved_path = match abs_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+                .body(format!("failed to resolve video path: {e}"))
+        }
+    };
+    let abs_str = match resolved_path.to_str() {
+        Some(s) => s.to_owned(),
+        None => return HttpResponse::BadRequest().body("path is not valid UTF-8"),
+    };
+
+    let hls_dir = state.cache_dir.join(id.as_str()).join(quality.as_str());
+    if let Err(e) = tokio::fs::create_dir_all(&hls_dir).await {
+        return HttpResponse::InternalServerError()
+            .body(format!("cache dir error: {e}"));
+    }
+
+    match media::transcode::create_init_segment(&abs_str, &hls_dir, &state.hwaccel, quality).await {
+        Ok(data) => HttpResponse::Ok()
+            .content_type("video/mp4")
+            .insert_header((
+                header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable",
+            ))
+            .body(data),
+        Err(e) => {
+            error!(error = %e, "init segment creation failed");
+            HttpResponse::ServiceUnavailable()
+                .body(format!("init segment creation failed: {e}"))
+        }
+    }
+}
+
+/// `GET /api/videos/{id}/segments/{filename}` — serve an fMP4 segment on-demand.
 ///
 /// Accepts an optional `?quality=high|medium|low` query parameter (default:
 /// `high`).  Segments are stored in and served from a quality-specific
@@ -2029,9 +2083,6 @@ async fn get_playlist(
 /// other.
 ///
 /// Segments are transcoded on-demand if they don't exist in the cache.
-/// Uses MPEG-TS format (like Jellyfin) for self-contained segments with
-/// embedded codec info and PTS timestamps, avoiding the fMP4
-/// baseMediaDecodeTime issues that cause playback freezes.
 async fn get_segment(
     params: web::Path<(String, String)>,
     query: web::Query<QualityQuery>,
@@ -3672,6 +3723,10 @@ async fn main() -> std::io::Result<()> {
             .route(
                 "/api/videos/{id}/playlist.m3u8",
                 web::get().to(get_playlist),
+            )
+            .route(
+                "/api/videos/{id}/init.mp4",
+                web::get().to(get_init_segment),
             )
             .route(
                 "/api/videos/{id}/segments/{filename}",

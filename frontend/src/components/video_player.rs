@@ -97,9 +97,10 @@ pub struct Representation {
 
 #[derive(Debug, Clone)]
 pub struct Playlist {
-    pub representations: Vec<Representation>,
-    pub is_live:         bool,
-    pub total_duration:  Option<f64>,
+    pub representations:  Vec<Representation>,
+    pub is_live:          bool,
+    pub total_duration:   Option<f64>,
+    pub init_segment_url: Option<String>,
 }
 
 pub struct VideoPlayerState {
@@ -162,7 +163,7 @@ impl VideoPlayerState {
 
 pub fn parse_media_playlist(
     text:              &str,
-    playlist_base_url: &str,
+    _playlist_base_url: &str,
     quality:           &str,
 ) -> Result<Playlist, String> {
     let lines: Vec<&str> = text
@@ -171,12 +172,25 @@ pub fn parse_media_playlist(
         .filter(|l| !l.is_empty())
         .collect();
 
-    let mut segments     = Vec::new();
-    let mut current_time = 0.0f64;
-    let mut i            = 0usize;
+    let mut segments         = Vec::new();
+    let mut current_time     = 0.0f64;
+    let mut init_segment_url = None;
+    let mut i                = 0usize;
 
     while i < lines.len() {
         let line = lines[i];
+
+        // Parse #EXT-X-MAP:URI="..." for the init segment.
+        if line.starts_with("#EXT-X-MAP:") {
+            if let Some(start) = line.find("URI=\"") {
+                let rest = &line[start + 5..];
+                if let Some(end) = rest.find('"') {
+                    init_segment_url = Some(rest[..end].to_string());
+                    info!("playlist: found init segment URL: {}", rest[..end].to_string());
+                }
+            }
+        }
+
         if line.starts_with("#EXTINF:")
             && let Some(duration_str) = line.split(',').next()
         {
@@ -199,15 +213,16 @@ pub fn parse_media_playlist(
         i += 1;
     }
 
-    info!("{:?}", segments);
+    info!("playlist: {} segments parsed", segments.len());
 
     let rep            = Representation { id: quality.to_string(), bitrate: 0, segments };
     let total_duration = Some(rep.segments.iter().map(|s| s.duration).sum());
 
     Ok(Playlist {
-        representations: vec![rep],
-        is_live:         false,
+        representations:  vec![rep],
+        is_live:          false,
         total_duration,
+        init_segment_url,
     })
 }
 
@@ -419,13 +434,45 @@ async fn evict_behind_playhead(
 // ── Segment pump ─────────────────────────────────────────────────────────────
 
 async fn run_segment_pump(
-    segments:     Vec<Segment>,
-    sb_ref:       Rc<RefCell<Option<SourceBuffer>>>,
-    video_ref:    NodeRef,
-    media_source: Rc<MediaSource>,
+    segments:         Vec<Segment>,
+    sb_ref:           Rc<RefCell<Option<SourceBuffer>>>,
+    video_ref:        NodeRef,
+    media_source:     Rc<MediaSource>,
+    init_segment_url: Option<String>,
 ) {
     let total = segments.len();
     info!("pump: {} segments total", total);
+
+    // ── 0. Append init segment (ftyp+moov) ─────────────────────────────
+    if let Some(ref init_url) = init_segment_url {
+        info!("pump: fetching init segment from {}", init_url);
+        match Request::get(init_url).send().await {
+            Ok(resp) => match resp.binary().await {
+                Ok(mut bytes) => {
+                    info!("pump: init segment fetched ({} bytes)", bytes.len());
+                    wait_until_not_updating(&sb_ref).await;
+                    let append_ok = {
+                        let sb_guard = sb_ref.borrow();
+                        match sb_guard.as_ref() {
+                            None => { error!("pump: SourceBuffer gone before init"); false }
+                            Some(sb) => {
+                                match sb.append_buffer_with_u8_array(bytes.as_mut_slice()) {
+                                    Ok(()) => { info!("pump: init segment appended OK"); true }
+                                    Err(e) => { error!("pump: init append failed: {:?}", e); false }
+                                }
+                            }
+                        }
+                    };
+                    if append_ok {
+                        wait_until_not_updating(&sb_ref).await;
+                        info!("pump: init segment append complete");
+                    }
+                }
+                Err(e) => error!("pump: init segment binary() failed: {e}"),
+            },
+            Err(e) => error!("pump: init segment fetch failed: {e}"),
+        }
+    }
 
     // Per-segment data slots: each independently borrowable.
     let data_slots: Vec<Rc<RefCell<Option<Vec<u8>>>>> = (0..total)
@@ -475,8 +522,8 @@ async fn run_segment_pump(
 
         // ── 2. Done? ───────────────────────────────────────────────────────
         if append_cursor >= total {
-            if media_source.ready_state() == web_sys::MediaSourceReadyState::Open {
-                let _ = media_source.end_of_stream();
+            if (*media_source).ready_state() == web_sys::MediaSourceReadyState::Open {
+                let _ = (*media_source).end_of_stream();
                 info!("pump: end_of_stream");
             }
             break;
@@ -625,27 +672,328 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         "player-overlay"
     };
 
+    // ── Play/pause toggle ───────────────────────────────────────────
+    let is_playing = use_state(|| false);
+
     let on_container_click = {
         let video_ref = video_player_ref.clone();
-        Callback::from(move |_| {
+        let is_playing = is_playing.clone();
+        Callback::from(move |_: MouseEvent| {
             if let Some(v) = video_ref.cast::<HtmlVideoElement>() {
-                let _ = v.play();
+                if v.paused() {
+                    let _ = v.play();
+                    is_playing.set(true);
+                } else {
+                    v.pause().ok();
+                    is_playing.set(false);
+                }
             }
         })
     };
     let on_mouse_leave       = Callback::from(move |_| {});
     let on_mouse_move        = Callback::from(move |_| {});
-    let on_speed_toggle      = Callback::from(move |_| { info!("toggling speed!"); });
-    let on_quality_toggle    = Callback::from(move |_| { info!("toggling quality!"); });
-    let on_quality_select    = Callback::from(move |_: String| { info!("selecting quality!"); });
-    let on_speed_select      = Callback::from(move |_: f32| { info!("selecting speed!"); });
-    let on_fullscreen_toggle = Callback::from(move |_| { info!("toggling fullscreen!"); });
 
-    let on_video_click = Callback::from(move |e: MouseEvent| {
-        if let Some(v) = e.target_dyn_into::<HtmlVideoElement>() {
-            let _ = v.play();
-        }
-    });
+    let on_play_pause = {
+        let video_ref = video_player_ref.clone();
+        let is_playing = is_playing.clone();
+        Callback::from(move |e: MouseEvent| {
+            e.stop_propagation();
+            if let Some(v) = video_ref.cast::<HtmlVideoElement>() {
+                if v.paused() {
+                    let _ = v.play();
+                    is_playing.set(true);
+                } else {
+                    v.pause().ok();
+                    is_playing.set(false);
+                }
+            }
+        })
+    };
+
+    // ── Speed menu ───────────────────────────────────────────────
+    let on_speed_toggle = {
+        let speed_menu_open = speed_menu_open.clone();
+        Callback::from(move |e: MouseEvent| {
+            e.stop_propagation();
+            speed_menu_open.set(!*speed_menu_open);
+        })
+    };
+    let on_speed_select = {
+        let playback_speed = playback_speed.clone();
+        let speed_menu_open = speed_menu_open.clone();
+        let video_ref = video_player_ref.clone();
+        Callback::from(move |speed: f32| {
+            playback_speed.set(speed);
+            speed_menu_open.set(false);
+            if let Some(v) = video_ref.cast::<HtmlVideoElement>() {
+                v.set_playback_rate(speed as f64);
+            }
+        })
+    };
+
+    // ── Quality menu ─────────────────────────────────────────────
+    let on_quality_toggle = {
+        let quality_menu_open = quality_menu_open.clone();
+        Callback::from(move |e: MouseEvent| {
+            e.stop_propagation();
+            quality_menu_open.set(!*quality_menu_open);
+        })
+    };
+    let on_quality_select = {
+        let selected_quality = selected_quality.clone();
+        let quality_menu_open = quality_menu_open.clone();
+        Callback::from(move |q: String| {
+            // Persist to localStorage.
+            if let Some(storage) = window()
+                .and_then(|w| w.local_storage().ok())
+                .flatten()
+            {
+                let _ = storage.set_item(QUALITY_STORAGE_KEY, &q);
+            }
+            selected_quality.set(q);
+            quality_menu_open.set(false);
+            // Quality change takes effect on next video load.
+        })
+    };
+
+    // ── Fullscreen ───────────────────────────────────────────────
+    let on_fullscreen_toggle = {
+        let container_ref = container_ref.clone();
+        let is_fullscreen = is_fullscreen.clone();
+        Callback::from(move |e: MouseEvent| {
+            e.stop_propagation();
+            if let Some(el) = container_ref.cast::<web_sys::HtmlElement>() {
+                if *is_fullscreen {
+                    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                        let _ = doc.exit_fullscreen();
+                    }
+                    is_fullscreen.set(false);
+                } else {
+                    let _ = el.request_fullscreen();
+                    is_fullscreen.set(true);
+                }
+            }
+        })
+    };
+
+    // ── Volume / mute ────────────────────────────────────────────
+    let on_mute_toggle = {
+        let video_ref = video_player_ref.clone();
+        let is_muted = is_muted.clone();
+        let volume = volume.clone();
+        Callback::from(move |e: MouseEvent| {
+            e.stop_propagation();
+            if let Some(v) = video_ref.cast::<HtmlVideoElement>() {
+                let new_muted = !v.muted();
+                v.set_muted(new_muted);
+                is_muted.set(new_muted);
+                if !new_muted && *volume == 0.0 {
+                    v.set_volume(1.0);
+                    volume.set(1.0);
+                }
+            }
+        })
+    };
+
+    let on_volume_change = {
+        let video_ref = video_player_ref.clone();
+        let volume = volume.clone();
+        let is_muted = is_muted.clone();
+        Callback::from(move |e: web_sys::InputEvent| {
+            if let Some(input) = e.target_dyn_into::<web_sys::HtmlInputElement>() {
+                if let Ok(val) = input.value().parse::<f64>() {
+                    volume.set(val);
+                    if let Some(v) = video_ref.cast::<HtmlVideoElement>() {
+                        v.set_volume(val);
+                        if val > 0.0 {
+                            v.set_muted(false);
+                            is_muted.set(false);
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    // ── Video click → play/pause ─────────────────────────────────
+    let on_video_click = {
+        let video_ref = video_player_ref.clone();
+        let is_playing = is_playing.clone();
+        Callback::from(move |e: MouseEvent| {
+            e.stop_propagation();
+            if let Some(v) = e.target_dyn_into::<HtmlVideoElement>() {
+                if v.paused() {
+                    let _ = v.play();
+                    is_playing.set(true);
+                } else {
+                    v.pause().ok();
+                    is_playing.set(false);
+                }
+            }
+        })
+    };
+
+    // ── Progress bar seeking (click + drag) ─────────────────────
+    let progress_ref    = use_node_ref();
+    let is_seeking      = use_state(|| false);
+    let seek_preview_pct = use_state(|| 0.0_f64);
+
+    // Helper: compute seek percentage from a MouseEvent relative to the
+    // progress bar element.
+    let calc_seek_pct = {
+        let progress_ref = progress_ref.clone();
+        Rc::new(move |e: &MouseEvent| -> Option<f64> {
+            progress_ref.cast::<web_sys::HtmlElement>().map(|el| {
+                let rect = el.get_bounding_client_rect();
+                let x = e.client_x() as f64 - rect.left();
+                (x / rect.width()).clamp(0.0, 1.0)
+            })
+        })
+    };
+
+    // mousedown on the progress bar → start drag
+    let on_progress_mousedown = {
+        let is_seeking = is_seeking.clone();
+        let seek_preview_pct = seek_preview_pct.clone();
+        let calc = calc_seek_pct.clone();
+        Callback::from(move |e: MouseEvent| {
+            e.stop_propagation();
+            e.prevent_default();
+            is_seeking.set(true);
+            if let Some(pct) = calc(&e) {
+                seek_preview_pct.set(pct * 100.0);
+            }
+        })
+    };
+
+    // Effect: while dragging, attach document-level mousemove/mouseup
+    // listeners so that dragging outside the bar still works.
+    {
+        let is_seeking       = is_seeking.clone();
+        let seek_preview_pct = seek_preview_pct.clone();
+        let video_ref        = video_player_ref.clone();
+        let duration         = duration.clone();
+        let current_time     = current_time.clone();
+        let progress_ref     = progress_ref.clone();
+
+        use_effect_with(*is_seeking, move |seeking| {
+            // Shared cleanup handles — always created so every return path
+            // returns the same closure type.
+            let move_ref: Rc<RefCell<Option<Closure<dyn FnMut(MouseEvent)>>>> =
+                Rc::new(RefCell::new(None));
+            let up_ref: Rc<RefCell<Option<Closure<dyn FnMut(MouseEvent)>>>> =
+                Rc::new(RefCell::new(None));
+            let doc_ref: Rc<RefCell<Option<web_sys::Document>>> =
+                Rc::new(RefCell::new(None));
+
+            if *seeking {
+                if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                    // mousemove → update preview position
+                    let progress_ref2 = progress_ref.clone();
+                    let seek_preview_pct2 = seek_preview_pct.clone();
+                    let on_move = Closure::wrap(Box::new(move |e: MouseEvent| {
+                        if let Some(el) = progress_ref2.cast::<web_sys::HtmlElement>() {
+                            let rect = el.get_bounding_client_rect();
+                            let x = e.client_x() as f64 - rect.left();
+                            let pct = (x / rect.width()).clamp(0.0, 1.0);
+                            seek_preview_pct2.set(pct * 100.0);
+                        }
+                    }) as Box<dyn FnMut(_)>);
+
+                    // mouseup → commit seek + stop drag
+                    let is_seeking2 = is_seeking.clone();
+                    let seek_preview_pct3 = seek_preview_pct.clone();
+                    let progress_ref3 = progress_ref.clone();
+                    let video_ref2 = video_ref.clone();
+                    let duration2 = duration.clone();
+                    let current_time2 = current_time.clone();
+                    let doc2 = doc.clone();
+                    let move_ref2 = move_ref.clone();
+                    let up_ref2   = up_ref.clone();
+
+                    let on_up = Closure::wrap(Box::new(move |e: MouseEvent| {
+                        if let Some(el) = progress_ref3.cast::<web_sys::HtmlElement>() {
+                            let rect = el.get_bounding_client_rect();
+                            let x = e.client_x() as f64 - rect.left();
+                            let pct = (x / rect.width()).clamp(0.0, 1.0);
+                            seek_preview_pct3.set(pct * 100.0);
+                            if *duration2 > 0 {
+                                let seek_to = pct * *duration2 as f64;
+                                if let Some(v) = video_ref2.cast::<HtmlVideoElement>() {
+                                    v.set_current_time(seek_to);
+                                    info!("seek: dragged to {:.2}s", seek_to);
+                                }
+                                current_time2.set(seek_to as u32);
+                            }
+                        }
+                        is_seeking2.set(false);
+
+                        // Remove document listeners.
+                        if let Some(cb) = move_ref2.borrow().as_ref() {
+                            let _ = doc2.remove_event_listener_with_callback(
+                                "mousemove", cb.as_ref().unchecked_ref(),
+                            );
+                        }
+                        if let Some(cb) = up_ref2.borrow().as_ref() {
+                            let _ = doc2.remove_event_listener_with_callback(
+                                "mouseup", cb.as_ref().unchecked_ref(),
+                            );
+                        }
+                    }) as Box<dyn FnMut(_)>);
+
+                    let _ = doc.add_event_listener_with_callback(
+                        "mousemove", on_move.as_ref().unchecked_ref(),
+                    );
+                    let _ = doc.add_event_listener_with_callback(
+                        "mouseup", on_up.as_ref().unchecked_ref(),
+                    );
+
+                    *move_ref.borrow_mut() = Some(on_move);
+                    *up_ref.borrow_mut()   = Some(on_up);
+                    *doc_ref.borrow_mut()  = Some(doc);
+                }
+            }
+
+            // Cleanup — same type regardless of branch.
+            let move_ref_cleanup = move_ref;
+            let up_ref_cleanup   = up_ref;
+            let doc_cleanup      = doc_ref;
+            move || {
+                if let Some(doc) = doc_cleanup.borrow().as_ref() {
+                    if let Some(cb) = move_ref_cleanup.borrow().as_ref() {
+                        let _ = doc.remove_event_listener_with_callback(
+                            "mousemove", cb.as_ref().unchecked_ref(),
+                        );
+                    }
+                    if let Some(cb) = up_ref_cleanup.borrow().as_ref() {
+                        let _ = doc.remove_event_listener_with_callback(
+                            "mouseup", cb.as_ref().unchecked_ref(),
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    // Click on the progress bar (for non-drag single clicks).
+    let on_progress_click = {
+        let video_ref = video_player_ref.clone();
+        let progress_ref = progress_ref.clone();
+        let duration = duration.clone();
+        Callback::from(move |e: MouseEvent| {
+            e.stop_propagation();
+            if *duration == 0 { return; }
+            if let Some(el) = progress_ref.cast::<web_sys::HtmlElement>() {
+                let rect = el.get_bounding_client_rect();
+                let x = e.client_x() as f64 - rect.left();
+                let pct = (x / rect.width()).clamp(0.0, 1.0);
+                let seek_to = pct * *duration as f64;
+                if let Some(v) = video_ref.cast::<HtmlVideoElement>() {
+                    v.set_current_time(seek_to);
+                }
+            }
+        })
+    };
 
     let fullscreen_icon: Html = if *is_fullscreen {
         icon_fullscreen_exit()
@@ -700,40 +1048,164 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let video_ref    = video_player_ref.clone();
         let sb_ref       = source_buffer_ref.clone();
         let media_source = media_source.clone();
+        let selected_quality = selected_quality.clone();
 
         use_effect_with(video_id.clone(), move |_| {
             spawn_local(async move {
-                let segments = {
+                let (segments, init_url) = {
                     let mut vps = match VideoPlayerState::new(NodeRef::default()) {
                         Ok(s)  => s,
                         Err(e) => { error!("VideoPlayerState::new: {:?}", e); return; }
                     };
                     if let Err(e) = vps
-                        .load_playlist(video_id.clone(), "original".to_string())
+                        .load_playlist(video_id.clone(), (*selected_quality).clone())
                         .await
                     {
                         error!("load_playlist failed: {:?}", e);
                         return;
                     }
-                    match vps.playlist.as_ref().and_then(|p| p.representations.first()) {
+                    let segs = match vps.playlist.as_ref().and_then(|p| p.representations.first()) {
                         Some(rep) => rep.segments.clone(),
                         None      => { error!("playlist empty"); return; }
-                    }
+                    };
+                    let init = vps.playlist.as_ref().and_then(|p| p.init_segment_url.clone());
+                    (segs, init)
                 };
 
-                info!("playlist loaded — {} segments", segments.len());
+                info!("playlist loaded — {} segments, init={:?}", segments.len(), init_url);
 
                 loop {
                     if sb_ref.borrow().is_some() { break; }
                     TimeoutFuture::new(20).await;
                 }
 
-                run_segment_pump(segments, sb_ref, video_ref, media_source).await;
+                run_segment_pump(segments, sb_ref, video_ref, media_source, init_url).await;
             });
 
             || ()
         });
     }
+
+    // ──────────────────────────────────────────────────────────────
+    // Effect 3: periodic UI update (current time, duration, play state)
+    // ──────────────────────────────────────────────────────────────
+    {
+        let video_ref  = video_player_ref.clone();
+        let current_time = current_time.clone();
+        let duration     = duration.clone();
+        let is_playing   = is_playing.clone();
+        let volume       = volume.clone();
+
+        use_effect_with((), move |_| {
+            use gloo_timers::callback::Interval;
+
+            let interval = Interval::new(250, move || {
+                if let Some(v) = video_ref.cast::<HtmlVideoElement>() {
+                    let ct = v.current_time() as u32;
+                    if ct != *current_time { current_time.set(ct); }
+
+                    // duration may change once MSE has enough data
+                    let dur = v.duration();
+                    if dur.is_finite() {
+                        let d = dur as u32;
+                        if d != *duration { duration.set(d); }
+                    }
+
+                    let playing = !v.paused() && !v.ended();
+                    if playing != *is_playing { is_playing.set(playing); }
+
+                    // Sync volume state on first tick.
+                    let vol = v.volume();
+                    if (*volume - vol).abs() > 0.01 { volume.set(vol); }
+                }
+            });
+
+            move || drop(interval)
+        });
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Effect 4: robust video event logging for diagnostics
+    // ──────────────────────────────────────────────────────────────
+    {
+        let video_ref = video_player_ref.clone();
+
+        use_effect_with((), move |_| {
+            let mut handles: Vec<(&str, Closure<dyn FnMut(web_sys::Event)>)> = Vec::new();
+            let video_for_cleanup: Option<HtmlVideoElement> = video_ref.cast::<HtmlVideoElement>();
+
+            if let Some(ref video) = video_for_cleanup {
+
+            // Helper: create an event listener closure that logs the event.
+            macro_rules! log_event {
+                ($name:expr, $video:expr) => {{
+                    let v = $video.clone();
+                    let name = $name;
+                    Closure::wrap(Box::new(move |_: web_sys::Event| {
+                        let ct = v.current_time();
+                        let rs = v.ready_state();
+                        let ns = v.network_state();
+                        let paused = v.paused();
+                        let ended = v.ended();
+                        let dur = v.duration();
+                        info!(
+                            "video event: {} — ct={:.2}s dur={:.1}s rs={} ns={} paused={} ended={}",
+                            name, ct, dur, rs, ns, paused, ended
+                        );
+                    }) as Box<dyn FnMut(_)>)
+                }};
+            }
+
+            let events: Vec<(&str, Closure<dyn FnMut(web_sys::Event)>)> = vec![
+                ("waiting",       log_event!("waiting",       video)),
+                ("playing",       log_event!("playing",       video)),
+                ("pause",         log_event!("pause",         video)),
+                ("seeking",       log_event!("seeking",       video)),
+                ("seeked",        log_event!("seeked",        video)),
+                ("stalled",       log_event!("stalled",       video)),
+                ("error",         log_event!("error",         video)),
+                ("ended",         log_event!("ended",         video)),
+                ("canplay",       log_event!("canplay",       video)),
+                ("canplaythrough", log_event!("canplaythrough", video)),
+                ("loadeddata",    log_event!("loadeddata",    video)),
+            ];
+
+                let target: &web_sys::EventTarget = video.as_ref();
+                for (name, closure) in events {
+                    let _ = target.add_event_listener_with_callback(
+                        name, closure.as_ref().unchecked_ref(),
+                    );
+                    handles.push((name, closure));
+                }
+            }
+
+            // Cleanup: remove all listeners (same closure type on all paths).
+            move || {
+                if let Some(ref video) = video_for_cleanup {
+                    let target: &web_sys::EventTarget = video.as_ref();
+                    for (name, closure) in &handles {
+                        let _ = target.remove_event_listener_with_callback(
+                            name, closure.as_ref().unchecked_ref(),
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    // ── Compute progress bar percentages ─────────────────────────
+    let played_pct = if *duration > 0 {
+        (*current_time as f64 / *duration as f64 * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+
+    // Play/pause icon
+    let play_pause_icon: Html = if *is_playing {
+        icon_pause()
+    } else {
+        icon_play()
+    };
 
     html! {
         <div
@@ -746,7 +1218,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             <div class={if true { "player-header" } else { "player-header player-header--hidden" }}>
                 <button
                     class="btn btn--back"
-                    onclick={Callback::from(move |_| {})}
+                    onclick={props.on_close.reform(|_| ())}
                 >
                     { icon_arrow_back() }
                     { " Back" }
@@ -768,22 +1240,36 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             />
 
             <div class={"player-controls"}>
-                <div class="player-progress-container">
+                <div class="player-progress-container"
+                    ref={progress_ref}
+                    onclick={on_progress_click}
+                    onmousedown={on_progress_mousedown}
+                >
                     <div class="player-progress">
                         <div class="player-progress__buffered" />
-                        <div class="player-progress__played" />
-                        <div class={if false {
+                        <div class="player-progress__played"
+                            style={format!("width: {:.1}%",
+                                if *is_seeking { *seek_preview_pct } else { played_pct })}
+                        />
+                        <div class={if *is_seeking {
                             "player-progress__thumb player-progress__thumb--dragging"
                         } else {
                             "player-progress__thumb"
-                        }} />
+                        }}
+                            style={format!("left: {:.1}%",
+                                if *is_seeking { *seek_preview_pct } else { played_pct })}
+                        />
                     </div>
                 </div>
 
                 <div class="player-controls__bottom">
                     <div class="player-controls__left">
-                        <button class="player-controls__btn" title="Play/Pause (k)">
-                            { icon_play() }
+                        <button
+                            class="player-controls__btn"
+                            title="Play/Pause (k)"
+                            onclick={on_play_pause}
+                        >
+                            { play_pause_icon }
                         </button>
 
                         <div
@@ -797,7 +1283,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 move |_| volume_slider_visible.set(false)
                             })}
                         >
-                            <button class="player-controls__btn" title="Mute (m)">
+                            <button
+                                class="player-controls__btn"
+                                title="Mute (m)"
+                                onclick={on_mute_toggle}
+                            >
                                 { volume_icon }
                             </button>
                             <div class={if *volume_slider_visible {
@@ -812,6 +1302,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                     step="0.05"
                                     value={volume.to_string()}
                                     class="player-volume__input"
+                                    oninput={on_volume_change}
                                 />
                             </div>
                         </div>

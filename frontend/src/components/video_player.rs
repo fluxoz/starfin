@@ -15,34 +15,14 @@ use log::info;
 const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
 
 // ── Seek-anchor constants ────────────────────────────────────────────────────
-// These must stay in sync with SEGMENT_DURATION, PRECACHE_SEGMENTS, and
-// SPARSE_CACHE_STRIDE in `src/main.rs`.
 const SEGMENT_DURATION_F: f64 = 6.0;
-const PRECACHE_SEGMENTS_F: f64 = 20.0;
-const SPARSE_CACHE_STRIDE_F: f64 = 3.0;
 
-/// Snaps a seek time to the **start** of the cached segment at or before `time`.
+/// Returns the segment index whose time range contains `time`.
 ///
-/// Within the dense pre-cache window every segment is cached, so we just
-/// snap to the segment boundary.  Beyond that window only every
-/// `SPARSE_CACHE_STRIDE_F`-th segment is cached, so we round down to the
-/// nearest anchor start.  The same logic applies whether the user is
-/// clicking forward or backward.
-fn snap_to_cached_segment(time: f64) -> f64 {
-    if time <= 0.0 {
-        return 0.0;
-    }
-    let dense_window = PRECACHE_SEGMENTS_F * SEGMENT_DURATION_F; // 120 seconds
-    if time < dense_window {
-        // Within the dense window — every segment is cached; snap to segment start.
-        let seg_index = (time / SEGMENT_DURATION_F) as usize;
-        return seg_index as f64 * SEGMENT_DURATION_F;
-    }
-    // Beyond the dense window — snap down to the nearest sparse anchor start.
-    let stride = SPARSE_CACHE_STRIDE_F as usize;
-    let seg_index = (time / SEGMENT_DURATION_F) as usize;
-    let anchor_index = (seg_index / stride) * stride;
-    anchor_index as f64 * SEGMENT_DURATION_F
+/// The backend generates any segment on demand (and caches it), so there
+/// is no need to restrict seeks to pre-cached positions.
+fn segment_for_time(time: f64) -> usize {
+    if time <= 0.0 { 0 } else { (time / SEGMENT_DURATION_F) as usize }
 }
 
 // ── Stream quality options ────────────────────────────────────────────────────
@@ -369,8 +349,7 @@ async fn pump_loop(
             PumpMsg::Quit => break,
 
             PumpMsg::Seek(t) => {
-                let snapped = snap_to_cached_segment(t);
-                next_seg = (snapped / SEGMENT_DURATION_F) as usize;
+                next_seg = segment_for_time(t);
                 pump_gen = pump_gen.wrapping_add(1);
                 match state {
                     // In-flight append: let it finish; UpdateEnd will pick up
@@ -815,8 +794,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
                         // Calculate which segment to start from when resuming.
                         let start_seg = if start_pos > 0.0 {
-                            let snapped = snap_to_cached_segment(start_pos);
-                            (snapped / SEGMENT_DURATION_F) as usize
+                            segment_for_time(start_pos)
                         } else {
                             0
                         };
@@ -845,7 +823,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         // already calls play() itself.
                         let _ = video.play();
                         if start_pos > 0.0 {
-                            video.set_current_time(snap_to_cached_segment(start_pos));
+                            video.set_current_time(start_pos);
                         }
                     });
                 }) as Box<dyn FnOnce()>);
@@ -1120,7 +1098,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         e.prevent_default();
                         let skip = if e.shift_key() { 10.0 } else { 5.0 };
                         let current = video.current_time();
-                        video.set_current_time(snap_to_cached_segment((current - skip).max(0.0)));
+                        video.set_current_time((current - skip).max(0.0));
                         skip_indicator.set(Some(("backward".to_string(), 25.0)));
                         let skip_indicator_clone = skip_indicator.clone();
                         spawn_local(async move {
@@ -1131,7 +1109,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     "j" | "J" => {
                         e.prevent_default();
                         let current = video.current_time();
-                        video.set_current_time(snap_to_cached_segment((current - 10.0).max(0.0)));
+                        video.set_current_time((current - 10.0).max(0.0));
                         skip_indicator.set(Some(("backward".to_string(), 25.0)));
                         let skip_indicator_clone = skip_indicator.clone();
                         spawn_local(async move {
@@ -1145,7 +1123,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         let skip = if e.shift_key() { 10.0 } else { 5.0 };
                         let dur = video.duration();
                         if dur.is_finite() {
-                            video.set_current_time(snap_to_cached_segment((video.current_time() + skip).min(dur)));
+                            video.set_current_time((video.current_time() + skip).min(dur));
                         }
                         skip_indicator.set(Some(("forward".to_string(), 75.0)));
                         let skip_indicator_clone = skip_indicator.clone();
@@ -1158,7 +1136,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         e.prevent_default();
                         let dur = video.duration();
                         if dur.is_finite() {
-                            video.set_current_time(snap_to_cached_segment((video.current_time() + 10.0).min(dur)));
+                            video.set_current_time((video.current_time() + 10.0).min(dur));
                         }
                         skip_indicator.set(Some(("forward".to_string(), 75.0)));
                         let skip_indicator_clone = skip_indicator.clone();
@@ -1219,7 +1197,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         let num: f64 = key.parse().unwrap_or(0.0);
                         let dur = video.duration();
                         if dur.is_finite() {
-                            video.set_current_time(snap_to_cached_segment(dur * (num / 10.0)));
+                            video.set_current_time(dur * (num / 10.0));
                         }
                     }
                     // < and > - Decrease/Increase playback speed
@@ -1575,6 +1553,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let is_dragging_up = is_dragging.clone();
             let video_ref_up = video_ref.clone();
             let just_dragged_up = just_dragged.clone();
+            let current_time_up = current_time.clone();
             let hover_time_move = hover_time.clone();
             let hover_position_move = hover_position.clone();
 
@@ -1605,8 +1584,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 just_dragged_up.set(true);
                 let seek_time = shared_seek_time_up.get();
 
+                // Update UI immediately so the progress bar doesn't lag
+                // behind the actual seek position (avoids a ≤150 ms gap
+                // waiting for the next polling-interval tick).
+                current_time_up.set(seek_time);
+
                 if let Some(video) = video_ref_up.cast::<HtmlVideoElement>() {
-                    video.set_current_time(snap_to_cached_segment(seek_time));
+                    video.set_current_time(seek_time);
                 }
 
                 if let Some((mousemove_closure, mouseup_closure)) =
@@ -1656,7 +1640,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     if let Some((seek_time, _)) =
                         calculate_seek_time(&e, &progress_el, video_duration)
                     {
-                        video.set_current_time(snap_to_cached_segment(seek_time));
+                        video.set_current_time(seek_time);
                     }
                 }
             }
@@ -1702,7 +1686,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     if relative_x < width / 3.0 {
                         // Left third - seek backward 10 seconds
                         let current = video.current_time();
-                        video.set_current_time(snap_to_cached_segment((current - 10.0).max(0.0)));
+                        video.set_current_time((current - 10.0).max(0.0));
                         skip_indicator.set(Some(("backward".to_string(), 25.0)));
                         let skip_indicator_clone = skip_indicator.clone();
                         spawn_local(async move {
@@ -1713,7 +1697,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         // Right third - seek forward 10 seconds
                         let dur = video.duration();
                         if dur.is_finite() {
-                            video.set_current_time(snap_to_cached_segment((video.current_time() + 10.0).min(dur)));
+                            video.set_current_time((video.current_time() + 10.0).min(dur));
                         }
                         skip_indicator.set(Some(("forward".to_string(), 75.0)));
                         let skip_indicator_clone = skip_indicator.clone();

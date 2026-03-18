@@ -729,10 +729,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     buffered_end.set(get_buffer_end(&video));
                     is_playing.set(!video.paused());
 
-                    // Check buffering state
-                    let ready_state = video.ready_state();
-                    is_buffering.set(ready_state < 3 && !video.paused());
-
                     // Check if video ended
                     video_ended.set(video.ended());
 

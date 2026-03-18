@@ -81,6 +81,22 @@ fn get_buffer_end(video: &HtmlVideoElement) -> f64 {
     0.0
 }
 
+/// Returns `true` if `time` falls inside one of the video's buffered ranges.
+///
+/// Used by the pump to skip segments that are already in the SourceBuffer,
+/// ensuring each segment is only fetched once as long as its data is present.
+fn is_time_buffered(video: &HtmlVideoElement, time: f64) -> bool {
+    let buffered = video.buffered();
+    for i in 0..buffered.length() {
+        if let (Ok(start), Ok(end)) = (buffered.start(i), buffered.end(i)) {
+            if time >= start && time < end {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // ── Thumbnail Preview State ──────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -299,6 +315,22 @@ async fn pump_loop(
     macro_rules! maybe_fetch {
         () => {
             if state == State::Idle {
+                // Skip segments whose data is already in the SourceBuffer.
+                // This is the single enforcement point for the invariant
+                // "each segment is fetched at most once while it remains
+                // buffered."  We check the midpoint of each segment (not
+                // the exact boundary) to avoid floating-point edge cases
+                // at range endpoints.
+                while next_seg < segments.len() {
+                    let seg_mid = next_seg as f64 * SEGMENT_DURATION_F
+                        + SEGMENT_DURATION_F * 0.5;
+                    if is_time_buffered(&video, seg_mid) {
+                        next_seg += 1;
+                    } else {
+                        break;
+                    }
+                }
+
                 let buffered_ahead = get_buffer_end(&video) - video.current_time();
                 if buffered_ahead < MSE_TARGET_BUFFER_S || next_seg == 0 {
                     if next_seg >= segments.len() {
@@ -349,13 +381,26 @@ async fn pump_loop(
             PumpMsg::Quit => break,
 
             PumpMsg::Seek(t) => {
-                next_seg = segment_for_time(t);
-                pump_gen = pump_gen.wrapping_add(1);
+                let target_seg = segment_for_time(t);
+                // Only bump the generation counter (which invalidates in-
+                // flight fetches) when the target segment actually changes.
+                // Firefox fires `seeking` 7+ times per user seek; each
+                // redundant gen-bump would discard the valid in-flight fetch.
+                let seg_changed = target_seg != next_seg;
+                if seg_changed {
+                    next_seg = target_seg;
+                    pump_gen = pump_gen.wrapping_add(1);
+                }
                 match state {
-                    // In-flight append: let it finish; UpdateEnd will pick up
-                    // the updated next_seg automatically.
+                    // In-flight append/remove: let it finish; UpdateEnd will
+                    // pick up the updated next_seg automatically.
                     State::Appending | State::Removing => {}
-                    // Idle or Fetching (stale fetch will be discarded on arrival).
+                    // Already fetching the correct segment — don't restart.
+                    // Resetting to Idle here would launch a second fetch for
+                    // the same segment, and two competing FetchDone responses
+                    // with identical gen would corrupt the state machine.
+                    State::Fetching if !seg_changed => {}
+                    // Idle, or Fetching a now-stale segment.
                     _ => {
                         state = State::Idle;
                         // Trim the back-buffer if the SourceBuffer is free.
@@ -922,7 +967,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let buffered_end = buffered_end.clone();
         let is_playing = is_playing.clone();
         let is_dragging = is_dragging.clone();
-        let is_buffering = is_buffering.clone();
         let video_ended = video_ended.clone();
 
         use_effect_with(video_ref.clone(), move |video_ref| {
@@ -947,10 +991,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     if *is_playing != playing {
                         is_playing.set(playing);
                     }
-                    let buffering = video.ready_state() < 3 && !video.paused();
-                    if *is_buffering != buffering {
-                        is_buffering.set(buffering);
-                    }
+                    // NOTE: Buffering detection is handled via `waiting`/`playing`
+                    // event listeners (see below), NOT by polling readyState.
+                    // MSE SourceBuffer operations transiently dip readyState during
+                    // normal playback even with 30+ seconds of buffer ahead, which
+                    // would cause spurious spinner flashes.
                     let ended = video.ended();
                     if *video_ended != ended {
                         video_ended.set(ended);
@@ -1010,6 +1055,76 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         )
                         .ok();
                     drop(cb);
+                }
+            }
+        });
+    }
+
+    // Buffering detection via `waiting`/`playing` events.
+    //
+    // The `waiting` event fires when playback stalls because the next
+    // frame is not available.  `playing` fires when playback resumes.
+    // This is far more accurate than polling `readyState`: MSE
+    // SourceBuffer operations transiently dip readyState during normal
+    // append cycles even when 30+ seconds of buffer are ahead, causing
+    // spurious spinner flashes if we relied on readyState alone.
+    {
+        let video_ref = video_ref.clone();
+        let is_buffering = is_buffering.clone();
+
+        use_effect_with(video_ref.clone(), move |video_ref| {
+            let video_opt = video_ref.cast::<HtmlVideoElement>();
+
+            let (waiting_cb, playing_cb) = if let Some(video) = video_opt.as_ref() {
+                let is_buf_w = is_buffering.clone();
+                let waiting = Closure::<dyn Fn()>::new(move || {
+                    if !*is_buf_w {
+                        is_buf_w.set(true);
+                    }
+                });
+                video
+                    .add_event_listener_with_callback(
+                        "waiting",
+                        waiting.as_ref().unchecked_ref(),
+                    )
+                    .ok();
+
+                let is_buf_p = is_buffering.clone();
+                let playing = Closure::<dyn Fn()>::new(move || {
+                    if *is_buf_p {
+                        is_buf_p.set(false);
+                    }
+                });
+                video
+                    .add_event_listener_with_callback(
+                        "playing",
+                        playing.as_ref().unchecked_ref(),
+                    )
+                    .ok();
+
+                (Some(waiting), Some(playing))
+            } else {
+                (None, None)
+            };
+
+            move || {
+                if let Some(video) = video_opt {
+                    if let Some(cb) = &waiting_cb {
+                        video
+                            .remove_event_listener_with_callback(
+                                "waiting",
+                                cb.as_ref().unchecked_ref(),
+                            )
+                            .ok();
+                    }
+                    if let Some(cb) = &playing_cb {
+                        video
+                            .remove_event_listener_with_callback(
+                                "playing",
+                                cb.as_ref().unchecked_ref(),
+                            )
+                            .ok();
+                    }
                 }
             }
         });

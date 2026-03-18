@@ -1,19 +1,20 @@
- use gloo_net::http::Request;
+use gloo_net::http::Request;
 use std::collections::VecDeque;
+use std::cell::{Cell, RefCell};
 use gloo_net::Error as GlooError;
 use gloo_timers::future::TimeoutFuture;
-use std::cell::RefCell;
+use serde::Deserialize;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{HtmlVideoElement, MediaSource, MouseEvent, Url, window, SourceBuffer};
+use web_sys::{HtmlVideoElement, KeyboardEvent, MediaSource, MouseEvent, Url, window, SourceBuffer};
 use yew::prelude::*;
 use log::{info, warn, error};
 
 // ── Playback speed options ───────────────────────────────────────────────────
-const PLAYBACK_SPEEDS: [f32; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
+const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
 
 const SEGMENT_DURATION_F: f64 = 6.0;
 
@@ -34,8 +35,12 @@ const QUALITY_OPTIONS: [(&str, &str); 4] = [
     ("low",      "Low (480p)"),
 ];
 
-fn format_time(seconds: u32) -> String {
-    if seconds == 0 {
+// ── Controls auto-hide timeout (milliseconds of inactivity) ─────────────────
+const CONTROL_HIDE_TIMEOUT_MS: f64 = 5000.0;
+const CONTROLS_VICINITY_PX: f64 = 80.0;
+
+fn format_time(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
         return "0:00".to_string();
     }
     let total_secs = seconds as u64;
@@ -47,6 +52,19 @@ fn format_time(seconds: u32) -> String {
     } else {
         format!("{mins}:{secs:02}")
     }
+}
+
+// ── Thumbnail Preview State ──────────────────────────────────────────────────
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct ThumbnailInfo {
+    pub url: String,
+    pub sprite_width: u32,
+    pub sprite_height: u32,
+    pub thumb_width: u32,
+    pub thumb_height: u32,
+    pub columns: u32,
+    pub rows: u32,
+    pub interval: f64,
 }
 
 // ── Data structures ──────────────────────────────────────────────────────────
@@ -663,23 +681,46 @@ async fn run_segment_pump(
 pub fn video_player(props: &VideoPlayerProps) -> Html {
 
     let video_player_ref      = use_node_ref();
+    let progress_ref          = use_node_ref();
+    let container_ref         = use_node_ref();
+    let thumbnail_canvas_ref  = use_node_ref();
+
+    // Player state
+    let current_time          = use_state(|| 0.0_f64);
+    let duration              = use_state(|| 0.0_f64);
+    let is_playing            = use_state(|| false);
+    let is_buffering          = use_state(|| false);
+
+    // Volume state
+    let volume                = use_state(|| 1.0_f64);
     let is_muted              = use_state(|| false);
-    let volume                = use_state(|| 0.0_f64);
-    let current_time          = use_state(|| 0u32);
-    let duration              = use_state(|| 0u32);
-    let volume_slider_visible = use_state(|| false);
-    let is_fullscreen         = use_state(|| false);
-    let playback_speed        = use_state(|| 1_f32);
+    let prev_volume           = use_state(|| 1.0_f64);
+
+    // Drag/Seek state
+    let is_dragging           = use_state(|| false);
+    let drag_time             = use_state(|| 0.0_f64);
+    let just_dragged          = use_state(|| false);
+
+    // Hover preview state
+    let is_hovering_progress  = use_state(|| false);
+    let hover_time            = use_state(|| 0.0_f64);
+    let hover_position        = use_state(|| 0.0_f64);
+
+    // UI visibility state
+    let controls_visible      = use_state(|| true);
+    let last_mouse_move       = use_mut_ref(|| js_sys::Date::now());
+    let is_near_controls      = use_mut_ref(|| false);
     let speed_menu_open       = use_state(|| false);
     let quality_menu_open     = use_state(|| false);
+    let volume_slider_visible = use_state(|| false);
 
-    let media_source = use_memo((), |_| MediaSource::new().expect("MediaSource::new"));
+    // Fullscreen state
+    let is_fullscreen         = use_state(|| false);
 
-    let source_buffer_ref: Rc<RefCell<Option<SourceBuffer>>> =
-        use_memo((), |_| Rc::new(RefCell::new(None)))
-            .as_ref()
-            .clone();
+    // Playback speed
+    let playback_speed        = use_state(|| 1.0_f64);
 
+    // Stream quality
     let initial_quality = window()
         .and_then(|w| w.local_storage().ok())
         .flatten()
@@ -688,6 +729,24 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         .filter(|q| QUALITY_OPTIONS.iter().any(|(v, _)| v == q))
         .unwrap_or_else(|| "original".to_string());
     let selected_quality = use_state(|| initial_quality);
+
+    // Skip indicator state
+    let skip_indicator        = use_state(|| Option::<(String, f64)>::None);
+
+    // Video ended state
+    let video_ended           = use_state(|| false);
+
+    // Thumbnail sprite state
+    let thumbnail_info        = use_state(|| Option::<ThumbnailInfo>::None);
+    let thumbnail_image       = use_state(|| Option::<web_sys::HtmlImageElement>::None);
+
+    // MSE state
+    let media_source = use_memo((), |_| MediaSource::new().expect("MediaSource::new"));
+
+    let source_buffer_ref: Rc<RefCell<Option<SourceBuffer>>> =
+        use_memo((), |_| Rc::new(RefCell::new(None)))
+            .as_ref()
+            .clone();
 
     let volume_icon: Html = if *is_muted || *volume == 0.0 {
         icon_volume_muted()
@@ -703,46 +762,62 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         format_time(*duration)
     );
 
-    let container_ref   = use_node_ref();
     let container_class = if *is_fullscreen {
         "player-overlay player-overlay--fullscreen"
     } else {
         "player-overlay"
     };
 
-    // ── Play/pause toggle ───────────────────────────────────────────
-    let is_playing = use_state(|| false);
-
+    // ── Close menus when clicking outside ────────────────────────────
     let on_container_click = {
-        let video_ref = video_player_ref.clone();
-        let is_playing = is_playing.clone();
+        let speed_menu_open = speed_menu_open.clone();
+        let quality_menu_open = quality_menu_open.clone();
         Callback::from(move |_: MouseEvent| {
-            if let Some(v) = video_ref.cast::<HtmlVideoElement>() {
-                if v.paused() {
-                    let _ = v.play();
-                    is_playing.set(true);
-                } else {
-                    v.pause().ok();
-                    is_playing.set(false);
-                }
+            speed_menu_open.set(false);
+            quality_menu_open.set(false);
+        })
+    };
+
+    // ── Mouse move handler — show controls and update vicinity flag ──
+    let on_mouse_move = {
+        let controls_visible = controls_visible.clone();
+        let last_mouse_move = last_mouse_move.clone();
+        let is_near_controls = is_near_controls.clone();
+        let container_ref = container_ref.clone();
+        Callback::from(move |e: MouseEvent| {
+            controls_visible.set(true);
+            *last_mouse_move.borrow_mut() = js_sys::Date::now();
+            if let Some(el) = container_ref.cast::<web_sys::HtmlElement>() {
+                let rect = el.get_bounding_client_rect();
+                let mouse_y = e.client_y() as f64;
+                let dist_from_bottom = (rect.bottom() - mouse_y).max(0.0);
+                let dist_from_top = (mouse_y - rect.top()).max(0.0);
+                *is_near_controls.borrow_mut() =
+                    dist_from_bottom < CONTROLS_VICINITY_PX || dist_from_top < CONTROLS_VICINITY_PX;
             }
         })
     };
-    let on_mouse_leave       = Callback::from(move |_| {});
-    let on_mouse_move        = Callback::from(move |_| {});
+
+    let on_mouse_leave = {
+        let is_near_controls = is_near_controls.clone();
+        Callback::from(move |_: MouseEvent| {
+            *is_near_controls.borrow_mut() = false;
+        })
+    };
 
     let on_play_pause = {
         let video_ref = video_player_ref.clone();
-        let is_playing = is_playing.clone();
+        let video_ended = video_ended.clone();
         Callback::from(move |e: MouseEvent| {
             e.stop_propagation();
             if let Some(v) = video_ref.cast::<HtmlVideoElement>() {
+                if *video_ended {
+                    v.set_current_time(0.0);
+                }
                 if v.paused() {
                     let _ = v.play();
-                    is_playing.set(true);
                 } else {
-                    v.pause().ok();
-                    is_playing.set(false);
+                    let _ = v.pause();
                 }
             }
         })
@@ -751,20 +826,22 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // ── Speed menu ───────────────────────────────────────────────
     let on_speed_toggle = {
         let speed_menu_open = speed_menu_open.clone();
+        let quality_menu_open = quality_menu_open.clone();
         Callback::from(move |e: MouseEvent| {
             e.stop_propagation();
             speed_menu_open.set(!*speed_menu_open);
+            quality_menu_open.set(false);
         })
     };
     let on_speed_select = {
         let playback_speed = playback_speed.clone();
         let speed_menu_open = speed_menu_open.clone();
         let video_ref = video_player_ref.clone();
-        Callback::from(move |speed: f32| {
+        Callback::from(move |speed: f64| {
             playback_speed.set(speed);
             speed_menu_open.set(false);
             if let Some(v) = video_ref.cast::<HtmlVideoElement>() {
-                v.set_playback_rate(speed as f64);
+                v.set_playback_rate(speed);
             }
         })
     };
@@ -772,24 +849,26 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // ── Quality menu ─────────────────────────────────────────────
     let on_quality_toggle = {
         let quality_menu_open = quality_menu_open.clone();
+        let speed_menu_open = speed_menu_open.clone();
         Callback::from(move |e: MouseEvent| {
             e.stop_propagation();
             quality_menu_open.set(!*quality_menu_open);
+            speed_menu_open.set(false);
         })
     };
     let on_quality_select = {
         let selected_quality = selected_quality.clone();
         let quality_menu_open = quality_menu_open.clone();
-        Callback::from(move |q: String| {
-            // Persist to localStorage.
+        Callback::from(move |quality: String| {
+            quality_menu_open.set(false);
+            // Persist preference.
             if let Some(storage) = window()
                 .and_then(|w| w.local_storage().ok())
                 .flatten()
             {
-                let _ = storage.set_item(QUALITY_STORAGE_KEY, &q);
+                let _ = storage.set_item(QUALITY_STORAGE_KEY, &quality);
             }
-            selected_quality.set(q);
-            quality_menu_open.set(false);
+            selected_quality.set(quality);
             // Quality change takes effect on next video load.
         })
     };
@@ -800,14 +879,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let is_fullscreen = is_fullscreen.clone();
         Callback::from(move |e: MouseEvent| {
             e.stop_propagation();
-            if let Some(el) = container_ref.cast::<web_sys::HtmlElement>() {
-                if *is_fullscreen {
-                    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-                        let _ = doc.exit_fullscreen();
-                    }
+            if let Some(container) = container_ref.cast::<web_sys::HtmlElement>() {
+                let doc = web_sys::window().unwrap().document().unwrap();
+                if doc.fullscreen_element().is_some() {
+                    let _ = doc.exit_fullscreen();
                     is_fullscreen.set(false);
                 } else {
-                    let _ = el.request_fullscreen();
+                    let _ = container.request_fullscreen();
                     is_fullscreen.set(true);
                 }
             }
@@ -819,15 +897,19 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let video_ref = video_player_ref.clone();
         let is_muted = is_muted.clone();
         let volume = volume.clone();
+        let prev_volume = prev_volume.clone();
         Callback::from(move |e: MouseEvent| {
             e.stop_propagation();
             if let Some(v) = video_ref.cast::<HtmlVideoElement>() {
-                let new_muted = !v.muted();
-                v.set_muted(new_muted);
-                is_muted.set(new_muted);
-                if !new_muted && *volume == 0.0 {
-                    v.set_volume(1.0);
-                    volume.set(1.0);
+                if *is_muted {
+                    is_muted.set(false);
+                    v.set_muted(false);
+                    volume.set(*prev_volume);
+                    v.set_volume(*prev_volume);
+                } else {
+                    prev_volume.set(*volume);
+                    is_muted.set(true);
+                    v.set_muted(true);
                 }
             }
         })
@@ -855,176 +937,290 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
     // ── Video click → play/pause ─────────────────────────────────
     let on_video_click = {
-        let is_playing = is_playing.clone();
         Callback::from(move |e: MouseEvent| {
             e.stop_propagation();
             if let Some(v) = e.target_dyn_into::<HtmlVideoElement>() {
                 if v.paused() {
                     let _ = v.play();
-                    is_playing.set(true);
                 } else {
-                    v.pause().ok();
-                    is_playing.set(false);
+                    let _ = v.pause();
                 }
             }
         })
     };
 
-    // ── Progress bar seeking (click + drag) ─────────────────────
-    let progress_ref    = use_node_ref();
-    let is_seeking      = use_state(|| false);
-    let seek_preview_pct = use_state(|| 0.0_f64);
-
-    // Helper: compute seek percentage from a MouseEvent relative to the
-    // progress bar element.
-    let calc_seek_pct = {
-        let progress_ref = progress_ref.clone();
-        Rc::new(move |e: &MouseEvent| -> Option<f64> {
-            progress_ref.cast::<web_sys::HtmlElement>().map(|el| {
-                let rect = el.get_bounding_client_rect();
-                let x = e.client_x() as f64 - rect.left();
-                (x / rect.width()).clamp(0.0, 1.0)
-            })
-        })
-    };
-
-    // mousedown on the progress bar → start drag
-    let on_progress_mousedown = {
-        let is_seeking = is_seeking.clone();
-        let seek_preview_pct = seek_preview_pct.clone();
-        let calc = calc_seek_pct.clone();
-        Callback::from(move |e: MouseEvent| {
-            e.stop_propagation();
-            e.prevent_default();
-            is_seeking.set(true);
-            if let Some(pct) = calc(&e) {
-                seek_preview_pct.set(pct * 100.0);
+    // ── Replay ───────────────────────────────────────────────────
+    let on_replay = {
+        let video_ref = video_player_ref.clone();
+        let video_ended = video_ended.clone();
+        Callback::from(move |_: MouseEvent| {
+            if let Some(v) = video_ref.cast::<HtmlVideoElement>() {
+                v.set_current_time(0.0);
+                let _ = v.play();
+                video_ended.set(false);
             }
         })
     };
 
-    // Effect: while dragging, attach document-level mousemove/mouseup
-    // listeners so that dragging outside the bar still works.
+    // ── Thumbnail sprite loading ─────────────────────────────────
     {
-        let is_seeking       = is_seeking.clone();
-        let seek_preview_pct = seek_preview_pct.clone();
-        let video_ref        = video_player_ref.clone();
-        let duration         = duration.clone();
-        let current_time     = current_time.clone();
-        let progress_ref     = progress_ref.clone();
+        let video_id = props.video_id.clone();
+        let thumbnail_info = thumbnail_info.clone();
+        let thumbnail_image = thumbnail_image.clone();
 
-        use_effect_with(*is_seeking, move |seeking| {
-            // Shared cleanup handles — always created so every return path
-            // returns the same closure type.
-            let move_ref: Rc<RefCell<Option<Closure<dyn FnMut(MouseEvent)>>>> =
-                Rc::new(RefCell::new(None));
-            let up_ref: Rc<RefCell<Option<Closure<dyn FnMut(MouseEvent)>>>> =
-                Rc::new(RefCell::new(None));
-            let doc_ref: Rc<RefCell<Option<web_sys::Document>>> =
-                Rc::new(RefCell::new(None));
+        use_effect_with(video_id.clone(), move |_| {
+            let thumbnail_info_clone = thumbnail_info.clone();
+            let thumbnail_image_clone = thumbnail_image.clone();
+            let video_id_clone = video_id.clone();
 
-            if *seeking {
-                if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-                    // mousemove → update preview position
-                    let progress_ref2 = progress_ref.clone();
-                    let seek_preview_pct2 = seek_preview_pct.clone();
-                    let on_move = Closure::wrap(Box::new(move |e: MouseEvent| {
-                        if let Some(el) = progress_ref2.cast::<web_sys::HtmlElement>() {
-                            let rect = el.get_bounding_client_rect();
-                            let x = e.client_x() as f64 - rect.left();
-                            let pct = (x / rect.width()).clamp(0.0, 1.0);
-                            seek_preview_pct2.set(pct * 100.0);
-                        }
-                    }) as Box<dyn FnMut(_)>);
-
-                    // mouseup → commit seek + stop drag
-                    let is_seeking2 = is_seeking.clone();
-                    let seek_preview_pct3 = seek_preview_pct.clone();
-                    let progress_ref3 = progress_ref.clone();
-                    let video_ref2 = video_ref.clone();
-                    let duration2 = duration.clone();
-                    let current_time2 = current_time.clone();
-                    let doc2 = doc.clone();
-                    let move_ref2 = move_ref.clone();
-                    let up_ref2   = up_ref.clone();
-
-                    let on_up = Closure::wrap(Box::new(move |e: MouseEvent| {
-                        if let Some(el) = progress_ref3.cast::<web_sys::HtmlElement>() {
-                            let rect = el.get_bounding_client_rect();
-                            let x = e.client_x() as f64 - rect.left();
-                            let pct = (x / rect.width()).clamp(0.0, 1.0);
-                            seek_preview_pct3.set(pct * 100.0);
-                            if *duration2 > 0 {
-                                let seek_to = pct * *duration2 as f64;
-                                if let Some(v) = video_ref2.cast::<HtmlVideoElement>() {
-                                    v.set_current_time(seek_to);
-                                    info!("seek: dragged to {:.2}s", seek_to);
-                                }
-                                current_time2.set(seek_to as u32);
-                            }
-                        }
-                        is_seeking2.set(false);
-
-                        // Remove document listeners.
-                        if let Some(cb) = move_ref2.borrow().as_ref() {
-                            let _ = doc2.remove_event_listener_with_callback(
-                                "mousemove", cb.as_ref().unchecked_ref(),
-                            );
-                        }
-                        if let Some(cb) = up_ref2.borrow().as_ref() {
-                            let _ = doc2.remove_event_listener_with_callback(
-                                "mouseup", cb.as_ref().unchecked_ref(),
-                            );
-                        }
-                    }) as Box<dyn FnMut(_)>);
-
-                    let _ = doc.add_event_listener_with_callback(
-                        "mousemove", on_move.as_ref().unchecked_ref(),
-                    );
-                    let _ = doc.add_event_listener_with_callback(
-                        "mouseup", on_up.as_ref().unchecked_ref(),
-                    );
-
-                    *move_ref.borrow_mut() = Some(on_move);
-                    *up_ref.borrow_mut()   = Some(on_up);
-                    *doc_ref.borrow_mut()  = Some(doc);
+            spawn_local(async move {
+                if let Ok(info) = fetch_thumbnail_info(&video_id_clone).await {
+                    // Load the sprite image
+                    let img = web_sys::HtmlImageElement::new().unwrap();
+                    let img_clone = img.clone();
+                    let thumbnail_image_onload = thumbnail_image_clone.clone();
+                    let onload = Closure::once(move || {
+                        thumbnail_image_onload.set(Some(img_clone));
+                    });
+                    img.set_onload(Some(onload.as_ref().unchecked_ref()));
+                    onload.forget();
+                    img.set_src(&info.url);
+                    thumbnail_info_clone.set(Some(info));
                 }
-            }
+            });
 
-            // Cleanup — same type regardless of branch.
-            let move_ref_cleanup = move_ref;
-            let up_ref_cleanup   = up_ref;
-            let doc_cleanup      = doc_ref;
-            move || {
-                if let Some(doc) = doc_cleanup.borrow().as_ref() {
-                    if let Some(cb) = move_ref_cleanup.borrow().as_ref() {
-                        let _ = doc.remove_event_listener_with_callback(
-                            "mousemove", cb.as_ref().unchecked_ref(),
-                        );
-                    }
-                    if let Some(cb) = up_ref_cleanup.borrow().as_ref() {
-                        let _ = doc.remove_event_listener_with_callback(
-                            "mouseup", cb.as_ref().unchecked_ref(),
-                        );
-                    }
-                }
-            }
+            || ()
         });
     }
+
+    // ── Effect to draw thumbnail on canvas when hovering ─────────
+    {
+        let thumbnail_canvas_ref = thumbnail_canvas_ref.clone();
+        let thumbnail_info = thumbnail_info.clone();
+        let thumbnail_image = thumbnail_image.clone();
+        let hover_time = hover_time.clone();
+        let is_hovering_progress = is_hovering_progress.clone();
+        let is_dragging = is_dragging.clone();
+        use_effect_with(
+            ((*hover_time).clone(), (*is_hovering_progress).clone(), (*is_dragging).clone()),
+            move |_| {
+                if !*is_hovering_progress && !*is_dragging {
+                    return;
+                }
+                if let (Some(info), Some(img)) = (&*thumbnail_info, &*thumbnail_image) {
+                    if let Some(canvas) = thumbnail_canvas_ref.cast::<web_sys::HtmlCanvasElement>() {
+                        if let Ok(Some(ctx)) = canvas.get_context("2d") {
+                            if let Ok(ctx) = ctx.dyn_into::<web_sys::CanvasRenderingContext2d>() {
+                                let thumb_index = if info.interval > 0.0 {
+                                    ((*hover_time) / info.interval).floor() as u32
+                                } else {
+                                    0
+                                };
+
+                                let max_index = info.columns * info.rows - 1;
+                                let thumb_index = thumb_index.min(max_index);
+
+                                let col = thumb_index % info.columns;
+                                let row = thumb_index / info.columns;
+
+                                let sx = (col * info.thumb_width) as f64;
+                                let sy = (row * info.thumb_height) as f64;
+
+                                ctx.clear_rect(0.0, 0.0, canvas.width() as f64, canvas.height() as f64);
+                                let _ = ctx.draw_image_with_html_image_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                                    img,
+                                    sx, sy,
+                                    info.thumb_width as f64, info.thumb_height as f64,
+                                    0.0, 0.0,
+                                    canvas.width() as f64, canvas.height() as f64,
+                                );
+                            }
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    // ── Progress bar interaction handlers ─────────────────────────
+    // Helper function to calculate seek time from mouse position
+    fn calculate_seek_time(
+        e: &MouseEvent,
+        progress_el: &web_sys::HtmlElement,
+        video_duration: f64,
+    ) -> Option<(f64, f64)> {
+        let rect = progress_el.get_bounding_client_rect();
+        let click_x = e.client_x() as f64 - rect.left();
+        let width = rect.width();
+        if width > 0.0 && video_duration.is_finite() && video_duration > 0.0 {
+            let seek_ratio = (click_x / width).clamp(0.0, 1.0);
+            Some((seek_ratio * video_duration, seek_ratio * 100.0))
+        } else {
+            None
+        }
+    }
+
+    // Progress bar hover handler
+    let on_progress_hover = {
+        let progress_ref = progress_ref.clone();
+        let is_hovering_progress = is_hovering_progress.clone();
+        let hover_time = hover_time.clone();
+        let hover_position = hover_position.clone();
+        let duration_state = duration.clone();
+        Callback::from(move |e: MouseEvent| {
+            is_hovering_progress.set(true);
+            if let Some(progress_el) = progress_ref.cast::<web_sys::HtmlElement>() {
+                if let Some((time, pos)) =
+                    calculate_seek_time(&e, &progress_el, *duration_state)
+                {
+                    hover_time.set(time);
+                    hover_position.set(pos);
+                }
+            }
+        })
+    };
+
+    // Progress bar leave handler
+    let on_progress_leave = {
+        let is_hovering_progress = is_hovering_progress.clone();
+        Callback::from(move |_: MouseEvent| {
+            is_hovering_progress.set(false);
+        })
+    };
+
+    // Progress bar mousedown - start dragging
+    let on_progress_mousedown = {
+        let video_ref = video_player_ref.clone();
+        let progress_ref = progress_ref.clone();
+        let is_dragging = is_dragging.clone();
+        let drag_time = drag_time.clone();
+        let current_time = current_time.clone();
+        let duration_state = duration.clone();
+        let just_dragged = just_dragged.clone();
+        let hover_time = hover_time.clone();
+        let hover_position = hover_position.clone();
+        Callback::from(move |e: MouseEvent| {
+            e.prevent_default();
+            let progress_el = match progress_ref.cast::<web_sys::HtmlElement>() {
+                Some(el) => el,
+                None => return,
+            };
+            let video = match video_ref.cast::<HtmlVideoElement>() {
+                Some(v) => v,
+                None => return,
+            };
+            let video_duration = video.duration();
+            if !video_duration.is_finite() || video_duration <= 0.0 {
+                return;
+            }
+            // Calculate initial seek position
+            let rect = progress_el.get_bounding_client_rect();
+            let click_x = e.client_x() as f64 - rect.left();
+            let width = rect.width();
+            if width <= 0.0 {
+                return;
+            }
+            let seek_ratio = (click_x / width).clamp(0.0, 1.0);
+            let initial_seek_time = seek_ratio * video_duration;
+
+            is_dragging.set(true);
+            drag_time.set(initial_seek_time);
+            current_time.set(initial_seek_time);
+
+            let shared_seek_time: Rc<Cell<f64>> = Rc::new(Cell::new(initial_seek_time));
+            let shared_seek_time_move = shared_seek_time.clone();
+            let shared_seek_time_up = shared_seek_time.clone();
+
+            let progress_ref_move = progress_ref.clone();
+            let duration_for_move = *duration_state;
+            let drag_time_move = drag_time.clone();
+            let current_time_move = current_time.clone();
+            let is_dragging_up = is_dragging.clone();
+            let video_ref_up = video_ref.clone();
+            let just_dragged_up = just_dragged.clone();
+            let hover_time_move = hover_time.clone();
+            let hover_position_move = hover_position.clone();
+
+            let closures: Rc<
+                RefCell<Option<(Closure<dyn Fn(MouseEvent)>, Closure<dyn Fn(MouseEvent)>)>>,
+            > = Rc::new(RefCell::new(None));
+            let closures_for_mouseup = closures.clone();
+
+            let on_mousemove = Closure::<dyn Fn(MouseEvent)>::new(move |e: MouseEvent| {
+                if let Some(progress_el) = progress_ref_move.cast::<web_sys::HtmlElement>() {
+                    let rect = progress_el.get_bounding_client_rect();
+                    let click_x = e.client_x() as f64 - rect.left();
+                    let width = rect.width();
+                    if width > 0.0 && duration_for_move > 0.0 {
+                        let seek_ratio = (click_x / width).clamp(0.0, 1.0);
+                        let seek_time = seek_ratio * duration_for_move;
+                        shared_seek_time_move.set(seek_time);
+                        drag_time_move.set(seek_time);
+                        current_time_move.set(seek_time);
+                        hover_time_move.set(seek_time);
+                        hover_position_move.set(seek_ratio * 100.0);
+                    }
+                }
+            });
+
+            let on_mouseup = Closure::<dyn Fn(MouseEvent)>::new(move |_: MouseEvent| {
+                is_dragging_up.set(false);
+                just_dragged_up.set(true);
+                let seek_time = shared_seek_time_up.get();
+                if let Some(video) = video_ref_up.cast::<HtmlVideoElement>() {
+                    video.set_current_time(seek_time);
+                }
+                if let Some((mousemove_closure, mouseup_closure)) =
+                    closures_for_mouseup.borrow_mut().take()
+                {
+                    if let Some(win) = window() {
+                        let doc = win.document().unwrap();
+                        let _ = doc.remove_event_listener_with_callback(
+                            "mousemove",
+                            mousemove_closure.as_ref().unchecked_ref(),
+                        );
+                        let _ = doc.remove_event_listener_with_callback(
+                            "mouseup",
+                            mouseup_closure.as_ref().unchecked_ref(),
+                        );
+                    }
+                }
+            });
+
+            if let Some(win) = window() {
+                let doc = win.document().unwrap();
+                let _ = doc.add_event_listener_with_callback(
+                    "mousemove",
+                    on_mousemove.as_ref().unchecked_ref(),
+                );
+                let _ = doc.add_event_listener_with_callback(
+                    "mouseup",
+                    on_mouseup.as_ref().unchecked_ref(),
+                );
+                *closures.borrow_mut() = Some((on_mousemove, on_mouseup));
+            }
+        })
+    };
 
     // Click on the progress bar (for non-drag single clicks).
     let on_progress_click = {
         let video_ref = video_player_ref.clone();
         let progress_ref = progress_ref.clone();
         let duration = duration.clone();
+        let just_dragged = just_dragged.clone();
         Callback::from(move |e: MouseEvent| {
             e.stop_propagation();
-            if *duration == 0 { return; }
+            // Skip the click if we just finished dragging.
+            if *just_dragged {
+                just_dragged.set(false);
+                return;
+            }
+            if *duration <= 0.0 { return; }
             if let Some(el) = progress_ref.cast::<web_sys::HtmlElement>() {
                 let rect = el.get_bounding_client_rect();
                 let x = e.client_x() as f64 - rect.left();
                 let pct = (x / rect.width()).clamp(0.0, 1.0);
-                let seek_to = pct * *duration as f64;
+                let seek_to = pct * *duration;
                 if let Some(v) = video_ref.cast::<HtmlVideoElement>() {
                     v.set_current_time(seek_to);
                 }
@@ -1039,6 +1235,239 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     };
 
     let title = props.title.clone();
+
+    // ── Keyboard hotkeys ─────────────────────────────────────────
+    {
+        let video_ref = video_player_ref.clone();
+        let container_ref = container_ref.clone();
+        let is_fullscreen = is_fullscreen.clone();
+        let is_muted = is_muted.clone();
+        let volume = volume.clone();
+        let prev_volume = prev_volume.clone();
+        let playback_speed = playback_speed.clone();
+        let skip_indicator = skip_indicator.clone();
+        use_effect_with(video_ref.clone(), move |_| {
+            let video_ref = video_ref.clone();
+            let container_ref = container_ref.clone();
+            let is_fullscreen = is_fullscreen.clone();
+            let is_muted = is_muted.clone();
+            let volume = volume.clone();
+            let prev_volume = prev_volume.clone();
+            let playback_speed = playback_speed.clone();
+            let skip_indicator = skip_indicator.clone();
+            let closure = Closure::<dyn Fn(KeyboardEvent)>::new(move |e: KeyboardEvent| {
+                // Ignore if typing in an input field
+                if let Some(target) = e.target() {
+                    if let Ok(el) = target.dyn_into::<web_sys::HtmlElement>() {
+                        let tag = el.tag_name().to_lowercase();
+                        if tag == "input" || tag == "textarea" {
+                            return;
+                        }
+                    }
+                }
+                let video = match video_ref.cast::<HtmlVideoElement>() {
+                    Some(v) => v,
+                    None => return,
+                };
+                let key = e.key();
+                match key.as_str() {
+                    " " | "k" | "K" => {
+                        e.prevent_default();
+                        if video.paused() {
+                            let _ = video.play();
+                        } else {
+                            let _ = video.pause();
+                        }
+                    }
+                    "ArrowLeft" => {
+                        e.prevent_default();
+                        let skip = if e.shift_key() { 10.0 } else { 5.0 };
+                        let current = video.current_time();
+                        video.set_current_time((current - skip).max(0.0));
+                        skip_indicator.set(Some(("backward".to_string(), 25.0)));
+                        let skip_indicator_clone = skip_indicator.clone();
+                        spawn_local(async move {
+                            TimeoutFuture::new(500).await;
+                            skip_indicator_clone.set(None);
+                        });
+                    }
+                    "j" | "J" => {
+                        e.prevent_default();
+                        let current = video.current_time();
+                        video.set_current_time((current - 10.0).max(0.0));
+                        skip_indicator.set(Some(("backward".to_string(), 25.0)));
+                        let skip_indicator_clone = skip_indicator.clone();
+                        spawn_local(async move {
+                            TimeoutFuture::new(500).await;
+                            skip_indicator_clone.set(None);
+                        });
+                    }
+                    "ArrowRight" => {
+                        e.prevent_default();
+                        let skip = if e.shift_key() { 10.0 } else { 5.0 };
+                        let dur = video.duration();
+                        if dur.is_finite() {
+                            video.set_current_time((video.current_time() + skip).min(dur));
+                        }
+                        skip_indicator.set(Some(("forward".to_string(), 75.0)));
+                        let skip_indicator_clone = skip_indicator.clone();
+                        spawn_local(async move {
+                            TimeoutFuture::new(500).await;
+                            skip_indicator_clone.set(None);
+                        });
+                    }
+                    "l" | "L" => {
+                        e.prevent_default();
+                        let dur = video.duration();
+                        if dur.is_finite() {
+                            video.set_current_time((video.current_time() + 10.0).min(dur));
+                        }
+                        skip_indicator.set(Some(("forward".to_string(), 75.0)));
+                        let skip_indicator_clone = skip_indicator.clone();
+                        spawn_local(async move {
+                            TimeoutFuture::new(500).await;
+                            skip_indicator_clone.set(None);
+                        });
+                    }
+                    "ArrowUp" => {
+                        e.prevent_default();
+                        let new_vol = (*volume + 0.1).min(1.0);
+                        volume.set(new_vol);
+                        video.set_volume(new_vol);
+                        if new_vol > 0.0 {
+                            is_muted.set(false);
+                            video.set_muted(false);
+                        }
+                    }
+                    "ArrowDown" => {
+                        e.prevent_default();
+                        let new_vol = (*volume - 0.1).max(0.0);
+                        volume.set(new_vol);
+                        video.set_volume(new_vol);
+                    }
+                    "m" | "M" => {
+                        e.prevent_default();
+                        if *is_muted {
+                            is_muted.set(false);
+                            video.set_muted(false);
+                            volume.set(*prev_volume);
+                            video.set_volume(*prev_volume);
+                        } else {
+                            prev_volume.set(*volume);
+                            is_muted.set(true);
+                            video.set_muted(true);
+                        }
+                    }
+                    "f" | "F" => {
+                        e.prevent_default();
+                        if let Some(container) = container_ref.cast::<web_sys::HtmlElement>() {
+                            let doc = web_sys::window().unwrap().document().unwrap();
+                            if doc.fullscreen_element().is_some() {
+                                let _ = doc.exit_fullscreen();
+                                is_fullscreen.set(false);
+                            } else {
+                                let _ = container.request_fullscreen();
+                                is_fullscreen.set(true);
+                            }
+                        }
+                    }
+                    "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+                        e.prevent_default();
+                        let num: f64 = key.parse().unwrap_or(0.0);
+                        let dur = video.duration();
+                        if dur.is_finite() {
+                            video.set_current_time(dur * (num / 10.0));
+                        }
+                    }
+                    "<" | "," => {
+                        e.prevent_default();
+                        let current = *playback_speed;
+                        if let Some(pos) =
+                            PLAYBACK_SPEEDS.iter().position(|&s| (s - current).abs() < 0.01)
+                        {
+                            if pos > 0 {
+                                let new_speed = PLAYBACK_SPEEDS[pos - 1];
+                                playback_speed.set(new_speed);
+                                video.set_playback_rate(new_speed);
+                            }
+                        }
+                    }
+                    ">" | "." => {
+                        e.prevent_default();
+                        let current = *playback_speed;
+                        if let Some(pos) =
+                            PLAYBACK_SPEEDS.iter().position(|&s| (s - current).abs() < 0.01)
+                        {
+                            if pos < PLAYBACK_SPEEDS.len() - 1 {
+                                let new_speed = PLAYBACK_SPEEDS[pos + 1];
+                                playback_speed.set(new_speed);
+                                video.set_playback_rate(new_speed);
+                            }
+                        }
+                    }
+                    "Home" => {
+                        e.prevent_default();
+                        video.set_current_time(0.0);
+                    }
+                    "End" => {
+                        e.prevent_default();
+                        let dur = video.duration();
+                        if dur.is_finite() {
+                            video.set_current_time(dur);
+                        }
+                    }
+                    _ => {}
+                }
+            });
+            if let Some(win) = window() {
+                let _ = win.add_event_listener_with_callback(
+                    "keydown",
+                    closure.as_ref().unchecked_ref(),
+                );
+            }
+            move || {
+                if let Some(win) = window() {
+                    let _ = win.remove_event_listener_with_callback(
+                        "keydown",
+                        closure.as_ref().unchecked_ref(),
+                    );
+                }
+            }
+        });
+    }
+
+    // ── Controls auto-hide ───────────────────────────────────────
+    {
+        let is_playing = is_playing.clone();
+        let quality_menu_open = quality_menu_open.clone();
+        let is_near_controls = is_near_controls.clone();
+        let controls_visible = controls_visible.clone();
+        let last_mouse_move = last_mouse_move.clone();
+
+        use_effect_with(
+            ((*is_playing).clone(), (*quality_menu_open).clone()),
+            move |_| {
+                use gloo_timers::callback::Interval;
+
+                let is_playing = is_playing.clone();
+                let quality_menu_open = quality_menu_open.clone();
+                let is_near_controls = is_near_controls.clone();
+                let controls_visible = controls_visible.clone();
+                let last_mouse_move = last_mouse_move.clone();
+
+                let interval = Interval::new(1000, move || {
+                    if *is_playing && !*quality_menu_open && !*is_near_controls.borrow() {
+                        let elapsed = js_sys::Date::now() - *last_mouse_move.borrow();
+                        if elapsed > CONTROL_HIDE_TIMEOUT_MS {
+                            controls_visible.set(false);
+                        }
+                    }
+                });
+
+                move || drop(interval)
+            },
+        );
+    }
 
     // ──────────────────────────────────────────────────────────────
     // Effect 1: attach MediaSource, create SourceBuffer in sourceopen
@@ -1133,29 +1562,37 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // Effect 3: periodic UI update (current time, duration, play state)
     // ──────────────────────────────────────────────────────────────
     {
-        let video_ref  = video_player_ref.clone();
+        let video_ref    = video_player_ref.clone();
         let current_time = current_time.clone();
         let duration     = duration.clone();
         let is_playing   = is_playing.clone();
         let volume       = volume.clone();
+        let video_ended  = video_ended.clone();
+        let is_dragging  = is_dragging.clone();
 
         use_effect_with((), move |_| {
             use gloo_timers::callback::Interval;
 
             let interval = Interval::new(250, move || {
                 if let Some(v) = video_ref.cast::<HtmlVideoElement>() {
-                    let ct = v.current_time() as u32;
-                    if ct != *current_time { current_time.set(ct); }
+                    // Don't update current_time while dragging (user is controlling it)
+                    if !*is_dragging {
+                        let ct = v.current_time();
+                        if (ct - *current_time).abs() > 0.5 { current_time.set(ct); }
+                    }
 
                     // duration may change once MSE has enough data
                     let dur = v.duration();
                     if dur.is_finite() {
-                        let d = dur as u32;
-                        if d != *duration { duration.set(d); }
+                        if (dur - *duration).abs() > 0.5 { duration.set(dur); }
                     }
 
                     let playing = !v.paused() && !v.ended();
                     if playing != *is_playing { is_playing.set(playing); }
+
+                    // Track video ended state
+                    let ended = v.ended();
+                    if ended != *video_ended { video_ended.set(ended); }
 
                     // Sync volume state on first tick.
                     let vol = v.volume();
@@ -1236,18 +1673,58 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     }
 
     // ── Compute progress bar percentages ─────────────────────────
-    let played_pct = if *duration > 0 {
-        (*current_time as f64 / *duration as f64 * 100.0).min(100.0)
+    let progress_percent = if *duration > 0.0 {
+        if *is_dragging {
+            (*drag_time / *duration * 100.0).min(100.0)
+        } else {
+            (*current_time / *duration * 100.0).min(100.0)
+        }
     } else {
         0.0
     };
 
+    let buffered_percent = if *duration > 0.0 {
+        // TODO: read actual buffered end from video element
+        progress_percent
+    } else {
+        0.0
+    };
+
+    let controls_class = if *controls_visible {
+        "player-controls"
+    } else {
+        "player-controls player-controls--hidden"
+    };
+
+    let header_class = if *controls_visible {
+        "player-header"
+    } else {
+        "player-header player-header--hidden"
+    };
+
     // Play/pause icon
-    let play_pause_icon: Html = if *is_playing {
+    let play_pause_icon: Html = if *video_ended {
+        icon_replay()
+    } else if *is_playing {
         icon_pause()
     } else {
         icon_play()
     };
+
+    // Calculate thumbnail preview position
+    let preview_style = if *is_hovering_progress || *is_dragging {
+        let left = (*hover_position).clamp(5.0, 95.0);
+        format!("left: {}%; display: block;", left)
+    } else {
+        "display: none;".to_string()
+    };
+    let preview_time = if *is_dragging {
+        *drag_time
+    } else {
+        *hover_time
+    };
+
+    let on_close = props.on_close.clone();
 
     html! {
         <div
@@ -1257,10 +1734,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             onmousemove={on_mouse_move}
             onmouseleave={on_mouse_leave}
         >
-            <div class={if true { "player-header" } else { "player-header player-header--hidden" }}>
+            // Header
+            <div class={header_class}>
                 <button
                     class="btn btn--back"
-                    onclick={props.on_close.reform(|_| ())}
+                    onclick={Callback::from(move |_| {
+                        on_close.emit(());
+                    })}
                 >
                     { icon_arrow_back() }
                     { " Back" }
@@ -1268,52 +1748,96 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 <span class="player-title">{ title }</span>
             </div>
 
-            if let Some(err) = Some(false) {
-                <div class="notice notice--error">
-                    <div class="notice__title">{ "Playback error" }</div>
-                    <div class="notice__body">{ err }</div>
+            // Buffering indicator
+            if *is_buffering {
+                <div class="player-buffering">
+                    <div class="player-buffering__spinner"></div>
                 </div>
             }
 
+            // Skip indicator (for double-tap/keyboard skip)
+            if let Some((direction, x_pos)) = &*skip_indicator {
+                <div
+                    class={format!("skip-indicator skip-indicator--{}", direction)}
+                    style={format!("left: {}%;", x_pos)}
+                >
+                    if direction == "forward" {
+                        <span class="skip-indicator__icon">{ icon_skip_forward() }</span>
+                        <span class="skip-indicator__text">{ "10s" }</span>
+                    } else {
+                        <span class="skip-indicator__icon">{ icon_skip_backward() }</span>
+                        <span class="skip-indicator__text">{ "10s" }</span>
+                    }
+                </div>
+            }
+
+            // Video element
             <video
                 ref={video_player_ref}
                 class="video-el"
                 onclick={on_video_click}
             />
 
-            <div class={"player-controls"}>
-                <div class="player-progress-container"
-                    ref={progress_ref}
-                    onclick={on_progress_click}
-                    onmousedown={on_progress_mousedown}
-                >
-                    <div class="player-progress">
-                        <div class="player-progress__buffered" />
-                        <div class="player-progress__played"
-                            style={format!("width: {:.1}%",
-                                if *is_seeking { *seek_preview_pct } else { played_pct })}
+            // Video end overlay
+            if *video_ended {
+                <div class="video-end-overlay">
+                    <button class="video-end-overlay__replay" onclick={on_replay}>
+                        <span class="replay-icon">{ icon_replay() }</span>
+                        <span>{ "Replay" }</span>
+                    </button>
+                </div>
+            }
+
+            // Controls bar
+            <div class={controls_class}>
+                // Progress bar container
+                <div class="player-progress-container">
+                    // Thumbnail preview
+                    <div class="player-preview" style={preview_style}>
+                        <canvas ref={thumbnail_canvas_ref} class="player-preview__canvas" width="160" height="90"></canvas>
+                        <div class="player-preview__time">{ format_time(preview_time) }</div>
+                    </div>
+
+                    // Progress bar
+                    <div
+                        ref={progress_ref}
+                        class="player-progress"
+                        onclick={on_progress_click}
+                        onmousedown={on_progress_mousedown}
+                        onmousemove={on_progress_hover}
+                        onmouseleave={on_progress_leave}
+                    >
+                        <div
+                            class="player-progress__buffered"
+                            style={format!("width: {}%", buffered_percent)}
                         />
-                        <div class={if *is_seeking {
-                            "player-progress__thumb player-progress__thumb--dragging"
-                        } else {
-                            "player-progress__thumb"
-                        }}
-                            style={format!("left: {:.1}%",
-                                if *is_seeking { *seek_preview_pct } else { played_pct })}
+                        <div
+                            class="player-progress__played"
+                            style={format!("width: {}%", progress_percent)}
+                        />
+                        // Hover indicator line
+                        if *is_hovering_progress || *is_dragging {
+                            <div
+                                class="player-progress__hover-line"
+                                style={format!("left: {}%", if *is_dragging { progress_percent } else { *hover_position })}
+                            />
+                        }
+                        <div
+                            class={if *is_dragging { "player-progress__thumb player-progress__thumb--dragging" } else { "player-progress__thumb" }}
+                            style={format!("left: {}%", progress_percent)}
                         />
                     </div>
                 </div>
 
+                // Bottom controls
                 <div class="player-controls__bottom">
+                    // Left side controls
                     <div class="player-controls__left">
-                        <button
-                            class="player-controls__btn"
-                            title="Play/Pause (k)"
-                            onclick={on_play_pause}
-                        >
+                        <button class="player-controls__btn" onclick={on_play_pause} title="Play/Pause (k)">
                             { play_pause_icon }
                         </button>
 
+                        // Volume control
                         <div
                             class="player-volume"
                             onmouseenter={Callback::from({
@@ -1325,26 +1849,18 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 move |_| volume_slider_visible.set(false)
                             })}
                         >
-                            <button
-                                class="player-controls__btn"
-                                title="Mute (m)"
-                                onclick={on_mute_toggle}
-                            >
+                            <button class="player-controls__btn" onclick={on_mute_toggle} title="Mute (m)">
                                 { volume_icon }
                             </button>
-                            <div class={if *volume_slider_visible {
-                                "player-volume__slider player-volume__slider--visible"
-                            } else {
-                                "player-volume__slider"
-                            }}>
+                            <div class={if *volume_slider_visible { "player-volume__slider player-volume__slider--visible" } else { "player-volume__slider" }}>
                                 <input
                                     type="range"
                                     min="0"
                                     max="1"
                                     step="0.05"
                                     value={volume.to_string()}
-                                    class="player-volume__input"
                                     oninput={on_volume_change}
+                                    class="player-volume__input"
                                 />
                             </div>
                         </div>
@@ -1352,7 +1868,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         <span class="player-controls__time">{ time_display }</span>
                     </div>
 
+                    // Right side controls
                     <div class="player-controls__right">
+                        // Playback speed
                         <div class="player-speed">
                             <button
                                 class="player-controls__btn player-controls__btn--text"
@@ -1365,14 +1883,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 <div class="player-speed__menu">
                                     { for PLAYBACK_SPEEDS.iter().map(|&speed| {
                                         let on_select = on_speed_select.clone();
-                                        let is_active = (*playback_speed - speed) == 0.0;
+                                        let is_active = (*playback_speed - speed).abs() < 0.01;
                                         html! {
                                             <button
-                                                class={if is_active {
-                                                    "player-speed__option player-speed__option--active"
-                                                } else {
-                                                    "player-speed__option"
-                                                }}
+                                                class={if is_active { "player-speed__option player-speed__option--active" } else { "player-speed__option" }}
                                                 onclick={Callback::from(move |e: MouseEvent| {
                                                     e.stop_propagation();
                                                     on_select.emit(speed);
@@ -1386,6 +1900,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
                         </div>
 
+                        // Quality selector
                         <div class="player-quality">
                             <button
                                 class="player-controls__btn player-controls__btn--text"
@@ -1405,11 +1920,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                         let value_str = value.to_string();
                                         html! {
                                             <button
-                                                class={if is_active {
-                                                    "player-quality__option player-quality__option--active"
-                                                } else {
-                                                    "player-quality__option"
-                                                }}
+                                                class={if is_active { "player-quality__option player-quality__option--active" } else { "player-quality__option" }}
                                                 onclick={Callback::from(move |e: MouseEvent| {
                                                     e.stop_propagation();
                                                     on_select.emit(value_str.clone());
@@ -1423,11 +1934,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
                         </div>
 
-                        <button
-                            class="player-controls__btn"
-                            onclick={on_fullscreen_toggle}
-                            title="Fullscreen (f)"
-                        >
+                        // Fullscreen button
+                        <button class="player-controls__btn" onclick={on_fullscreen_toggle} title="Fullscreen (f)">
                             { fullscreen_icon }
                         </button>
                     </div>
@@ -1435,6 +1943,23 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             </div>
         </div>
     }
+}
+
+// ── Thumbnail Info Fetching ──────────────────────────────────────────────────
+async fn fetch_thumbnail_info(video_id: &str) -> Result<ThumbnailInfo, String> {
+    let url = format!("/api/videos/{video_id}/thumbnails/info");
+    let resp = Request::get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("fetch error: {e:?}"))?;
+    if !resp.ok() {
+        return Err(format!("HTTP {} for {url}", resp.status()));
+    }
+    let info: ThumbnailInfo = resp
+        .json()
+        .await
+        .map_err(|e| format!("JSON parse error: {e:?}"))?;
+    Ok(info)
 }
 
 // ── SVG Icons ────────────────────────────────────────────────────────────────

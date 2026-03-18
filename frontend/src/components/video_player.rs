@@ -1002,7 +1002,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let is_hovering_progress = is_hovering_progress.clone();
         let is_dragging = is_dragging.clone();
         use_effect_with(
-            ((*hover_time).clone(), (*is_hovering_progress).clone(), (*is_dragging).clone()),
+            (*hover_time, *is_hovering_progress, *is_dragging),
             move |_| {
                 if !*is_hovering_progress && !*is_dragging {
                     return;
@@ -1174,30 +1174,32 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     closures_for_mouseup.borrow_mut().take()
                 {
                     if let Some(win) = window() {
-                        let doc = win.document().unwrap();
-                        let _ = doc.remove_event_listener_with_callback(
-                            "mousemove",
-                            mousemove_closure.as_ref().unchecked_ref(),
-                        );
-                        let _ = doc.remove_event_listener_with_callback(
-                            "mouseup",
-                            mouseup_closure.as_ref().unchecked_ref(),
-                        );
+                        if let Some(doc) = win.document() {
+                            let _ = doc.remove_event_listener_with_callback(
+                                "mousemove",
+                                mousemove_closure.as_ref().unchecked_ref(),
+                            );
+                            let _ = doc.remove_event_listener_with_callback(
+                                "mouseup",
+                                mouseup_closure.as_ref().unchecked_ref(),
+                            );
+                        }
                     }
                 }
             });
 
             if let Some(win) = window() {
-                let doc = win.document().unwrap();
-                let _ = doc.add_event_listener_with_callback(
-                    "mousemove",
-                    on_mousemove.as_ref().unchecked_ref(),
-                );
-                let _ = doc.add_event_listener_with_callback(
-                    "mouseup",
-                    on_mouseup.as_ref().unchecked_ref(),
-                );
-                *closures.borrow_mut() = Some((on_mousemove, on_mouseup));
+                if let Some(doc) = win.document() {
+                    let _ = doc.add_event_listener_with_callback(
+                        "mousemove",
+                        on_mousemove.as_ref().unchecked_ref(),
+                    );
+                    let _ = doc.add_event_listener_with_callback(
+                        "mouseup",
+                        on_mouseup.as_ref().unchecked_ref(),
+                    );
+                    *closures.borrow_mut() = Some((on_mousemove, on_mouseup));
+                }
             }
         })
     };

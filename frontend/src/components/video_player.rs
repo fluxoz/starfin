@@ -228,6 +228,36 @@ pub fn parse_media_playlist(
 
 // ── Segment pump helpers ─────────────────────────────────────────────────────
 
+/// Strip leading `ftyp` and `moov` boxes from an fMP4 segment, returning
+/// only the `moof+mdat` fragment data.
+///
+/// Each segment produced by ffmpeg with `empty_moov` contains
+/// `[ftyp][moov][moof][mdat]`.  The init segment (ftyp+moov) is appended
+/// once to the SourceBuffer; including it again in every media segment
+/// causes MSE to re-initialize the decode context and the buffer range
+/// never extends past the first segment's duration.
+fn strip_init_boxes(data: &[u8]) -> &[u8] {
+    let mut pos: usize = 0;
+
+    while pos + 8 <= data.len() {
+        let size = u32::from_be_bytes([
+            data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
+        ]) as usize;
+        if size < 8 || pos + size > data.len() {
+            break;
+        }
+        let box_type = &data[pos + 4..pos + 8];
+
+        if box_type == b"ftyp" || box_type == b"moov" {
+            pos += size;            // skip this box
+        } else {
+            break;                  // reached moof/mdat — return from here
+        }
+    }
+
+    &data[pos..]
+}
+
 /// Wait until sb.updating is false, yielding to the JS event loop each tick.
 async fn wait_until_not_updating(sb_ref: &Rc<RefCell<Option<SourceBuffer>>>) {
     loop {
@@ -545,17 +575,29 @@ async fn run_segment_pump(
         wait_until_not_updating(&sb_ref).await;
 
         // ── 6. appendBuffer ────────────────────────────────────────────────
-        let mut data = data_slots[append_cursor].borrow().clone().unwrap();
-        let seq      = seqs[append_cursor];
+        let data_full = data_slots[append_cursor].borrow().clone().unwrap();
+        let seq       = seqs[append_cursor];
 
-        info!("pump: appending seg {:?} (cursor={}, {} bytes)", seq, append_cursor, data.len());
+        // Strip the leading ftyp+moov boxes — the init segment was already
+        // appended once; including them again resets MSE's decode context
+        // and prevents the buffer from growing past the first segment.
+        let fragment = strip_init_boxes(&data_full);
+
+        info!(
+            "pump: appending seg {:?} (cursor={}, {} raw bytes, {} after strip)",
+            seq, append_cursor, data_full.len(), fragment.len()
+        );
 
         let append_ok = {
             let sb_guard = sb_ref.borrow();
             match sb_guard.as_ref() {
                 None => { error!("pump: SourceBuffer gone"); break; }
                 Some(sb) => {
-                    match sb.append_buffer_with_u8_array(data.as_mut_slice()) {
+                    // append_buffer_with_u8_array needs &mut [u8] but we
+                    // only have an immutable slice from strip_init_boxes.
+                    // Copy just the fragment portion into a mutable Vec.
+                    let mut buf = fragment.to_vec();
+                    match sb.append_buffer_with_u8_array(buf.as_mut_slice()) {
                         Ok(()) => {
                             info!("pump: appended seg {:?} (cursor={}) OK", seq, append_cursor);
                             true
@@ -1018,8 +1060,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 let mime = "video/mp4; codecs=\"avc1.42E01E,mp4a.40.2\"";
                 match ms_for_open.add_source_buffer(mime) {
                     Ok(sb) => {
+                        // Use "sequence" mode so MSE chains fragments
+                        // sequentially regardless of in-fragment PTS values.
+                        // This is critical: cached segments may still have
+                        // PTS starting at 0, and sequence mode ensures each
+                        // fragment is placed after the previous one.
+                        sb.set_mode(web_sys::SourceBufferAppendMode::Sequence);
+                        info!("SourceBuffer created ok (mode=sequence)");
                         *sb_ref_inner.borrow_mut() = Some(sb);
-                        info!("SourceBuffer created ok");
                     }
                     Err(e) => error!("add_source_buffer failed: {:?}", e),
                 }

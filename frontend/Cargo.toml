@@ -26,6 +26,7 @@ web-sys = { version = "0.3", features = [
     "MediaSource",
     "MediaSourceReadyState",
     "SourceBuffer",
+    "SourceBufferAppendMode",
     "SourceBufferList",
     "TimeRanges",
     "MediaStreamConstraints",

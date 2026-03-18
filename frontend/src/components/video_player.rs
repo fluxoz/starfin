@@ -522,8 +522,8 @@ async fn run_segment_pump(
 
         // ── 2. Done? ───────────────────────────────────────────────────────
         if append_cursor >= total {
-            if (*media_source).ready_state() == web_sys::MediaSourceReadyState::Open {
-                let _ = (*media_source).end_of_stream();
+            if media_source.ready_state() == web_sys::MediaSourceReadyState::Open {
+                let _ = media_source.end_of_stream();
                 info!("pump: end_of_stream");
             }
             break;
@@ -817,7 +817,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
     // ── Video click → play/pause ─────────────────────────────────
     let on_video_click = {
-        let video_ref = video_player_ref.clone();
         let is_playing = is_playing.clone();
         Callback::from(move |e: MouseEvent| {
             e.stop_propagation();
@@ -1135,40 +1134,39 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let video_for_cleanup: Option<HtmlVideoElement> = video_ref.cast::<HtmlVideoElement>();
 
             if let Some(ref video) = video_for_cleanup {
+                // Helper: create a closure that logs video state for a named event.
+                macro_rules! log_event {
+                    ($name:expr, $video:expr) => {{
+                        let v = $video.clone();
+                        let name = $name;
+                        Closure::wrap(Box::new(move |_: web_sys::Event| {
+                            info!(
+                                "video event: {} — ct={:.2}s dur={:.1}s rs={} ns={} paused={} ended={}",
+                                name,
+                                v.current_time(),
+                                v.duration(),
+                                v.ready_state(),
+                                v.network_state(),
+                                v.paused(),
+                                v.ended(),
+                            );
+                        }) as Box<dyn FnMut(_)>)
+                    }};
+                }
 
-            // Helper: create an event listener closure that logs the event.
-            macro_rules! log_event {
-                ($name:expr, $video:expr) => {{
-                    let v = $video.clone();
-                    let name = $name;
-                    Closure::wrap(Box::new(move |_: web_sys::Event| {
-                        let ct = v.current_time();
-                        let rs = v.ready_state();
-                        let ns = v.network_state();
-                        let paused = v.paused();
-                        let ended = v.ended();
-                        let dur = v.duration();
-                        info!(
-                            "video event: {} — ct={:.2}s dur={:.1}s rs={} ns={} paused={} ended={}",
-                            name, ct, dur, rs, ns, paused, ended
-                        );
-                    }) as Box<dyn FnMut(_)>)
-                }};
-            }
-
-            let events: Vec<(&str, Closure<dyn FnMut(web_sys::Event)>)> = vec![
-                ("waiting",       log_event!("waiting",       video)),
-                ("playing",       log_event!("playing",       video)),
-                ("pause",         log_event!("pause",         video)),
-                ("seeking",       log_event!("seeking",       video)),
-                ("seeked",        log_event!("seeked",        video)),
-                ("stalled",       log_event!("stalled",       video)),
-                ("error",         log_event!("error",         video)),
-                ("ended",         log_event!("ended",         video)),
-                ("canplay",       log_event!("canplay",       video)),
-                ("canplaythrough", log_event!("canplaythrough", video)),
-                ("loadeddata",    log_event!("loadeddata",    video)),
-            ];
+                let events: Vec<(&str, Closure<dyn FnMut(web_sys::Event)>)> = vec![
+                    ("waiting",        log_event!("waiting",        video)),
+                    ("playing",        log_event!("playing",        video)),
+                    ("pause",          log_event!("pause",          video)),
+                    ("seeking",        log_event!("seeking",        video)),
+                    ("seeked",         log_event!("seeked",         video)),
+                    ("stalled",        log_event!("stalled",        video)),
+                    ("error",          log_event!("error",          video)),
+                    ("ended",          log_event!("ended",          video)),
+                    ("canplay",        log_event!("canplay",        video)),
+                    ("canplaythrough", log_event!("canplaythrough", video)),
+                    ("loadeddata",     log_event!("loadeddata",     video)),
+                ];
 
                 let target: &web_sys::EventTarget = video.as_ref();
                 for (name, closure) in events {

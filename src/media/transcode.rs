@@ -130,7 +130,7 @@ pub async fn create_init_segment(
     abs_path: &str,
     hls_dir: &Path,
     hwaccel: &HwAccel,
-    quality: super::transcode::Quality,
+    quality: Quality,
 ) -> Result<Vec<u8>, String> {
     let init_path = hls_dir.join("init.mp4");
 

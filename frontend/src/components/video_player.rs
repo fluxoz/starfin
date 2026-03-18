@@ -710,7 +710,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let buffered_end = buffered_end.clone();
         let is_playing = is_playing.clone();
         let is_dragging = is_dragging.clone();
-        let is_buffering = is_buffering.clone();
         let video_ended = video_ended.clone();
         let mse_state = mse_state.clone();
 
@@ -737,6 +736,79 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 }
             });
             move || drop(interval)
+        });
+    }
+
+    // Buffering state: use waiting/playing/pause events instead of polling readyState
+    // (readyState transiently dips during MSE appendBuffer even with plenty of buffer ahead)
+    {
+        let video_ref = video_ref.clone();
+        let is_buffering = is_buffering.clone();
+
+        use_effect_with(video_ref.clone(), move |video_ref| {
+            let video_opt = video_ref.cast::<HtmlVideoElement>();
+
+            let cbs = video_opt.as_ref().map(|video| {
+                let is_buffering_w = is_buffering.clone();
+                let waiting_cb = Closure::<dyn Fn()>::new(move || {
+                    is_buffering_w.set(true);
+                });
+                video
+                    .add_event_listener_with_callback(
+                        "waiting",
+                        waiting_cb.as_ref().unchecked_ref(),
+                    )
+                    .ok();
+
+                let is_buffering_p = is_buffering.clone();
+                let playing_cb = Closure::<dyn Fn()>::new(move || {
+                    is_buffering_p.set(false);
+                });
+                video
+                    .add_event_listener_with_callback(
+                        "playing",
+                        playing_cb.as_ref().unchecked_ref(),
+                    )
+                    .ok();
+
+                let is_buffering_pa = is_buffering.clone();
+                let pause_cb = Closure::<dyn Fn()>::new(move || {
+                    is_buffering_pa.set(false);
+                });
+                video
+                    .add_event_listener_with_callback(
+                        "pause",
+                        pause_cb.as_ref().unchecked_ref(),
+                    )
+                    .ok();
+
+                (waiting_cb, playing_cb, pause_cb)
+            });
+
+            move || {
+                if let (Some((waiting_cb, playing_cb, pause_cb)), Some(video)) =
+                    (cbs, video_opt)
+                {
+                    video
+                        .remove_event_listener_with_callback(
+                            "waiting",
+                            waiting_cb.as_ref().unchecked_ref(),
+                        )
+                        .ok();
+                    video
+                        .remove_event_listener_with_callback(
+                            "playing",
+                            playing_cb.as_ref().unchecked_ref(),
+                        )
+                        .ok();
+                    video
+                        .remove_event_listener_with_callback(
+                            "pause",
+                            pause_cb.as_ref().unchecked_ref(),
+                        )
+                        .ok();
+                }
+            }
         });
     }
 

@@ -1,31 +1,26 @@
 use gloo_net::http::Request;
-use std::collections::VecDeque;
-use std::cell::{Cell, RefCell};
-use gloo_net::Error as GlooError;
+use gloo_timers::callback::Interval;
 use gloo_timers::future::TimeoutFuture;
 use serde::Deserialize;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-use wasm_bindgen_futures::JsFuture;
-use web_sys::{HtmlVideoElement, KeyboardEvent, MediaSource, MouseEvent, Url, window, SourceBuffer};
+use web_sys::{HtmlVideoElement, KeyboardEvent, MouseEvent, window};
 use yew::prelude::*;
-use log::{info, warn, error};
+use log::error;
 
 // ── Playback speed options ───────────────────────────────────────────────────
 const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
 
 const SEGMENT_DURATION_F: f64 = 6.0;
 
-/// How many segments ahead of the *playhead* the pump is allowed to buffer.
-const LOOKAHEAD: usize = 3;
-
-/// Seconds of already-played data to keep behind the playhead.
-const KEEP_BEHIND_SECS: f64 = 10.0;
-
-/// Poll interval (ms) when the pump is waiting for the playhead to advance.
-const PLAYBACK_POLL_MS: u32 = 250;
+// ── MSE player constants ─────────────────────────────────────────────────────
+/// Target seconds of video to keep buffered ahead of the playback position.
+const MSE_TARGET_BUFFER_S: f64 = 30.0;
+/// Seconds of back-buffer to retain behind the playback position when seeking.
+const MSE_BACK_BUFFER_S: f64 = 5.0;
 
 const QUALITY_STORAGE_KEY: &str = "starfin_quality";
 const QUALITY_OPTIONS: [(&str, &str); 4] = [
@@ -76,187 +71,109 @@ pub struct VideoPlayerProps {
     pub on_close: Callback<()>,
 }
 
-#[derive(Debug, Clone)]
-pub struct Segment {
-    pub url:               String,
-    pub representation_id: String,
-    pub start_time:        f64,
-    pub duration:          f64,
-    pub data:              Option<Vec<u8>>,
-    pub seq:               Option<u64>,
+struct SegmentInfo {
+    url: String,
+    #[allow(dead_code)]
+    duration: f64,
 }
 
-impl Segment {
-    pub async fn fetch(&mut self) -> Result<(), GlooError> {
-        if self.data.is_some() {
-            return Ok(());
-        }
-        let bytes = Request::get(&self.url)
-            .send()
-            .await?
-            .binary()
-            .await?;
-        self.data = Some(bytes);
-        Ok(())
-    }
-
-    pub fn append_to(&mut self, source_buffer: &SourceBuffer) -> Result<(), JsValue> {
-        let data = self.data.as_mut().expect("call .fetch() first");
-        source_buffer.append_buffer_with_u8_array(data.as_mut_slice())
-    }
+struct MseState {
+    media_source: web_sys::MediaSource,
+    source_buffer: web_sys::SourceBuffer,
+    /// Blob URL created for this MediaSource; revoked on cleanup.
+    object_url: String,
+    /// Parsed segment list from the M3U8 playlist.
+    segments: Vec<SegmentInfo>,
+    /// URL of the fMP4 init segment (ftyp+moov).
+    init_segment_url: Option<String>,
+    /// Whether the init segment has been appended.
+    init_appended: bool,
+    /// Index of the next segment to fetch.
+    next_seg: usize,
+    /// True while `SourceBuffer.appendBuffer` is in progress.
+    is_appending: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct Representation {
-    pub id:       String,
-    pub bitrate:  u32,
-    pub segments: Vec<Segment>,
-}
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
-pub struct Playlist {
-    pub representations:  Vec<Representation>,
-    pub is_live:          bool,
-    pub total_duration:   Option<f64>,
-    pub init_segment_url: Option<String>,
-}
-
-pub struct VideoPlayerState {
-    pub segment_queue:          VecDeque<Segment>,
-    pub media_source:           MediaSource,
-    pub source_buffer:          Option<SourceBuffer>,
-    pub video_element:          NodeRef,
-    pub current_representation: String,
-    pub playlist:               Option<Playlist>,
-}
-
-impl VideoPlayerState {
-    pub fn new(video_ref: NodeRef) -> Result<Self, JsValue> {
-        let media_source = MediaSource::new()?;
-        Ok(Self {
-            segment_queue:          VecDeque::with_capacity(32),
-            media_source,
-            source_buffer:          None,
-            video_element:          video_ref,
-            current_representation: String::new(),
-            playlist:               None,
-        })
-    }
-
-    pub async fn load_playlist(
-        &mut self,
-        video_id: String,
-        quality:  String,
-    ) -> Result<(), JsValue> {
-        let playlist_url = format!(
-            "/api/videos/{}/playlist.m3u8?quality={}",
-            video_id, quality
-        );
-        let text = Request::get(&playlist_url)
-            .send()
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?
-            .text()
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let parsed = parse_media_playlist(&text, &playlist_url, &quality)
-            .map_err(|e| JsValue::from_str(&e))?;
-
-        info!("{:?}", parsed);
-        self.playlist               = Some(parsed.clone());
-        self.current_representation = quality;
-
-        if let Some(rep) = parsed.representations.first() {
-            for seg in &rep.segments {
-                self.segment_queue.push_back(seg.clone());
+fn get_buffer_end(video: &HtmlVideoElement) -> f64 {
+    let current_time = video.current_time();
+    let buffered = video.buffered();
+    for i in 0..buffered.length() {
+        if let (Ok(start), Ok(end)) = (buffered.start(i), buffered.end(i)) {
+            if current_time >= start && current_time <= end {
+                return end;
             }
         }
-
-        Ok(())
     }
+    0.0
 }
 
-// ── Playlist parser ──────────────────────────────────────────────────────────
+/// Resolve a relative segment path against the playlist URL.
+fn resolve_segment_url(playlist_url: &str, segment_path: &str) -> String {
+    if segment_path.starts_with("http://")
+        || segment_path.starts_with("https://")
+        || segment_path.starts_with('/')
+    {
+        return segment_path.to_string();
+    }
+    let (path_part, query_part) = if let Some(q) = playlist_url.find('?') {
+        (&playlist_url[..q], &playlist_url[q..])
+    } else {
+        (playlist_url, "")
+    };
+    let base = if let Some(slash) = path_part.rfind('/') {
+        &path_part[..=slash]
+    } else {
+        "/"
+    };
+    format!("{base}{segment_path}{query_part}")
+}
 
-pub fn parse_media_playlist(
-    text:              &str,
-    _playlist_base_url: &str,
-    quality:           &str,
-) -> Result<Playlist, String> {
-    let lines: Vec<&str> = text
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect();
+/// Parse an HLS M3U8 playlist and return the list of segments plus an
+/// optional init segment URL (from `#EXT-X-MAP`).
+fn parse_m3u8(text: &str, playlist_url: &str) -> (Vec<SegmentInfo>, Option<String>) {
+    let mut segments = Vec::new();
+    let mut pending_duration: Option<f64> = None;
+    let mut init_segment_url: Option<String> = None;
 
-    let mut segments         = Vec::new();
-    let mut current_time     = 0.0f64;
-    let mut init_segment_url = None;
-    let mut i                = 0usize;
-
-    while i < lines.len() {
-        let line = lines[i];
+    for line in text.lines() {
+        let line = line.trim();
 
         // Parse #EXT-X-MAP:URI="..." for the init segment.
         if line.starts_with("#EXT-X-MAP:") {
             if let Some(start) = line.find("URI=\"") {
                 let rest = &line[start + 5..];
                 if let Some(end) = rest.find('"') {
-                    init_segment_url = Some(rest[..end].to_string());
-                    info!("playlist: found init segment URL: {}", rest[..end].to_string());
+                    init_segment_url = Some(resolve_segment_url(playlist_url, &rest[..end]));
                 }
             }
+            continue;
         }
 
-        if line.starts_with("#EXTINF:")
-            && let Some(duration_str) = line.split(',').next()
-        {
-            let duration_str = duration_str.trim_start_matches("#EXTINF:");
-            if let Ok(duration) = duration_str.parse::<f64>() {
-                i += 1;
-                if i < lines.len() && !lines[i].starts_with('#') {
-                    segments.push(Segment {
-                        url:               lines[i].to_string(),
-                        representation_id: quality.to_string(),
-                        start_time:        current_time,
-                        duration,
-                        data:              None,
-                        seq:               Some(segments.len() as u64),
-                    });
-                    current_time += duration;
-                }
+        if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            let duration = rest
+                .split(',')
+                .next()
+                .and_then(|d| d.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            pending_duration = Some(duration);
+        } else if !line.starts_with('#') && !line.is_empty() {
+            if let Some(duration) = pending_duration.take() {
+                segments.push(SegmentInfo {
+                    url: resolve_segment_url(playlist_url, line),
+                    duration,
+                });
             }
         }
-        i += 1;
     }
-
-    info!("playlist: {} segments parsed", segments.len());
-
-    let rep            = Representation { id: quality.to_string(), bitrate: 0, segments };
-    let total_duration = Some(rep.segments.iter().map(|s| s.duration).sum());
-
-    Ok(Playlist {
-        representations:  vec![rep],
-        is_live:          false,
-        total_duration,
-        init_segment_url,
-    })
+    (segments, init_segment_url)
 }
-
-// ── Segment pump helpers ─────────────────────────────────────────────────────
 
 /// Strip leading `ftyp` and `moov` boxes from an fMP4 segment, returning
 /// the byte offset where `moof+mdat` fragment data begins.
-///
-/// Each segment produced by ffmpeg with `empty_moov` contains
-/// `[ftyp][moov][moof][mdat]`.  The init segment (ftyp+moov) is appended
-/// once to the SourceBuffer; including it again in every media segment
-/// causes MSE to re-initialize the decode context and the buffer range
-/// never extends past the first segment's duration.
 fn strip_init_offset(data: &[u8]) -> usize {
     let mut pos: usize = 0;
-
     while pos + 8 <= data.len() {
         let size = u32::from_be_bytes([
             data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
@@ -265,414 +182,210 @@ fn strip_init_offset(data: &[u8]) -> usize {
             break;
         }
         let box_type = &data[pos + 4..pos + 8];
-
         if box_type == b"ftyp" || box_type == b"moov" {
-            pos += size;            // skip this box
+            pos += size;
         } else {
-            break;                  // reached moof/mdat — return from here
+            break;
         }
     }
-
     pos
 }
 
-/// Wait until sb.updating is false, yielding to the JS event loop each tick.
-async fn wait_until_not_updating(sb_ref: &Rc<RefCell<Option<SourceBuffer>>>) {
-    loop {
-        let updating = sb_ref
-            .borrow()
-            .as_ref()
-            .map(|sb| sb.updating())
-            .unwrap_or(false);
-        if !updating { return; }
-        TimeoutFuture::new(0).await;
-    }
-}
-
-/// Return the segment index that the playhead currently falls inside.
-fn playhead_segment_index(video: &HtmlVideoElement, start_times: &[(f64, f64)]) -> usize {
-    let ct = video.current_time();
-    start_times
-        .iter()
-        .position(|(start, dur)| ct < start + dur)
-        .unwrap_or(start_times.len().saturating_sub(1))
-}
-
-/// Log the current buffered ranges for debugging.
-fn log_buffered_ranges(video: &HtmlVideoElement) {
-    let buffered = video.buffered();
-    let len = buffered.length();
-    if len == 0 {
-        info!("  buffered: (empty)");
-        return;
-    }
-    for i in 0..len {
-        if let (Ok(s), Ok(e)) = (buffered.start(i), buffered.end(i)) {
-            info!("  buffered[{}]: {:.2}s – {:.2}s ({:.2}s)", i, s, e, e - s);
-        }
-    }
-}
-
-/// Try to start playback.  First attempts unmuted; if the browser rejects
-/// (autoplay policy), retries muted.  Returns true if playing.
-async fn try_play(video: &HtmlVideoElement) -> bool {
-    // Attempt 1: play with current audio state
-    let promise = video.play();
-    match promise {
-        Ok(p) => {
-            match JsFuture::from(p).await {
-                Ok(_) => {
-                    info!("pump: play() succeeded");
-                    return true;
-                }
-                Err(e) => {
-                    warn!("pump: play() rejected: {:?} — retrying muted", e);
-                }
-            }
-        }
-        Err(e) => {
-            warn!("pump: play() threw: {:?} — retrying muted", e);
-        }
-    }
-
-    // Attempt 2: mute and try again
-    video.set_muted(true);
-    let promise = video.play();
-    match promise {
-        Ok(p) => {
-            match JsFuture::from(p).await {
-                Ok(_) => {
-                    info!("pump: play() succeeded (muted)");
-                    return true;
-                }
-                Err(e) => {
-                    error!("pump: play() rejected even muted: {:?}", e);
-                }
-            }
-        }
-        Err(e) => {
-            error!("pump: play() threw even muted: {:?}", e);
-        }
-    }
-
-    false
-}
-
-/// Block until the playhead is within LOOKAHEAD segments of append_cursor.
-///
-/// Also handles paused/stalled states by allowing a small extra buffer so
-/// the pump doesn't deadlock.
-async fn wait_for_playhead(
-    video_ref:     &NodeRef,
-    start_times:   &[(f64, f64)],
-    append_cursor: usize,
-) {
-    if append_cursor < LOOKAHEAD {
-        info!("pump gate: cursor={} < LOOKAHEAD={}, allowing immediately", append_cursor, LOOKAHEAD);
-        return;
-    }
-
-    let mut logged_waiting = false;
-    let mut poll_count: u32 = 0;
-
-    loop {
-        let (ready, debug_info) = {
-            if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-                let ct     = video.current_time();
-                let paused = video.paused();
-                let ended  = video.ended();
-                let ph     = playhead_segment_index(&video, start_times);
-                let rs     = video.ready_state();
-
-                let debug = format!(
-                    "ct={:.2}s ph_seg={} cursor={} paused={} ended={} readyState={}",
-                    ct, ph, append_cursor, paused, ended, rs
-                );
-
-                // Allow appending if we're within the lookahead window
-                if append_cursor < ph + LOOKAHEAD {
-                    (true, debug)
-                }
-                // If paused/ended/stalled, allow one extra segment so there's
-                // data ready when the user resumes.
-                else if paused || ended || rs < 3 {
-                    let allow = append_cursor < ph + LOOKAHEAD + 2;
-                    (allow, debug)
-                } else {
-                    (false, debug)
-                }
-            } else {
-                (true, "no video element".to_string())
-            }
-        };
-
-        if ready {
-            if logged_waiting {
-                info!("pump gate: RESUMING — {}", debug_info);
-            }
-            return;
-        }
-
-        if !logged_waiting {
-            info!("pump gate: WAITING — {}", debug_info);
-            // Also log buffered ranges on first wait
-            if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-                log_buffered_ranges(&video);
-            }
-            logged_waiting = true;
-        }
-
-        // Periodic status while waiting (every ~2 seconds)
-        poll_count += 1;
-        if poll_count % 8 == 0 {
-            info!("pump gate: still waiting — {}", debug_info);
-            if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-                log_buffered_ranges(&video);
-            }
-        }
-
-        TimeoutFuture::new(PLAYBACK_POLL_MS).await;
-    }
-}
-
-/// Remove buffered data that is safely behind the playhead.
-async fn evict_behind_playhead(
-    video_ref: &NodeRef,
-    sb_ref:    &Rc<RefCell<Option<SourceBuffer>>>,
-) {
-    let evict_end = {
-        if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-            let target = video.current_time() - KEEP_BEHIND_SECS;
-            if target <= 0.5 { return; }
-            target
-        } else {
-            return;
-        }
-    };
-
-    let has_data_to_remove = {
-        let sb_guard = sb_ref.borrow();
-        sb_guard.as_ref()
-            .and_then(|sb| sb.buffered().ok())
-            .filter(|r| r.length() > 0)
-            .and_then(|r| r.start(0).ok())
-            .map(|buf_start| buf_start < evict_end)
-            .unwrap_or(false)
-    };
-
-    if !has_data_to_remove { return; }
-
-    let remove_ok = {
-        let sb_guard = sb_ref.borrow();
-        match sb_guard.as_ref() {
-            None => false,
-            Some(sb) => match sb.remove(0.0, evict_end) {
-                Ok(())  => true,
-                Err(e)  => { error!("pump: remove failed: {:?}", e); false }
-            }
-        }
-    };
-
-    if remove_ok {
-        wait_until_not_updating(sb_ref).await;
-        info!("pump: evicted up to {:.2}s", evict_end);
-    }
-}
-
 // ── Segment pump ─────────────────────────────────────────────────────────────
+/// Pump the next HLS segment into the MSE SourceBuffer.
+///
+/// Returns immediately if:
+/// - `state` is `None` (not yet initialised),
+/// - a previous append is still in flight (`is_appending`), or
+/// - the forward buffer already exceeds `MSE_TARGET_BUFFER_S`.
+///
+/// When all segments have been fed, signals end-of-stream on the MediaSource.
+fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) {
+    // --- Phase 0: If the init segment hasn't been appended yet, do that first.
+    {
+        let mut borrow = state.borrow_mut();
+        let mse = match borrow.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        if mse.is_appending {
+            return;
+        }
+        if !mse.init_appended {
+            if let Some(init_url) = mse.init_segment_url.clone() {
+                mse.is_appending = true;
+                let state_clone = state.clone();
+                let video_clone = video.clone();
+                drop(borrow); // release borrow before async
 
-async fn run_segment_pump(
-    segments:         Vec<Segment>,
-    sb_ref:           Rc<RefCell<Option<SourceBuffer>>>,
-    video_ref:        NodeRef,
-    media_source:     Rc<MediaSource>,
-    init_segment_url: Option<String>,
-) {
-    let total = segments.len();
-    info!("pump: {} segments total", total);
-
-    // ── 0. Append init segment (ftyp+moov) ─────────────────────────────
-    if let Some(ref init_url) = init_segment_url {
-        info!("pump: fetching init segment from {}", init_url);
-        match Request::get(init_url).send().await {
-            Ok(resp) => match resp.binary().await {
-                Ok(mut bytes) => {
-                    info!("pump: init segment fetched ({} bytes)", bytes.len());
-                    wait_until_not_updating(&sb_ref).await;
-                    let append_ok = {
-                        let sb_guard = sb_ref.borrow();
-                        match sb_guard.as_ref() {
-                            None => { error!("pump: SourceBuffer gone before init"); false }
-                            Some(sb) => {
-                                match sb.append_buffer_with_u8_array(bytes.as_mut_slice()) {
-                                    Ok(()) => { info!("pump: init segment appended OK"); true }
-                                    Err(e) => { error!("pump: init append failed: {:?}", e); false }
+                spawn_local(async move {
+                    let bytes = match Request::get(&init_url).send().await {
+                        Ok(r) => match r.binary().await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                error!("Failed to read init segment: {e:?}");
+                                if let Some(s) = state_clone.borrow_mut().as_mut() {
+                                    s.is_appending = false;
                                 }
+                                return;
                             }
+                        },
+                        Err(e) => {
+                            error!("Failed to fetch init segment: {e:?}");
+                            if let Some(s) = state_clone.borrow_mut().as_mut() {
+                                s.is_appending = false;
+                            }
+                            return;
                         }
                     };
-                    if append_ok {
-                        wait_until_not_updating(&sb_ref).await;
-                        info!("pump: init segment append complete");
+
+                    let source_buffer = {
+                        let borrow = state_clone.borrow();
+                        match borrow.as_ref() {
+                            Some(s) => s.source_buffer.clone(),
+                            None => return,
+                        }
+                    };
+
+                    // updateend listener for init segment
+                    let state_for_end = state_clone.clone();
+                    let video_for_end = video_clone.clone();
+                    let updateend_cb = Closure::once(Box::new(move || {
+                        {
+                            let mut borrow = state_for_end.borrow_mut();
+                            if let Some(s) = borrow.as_mut() {
+                                s.is_appending = false;
+                                s.init_appended = true;
+                            }
+                        }
+                        pump_segments(state_for_end, video_for_end);
+                    }) as Box<dyn FnOnce()>);
+                    source_buffer
+                        .add_event_listener_with_callback(
+                            "updateend",
+                            updateend_cb.as_ref().unchecked_ref(),
+                        )
+                        .ok();
+                    updateend_cb.forget();
+
+                    let uint8_array = js_sys::Uint8Array::from(bytes.as_slice());
+                    let array_buffer = uint8_array.buffer();
+                    if source_buffer
+                        .append_buffer_with_array_buffer(&array_buffer)
+                        .is_err()
+                    {
+                        if let Some(s) = state_clone.borrow_mut().as_mut() {
+                            s.is_appending = false;
+                            s.init_appended = true; // skip init if it fails
+                        }
                     }
-                }
-                Err(e) => error!("pump: init segment binary() failed: {e}"),
-            },
-            Err(e) => error!("pump: init segment fetch failed: {e}"),
+                });
+                return;
+            } else {
+                // No init segment URL — mark as done
+                mse.init_appended = true;
+            }
         }
     }
 
-    // Per-segment data slots: each independently borrowable.
-    let data_slots: Vec<Rc<RefCell<Option<Vec<u8>>>>> = (0..total)
-        .map(|_| Rc::new(RefCell::new(None)))
-        .collect();
-
-    // Read-only metadata.
-    let urls: Vec<String>        = segments.iter().map(|s| s.url.clone()).collect();
-    let seqs: Vec<Option<u64>>   = segments.iter().map(|s| s.seq).collect();
-    let start_times: Vec<(f64, f64)> = segments
-        .iter()
-        .map(|s| (s.start_time, s.duration))
-        .collect();
-
-    let mut append_cursor: usize = 0;
-    let mut fetch_cursor:  usize = 0;
-    let mut playing = false;
-
-    loop {
-        // ── 1. Prefetch ────────────────────────────────────────────────────
-        {
-            let fetch_up_to = (append_cursor + 2).min(total);
-            while fetch_cursor < fetch_up_to {
-                let idx  = fetch_cursor;
-                let slot = data_slots[idx].clone();
-                let url  = urls[idx].clone();
-
-                let already_has_data = slot.borrow().is_some();
-                if !already_has_data {
-                    info!("pump: prefetching seg {}", idx);
-                    spawn_local(async move {
-                        match Request::get(&url).send().await {
-                            Ok(resp) => match resp.binary().await {
-                                Ok(bytes) => {
-                                    info!("pump: fetched seg {} ({} bytes)", idx, bytes.len());
-                                    *slot.borrow_mut() = Some(bytes);
-                                }
-                                Err(e) => error!("prefetch binary failed seg {idx}: {e}"),
-                            },
-                            Err(e) => error!("prefetch send failed seg {idx}: {e}"),
-                        }
-                    });
-                }
-                fetch_cursor += 1;
+    // --- Phase 1: Regular segment pumping
+    let seg_url = {
+        let mut borrow = state.borrow_mut();
+        let mse = match borrow.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        if mse.is_appending {
+            return;
+        }
+        let buffered_ahead = get_buffer_end(&video) - video.current_time();
+        if buffered_ahead >= MSE_TARGET_BUFFER_S && mse.next_seg != 0 {
+            return;
+        }
+        if mse.next_seg >= mse.segments.len() {
+            if mse.media_source.ready_state() == web_sys::MediaSourceReadyState::Open {
+                let _ = mse.media_source.end_of_stream();
             }
+            return;
         }
+        let url = mse.segments[mse.next_seg].url.clone();
+        mse.is_appending = true;
+        url
+    };
 
-        // ── 2. Done? ───────────────────────────────────────────────────────
-        if append_cursor >= total {
-            if media_source.ready_state() == web_sys::MediaSourceReadyState::Open {
-                let _ = media_source.end_of_stream();
-                info!("pump: end_of_stream");
-            }
-            break;
-        }
-
-        // ── 3. PLAYHEAD GATE ───────────────────────────────────────────────
-        wait_for_playhead(&video_ref, &start_times, append_cursor).await;
-
-        // ── 4. Wait for segment bytes ──────────────────────────────────────
-        info!("pump: waiting for data seg {}", append_cursor);
-        loop {
-            let has_data = data_slots[append_cursor].borrow().is_some();
-            if has_data { break; }
-            TimeoutFuture::new(10).await;
-        }
-        info!("pump: data ready for seg {}", append_cursor);
-
-        // ── 5. Ensure SourceBuffer is idle ─────────────────────────────────
-        wait_until_not_updating(&sb_ref).await;
-
-        // ── 6. appendBuffer ────────────────────────────────────────────────
-        let mut data_full = data_slots[append_cursor].borrow().clone().unwrap();
-        let seq           = seqs[append_cursor];
-
-        // Strip the leading ftyp+moov boxes — the init segment was already
-        // appended once; including them again resets MSE's decode context
-        // and prevents the buffer from growing past the first segment.
-        let offset = strip_init_offset(&data_full);
-
-        info!(
-            "pump: appending seg {:?} (cursor={}, {} raw bytes, {} after strip)",
-            seq, append_cursor, data_full.len(), data_full.len() - offset
-        );
-
-        let append_ok = {
-            let sb_guard = sb_ref.borrow();
-            match sb_guard.as_ref() {
-                None => { error!("pump: SourceBuffer gone"); break; }
-                Some(sb) => {
-                    match sb.append_buffer_with_u8_array(&mut data_full[offset..]) {
-                        Ok(()) => {
-                            info!("pump: appended seg {:?} (cursor={}) OK", seq, append_cursor);
-                            true
-                        }
-                        Err(e) => {
-                            error!("pump: appendBuffer failed seg {:?}: {:?}", seq, e);
-                            false
-                        }
+    let state_clone = state.clone();
+    let video_clone = video.clone();
+    spawn_local(async move {
+        let bytes = match Request::get(&seg_url).send().await {
+            Ok(r) => match r.binary().await {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("Failed to read segment bytes: {e:?}");
+                    if let Some(s) = state_clone.borrow_mut().as_mut() {
+                        s.is_appending = false;
                     }
+                    return;
                 }
+            },
+            Err(e) => {
+                error!("Failed to fetch segment: {e:?}");
+                if let Some(s) = state_clone.borrow_mut().as_mut() {
+                    s.is_appending = false;
+                }
+                return;
             }
         };
 
-        if !append_ok {
-            append_cursor += 1;
-            continue;
-        }
+        let source_buffer = {
+            let borrow = state_clone.borrow();
+            match borrow.as_ref() {
+                Some(s) => s.source_buffer.clone(),
+                None => return,
+            }
+        };
 
-        // ── 7. Wait for append to finish ──────────────────────────────────
-        wait_until_not_updating(&sb_ref).await;
-        info!("pump: append complete for seg {:?}", seq);
-
-        // Log video state after append
-        if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-            info!(
-                "pump: after append — ct={:.2}s paused={} readyState={} networkState={}",
-                video.current_time(),
-                video.paused(),
-                video.ready_state(),
-                video.network_state()
-            );
-            log_buffered_ranges(&video);
-        }
-
-        // ── 8. Free fetched bytes ─────────────────────────────────────────
-        *data_slots[append_cursor].borrow_mut() = None;
-
-        // ── 9. Start playback ─────────────────────────────────────────────
-        if !playing {
-            if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-                playing = try_play(&video).await;
-                if playing {
-                    info!(
-                        "pump: playback started — ct={:.2}s paused={} readyState={}",
-                        video.current_time(),
-                        video.paused(),
-                        video.ready_state()
-                    );
-                } else {
-                    warn!("pump: could not start playback");
+        // One-shot updateend listener: advance segment pointer and re-pump.
+        let state_for_end = state_clone.clone();
+        let video_for_end = video_clone.clone();
+        let updateend_cb = Closure::once(Box::new(move || {
+            {
+                let mut borrow = state_for_end.borrow_mut();
+                if let Some(s) = borrow.as_mut() {
+                    s.is_appending = false;
+                    s.next_seg += 1;
                 }
             }
+            let s = state_for_end;
+            let v = video_for_end;
+            // Re-pump on next microtask to avoid stack overflow with many segments
+            spawn_local(async move {
+                pump_segments(s, v);
+            });
+        }) as Box<dyn FnOnce()>);
+        source_buffer
+            .add_event_listener_with_callback(
+                "updateend",
+                updateend_cb.as_ref().unchecked_ref(),
+            )
+            .ok();
+        updateend_cb.forget();
+
+        // Strip the leading ftyp+moov boxes — the init segment was already
+        // appended once; including them again resets MSE's decode context.
+        let offset = strip_init_offset(&bytes);
+        let data_to_append = &bytes[offset..];
+
+        let uint8_array = js_sys::Uint8Array::from(data_to_append);
+        let array_buffer = uint8_array.buffer();
+        if source_buffer
+            .append_buffer_with_array_buffer(&array_buffer)
+            .is_err()
+        {
+            if let Some(s) = state_clone.borrow_mut().as_mut() {
+                s.is_appending = false;
+            }
         }
-
-        // ── 10. Evict old data ────────────────────────────────────────────
-        evict_behind_playhead(&video_ref, &sb_ref).await;
-
-        append_cursor += 1;
-    }
-
-    info!("pump: finished");
+    });
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -740,13 +453,15 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let thumbnail_info        = use_state(|| Option::<ThumbnailInfo>::None);
     let thumbnail_image       = use_state(|| Option::<web_sys::HtmlImageElement>::None);
 
-    // MSE state
-    let media_source = use_memo((), |_| MediaSource::new().expect("MediaSource::new"));
+    // MSE state — stored in use_mut_ref (Rc<RefCell<…>>) rather than
+    // use_state, because the MSE state is set asynchronously inside a
+    // spawn_local block. use_mut_ref wraps a single Rc<RefCell<T>> shared
+    // by all clones, so writes made by the async task are immediately
+    // visible to the cleanup closure.
+    let mse_state = use_mut_ref(|| Option::<MseState>::None);
 
-    let source_buffer_ref: Rc<RefCell<Option<SourceBuffer>>> =
-        use_memo((), |_| Rc::new(RefCell::new(None)))
-            .as_ref()
-            .clone();
+    // Buffered end state for UI display
+    let buffered_end = use_state(|| 0.0_f64);
 
     let volume_icon: Html = if *is_muted || *volume == 0.0 {
         icon_volume_muted()
@@ -1174,32 +889,28 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     closures_for_mouseup.borrow_mut().take()
                 {
                     if let Some(win) = window() {
-                        if let Some(doc) = win.document() {
-                            let _ = doc.remove_event_listener_with_callback(
-                                "mousemove",
-                                mousemove_closure.as_ref().unchecked_ref(),
-                            );
-                            let _ = doc.remove_event_listener_with_callback(
-                                "mouseup",
-                                mouseup_closure.as_ref().unchecked_ref(),
-                            );
-                        }
+                        let _ = win.remove_event_listener_with_callback(
+                            "mousemove",
+                            mousemove_closure.as_ref().unchecked_ref(),
+                        );
+                        let _ = win.remove_event_listener_with_callback(
+                            "mouseup",
+                            mouseup_closure.as_ref().unchecked_ref(),
+                        );
                     }
                 }
             });
 
             if let Some(win) = window() {
-                if let Some(doc) = win.document() {
-                    let _ = doc.add_event_listener_with_callback(
-                        "mousemove",
-                        on_mousemove.as_ref().unchecked_ref(),
-                    );
-                    let _ = doc.add_event_listener_with_callback(
-                        "mouseup",
-                        on_mouseup.as_ref().unchecked_ref(),
-                    );
-                    *closures.borrow_mut() = Some((on_mousemove, on_mouseup));
-                }
+                let _ = win.add_event_listener_with_callback(
+                    "mousemove",
+                    on_mousemove.as_ref().unchecked_ref(),
+                );
+                let _ = win.add_event_listener_with_callback(
+                    "mouseup",
+                    on_mouseup.as_ref().unchecked_ref(),
+                );
+                *closures.borrow_mut() = Some((on_mousemove, on_mouseup));
             }
         })
     };
@@ -1472,96 +1183,159 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     }
 
     // ──────────────────────────────────────────────────────────────
-    // Effect 1: attach MediaSource, create SourceBuffer in sourceopen
+    // MSE Effect: Initialize MSE player (re-initialise on video ID or quality change)
     // ──────────────────────────────────────────────────────────────
     {
-        let video_ref    = video_player_ref.clone();
-        let media_source = media_source.clone();
-        let sb_ref       = source_buffer_ref.clone();
-
-        use_effect_with((), move |_| {
-            let sb_ref_inner = sb_ref.clone();
-            let ms_for_open  = media_source.clone();
-
-            let on_source_open = Closure::wrap(Box::new(move |_: web_sys::Event| {
-                let mime = "video/mp4; codecs=\"avc1.42E01E,mp4a.40.2\"";
-                match ms_for_open.add_source_buffer(mime) {
-                    Ok(sb) => {
-                        // Use "sequence" mode so MSE chains fragments
-                        // sequentially regardless of in-fragment PTS values.
-                        // This is critical: cached segments may still have
-                        // PTS starting at 0, and sequence mode ensures each
-                        // fragment is placed after the previous one.
-                        sb.set_mode(web_sys::SourceBufferAppendMode::Sequence);
-                        info!("SourceBuffer created ok (mode=sequence)");
-                        *sb_ref_inner.borrow_mut() = Some(sb);
-                    }
-                    Err(e) => error!("add_source_buffer failed: {:?}", e),
-                }
-            }) as Box<dyn FnMut(_)>);
-
-            media_source.set_onsourceopen(Some(on_source_open.as_ref().unchecked_ref()));
-            on_source_open.forget();
-
-            if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-                match Url::create_object_url_with_source(&*media_source) {
-                    Ok(url) => video.set_src(&url),
-                    Err(e)  => error!("create_object_url failed: {:?}", e),
-                }
-            }
-
-            || ()
-        });
-    }
-
-    // ──────────────────────────────────────────────────────────────
-    // Effect 2: load playlist → wait for SB → run pump
-    // ──────────────────────────────────────────────────────────────
-    {
-        let video_id     = props.video_id.clone();
-        let video_ref    = video_player_ref.clone();
-        let sb_ref       = source_buffer_ref.clone();
-        let media_source = media_source.clone();
+        let video_ref = video_player_ref.clone();
+        let mse_state = mse_state.clone();
         let selected_quality = selected_quality.clone();
 
-        use_effect_with(video_id.clone(), move |_| {
-            spawn_local(async move {
-                let (segments, init_url) = {
-                    let mut vps = match VideoPlayerState::new(NodeRef::default()) {
-                        Ok(s)  => s,
-                        Err(e) => { error!("VideoPlayerState::new: {:?}", e); return; }
+        use_effect_with(
+            (props.video_id.clone(), (*selected_quality).clone()),
+            move |(video_id, quality)| {
+                let video_id = video_id.clone();
+                let quality = quality.clone();
+                let video_ref_clone = video_ref.clone();
+                let mse_state_clone = mse_state.clone();
+
+                spawn_local(async move {
+                    // Give time for video element to be created
+                    TimeoutFuture::new(50).await;
+
+                    let video = match video_ref_clone.cast::<HtmlVideoElement>() {
+                        Some(v) => v,
+                        None => {
+                            error!("Video element not found");
+                            return;
+                        }
                     };
-                    if let Err(e) = vps
-                        .load_playlist(video_id.clone(), (*selected_quality).clone())
-                        .await
+
+                    let playlist_url = format!(
+                        "/api/videos/{}/playlist.m3u8?quality={}",
+                        video_id, quality
+                    );
+
+                    // Check if the browser has native HLS support (Safari)
+                    if !video
+                        .can_play_type("application/vnd.apple.mpegurl")
+                        .is_empty()
                     {
-                        error!("load_playlist failed: {:?}", e);
+                        video.set_src(&playlist_url);
+                        let _ = video.play();
                         return;
                     }
-                    let segs = match vps.playlist.as_ref().and_then(|p| p.representations.first()) {
-                        Some(rep) => rep.segments.clone(),
-                        None      => { error!("playlist empty"); return; }
+
+                    // Create a MediaSource
+                    let media_source = match web_sys::MediaSource::new() {
+                        Ok(ms) => ms,
+                        Err(_) => {
+                            error!("Browser does not support Media Source Extensions");
+                            return;
+                        }
                     };
-                    let init = vps.playlist.as_ref().and_then(|p| p.init_segment_url.clone());
-                    (segs, init)
-                };
 
-                info!("playlist loaded — {} segments, init={:?}", segments.len(), init_url);
+                    // Attach the MediaSource to the video element via a blob URL.
+                    let object_url = match web_sys::Url::create_object_url_with_source(&media_source) {
+                        Ok(u) => u,
+                        Err(_) => {
+                            error!("Failed to create MediaSource URL");
+                            return;
+                        }
+                    };
+                    video.set_src(&object_url);
 
-                loop {
-                    if sb_ref.borrow().is_some() { break; }
-                    TimeoutFuture::new(20).await;
+                    // All SourceBuffer setup must happen inside the sourceopen callback.
+                    let playlist_url_for_open = playlist_url.clone();
+                    let video_for_open = video.clone();
+                    let mse_state_for_open = mse_state_clone.clone();
+                    let media_source_for_open = media_source.clone();
+                    let object_url_for_open = object_url.clone();
+
+                    let sourceopen_cb = Closure::once(Box::new(move || {
+                        let playlist_url = playlist_url_for_open;
+                        let video = video_for_open;
+                        let mse_state = mse_state_for_open;
+                        let media_source = media_source_for_open;
+                        let object_url = object_url_for_open;
+
+                        spawn_local(async move {
+                            // Fetch the M3U8 playlist.
+                            let resp = match Request::get(&playlist_url).send().await {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    error!("Failed to fetch playlist: {e:?}");
+                                    return;
+                                }
+                            };
+                            let text = match resp.text().await {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    error!("Failed to read playlist: {e:?}");
+                                    return;
+                                }
+                            };
+
+                            // Parse segment list.
+                            let (segments, init_segment_url) = parse_m3u8(&text, &playlist_url);
+                            if segments.is_empty() {
+                                error!("Playlist contains no segments");
+                                return;
+                            }
+
+                            // Create the SourceBuffer with fMP4 MIME type.
+                            let mime = "video/mp4; codecs=\"avc1.42E01E,mp4a.40.2\"";
+                            let source_buffer = match media_source.add_source_buffer(mime) {
+                                Ok(sb) => sb,
+                                Err(e) => {
+                                    error!("add_source_buffer failed: {:?}", e);
+                                    return;
+                                }
+                            };
+
+                            // Store MSE state.
+                            *mse_state.borrow_mut() = Some(MseState {
+                                media_source,
+                                source_buffer,
+                                object_url,
+                                segments,
+                                init_segment_url,
+                                init_appended: false,
+                                next_seg: 0,
+                                is_appending: false,
+                            });
+
+                            // Kick off the segment pump.
+                            pump_segments(mse_state, video);
+                        });
+                    }) as Box<dyn FnOnce()>);
+
+                    media_source
+                        .add_event_listener_with_callback(
+                            "sourceopen",
+                            sourceopen_cb.as_ref().unchecked_ref(),
+                        )
+                        .ok();
+                    sourceopen_cb.forget();
+                });
+
+                // Cleanup: tear down old MSE state when deps change or component unmounts.
+                let mse_state_for_cleanup = mse_state.clone();
+                let video_ref_for_cleanup = video_ref.clone();
+                move || {
+                    if let Some(state) = mse_state_for_cleanup.borrow_mut().take() {
+                        let _ = state.media_source.end_of_stream();
+                        let _ = web_sys::Url::revoke_object_url(&state.object_url);
+                        if let Some(video) = video_ref_for_cleanup.cast::<HtmlVideoElement>() {
+                            video.set_src("");
+                        }
+                    }
                 }
-
-                run_segment_pump(segments, sb_ref, video_ref, media_source, init_url).await;
-            });
-
-            || ()
-        });
+            },
+        );
     }
 
     // ──────────────────────────────────────────────────────────────
-    // Effect 3: periodic UI update (current time, duration, play state)
+    // Effect: periodic UI update + MSE pump top-up
     // ──────────────────────────────────────────────────────────────
     {
         let video_ref    = video_player_ref.clone();
@@ -1571,23 +1345,30 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let volume       = volume.clone();
         let video_ended  = video_ended.clone();
         let is_dragging  = is_dragging.clone();
+        let mse_state    = mse_state.clone();
+        let buffered_end = buffered_end.clone();
 
-        use_effect_with((), move |_| {
-            use gloo_timers::callback::Interval;
+        use_effect_with(video_ref.clone(), move |video_ref| {
+            let video_ref = video_ref.clone();
+            let mse_state_for_interval = mse_state.clone();
 
-            let interval = Interval::new(250, move || {
+            let interval = Interval::new(150, move || {
                 if let Some(v) = video_ref.cast::<HtmlVideoElement>() {
                     // Don't update current_time while dragging (user is controlling it)
                     if !*is_dragging {
                         let ct = v.current_time();
-                        if (ct - *current_time).abs() > 0.5 { current_time.set(ct); }
+                        if (ct - *current_time).abs() > 0.25 { current_time.set(ct); }
                     }
 
                     // duration may change once MSE has enough data
                     let dur = v.duration();
-                    if dur.is_finite() {
+                    if dur.is_finite() && dur > 0.0 {
                         if (dur - *duration).abs() > 0.5 { duration.set(dur); }
                     }
+
+                    // Update buffered end for progress bar display
+                    let buf_end = get_buffer_end(&v);
+                    if (buf_end - *buffered_end).abs() > 0.5 { buffered_end.set(buf_end); }
 
                     let playing = !v.paused() && !v.ended();
                     if playing != *is_playing { is_playing.set(playing); }
@@ -1599,6 +1380,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     // Sync volume state on first tick.
                     let vol = v.volume();
                     if (*volume - vol).abs() > 0.01 { volume.set(vol); }
+
+                    // Top up the MSE buffer as playback advances
+                    pump_segments(mse_state_for_interval.clone(), v);
                 }
             });
 
@@ -1607,68 +1391,58 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     }
 
     // ──────────────────────────────────────────────────────────────
-    // Effect 4: robust video event logging for diagnostics
+    // Effect: Handle seeks to unbuffered positions for the MSE player
     // ──────────────────────────────────────────────────────────────
     {
         let video_ref = video_player_ref.clone();
+        let mse_state = mse_state.clone();
 
-        use_effect_with((), move |_| {
-            let mut handles: Vec<(&str, Closure<dyn FnMut(web_sys::Event)>)> = Vec::new();
-            let video_for_cleanup: Option<HtmlVideoElement> = video_ref.cast::<HtmlVideoElement>();
+        use_effect_with(video_ref.clone(), move |video_ref| {
+            let video_opt = video_ref.cast::<HtmlVideoElement>();
 
-            if let Some(ref video) = video_for_cleanup {
-                // Helper: create a closure that logs video state for a named event.
-                macro_rules! log_event {
-                    ($name:expr, $video:expr) => {{
-                        let v = $video.clone();
-                        let name = $name;
-                        Closure::wrap(Box::new(move |_: web_sys::Event| {
-                            info!(
-                                "video event: {} — ct={:.2}s dur={:.1}s rs={} ns={} paused={} ended={}",
-                                name,
-                                v.current_time(),
-                                v.duration(),
-                                v.ready_state(),
-                                v.network_state(),
-                                v.paused(),
-                                v.ended(),
-                            );
-                        }) as Box<dyn FnMut(_)>)
-                    }};
-                }
+            let seeked_cb = video_opt.as_ref().map(|video| {
+                let mse_state_for_seeked = mse_state.clone();
+                let video_for_seeked = video.clone();
 
-                let events: Vec<(&str, Closure<dyn FnMut(web_sys::Event)>)> = vec![
-                    ("waiting",        log_event!("waiting",        video)),
-                    ("playing",        log_event!("playing",        video)),
-                    ("pause",          log_event!("pause",          video)),
-                    ("seeking",        log_event!("seeking",        video)),
-                    ("seeked",         log_event!("seeked",         video)),
-                    ("stalled",        log_event!("stalled",        video)),
-                    ("error",          log_event!("error",          video)),
-                    ("ended",          log_event!("ended",          video)),
-                    ("canplay",        log_event!("canplay",        video)),
-                    ("canplaythrough", log_event!("canplaythrough", video)),
-                    ("loadeddata",     log_event!("loadeddata",     video)),
-                ];
+                let cb = Closure::<dyn Fn()>::new(move || {
+                    let current_time = video_for_seeked.current_time();
+                    let buf_end = get_buffer_end(&video_for_seeked);
 
-                let target: &web_sys::EventTarget = video.as_ref();
-                for (name, closure) in events {
-                    let _ = target.add_event_listener_with_callback(
-                        name, closure.as_ref().unchecked_ref(),
-                    );
-                    handles.push((name, closure));
-                }
-            }
-
-            // Cleanup: remove all listeners (same closure type on all paths).
-            move || {
-                if let Some(ref video) = video_for_cleanup {
-                    let target: &web_sys::EventTarget = video.as_ref();
-                    for (name, closure) in &handles {
-                        let _ = target.remove_event_listener_with_callback(
-                            name, closure.as_ref().unchecked_ref(),
-                        );
+                    // If the seek target is already buffered, just re-pump.
+                    if buf_end > current_time {
+                        pump_segments(mse_state_for_seeked.clone(), video_for_seeked.clone());
+                        return;
                     }
+
+                    // Seeking to unbuffered territory — reset segment pointer and re-pump.
+                    {
+                        let mut borrow = mse_state_for_seeked.borrow_mut();
+                        if let Some(mse) = borrow.as_mut() {
+                            if !mse.source_buffer.updating() {
+                                let remove_end = (current_time - MSE_BACK_BUFFER_S).max(0.0);
+                                if remove_end > 0.0 {
+                                    let _ = mse.source_buffer.remove(0.0, remove_end);
+                                }
+                            }
+                            mse.next_seg = (current_time / SEGMENT_DURATION_F) as usize;
+                            mse.is_appending = false;
+                        }
+                    }
+                    pump_segments(mse_state_for_seeked.clone(), video_for_seeked.clone());
+                });
+
+                video
+                    .add_event_listener_with_callback("seeked", cb.as_ref().unchecked_ref())
+                    .ok();
+                cb
+            });
+
+            move || {
+                if let (Some(cb), Some(video)) = (&seeked_cb, video_opt) {
+                    let _ = video.remove_event_listener_with_callback(
+                        "seeked",
+                        cb.as_ref().unchecked_ref(),
+                    );
                 }
             }
         });
@@ -1686,8 +1460,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     };
 
     let buffered_percent = if *duration > 0.0 {
-        // TODO: read actual buffered end from video element
-        progress_percent
+        (*buffered_end / *duration * 100.0).min(100.0)
     } else {
         0.0
     };

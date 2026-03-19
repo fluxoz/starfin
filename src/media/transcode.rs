@@ -525,34 +525,30 @@ pub fn create_init_segment(abs_path: &str, quality: Quality, hwaccel: &HwAccel) 
         true
     };
 
-    // Hybrid case: video is remuxable (H.264) but audio needs transcoding
-    // (e.g. multi-channel AAC, AC-3, FLAC).  The media segments are
-    // generated via hybrid_segment() which transcodes audio to stereo AAC,
-    // so the init segment must also have AAC audio codec params — NOT the
-    // original incompatible audio params.  We generate segment 0 via the
-    // same path and extract ftyp+moov from it.
-    let is_hybrid = quality.can_remux()
-        && !source_is_remuxable(&ictx)
-        && video_is_remuxable(&ictx);
-
-    if needs_transcode || is_hybrid {
-        // For transcode/hybrid paths, generate segment 0 and extract init
-        // from it.  The fMP4 segment 0 already contains ftyp+moov at the
-        // start with the correct codec params for the encoder path used.
+    if needs_transcode {
+        // For transcode paths, generate segment 0 and extract init from it.
+        // The fMP4 segment 0 already contains ftyp+moov at the start.
         drop(ictx);
         let tmp_dir = std::env::temp_dir().join(format!("starfin_init_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp_dir);
+        let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
 
-        // Generate segment 0 to get the init segment.
-        // `create_segment` picks the correct path based on quality and
-        // source compatibility:
-        //   - pure remux  (source_is_remuxable) — copies all packets
-        //   - hybrid      (video_is_remuxable)  — copies video, AAC audio
-        //   - transcode   (otherwise)           — re-encodes everything
-        // The resulting ftyp+moov will have the exact codec params that
-        // all subsequent media segments will use, avoiding the mismatch
-        // that previously occurred in the hybrid case (init had original
-        // audio params but media segments had AAC stereo).
+        // Create a minimal segment to extract the init from.
+        let tmp_seg = tmp_dir.join("init_extract.mp4");
+        let mut ictx2 = ffmpeg_next::format::input(&abs_path)
+            .map_err(|e| format!("failed to open input for init: {e}"))?;
+
+        if source_is_remuxable(&ictx2) || video_is_remuxable(&ictx2) {
+            // Even though quality requires transcode, generate init from remux path
+            // for codec params — but actually we need the transcode codec params.
+            // Fall through to remux-based extraction and let the actual segment
+            // transcode handle the rest.
+            drop(ictx2);
+        } else {
+            drop(ictx2);
+        }
+
+        // Generate segment 0 to get the init segment
         let seg0_path = tmp_dir.join("seg_00000.m4s");
         if !seg0_path.exists() {
             create_segment(abs_path, &tmp_dir, 0, hwaccel, quality, None)?;

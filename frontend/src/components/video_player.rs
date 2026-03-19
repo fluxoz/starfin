@@ -7,7 +7,7 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{window, HtmlVideoElement, KeyboardEvent, MouseEvent};
+use web_sys::{window, HtmlVideoElement, KeyboardEvent, MouseEvent, SourceBufferAppendMode};
 use yew::prelude::*;
 
 // ── Playback speed options ───────────────────────────────────────────────────
@@ -81,15 +81,6 @@ const MSE_TARGET_BUFFER_S: f64 = 30.0;
 /// `backBufferLength` is also 30 s.  dash.js's `bufferToKeep` is 20 s.
 const MSE_BACK_BUFFER_S: f64 = 30.0;
 
-/// Maximum gap (seconds) at a segment boundary that the player will
-/// automatically skip over.  Due to keyframe alignment, fMP4 segments from
-/// the remux path can have small presentation-time gaps (typically one
-/// GOP = 0.1 – 0.5 s).  dash.js's GapController uses
-/// `STALL_THRESHOLD = 0.5 s`; Shaka Player uses `GAP_OVERLAP_TOLERANCE_SECONDS
-/// = 0.5`; hls.js uses `MAX_START_GAP_JUMP = 2.0`.  We use 0.5 s which
-/// handles the common case without skipping intentional pauses.
-const GAP_JUMP_THRESHOLD_S: f64 = 0.5;
-
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn format_time(seconds: f64) -> String {
@@ -127,38 +118,6 @@ fn is_time_buffered(video: &HtmlVideoElement, time: f64) -> bool {
     for i in 0..buffered.length() {
         if let (Ok(s), Ok(e)) = (buffered.start(i), buffered.end(i)) {
             if time >= s && time <= e {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Gap-jump helper — if the playhead is stalled just before a small gap,
-/// nudge it to the start of the next buffered range.
-///
-/// This mirrors dash.js `GapController.jumpGap()` and Shaka Player's
-/// `StreamingEngine.onStall_()`.  Small gaps naturally arise in fMP4/DASH
-/// because segment boundaries don't always align with keyframes — the
-/// remux path starts each segment at the first keyframe **at or after**
-/// `seg_index × 6 s`, so there can be a sub-second gap between the end
-/// of one segment and the start of the next.
-///
-/// Returns `true` if a gap was jumped.
-fn try_jump_gap(video: &HtmlVideoElement) -> bool {
-    let current = video.current_time();
-    let buffered = video.buffered();
-    let len = buffered.length();
-    for i in 0..len {
-        if let (Ok(start), Ok(_end)) = (buffered.start(i), buffered.end(i)) {
-            // If the next buffered range starts just ahead of the current
-            // position, jump to it.
-            let gap = start - current;
-            if gap > 0.0 && gap <= GAP_JUMP_THRESHOLD_S {
-                log::info!(
-                    "gap-jump: nudging playhead from {current:.3}s to {start:.3}s (gap={gap:.3}s)"
-                );
-                video.set_current_time(start);
                 return true;
             }
         }
@@ -615,14 +574,14 @@ async fn pump_loop(
         // Compute how much data is buffered ahead of the current playhead
         // using segment indices rather than video.buffered() ranges.
         //
-        // After appending segment N, the buffer extends to approximately
-        // (N + 1) × SEGMENT_DURATION on the timeline.  We compare that
-        // against the current playhead position to decide if we should
-        // sleep or fetch the next segment.
+        // In Sequence mode, after appending segment N, the buffer extends
+        // to approximately (N + 1) × SEGMENT_DURATION on the timeline.
+        // We compare that against the current playhead position to decide
+        // if we should sleep or fetch the next segment.
         //
         // This avoids the issue where video.buffered() returns empty
-        // ranges immediately after a seek, causing the pump to fetch all
-        // segments at once.
+        // ranges immediately after a seek+flush, causing the pump to
+        // hammer the server with all remaining segments.
         if let Some(last_seg) = last_appended {
             let buffered_to = (last_seg as f64 + 1.0) * SEGMENT_DURATION_F;
             let current = video.current_time();
@@ -1011,24 +970,21 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
                         };
 
-                        // Use the default "segments" mode — the browser
-                        // uses each fragment's baseMediaDecodeTime (from the
-                        // moof/traf/tfdt box) to place it on the timeline.
+                        // Use "sequence" mode — the browser ignores in-fragment
+                        // PTS and chains fragments end-to-end starting from
+                        // `timestampOffset`.  This approach is used by hls.js
+                        // for fMP4/CMAF content (see hls.js
+                        // `BufferController.createSourceBuffers()`).  It is
+                        // more robust than "segments" mode because it doesn't
+                        // depend on the backend producing correct continuous
+                        // PTS values.
                         //
-                        // This matches how dash.js, Shaka Player, and all
-                        // standard DASH clients operate.  The backend
-                        // already produces continuous PTS (segment N starts
-                        // at N × 6 s) via the PTS rebasing in
-                        // `remux_segment`, `hybrid_segment`, and
-                        // `transcode_segment_body`, so segments mode gives
-                        // correct timeline placement without any
-                        // timestampOffset management.
-                        //
-                        // Ref: dash.js SourceBufferSink — uses default
-                        //      "segments" mode.
-                        // Ref: DASH-IF IOP v4.3 §3.2 — segment timeline
-                        //      based on in-band timing.
-                        log::info!("MSE: SourceBuffer created in Segments mode (default)");
+                        // For seeking to unbuffered positions, we flush the
+                        // buffer and set timestampOffset to the target time
+                        // before restarting the pump (matching hls.js's
+                        // `onBufferFlushing` + timestampOffset reset pattern).
+                        source_buffer.set_mode(SourceBufferAppendMode::Sequence);
+                        log::info!("MSE: SourceBuffer created in Sequence mode");
 
                         // Set the total presentation duration from the MPD so
                         // the browser knows the full video length.
@@ -1077,6 +1033,15 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         } else {
                             0
                         };
+
+                        // In Sequence mode, set timestampOffset to the start
+                        // position so segments are placed at the correct
+                        // timeline position.
+                        if start_seg > 0 {
+                            let ts_offset = start_seg as f64 * SEGMENT_DURATION_F;
+                            source_buffer.set_timestamp_offset(ts_offset);
+                            log::info!("MSE: initial timestampOffset = {ts_offset}s (segment {start_seg})");
+                        }
 
                         // Store MSE state.
                         *mse_state.borrow_mut() = Some(MseState {
@@ -1209,18 +1174,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     // Check if video ended
                     video_ended.set(video.ended());
 
-                    // Safety-net gap-jump: if the video is playing but the
-                    // playhead hasn't advanced and there's a gap ahead,
-                    // nudge past it.  This catches cases where the browser
-                    // doesn't fire a `waiting` event for very small gaps.
-                    if !video.paused() && !video.ended() {
-                        let ready_state = video.ready_state();
-                        // HAVE_CURRENT_DATA (2) or less = stalled
-                        if ready_state <= 2 {
-                            try_jump_gap(&video);
-                        }
-                    }
-
                     // Safety-net: restart the pump when it has exited
                     // (pump_running == false) but there are still segments
                     // to fetch and the buffer is below target.
@@ -1260,12 +1213,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
     // Detect buffering via waiting/playing events (NOT readyState polling,
     // which gives false positives during appendBuffer operations).
-    //
-    // The `waiting` handler also implements gap-jumping: when the browser
-    // stalls because it hit a small gap between segment boundaries (common
-    // with fMP4/DASH due to keyframe alignment), the handler nudges the
-    // playhead past the gap so playback resumes immediately.  This matches
-    // dash.js `GapController.jumpGap()` and Shaka Player's stall detector.
     {
         let video_ref = video_ref.clone();
         let is_buffering = is_buffering.clone();
@@ -1275,15 +1222,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
             let waiting_cb = video_opt.as_ref().map(|video| {
                 let is_buffering = is_buffering.clone();
-                let video_for_gap = video.clone();
                 let cb = Closure::<dyn Fn()>::new(move || {
-                    // Try to jump a small gap at a segment boundary.
-                    // If a gap was jumped, the browser will fire a new
-                    // `playing` event once it resumes.
-                    if !try_jump_gap(&video_for_gap) {
-                        // No gap found — genuine buffering.
-                        is_buffering.set(true);
-                    }
+                    is_buffering.set(true);
                 });
                 video
                     .add_event_listener_with_callback("waiting", cb.as_ref().unchecked_ref())
@@ -1347,10 +1287,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     //    segments).  If the target is already buffered, continue; otherwise
     //    cancel the current download and start from the target segment.
     //
-    // In Segments mode, the browser places each fragment according to its
-    // internal baseMediaDecodeTime (from the moof/traf/tfdt box).  Seeking
-    // to an unbuffered position only requires repointing the pump to the
-    // target segment — no buffer flush or timestampOffset manipulation.
+    // In Sequence mode, seeking to an unbuffered position requires:
+    //   1. Abort any pending SourceBuffer operation
+    //   2. Remove all buffered data
+    //   3. Set timestampOffset to the target segment's start time
+    //   4. Restart the pump from the target segment
     //
     // Firefox fires `seeking` up to 7 times for a single user seek, so
     // we only bump the pump generation when `next_seg` actually changes.
@@ -1385,42 +1326,105 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             start_pump(&mse_state_for_seek, &video_for_seek);
                         }
                     } else {
-                        // Seek target is NOT buffered.  In Segments mode,
-                        // we just cancel the current pump, repoint
-                        // `next_seg` to the target, and restart.  The
-                        // browser places each fragment at the correct
-                        // timeline position via baseMediaDecodeTime —
-                        // no flush or timestampOffset needed.
+                        // Seek target is NOT buffered.  In Sequence mode we
+                        // must flush the buffer and reset timestampOffset.
                         //
-                        // Modelled after dash.js
-                        //   StreamProcessor.prepareInnerPeriodPlaybackSeeking():
-                        //     → clearScheduleTimer() + fragmentModel.abortRequests()
-                        //     → setExplicitBufferingTime(targetTime)
-                        //     → scheduleController.startScheduleTimer()
-                        log::info!("seek: target {seek_time:.1}s not buffered, restarting pump from segment {target_seg}");
+                        // Modelled after dash.js StreamProcessor.prepareInnerPeriodPlaybackSeeking():
+                        //   → clearScheduleTimer() + fragmentModel.abortRequests()
+                        //   → bufferController.prepareForPlaybackSeek()
+                        //   → bufferController.clearBuffers(clearRanges)
+                        //   → setExplicitBufferingTime(targetTime)
+                        //   → scheduleController.startScheduleTimer()
+                        //
+                        // Also matches hls.js: flush buffer → set timestampOffset → restart loading.
+                        log::info!("seek: target {seek_time:.1}s not buffered, flushing and restarting from segment {target_seg}");
 
                         // Cancel the current pump immediately (synchronous),
                         // analogous to dash.js clearScheduleTimer() +
                         // fragmentModel.abortRequests().
-                        {
+                        // Capture the generation BEFORE spawning async work
+                        // so that concurrent seeking events (Firefox fires up
+                        // to 7) can be detected and abandoned.
+                        let my_gen = {
                             let mut borrow = mse_state_for_seek.borrow_mut();
                             if let Some(mse) = borrow.as_mut() {
-                                // Only bump generation if the target segment
-                                // actually changed (Firefox multi-seeking guard).
-                                if mse.next_seg == target_seg && mse.pump_running {
-                                    return;
-                                }
                                 mse.pump_gen = mse.pump_gen.wrapping_add(1);
                                 mse.pump_running = false;
                                 mse.next_seg = target_seg;
                                 mse.last_appended_seg = None;
+                                mse.pump_gen
                             } else {
                                 return;
                             }
-                        }
+                        };
 
-                        // Restart the pump from the new position.
-                        force_start_pump(&mse_state_for_seek, &video_for_seek);
+                        let mse_state_c = mse_state_for_seek.clone();
+                        let video_c = video_for_seek.clone();
+                        spawn_local(async move {
+                            // Get SourceBuffer reference, but only if our
+                            // generation is still current (no newer seek).
+                            let sb = {
+                                let borrow = mse_state_c.borrow();
+                                match borrow.as_ref() {
+                                    Some(s) if s.pump_gen == my_gen => {
+                                        s.source_buffer.clone()
+                                    }
+                                    _ => return, // another seek superseded us
+                                }
+                            };
+
+                            // Wait for SourceBuffer to finish any pending op.
+                            // Timeout after 2 seconds to avoid infinite loops.
+                            for _ in 0..400 {
+                                if !sb.updating() { break; }
+                                TimeoutFuture::new(5).await;
+                            }
+
+                            // Re-check: if another seek happened while we
+                            // waited, abandon (Firefox multiple-seeking guard).
+                            {
+                                let borrow = mse_state_c.borrow();
+                                if !matches!(borrow.as_ref(), Some(s) if s.pump_gen == my_gen) {
+                                    return;
+                                }
+                            }
+
+                            // Abort + remove all buffered data.
+                            // Analogous to dash.js bufferController.clearBuffers().
+                            let _ = sb.abort();
+                            let remove_end = {
+                                let borrow = mse_state_c.borrow();
+                                borrow.as_ref()
+                                    .map(|s| s.media_source.duration())
+                                    .filter(|d| d.is_finite() && *d > 0.0)
+                                    .unwrap_or(86400.0)
+                            };
+                            let _ = sb.remove(0.0, remove_end);
+
+                            // Wait for the remove to complete (timeout 2 s).
+                            for _ in 0..400 {
+                                if !sb.updating() { break; }
+                                TimeoutFuture::new(5).await;
+                            }
+
+                            // Re-check again after the remove await.
+                            {
+                                let borrow = mse_state_c.borrow();
+                                if !matches!(borrow.as_ref(), Some(s) if s.pump_gen == my_gen) {
+                                    return;
+                                }
+                            }
+
+                            // Set timestampOffset so Sequence mode places the
+                            // next appended fragment at the target position.
+                            let ts_offset = target_seg as f64 * SEGMENT_DURATION_F;
+                            sb.set_timestamp_offset(ts_offset);
+                            log::info!("seek: timestampOffset = {ts_offset}s, restarting pump from segment {target_seg}");
+
+                            // Restart the pump.
+                            // Analogous to dash.js scheduleController.startScheduleTimer().
+                            force_start_pump(&mse_state_c, &video_c);
+                        });
                     }
                 });
 

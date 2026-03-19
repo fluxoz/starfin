@@ -125,8 +125,12 @@ struct MseState {
     segments: Vec<SegmentInfo>,
     /// Index of the next segment to fetch.
     next_seg: usize,
-    /// True while `SourceBuffer.appendBuffer` is in progress.
-    is_appending: bool,
+    /// Generation counter — incremented by `start_pump` to cancel any
+    /// previously-running pump loop.
+    pump_gen: u32,
+    /// True while a `pump_loop` is active.  The 150ms timer uses this
+    /// to decide whether the pump needs restarting.
+    pump_running: bool,
 }
 
 /// Parse a DASH MPD manifest and return the list of segment URLs with durations.
@@ -286,119 +290,175 @@ fn is_seg_buffered(sb: &web_sys::SourceBuffer, seg_idx: usize) -> bool {
     false
 }
 
-/// Pump DASH fMP4 segments into the MSE SourceBuffer.
+/// Check whether `pump_gen` inside `MseState` still matches the expected
+/// generation.  Returns `false` (= caller should exit) when the state has
+/// been dropped or a newer pump has been started (e.g. after a seek).
+fn is_pump_current(state: &Rc<RefCell<Option<MseState>>>, pump_id: u32) -> bool {
+    let borrow = state.borrow();
+    matches!(borrow.as_ref(), Some(s) if s.pump_gen == pump_id)
+}
+
+/// Start (or restart) the async segment-pump loop.
 ///
-/// This is the main buffer-fill loop, called:
-/// - From the 150ms top-up timer (to keep the buffer ahead of playback),
-/// - From the persistent `updateend` listener (to chain the next append), and
-/// - After a seek (to fill the buffer at the new position).
+/// Increments `pump_gen` so any previously-running `pump_loop` will detect
+/// the mismatch and exit cleanly.  Then spawns a new `pump_loop`.
 ///
-/// The function is idempotent — multiple concurrent calls safely serialise
-/// through the `is_appending` flag in `MseState`.
-///
-/// Algorithm (per DASH-IF IOP buffer management):
-/// 1. Skip if an append is already in flight.
-/// 2. Skip segments whose midpoint is already inside a buffered range.
-/// 3. Stop when the forward buffer exceeds `MSE_TARGET_BUFFER_S`.
-/// 4. Signal `endOfStream()` when all segments have been appended.
-fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) {
-    let (seg_url, seg_idx) = {
+/// Call sites:
+/// - MSE initialisation (after the init segment is appended)
+/// - Seek handler (when the seek target is not buffered)
+/// - 150ms timer safety-net (only when `pump_running` is false)
+fn start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElement) {
+    let pump_id = {
         let mut borrow = state.borrow_mut();
-        let mse = match borrow.as_mut() {
-            Some(s) => s,
+        match borrow.as_mut() {
+            Some(s) => {
+                s.pump_gen = s.pump_gen.wrapping_add(1);
+                s.pump_running = true;
+                s.pump_gen
+            }
             None => return,
-        };
-        // Guard: only one in-flight fetch/append at a time.
-        if mse.is_appending {
-            return;
         }
-
-        // Skip already-buffered segments so we don't re-fetch them.
-        while mse.next_seg < mse.segments.len()
-            && is_seg_buffered(&mse.source_buffer, mse.next_seg)
-        {
-            mse.next_seg += 1;
-        }
-
-        // All segments appended → signal EOS.
-        if mse.next_seg >= mse.segments.len() {
-            // end_of_stream() will fail if the MediaSource isn't open,
-            // which is fine — just ignore the error.
-            let _ = mse.media_source.end_of_stream();
-            return;
-        }
-
-        // Buffer-ahead gate: don't fetch more than MSE_TARGET_BUFFER_S ahead.
-        let buffered_ahead = get_buffer_end(&video) - video.current_time();
-        if buffered_ahead >= MSE_TARGET_BUFFER_S {
-            return;
-        }
-
-        let url = mse.segments[mse.next_seg].url.clone();
-        let idx = mse.next_seg;
-        mse.is_appending = true;
-        (url, idx)
     };
-
-    let state_clone = state.clone();
-    let video_clone = video.clone();
+    let state_c = state.clone();
+    let video_c = video.clone();
     spawn_local(async move {
+        pump_loop(state_c.clone(), video_c, pump_id).await;
+        // Mark pump as no longer running so the timer safety-net can
+        // restart it if needed.
+        if let Some(s) = state_c.borrow_mut().as_mut() {
+            if s.pump_gen == pump_id {
+                s.pump_running = false;
+            }
+        }
+    });
+}
+
+/// Sequential async loop that fetches and appends DASH fMP4 segments.
+///
+/// Per DASH-IF IOP v4.3 §3.2 the client processes segments **one at a time**:
+///   fetch → strip init boxes → wait for SourceBuffer idle → appendBuffer
+///   → wait for updateend → advance next_seg → repeat.
+///
+/// The loop exits when:
+/// - All segments have been appended (`endOfStream` is signalled),
+/// - `pump_gen` no longer matches (a seek started a newer pump), or
+/// - `MseState` has been dropped (component unmount / quality change).
+///
+/// A 500 ms sleep is used when the forward buffer exceeds
+/// `MSE_TARGET_BUFFER_S`; this keeps CPU usage near zero while the user
+/// watches the already-buffered content.
+async fn pump_loop(
+    state: Rc<RefCell<Option<MseState>>>,
+    video: HtmlVideoElement,
+    pump_id: u32,
+) {
+    loop {
+        // ── 1. Generation check ──────────────────────────────────────
+        if !is_pump_current(&state, pump_id) {
+            return;
+        }
+
+        // ── 2. Determine the next segment to fetch ───────────────────
+        let (seg_url, seg_idx, sb) = {
+            let mut borrow = state.borrow_mut();
+            let mse = match borrow.as_mut() {
+                Some(s) if s.pump_gen == pump_id => s,
+                _ => return,
+            };
+
+            // Skip segments whose midpoint is already inside a buffered
+            // range (avoids re-fetching after backward seeks or Firefox's
+            // multiple `seeking` events).
+            while mse.next_seg < mse.segments.len()
+                && is_seg_buffered(&mse.source_buffer, mse.next_seg)
+            {
+                mse.next_seg += 1;
+            }
+
+            // All segments done → signal end-of-stream.
+            if mse.next_seg >= mse.segments.len() {
+                let _ = mse.media_source.end_of_stream();
+                return;
+            }
+
+            (
+                mse.segments[mse.next_seg].url.clone(),
+                mse.next_seg,
+                mse.source_buffer.clone(),
+            )
+        };
+
+        // ── 3. Buffer-ahead gate ─────────────────────────────────────
+        let buf_ahead = get_buffer_end(&video) - video.current_time();
+        if buf_ahead >= MSE_TARGET_BUFFER_S {
+            // Enough data buffered — sleep and re-check.
+            TimeoutFuture::new(500).await;
+            continue;
+        }
+
+        // ── 4. Fetch the segment ─────────────────────────────────────
         let bytes = match Request::get(&seg_url).send().await {
             Ok(r) => match r.binary().await {
                 Ok(b) => b,
                 Err(e) => {
-                    log::error!("segment {seg_idx}: read error: {e:?}");
-                    if let Some(s) = state_clone.borrow_mut().as_mut() {
-                        s.is_appending = false;
-                    }
-                    return;
+                    log::error!("segment {seg_idx}: body read error: {e:?}");
+                    TimeoutFuture::new(1000).await;
+                    continue;
                 }
             },
             Err(e) => {
                 log::error!("segment {seg_idx}: fetch error: {e:?}");
-                if let Some(s) = state_clone.borrow_mut().as_mut() {
-                    s.is_appending = false;
-                }
-                return;
+                TimeoutFuture::new(1000).await;
+                continue;
             }
         };
 
-        // Strip ftyp+moov from fMP4 segments — only moof+mdat should be
-        // appended after the init segment has been loaded.
+        // Re-check generation after the (potentially slow) network fetch.
+        if !is_pump_current(&state, pump_id) {
+            return;
+        }
+
+        // ── 5. Strip init boxes & append ─────────────────────────────
+        // fMP4 segments contain [ftyp][moov][moof][mdat]; only moof+mdat
+        // should be appended after the init segment.
         let media_bytes = strip_init_boxes(&bytes);
 
-        let source_buffer = {
-            let borrow = state_clone.borrow();
-            match borrow.as_ref() {
-                Some(s) => s.source_buffer.clone(),
-                None => return,
-            }
-        };
-
-        // Wait until the SourceBuffer is not updating (previous remove may
-        // still be in progress after a seek).  200 iterations × 5ms = 1s max.
-        for _ in 0..200 {
-            if !source_buffer.updating() {
-                break;
-            }
+        // Wait for SourceBuffer to finish any previous operation.
+        let sb_ref: &web_sys::SourceBuffer = &sb;
+        while sb_ref.updating() {
             TimeoutFuture::new(5).await;
+            if !is_pump_current(&state, pump_id) {
+                return;
+            }
         }
 
         let uint8_array = js_sys::Uint8Array::from(media_bytes.as_slice());
         let array_buffer = uint8_array.buffer();
-        if source_buffer
-            .append_buffer_with_array_buffer(&array_buffer)
-            .is_err()
-        {
+        if sb.append_buffer_with_array_buffer(&array_buffer).is_err() {
             log::error!("segment {seg_idx}: appendBuffer failed");
-            if let Some(s) = state_clone.borrow_mut().as_mut() {
-                s.is_appending = false;
+            TimeoutFuture::new(1000).await;
+            continue;
+        }
+
+        // ── 6. Wait for append to complete ───────────────────────────
+        while sb_ref.updating() {
+            TimeoutFuture::new(5).await;
+            if !is_pump_current(&state, pump_id) {
+                return;
             }
         }
-        // NOTE: `is_appending` is cleared and `next_seg` advanced by the
-        // persistent `updateend` listener registered once in the MSE init
-        // effect — NOT here.  This prevents listener accumulation.
-    });
+
+        // ── 7. Advance to next segment ───────────────────────────────
+        {
+            let mut borrow = state.borrow_mut();
+            if let Some(s) = borrow.as_mut() {
+                if s.pump_gen != pump_id {
+                    return;
+                }
+                s.next_seg = seg_idx + 1;
+            }
+        }
+    }
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -704,27 +764,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             return;
                         }
 
-                        // Wait for the init segment to be appended before proceeding.
-                        let sb_for_wait = source_buffer.clone();
-                        let init_done = Rc::new(Cell::new(false));
-                        let init_done_for_cb = init_done.clone();
-                        let updateend_cb = Closure::once(Box::new(move || {
-                            init_done_for_cb.set(true);
-                        }) as Box<dyn FnOnce()>);
-                        sb_for_wait
-                            .add_event_listener_with_callback(
-                                "updateend",
-                                updateend_cb.as_ref().unchecked_ref(),
-                            )
-                            .ok();
-                        updateend_cb.forget();
-
-                        // Poll until init segment is appended.
-                        for _ in 0..100 {
-                            if init_done.get() {
+                        // Wait for the init segment append to complete
+                        // (simple polling — no leaked event listeners).
+                        for _ in 0..200 {
+                            if !source_buffer.updating() {
                                 break;
                             }
-                            TimeoutFuture::new(10).await;
+                            TimeoutFuture::new(5).await;
                         }
 
                         // Calculate which segment to start from when resuming.
@@ -741,45 +787,18 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             object_url,
                             segments,
                             next_seg: start_seg,
-                            is_appending: false,
+                            pump_gen: 0,
+                            pump_running: false,
                         });
-
-                        // Register a persistent updateend listener.  This is
-                        // the ONLY place that advances `next_seg` and clears
-                        // `is_appending`, preventing the listener accumulation
-                        // bug that caused segment skipping.
-                        let mse_for_updateend = mse_state.clone();
-                        let video_for_updateend = video.clone();
-                        let persistent_cb = Closure::<dyn Fn()>::new(move || {
-                            {
-                                let mut borrow = mse_for_updateend.borrow_mut();
-                                if let Some(s) = borrow.as_mut() {
-                                    if s.is_appending {
-                                        s.is_appending = false;
-                                        s.next_seg += 1;
-                                    }
-                                }
-                            }
-                            pump_segments(
-                                mse_for_updateend.clone(),
-                                video_for_updateend.clone(),
-                            );
-                        });
-                        source_buffer
-                            .add_event_listener_with_callback(
-                                "updateend",
-                                persistent_cb.as_ref().unchecked_ref(),
-                            )
-                            .ok();
-                        persistent_cb.forget();
 
                         status.set(String::new());
                         if start_pos > 0.0 {
                             video.set_current_time(start_pos);
                         }
 
-                        // Kick off the segment pump.
-                        pump_segments(mse_state, video);
+                        // Start the sequential async pump loop (per DASH-IF
+                        // IOP v4.3 §3.2: fetch → append → wait → repeat).
+                        start_pump(&mse_state, &video);
                     });
                 }) as Box<dyn FnOnce()>);
 
@@ -861,7 +880,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         );
     }
 
-    // Update time/duration periodically and pump MSE segments
+    // Update time/duration periodically.  Also acts as a safety-net to
+    // restart the pump loop if it exited unexpectedly (e.g. a transient
+    // network error exhausted its retries).
     {
         let video_ref = video_ref.clone();
         let current_time = current_time.clone();
@@ -874,7 +895,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
         use_effect_with(video_ref.clone(), move |video_ref| {
             let video_ref = video_ref.clone();
-            let mse_state_for_interval = mse_state.clone();
             let interval = Interval::new(150, move || {
                 if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
                     if !*is_dragging {
@@ -890,8 +910,23 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     // Check if video ended
                     video_ended.set(video.ended());
 
-                    // Top up the MSE buffer as playback advances
-                    pump_segments(mse_state_for_interval.clone(), video);
+                    // Safety-net: restart the pump only when it has
+                    // actually exited (pump_running == false) but there
+                    // is still work to do.
+                    let needs_restart = {
+                        let borrow = mse_state.borrow();
+                        if let Some(s) = borrow.as_ref() {
+                            !s.pump_running
+                                && s.next_seg < s.segments.len()
+                                && get_buffer_end(&video) - video.current_time()
+                                    < MSE_TARGET_BUFFER_S
+                        } else {
+                            false
+                        }
+                    };
+                    if needs_restart {
+                        start_pump(&mse_state, &video);
+                    }
                 }
             });
             move || drop(interval)
@@ -982,10 +1017,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             mse.next_seg = target_seg;
                         }
                     }
-                    // Kick the pump — if an append is in flight, pump_segments
-                    // will return immediately and the persistent updateend
-                    // listener will chain the next fetch at the new next_seg.
-                    pump_segments(mse_state_for_seeked.clone(), video_for_seeked.clone());
+                    // Start a new pump loop at the seek target.  The
+                    // generation bump cancels the previous loop.
+                    start_pump(&mse_state_for_seeked, &video_for_seeked);
                 });
 
                 video

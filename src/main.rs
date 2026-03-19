@@ -981,11 +981,11 @@ type FfprobeMeta = media::probe::ProbeMeta;
 /// Because ffmpeg-next calls are synchronous (they block while reading the
 /// file header), we run them on a blocking Tokio thread so the async runtime
 /// is not starved.
-async fn probe_video(path: &Path) -> (u32, FfprobeMeta) {
+async fn probe_video(path: &Path) -> (f64, FfprobeMeta) {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || media::probe::probe_video(&path))
         .await
-        .unwrap_or((0, FfprobeMeta::default()))
+        .unwrap_or((0.0, FfprobeMeta::default()))
 }
 
 // ── Library scanning ─────────────────────────────────────────────────────────
@@ -1151,7 +1151,7 @@ async fn scan_library(library_path: &Path) -> (Vec<VideoItem>, VideoPathIndex) {
                 tags: vec![],
                 rating: 0.0,
                 year: meta.year.unwrap_or(0),
-                duration_secs,
+                duration_secs: duration_secs as u32,
                 director: meta.director.unwrap_or_default(),
                 date_added: file_date_added(&abs),
                 favorite: false,
@@ -1348,7 +1348,7 @@ async fn scan_ws(
                     tags: vec![],
                     rating: 0.0,
                     year: meta.year.unwrap_or(0),
-                    duration_secs,
+                    duration_secs: duration_secs as u32,
                     director: meta.director.unwrap_or_default(),
                     date_added: file_date_added(&abs),
                     favorite: false,
@@ -1444,10 +1444,10 @@ async fn generate_quick_thumbnail(
     }
 
     let (duration_secs, _) = probe_video(video_path).await;
-    if duration_secs == 0 {
+    if duration_secs <= 0.0 {
         return false;
     }
-    let duration = duration_secs as f64;
+    let duration = duration_secs;
 
     // Pick a fresh random position in [20 %, 80 %) of the runtime.
     let random_byte = Uuid::new_v4().as_bytes()[0];
@@ -1494,11 +1494,11 @@ async fn generate_deep_thumbnail(
     }
 
     let (duration_secs, _) = probe_video(video_path).await;
-    if duration_secs == 0 {
+    if duration_secs <= 0.0 {
         return false;
     }
 
-    let duration = duration_secs as f64;
+    let duration = duration_secs;
     let start = duration * 0.20;
     let length = duration * 0.60;
 
@@ -1969,7 +1969,7 @@ async fn get_manifest(
 
     // Get video duration via ffprobe (metadata is not needed for manifest generation)
     let (duration_secs, _metadata) = probe_video(&abs_path).await;
-    if duration_secs == 0 {
+    if duration_secs <= 0.0 {
         return HttpResponse::ServiceUnavailable()
             .body("Could not determine video duration. Ensure ffprobe is installed and the video file is valid.");
     }
@@ -1981,15 +1981,17 @@ async fn get_manifest(
             .body(format!("cache dir error: {e}"));
     }
 
-    // Calculate number of segments based on duration
-    let duration = duration_secs as f64;
+    // Calculate number of segments based on duration (f64 for sub-second precision).
+    let duration = duration_secs;
     let num_segments = (duration / SEGMENT_DURATION).ceil() as usize;
 
-    // Format duration as ISO 8601 duration for MPD
-    let hours = duration_secs / 3600;
-    let minutes = (duration_secs % 3600) / 60;
-    let seconds = duration_secs % 60;
-    let pt_duration = format!("PT{hours}H{minutes}M{seconds}S");
+    // Format duration as ISO 8601 duration for MPD.
+    // Use fractional seconds so that the frontend gets sub-second precision,
+    // matching how dash.js MPD parser handles mediaPresentationDuration.
+    let hours = (duration as u64) / 3600;
+    let minutes = ((duration as u64) % 3600) / 60;
+    let frac_seconds = duration - (hours * 3600 + minutes * 60) as f64;
+    let pt_duration = format!("PT{hours}H{minutes}M{frac_seconds:.3}S");
 
     // Build the DASH MPD manifest.
     let mut mpd = String::new();
@@ -2407,11 +2409,11 @@ async fn get_thumbnail_info(
 
     // Get video duration
     let (duration_secs, _) = probe_video(&abs_path).await;
-    if duration_secs == 0 {
+    if duration_secs <= 0.0 {
         return HttpResponse::ServiceUnavailable().body("Could not determine video duration");
     }
 
-    let duration = duration_secs as f64;
+    let duration = duration_secs;
     let num_thumbnails = ((duration / THUMBNAIL_INTERVAL).ceil() as u32).max(1);
     let columns = THUMBNAILS_PER_ROW.min(num_thumbnails);
     let rows = (num_thumbnails as f64 / columns as f64).ceil() as u32;
@@ -2595,7 +2597,7 @@ async fn generate_sprite(
     }
 
     let (duration_secs, _) = probe_video(abs_path).await;
-    if duration_secs == 0 {
+    if duration_secs <= 0.0 {
         return false;
     }
 
@@ -2605,8 +2607,9 @@ async fn generate_sprite(
     };
 
     let sprite_dir_owned = sprite_dir.clone();
+    let duration_secs_u32 = duration_secs as u32;
     tokio::task::spawn_blocking(move || {
-        media::sprite::generate_sprite_sheet(&resolved_path, duration_secs, &sprite_dir_owned, &kill)
+        media::sprite::generate_sprite_sheet(&resolved_path, duration_secs_u32, &sprite_dir_owned, &kill)
     })
     .await
     .unwrap_or(false)
@@ -2792,11 +2795,11 @@ async fn run_precache_worker(
                 // First segment exists; check whether the last expected sparse
                 // anchor is also present.
                 let (dur_secs, _) = probe_video(abs).await;
-                if dur_secs == 0 {
+                if dur_secs <= 0.0 {
                     // Can't determine duration — treat as done to avoid infinite retry.
                     true
                 } else {
-                    let total_segs = (dur_secs as f64 / SEGMENT_DURATION).ceil() as usize;
+                    let total_segs = (dur_secs / SEGMENT_DURATION).ceil() as usize;
                     if total_segs > PRECACHE_SEGMENTS {
                         let last_anchor =
                             ((total_segs - 1) / SPARSE_CACHE_STRIDE) * SPARSE_CACHE_STRIDE;
@@ -2854,11 +2857,11 @@ async fn run_precache_worker(
 
             // Determine how many segments to pre-cache (capped by video duration).
             let (duration_secs, _) = probe_video(&abs).await;
-            if duration_secs == 0 {
+            if duration_secs <= 0.0 {
                 progress.write().advance();
                 continue;
             }
-            let total_segments = (duration_secs as f64 / SEGMENT_DURATION).ceil() as usize;
+            let total_segments = (duration_secs / SEGMENT_DURATION).ceil() as usize;
 
             // Dense: every segment in the initial pre-cache window for instant playback start.
             // Sparse: every SPARSE_CACHE_STRIDE-th segment beyond that window as seek anchors.

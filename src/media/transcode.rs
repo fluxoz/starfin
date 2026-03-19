@@ -777,10 +777,17 @@ fn remux_segment(
     let out_audio_tb = out_audio_idx_val.map(|i| octx.stream(i).unwrap().time_base()).unwrap_or(out_audio_tb);
 
     let mut got_video_keyframe = false;
-    // PTS offsets (in output time base) used to rebase timestamps so each
-    // segment starts near PTS 0, preventing A/V desync in DASH players.
+    // PTS offsets (in output time base) used to rebase timestamps so that
+    // first-packet PTS is subtracted, then a segment-start offset is added,
+    // producing continuous PTS across the presentation (seg N starts at
+    // N × 6s).  This allows the browser to use MSE Segments mode for
+    // random-access seeking per DASH-IF IOP v4.3 §3.2.
     let mut video_pts_offset: Option<i64> = None;
     let mut audio_pts_offset: Option<i64> = None;
+
+    // Segment-start offsets in each output time base so PTS is continuous.
+    let seg_video_start = (start_time * out_video_tb.1 as f64 / out_video_tb.0 as f64) as i64;
+    let seg_audio_start = (start_time * out_audio_tb.1 as f64 / out_audio_tb.0 as f64) as i64;
 
     for (stream, mut packet) in ictx.packets() {
         if let Some(k) = kill {
@@ -831,30 +838,31 @@ fn remux_segment(
         if is_video {
             packet.set_stream(out_video_idx);
             packet.rescale_ts(in_video_tb, out_video_tb);
-            // Record the first video DTS (or PTS) as the offset to rebase to
-            // zero.  Using DTS prevents negative DTS values for B-frame
-            // content where DTS < PTS on the first packet.
+            // Record the first video DTS (or PTS) as the offset to rebase
+            // to zero, then add the segment-start offset for continuous PTS.
+            // Using DTS prevents negative DTS values for B-frame content
+            // where DTS < PTS on the first packet.
             if video_pts_offset.is_none() {
                 video_pts_offset = packet.dts().or(packet.pts());
             }
             if let (Some(offset), Some(p)) = (video_pts_offset, packet.pts()) {
-                packet.set_pts(Some(p - offset));
+                packet.set_pts(Some(p - offset + seg_video_start));
             }
             if let (Some(offset), Some(d)) = (video_pts_offset, packet.dts()) {
-                packet.set_dts(Some(d - offset));
+                packet.set_dts(Some(d - offset + seg_video_start));
             }
         } else if let Some(out_ai) = out_audio_idx_val {
             packet.set_stream(out_ai);
             packet.rescale_ts(in_audio_tb.unwrap(), out_audio_tb);
-            // Record the first audio DTS (or PTS) as the offset to rebase to zero.
+            // Same rebase + segment-start offset for audio.
             if audio_pts_offset.is_none() {
                 audio_pts_offset = packet.dts().or(packet.pts());
             }
             if let (Some(offset), Some(p)) = (audio_pts_offset, packet.pts()) {
-                packet.set_pts(Some(p - offset));
+                packet.set_pts(Some(p - offset + seg_audio_start));
             }
             if let (Some(offset), Some(d)) = (audio_pts_offset, packet.dts()) {
-                packet.set_dts(Some(d - offset));
+                packet.set_dts(Some(d - offset + seg_audio_start));
             }
         } else {
             continue;
@@ -1034,6 +1042,10 @@ fn hybrid_segment(
     let mut got_video_keyframe = false;
     let mut video_pts_offset: Option<i64> = None;
 
+    // Segment-start offset for video in the output time base so PTS is
+    // continuous across segments (matches the audio_ts_offset below).
+    let seg_video_start = (start_time * out_video_tb.1 as f64 / out_video_tb.0 as f64) as i64;
+
     // Audio synthetic PTS (in 1/sample_rate time base).
     let mut audio_sample_count: i64 = 0;
     let audio_ts_offset = (start_time * audio_sample_rate as f64) as i64;
@@ -1075,17 +1087,17 @@ fn hybrid_segment(
                 got_video_keyframe = true;
             }
 
-            // Copy video packet directly (remux).
+            // Copy video packet directly (remux), adding continuous PTS.
             packet.set_stream(out_video_idx);
             packet.rescale_ts(in_video_tb, out_video_tb);
             if video_pts_offset.is_none() {
                 video_pts_offset = packet.dts().or(packet.pts());
             }
             if let (Some(offset), Some(p)) = (video_pts_offset, packet.pts()) {
-                packet.set_pts(Some(p - offset));
+                packet.set_pts(Some(p - offset + seg_video_start));
             }
             if let (Some(offset), Some(d)) = (video_pts_offset, packet.dts()) {
-                packet.set_dts(Some(d - offset));
+                packet.set_dts(Some(d - offset + seg_video_start));
             }
             let _ = packet.write_interleaved(&mut octx);
         } else if is_audio {

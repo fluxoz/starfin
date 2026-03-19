@@ -500,14 +500,17 @@ async fn pump_loop(
         };
 
         // ── 3. Buffer-ahead gate ─────────────────────────────────────
-        // Compute how much data is buffered ahead of the *current playback
-        // position*.  If the playhead is inside a buffered range, use that
-        // range's end; otherwise use 0 so we don't sleep when the playhead
-        // is in a gap (e.g. right after a seek to an unbuffered position).
+        // Use the segment's timeline position to throttle fetching.
+        // This is deterministic and doesn't depend on PTS correctness
+        // or `video.buffered()` reflecting appended data accurately.
+        //
+        // The segment at `seg_idx` covers approximately
+        // [seg_idx × 6, (seg_idx + 1) × 6).  If the END of this segment
+        // is more than MSE_TARGET_BUFFER_S ahead of the current playback
+        // position, sleep and re-check.
+        let seg_end_time = (seg_idx as f64 + 1.0) * SEGMENT_DURATION_F;
         let current = video.current_time();
-        let buf_end = buffered_end_at(&video, current);
-        let buf_ahead = if buf_end > current { buf_end - current } else { 0.0 };
-        if buf_ahead >= MSE_TARGET_BUFFER_S {
+        if seg_end_time - current > MSE_TARGET_BUFFER_S {
             TimeoutFuture::new(500).await;
             continue;
         }
@@ -838,8 +841,24 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         }
 
                         // fMP4 segments use video/mp4 MIME type with codecs.
-                        // H.264 High Profile (avc1.64001F) + AAC-LC (mp4a.40.2).
-                        let mime = "video/mp4; codecs=\"avc1.64001F,mp4a.40.2\"";
+                        // Try multiple H.264 profile/level + audio codec
+                        // combinations via isTypeSupported() to find one this
+                        // browser accepts.  The init segment provides the real
+                        // codec parameters; the MIME string here just needs to
+                        // be permissive enough for the browser to create the
+                        // decoder pipeline.
+                        let mime_candidates = [
+                            "video/mp4; codecs=\"avc1.640029,mp4a.40.2\"",  // H.264 High L4.1, AAC-LC
+                            "video/mp4; codecs=\"avc1.64001F,mp4a.40.2\"",  // H.264 High L3.1, AAC-LC
+                            "video/mp4; codecs=\"avc1.4D4028,mp4a.40.2\"",  // H.264 Main L4.0, AAC-LC
+                            "video/mp4; codecs=\"avc1.42E01E,mp4a.40.2\"",  // H.264 Baseline L3.0, AAC-LC
+                            "video/mp4; codecs=\"avc1.640029,mp4a.40.5\"",  // H.264 High, HE-AAC
+                            "video/mp4; codecs=\"avc1.640029,mp3\"",        // H.264 High, MP3
+                            "video/mp4",                                     // Generic fallback
+                        ];
+                        let mime = mime_candidates.iter()
+                            .find(|m| web_sys::MediaSource::is_type_supported(m))
+                            .unwrap_or(&"video/mp4");
 
                         // Create the SourceBuffer.
                         let source_buffer = match media_source.add_source_buffer(mime) {
@@ -1038,15 +1057,16 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
                     // Safety-net: restart the pump only when it has
                     // actually exited (pump_running == false) but there
-                    // is still work to do.
+                    // is still work to do.  Use the same segment-index-based
+                    // check as the pump's buffer-ahead gate.
                     let needs_restart = {
                         let borrow = mse_state.borrow();
                         if let Some(s) = borrow.as_ref() {
                             let ct = video.current_time();
+                            let next_end = (s.next_seg as f64 + 1.0) * SEGMENT_DURATION_F;
                             !s.pump_running
                                 && s.next_seg < s.segments.len()
-                                && buffered_end_at(&video, ct) - ct
-                                    < MSE_TARGET_BUFFER_S
+                                && next_end - ct <= MSE_TARGET_BUFFER_S
                         } else {
                             false
                         }

@@ -511,7 +511,7 @@ fn write_fmp4_header(octx: &mut ffmpeg_next::format::context::Output) -> Result<
         // ── Diagnostic: verify movflags were applied ─────────────────────
         let pd = (*octx.as_mut_ptr()).priv_data;
         if !pd.is_null() {
-            let mut out_val: *mut std::os::raw::c_char = std::ptr::null_mut();
+            let mut out_val: *mut u8 = std::ptr::null_mut();
             let probe_key = std::ffi::CString::new("movflags").unwrap();
             let get_ret = ffmpeg_next::ffi::av_opt_get(
                 pd,
@@ -520,7 +520,8 @@ fn write_fmp4_header(octx: &mut ffmpeg_next::format::context::Output) -> Result<
                 &mut out_val,
             );
             if get_ret >= 0 && !out_val.is_null() {
-                let flags_str = std::ffi::CStr::from_ptr(out_val).to_string_lossy();
+                let flags_str = std::ffi::CStr::from_ptr(out_val as *const std::os::raw::c_char)
+                    .to_string_lossy();
                 if !flags_str.contains("empty_moov") {
                     eprintln!(
                         "[fmp4] WARNING: movflags readback = '{}' — empty_moov NOT set!",

@@ -46,6 +46,7 @@ const CONTROLS_VICINITY_PX: f64 = 80.0;
 /// Target seconds of video to keep buffered ahead of the playback position.
 const MSE_TARGET_BUFFER_S: f64 = 30.0;
 /// Seconds of back-buffer to retain behind the playback position when seeking.
+#[allow(dead_code)]
 const MSE_BACK_BUFFER_S: f64 = 5.0;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -265,35 +266,78 @@ fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Pump the next DASH fMP4 segment into the MSE SourceBuffer.
+/// Check whether the midpoint of a given segment is already inside one of
+/// the SourceBuffer's buffered time ranges.  This prevents re-fetching
+/// segments that are already in the buffer (important because Firefox fires
+/// the `seeking` event up to 7 times per user seek).
+fn is_seg_buffered(sb: &web_sys::SourceBuffer, seg_idx: usize) -> bool {
+    let mid = (seg_idx as f64 + 0.5) * SEGMENT_DURATION_F;
+    let ranges = match sb.buffered() {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    for i in 0..ranges.length() {
+        if let (Ok(s), Ok(e)) = (ranges.start(i), ranges.end(i)) {
+            if mid >= s && mid <= e {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Pump DASH fMP4 segments into the MSE SourceBuffer.
 ///
-/// Returns immediately if:
-/// - `state` is `None` (not yet initialised),
-/// - a previous append is still in flight (`is_appending`), or
-/// - the forward buffer already exceeds `MSE_TARGET_BUFFER_S`.
+/// This is the main buffer-fill loop, called:
+/// - From the 150ms top-up timer (to keep the buffer ahead of playback),
+/// - From the persistent `updateend` listener (to chain the next append), and
+/// - After a seek (to fill the buffer at the new position).
 ///
-/// When all segments have been fed, signals end-of-stream on the MediaSource.
+/// The function is idempotent — multiple concurrent calls safely serialise
+/// through the `is_appending` flag in `MseState`.
+///
+/// Algorithm (per DASH-IF IOP buffer management):
+/// 1. Skip if an append is already in flight.
+/// 2. Skip segments whose midpoint is already inside a buffered range.
+/// 3. Stop when the forward buffer exceeds `MSE_TARGET_BUFFER_S`.
+/// 4. Signal `endOfStream()` when all segments have been appended.
 fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) {
-    let seg_url = {
+    let (seg_url, seg_idx) = {
         let mut borrow = state.borrow_mut();
         let mse = match borrow.as_mut() {
             Some(s) => s,
             None => return,
         };
+        // Guard: only one in-flight fetch/append at a time.
         if mse.is_appending {
             return;
         }
-        let buffered_ahead = get_buffer_end(&video) - video.current_time();
-        if buffered_ahead >= MSE_TARGET_BUFFER_S && mse.next_seg != 0 {
-            return;
+
+        // Skip already-buffered segments so we don't re-fetch them.
+        while mse.next_seg < mse.segments.len()
+            && is_seg_buffered(&mse.source_buffer, mse.next_seg)
+        {
+            mse.next_seg += 1;
         }
+
+        // All segments appended → signal EOS.
         if mse.next_seg >= mse.segments.len() {
+            // end_of_stream() will fail if the MediaSource isn't open,
+            // which is fine — just ignore the error.
             let _ = mse.media_source.end_of_stream();
             return;
         }
+
+        // Buffer-ahead gate: don't fetch more than MSE_TARGET_BUFFER_S ahead.
+        let buffered_ahead = get_buffer_end(&video) - video.current_time();
+        if buffered_ahead >= MSE_TARGET_BUFFER_S {
+            return;
+        }
+
         let url = mse.segments[mse.next_seg].url.clone();
+        let idx = mse.next_seg;
         mse.is_appending = true;
-        url
+        (url, idx)
     };
 
     let state_clone = state.clone();
@@ -303,7 +347,7 @@ fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) 
             Ok(r) => match r.binary().await {
                 Ok(b) => b,
                 Err(e) => {
-                    log::error!("Failed to read segment bytes: {e:?}");
+                    log::error!("segment {seg_idx}: read error: {e:?}");
                     if let Some(s) = state_clone.borrow_mut().as_mut() {
                         s.is_appending = false;
                     }
@@ -311,7 +355,7 @@ fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) 
                 }
             },
             Err(e) => {
-                log::error!("Failed to fetch segment: {e:?}");
+                log::error!("segment {seg_idx}: fetch error: {e:?}");
                 if let Some(s) = state_clone.borrow_mut().as_mut() {
                     s.is_appending = false;
                 }
@@ -331,30 +375,14 @@ fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) 
             }
         };
 
-        // One-shot updateend listener: advance segment pointer and re-pump.
-        let state_for_end = state_clone.clone();
-        let video_for_end = video_clone.clone();
-        let updateend_cb = Closure::once(Box::new(move || {
-            {
-                let mut borrow = state_for_end.borrow_mut();
-                if let Some(s) = borrow.as_mut() {
-                    s.is_appending = false;
-                    s.next_seg += 1;
-                }
+        // Wait until the SourceBuffer is not updating (previous remove may
+        // still be in progress after a seek).
+        for _ in 0..200 {
+            if !source_buffer.updating() {
+                break;
             }
-            let s = state_for_end;
-            let v = video_for_end;
-            spawn_local(async move {
-                pump_segments(s, v);
-            });
-        }) as Box<dyn FnOnce()>);
-        source_buffer
-            .add_event_listener_with_callback(
-                "updateend",
-                updateend_cb.as_ref().unchecked_ref(),
-            )
-            .ok();
-        updateend_cb.forget();
+            TimeoutFuture::new(5).await;
+        }
 
         let uint8_array = js_sys::Uint8Array::from(media_bytes.as_slice());
         let array_buffer = uint8_array.buffer();
@@ -362,10 +390,14 @@ fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) 
             .append_buffer_with_array_buffer(&array_buffer)
             .is_err()
         {
+            log::error!("segment {seg_idx}: appendBuffer failed");
             if let Some(s) = state_clone.borrow_mut().as_mut() {
                 s.is_appending = false;
             }
         }
+        // NOTE: `is_appending` is cleared and `next_seg` advanced by the
+        // persistent `updateend` listener registered once in the MSE init
+        // effect — NOT here.  This prevents listener accumulation.
     });
 }
 
@@ -705,12 +737,41 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         // Store MSE state.
                         *mse_state.borrow_mut() = Some(MseState {
                             media_source,
-                            source_buffer,
+                            source_buffer: source_buffer.clone(),
                             object_url,
                             segments,
                             next_seg: start_seg,
                             is_appending: false,
                         });
+
+                        // Register a persistent updateend listener.  This is
+                        // the ONLY place that advances `next_seg` and clears
+                        // `is_appending`, preventing the listener accumulation
+                        // bug that caused segment skipping.
+                        let mse_for_updateend = mse_state.clone();
+                        let video_for_updateend = video.clone();
+                        let persistent_cb = Closure::<dyn Fn()>::new(move || {
+                            {
+                                let mut borrow = mse_for_updateend.borrow_mut();
+                                if let Some(s) = borrow.as_mut() {
+                                    if s.is_appending {
+                                        s.is_appending = false;
+                                        s.next_seg += 1;
+                                    }
+                                }
+                            }
+                            pump_segments(
+                                mse_for_updateend.clone(),
+                                video_for_updateend.clone(),
+                            );
+                        });
+                        source_buffer
+                            .add_event_listener_with_callback(
+                                "updateend",
+                                persistent_cb.as_ref().unchecked_ref(),
+                            )
+                            .ok();
+                        persistent_cb.forget();
 
                         status.set(String::new());
                         if start_pos > 0.0 {
@@ -808,7 +869,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let buffered_end = buffered_end.clone();
         let is_playing = is_playing.clone();
         let is_dragging = is_dragging.clone();
-        let is_buffering = is_buffering.clone();
         let video_ended = video_ended.clone();
         let mse_state = mse_state.clone();
 
@@ -827,10 +887,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     buffered_end.set(get_buffer_end(&video));
                     is_playing.set(!video.paused());
 
-                    // Check buffering state
-                    let ready_state = video.ready_state();
-                    is_buffering.set(ready_state < 3 && !video.paused());
-
                     // Check if video ended
                     video_ended.set(video.ended());
 
@@ -839,6 +895,61 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 }
             });
             move || drop(interval)
+        });
+    }
+
+    // Detect buffering via waiting/playing events (NOT readyState polling,
+    // which gives false positives during appendBuffer operations).
+    {
+        let video_ref = video_ref.clone();
+        let is_buffering = is_buffering.clone();
+
+        use_effect_with(video_ref.clone(), move |video_ref| {
+            let video_opt = video_ref.cast::<HtmlVideoElement>();
+
+            let waiting_cb = video_opt.as_ref().map(|video| {
+                let is_buffering = is_buffering.clone();
+                let cb = Closure::<dyn Fn()>::new(move || {
+                    is_buffering.set(true);
+                });
+                video
+                    .add_event_listener_with_callback("waiting", cb.as_ref().unchecked_ref())
+                    .ok();
+                cb
+            });
+
+            let playing_cb = video_opt.as_ref().map(|video| {
+                let is_buffering = is_buffering.clone();
+                let cb = Closure::<dyn Fn()>::new(move || {
+                    is_buffering.set(false);
+                });
+                video
+                    .add_event_listener_with_callback("playing", cb.as_ref().unchecked_ref())
+                    .ok();
+                cb
+            });
+
+            let video_opt_cleanup = video_opt.clone();
+            move || {
+                if let Some(video) = video_opt_cleanup {
+                    if let Some(cb) = waiting_cb {
+                        video
+                            .remove_event_listener_with_callback(
+                                "waiting",
+                                cb.as_ref().unchecked_ref(),
+                            )
+                            .ok();
+                    }
+                    if let Some(cb) = playing_cb {
+                        video
+                            .remove_event_listener_with_callback(
+                                "playing",
+                                cb.as_ref().unchecked_ref(),
+                            )
+                            .ok();
+                    }
+                }
+            }
         });
     }
 
@@ -856,25 +967,24 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
                 let cb = Closure::<dyn Fn()>::new(move || {
                     let current_time = video_for_seeked.current_time();
-                    let buf_end = get_buffer_end(&video_for_seeked);
+                    let target_seg = segment_for_time(current_time);
 
-                    // If the seek target is already buffered, nothing to do.
-                    if buf_end > current_time {
-                        return;
-                    }
-
-                    // Seeking to unbuffered territory — reset segment pointer and re-pump.
                     {
                         let mut borrow = mse_state_for_seeked.borrow_mut();
                         if let Some(mse) = borrow.as_mut() {
-                            if !mse.source_buffer.updating() {
-                                let remove_end = (current_time - MSE_BACK_BUFFER_S).max(0.0);
-                                if remove_end > 0.0 {
-                                    let _ = mse.source_buffer.remove(0.0, remove_end);
-                                }
+                            // If the target segment is already buffered, just
+                            // let the pump fill ahead from where it left off.
+                            if is_seg_buffered(&mse.source_buffer, target_seg) {
+                                return;
                             }
-                            mse.next_seg = segment_for_time(current_time);
-                            mse.is_appending = false;
+
+                            // Unbuffered seek: point the pump at the seek target.
+                            // Only reset is_appending if nothing is in flight —
+                            // the persistent updateend listener will handle it.
+                            mse.next_seg = target_seg;
+                            if !mse.is_appending {
+                                // Safe to kick the pump immediately.
+                            }
                         }
                     }
                     pump_segments(mse_state_for_seeked.clone(), video_for_seeked.clone());

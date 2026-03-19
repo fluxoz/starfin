@@ -139,13 +139,23 @@ struct MseState {
 /// emits: a single Period with a single AdaptationSet containing a
 /// SegmentTemplate with a SegmentTimeline.
 ///
-/// Returns `(init_url, segments)`.
-fn parse_mpd(text: &str) -> (String, Vec<SegmentInfo>) {
+/// Returns `(init_url, total_duration_secs, segments)`.
+fn parse_mpd(text: &str) -> (String, f64, Vec<SegmentInfo>) {
     let mut init_url = String::new();
     let mut media_template = String::new();
     let mut start_number: usize = 0;
     let mut timescale: f64 = 1000.0;
     let mut segments = Vec::new();
+    let mut total_duration: f64 = 0.0;
+
+    // Extract mediaPresentationDuration from <MPD> tag (ISO 8601 duration).
+    // We support the format "PTxHxMxS" or "PTxMxS" or "PTxS".
+    if let Some(mpd_start) = text.find("mediaPresentationDuration=\"") {
+        let rest = &text[mpd_start + 27..];
+        if let Some(end) = rest.find('"') {
+            total_duration = parse_iso8601_duration(&rest[..end]);
+        }
+    }
 
     // Extract SegmentTemplate attributes
     if let Some(st_start) = text.find("<SegmentTemplate") {
@@ -233,7 +243,32 @@ fn parse_mpd(text: &str) -> (String, Vec<SegmentInfo>) {
         }
     }
 
-    (init_url, segments)
+    (init_url, total_duration, segments)
+}
+
+/// Parse an ISO 8601 duration like "PT1H23M45S" or "PT0H0M30S" into seconds.
+fn parse_iso8601_duration(s: &str) -> f64 {
+    let s = s.strip_prefix("PT").unwrap_or(s);
+    let mut total = 0.0_f64;
+    let mut num_buf = String::new();
+    for ch in s.chars() {
+        match ch {
+            'H' | 'h' => {
+                total += num_buf.parse::<f64>().unwrap_or(0.0) * 3600.0;
+                num_buf.clear();
+            }
+            'M' | 'm' => {
+                total += num_buf.parse::<f64>().unwrap_or(0.0) * 60.0;
+                num_buf.clear();
+            }
+            'S' | 's' => {
+                total += num_buf.parse::<f64>().unwrap_or(0.0);
+                num_buf.clear();
+            }
+            _ => num_buf.push(ch),
+        }
+    }
+    total
 }
 
 /// Strip ftyp and moov boxes from an fMP4 segment, keeping only moof+mdat.
@@ -713,7 +748,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         };
 
                         // Parse segment list from MPD.
-                        let (init_url, segments) = parse_mpd(&text);
+                        let (init_url, total_duration, segments) = parse_mpd(&text);
                         if segments.is_empty() {
                             error.set(Some("Manifest contains no segments.".to_string()));
                             return;
@@ -737,6 +772,18 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 return;
                             }
                         };
+
+                        // Use "sequence" mode: the browser chains each appended
+                        // fragment at the end of the previous one, regardless of
+                        // in-fragment PTS values.  This is necessary because the
+                        // fMP4 segments may have per-segment PTS starting at 0.
+                        source_buffer.set_mode(web_sys::SourceBufferAppendMode::Sequence);
+
+                        // Set the total presentation duration from the MPD so
+                        // the browser knows the full video length.
+                        if total_duration > 0.0 {
+                            media_source.set_duration(total_duration);
+                        }
 
                         // Fetch and append the init segment (ftyp+moov) first.
                         let init_bytes = match Request::get(&init_url).send().await {

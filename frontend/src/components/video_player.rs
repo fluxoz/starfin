@@ -176,9 +176,11 @@ struct MseState {
     pump_gen: u32,
     /// True while a `pump_loop` future is alive.
     pump_running: bool,
-    /// Number of segments successfully appended in the current pump run.
-    /// Used by the safety-net timer to detect stalls.
-    appended_count: u32,
+    /// The highest segment index that has been successfully appended to the
+    /// SourceBuffer.  Used by the segment-index-based buffer gate to decide
+    /// whether enough data has been buffered ahead of the playhead.
+    /// Set to `None` until the first media segment is appended.
+    last_appended_seg: Option<usize>,
 }
 
 /// Parse a DASH MPD manifest and return the list of segment URLs with durations.
@@ -450,9 +452,42 @@ fn start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElement) {
         let mut borrow = state.borrow_mut();
         match borrow.as_mut() {
             Some(s) => {
+                // If a pump is already running for this generation, don't
+                // start another one — that would cause duplicate requests.
+                if s.pump_running {
+                    return;
+                }
                 s.pump_gen = s.pump_gen.wrapping_add(1);
                 s.pump_running = true;
-                s.appended_count = 0;
+                s.pump_gen
+            }
+            None => return,
+        }
+    };
+    let state_c = state.clone();
+    let video_c = video.clone();
+    spawn_local(async move {
+        pump_loop(state_c.clone(), video_c, pump_id).await;
+        if let Some(s) = state_c.borrow_mut().as_mut() {
+            if s.pump_gen == pump_id {
+                s.pump_running = false;
+            }
+        }
+    });
+}
+
+/// Force-start a new pump loop, cancelling any currently-running one.
+///
+/// Unlike `start_pump()`, this always bumps the generation counter and
+/// spawns a new loop regardless of whether a pump is already running.
+/// Used by the seek handler which must immediately repoint the pump.
+fn force_start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElement) {
+    let pump_id = {
+        let mut borrow = state.borrow_mut();
+        match borrow.as_mut() {
+            Some(s) => {
+                s.pump_gen = s.pump_gen.wrapping_add(1);
+                s.pump_running = true;
                 s.pump_gen
             }
             None => return,
@@ -483,13 +518,20 @@ fn start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElement) {
 /// Steps per iteration (per DASH-IF IOP v4.3 §3.2):
 ///   1. Determine the next segment needed.
 ///   2. Enforce a forward buffer limit — sleep when enough data is buffered.
-///      Uses `video.buffered()` which is reliable because we use Sequence
-///      mode (the browser auto-places each fragment correctly on the timeline).
 ///   3. Evict old played data behind the playhead to bound memory.
 ///   4. Fetch the segment over HTTP.
 ///   5. Strip redundant init boxes (ftyp/moov) from the fMP4 data.
 ///   6. Wait for the SourceBuffer to be idle, then `appendBuffer`.
 ///   7. Wait for `updateend`, advance to the next segment, repeat.
+///
+/// Buffer-ahead gate: uses a segment-index-based calculation rather than
+/// querying `video.buffered()`.  The browser's buffered ranges can be empty
+/// or stale immediately after a seek+flush, which would cause the pump to
+/// fetch all segments at once.  By computing the buffered-ahead duration
+/// from `(last_appended_seg + 1) * SEGMENT_DURATION - current_time`, we
+/// get a deterministic gate that works regardless of browser timing.
+/// This mirrors dash.js ScheduleController:
+///   `if (bufferLevel + segmentDuration > bufferTarget) wait`
 ///
 /// The loop exits when all segments are appended, the generation counter
 /// no longer matches (a seek started a newer pump), or the MseState has
@@ -506,16 +548,16 @@ async fn pump_loop(
         }
 
         // ── 2. Determine the next segment to fetch ───────────────────
-        let (seg_url, seg_idx, sb) = {
-            let mut borrow = state.borrow_mut();
-            let mse = match borrow.as_mut() {
+        let (seg_url, seg_idx, sb, last_appended) = {
+            let borrow = state.borrow();
+            let mse = match borrow.as_ref() {
                 Some(s) if s.pump_gen == pump_id => s,
                 _ => return,
             };
 
             // All segments appended — signal EOS.
             if mse.next_seg >= mse.segments.len() {
-                log::info!("pump: all {} segments appended, signalling EOS", mse.segments.len());
+                log::info!("pump[{pump_id}]: all {} segments appended, signalling EOS", mse.segments.len());
                 let _ = mse.media_source.end_of_stream();
                 return;
             }
@@ -524,24 +566,31 @@ async fn pump_loop(
                 mse.segments[mse.next_seg].url.clone(),
                 mse.next_seg,
                 mse.source_buffer.clone(),
+                mse.last_appended_seg,
             )
         };
 
-        // ── 3. Buffer-ahead gate ─────────────────────────────────────
-        // Modelled after dash.js ScheduleController's check:
-        //   `if (bufferLevel + segmentDuration > bufferTarget) sleep`
-        // and Shaka Player's StreamingEngine `getBufferAhead_()`.
+        // ── 3. Buffer-ahead gate (segment-index based) ───────────────
+        // Compute how much data is buffered ahead of the current playhead
+        // using segment indices rather than video.buffered() ranges.
         //
-        // We query `video.buffered()` to see how far ahead of the playhead
-        // data is buffered.  In Sequence mode the browser auto-places
-        // fragments on the timeline based on timestampOffset, so buffered
-        // ranges accurately reflect appended data.
-        let current = video.current_time();
-        let buf_end = buffered_end_at(&video, current);
-        let buf_ahead = if buf_end > current { buf_end - current } else { 0.0 };
-        if buf_ahead >= MSE_TARGET_BUFFER_S {
-            TimeoutFuture::new(500).await;
-            continue;
+        // In Sequence mode, after appending segment N, the buffer extends
+        // to approximately (N + 1) × SEGMENT_DURATION on the timeline.
+        // We compare that against the current playhead position to decide
+        // if we should sleep or fetch the next segment.
+        //
+        // This avoids the issue where video.buffered() returns empty
+        // ranges immediately after a seek+flush, causing the pump to
+        // hammer the server with all remaining segments.
+        if let Some(last_seg) = last_appended {
+            let buffered_to = (last_seg as f64 + 1.0) * SEGMENT_DURATION_F;
+            let current = video.current_time();
+            let buf_ahead = buffered_to - current;
+            if buf_ahead >= MSE_TARGET_BUFFER_S {
+                // Enough data buffered ahead — sleep and re-check.
+                TimeoutFuture::new(500).await;
+                continue;
+            }
         }
 
         // ── 4. Evict old data behind the playhead ────────────────────
@@ -551,7 +600,7 @@ async fn pump_loop(
         }
 
         // ── 5. Fetch the segment ─────────────────────────────────────
-        log::debug!("pump: fetching segment {seg_idx}");
+        log::info!("pump[{pump_id}]: fetching segment {seg_idx}");
         let bytes = match Request::get(&seg_url).send().await {
             Ok(r) => match r.binary().await {
                 Ok(b) => b,
@@ -613,11 +662,10 @@ async fn pump_loop(
                     return;
                 }
                 s.next_seg = seg_idx + 1;
-                s.appended_count += 1;
-                log::debug!(
-                    "pump: appended segment {seg_idx}, next_seg={}, buf_end={:.1}s",
-                    s.next_seg,
-                    buffered_end_at(&video, video.current_time())
+                s.last_appended_seg = Some(seg_idx);
+                log::info!(
+                    "pump[{pump_id}]: appended segment {seg_idx}, next_seg={}",
+                    s.next_seg
                 );
             }
         }
@@ -1004,7 +1052,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             next_seg: start_seg,
                             pump_gen: 0,
                             pump_running: false,
-                            appended_count: 0,
+                            last_appended_seg: None,
                         });
 
                         status.set(String::new());
@@ -1130,18 +1178,26 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     // (pump_running == false) but there are still segments
                     // to fetch and the buffer is below target.
                     //
-                    // Uses video.buffered() which is reliable in Sequence
-                    // mode.  This mirrors dash.js ScheduleController's
-                    // periodic buffer check.
+                    // Uses segment-index-based check (not video.buffered())
+                    // to avoid false-positive restarts when buffered ranges
+                    // are temporarily empty after a seek.  This mirrors
+                    // dash.js ScheduleController's periodic buffer check.
                     let needs_restart = {
                         let borrow = mse_state.borrow();
                         if let Some(s) = borrow.as_ref() {
-                            let ct = video.current_time();
-                            let buf_end = buffered_end_at(&video, ct);
-                            let buf_ahead = if buf_end > ct { buf_end - ct } else { 0.0 };
-                            !s.pump_running
-                                && s.next_seg < s.segments.len()
-                                && buf_ahead < MSE_TARGET_BUFFER_S
+                            if s.pump_running || s.next_seg >= s.segments.len() {
+                                false
+                            } else {
+                                // Use segment-index-based buffer check
+                                let buf_ahead = match s.last_appended_seg {
+                                    Some(last) => {
+                                        let buffered_to = (last as f64 + 1.0) * SEGMENT_DURATION_F;
+                                        buffered_to - video.current_time()
+                                    }
+                                    None => 0.0, // no segments appended yet → needs data
+                                };
+                                buf_ahead < MSE_TARGET_BUFFER_S
+                            }
                         } else {
                             false
                         }
@@ -1273,23 +1329,47 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         // Seek target is NOT buffered.  In Sequence mode we
                         // must flush the buffer and reset timestampOffset.
                         //
-                        // This matches hls.js's approach: flush buffer →
-                        // set timestampOffset → restart loading.
+                        // Modelled after dash.js StreamProcessor.prepareInnerPeriodPlaybackSeeking():
+                        //   → clearScheduleTimer() + fragmentModel.abortRequests()
+                        //   → bufferController.prepareForPlaybackSeek()
+                        //   → bufferController.clearBuffers(clearRanges)
+                        //   → setExplicitBufferingTime(targetTime)
+                        //   → scheduleController.startScheduleTimer()
+                        //
+                        // Also matches hls.js: flush buffer → set timestampOffset → restart loading.
                         log::info!("seek: target {seek_time:.1}s not buffered, flushing and restarting from segment {target_seg}");
+
+                        // Cancel the current pump immediately (synchronous),
+                        // analogous to dash.js clearScheduleTimer() +
+                        // fragmentModel.abortRequests().
+                        // Capture the generation BEFORE spawning async work
+                        // so that concurrent seeking events (Firefox fires up
+                        // to 7) can be detected and abandoned.
+                        let my_gen = {
+                            let mut borrow = mse_state_for_seek.borrow_mut();
+                            if let Some(mse) = borrow.as_mut() {
+                                mse.pump_gen = mse.pump_gen.wrapping_add(1);
+                                mse.pump_running = false;
+                                mse.next_seg = target_seg;
+                                mse.last_appended_seg = None;
+                                mse.pump_gen
+                            } else {
+                                return;
+                            }
+                        };
 
                         let mse_state_c = mse_state_for_seek.clone();
                         let video_c = video_for_seek.clone();
                         spawn_local(async move {
-                            // Cancel the current pump by bumping generation.
+                            // Get SourceBuffer reference, but only if our
+                            // generation is still current (no newer seek).
                             let sb = {
-                                let mut borrow = mse_state_c.borrow_mut();
-                                if let Some(mse) = borrow.as_mut() {
-                                    mse.pump_gen = mse.pump_gen.wrapping_add(1);
-                                    mse.pump_running = false;
-                                    mse.next_seg = target_seg;
-                                    mse.source_buffer.clone()
-                                } else {
-                                    return;
+                                let borrow = mse_state_c.borrow();
+                                match borrow.as_ref() {
+                                    Some(s) if s.pump_gen == my_gen => {
+                                        s.source_buffer.clone()
+                                    }
+                                    _ => return, // another seek superseded us
                                 }
                             };
 
@@ -1300,9 +1380,17 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 TimeoutFuture::new(5).await;
                             }
 
+                            // Re-check: if another seek happened while we
+                            // waited, abandon (Firefox multiple-seeking guard).
+                            {
+                                let borrow = mse_state_c.borrow();
+                                if !matches!(borrow.as_ref(), Some(s) if s.pump_gen == my_gen) {
+                                    return;
+                                }
+                            }
+
                             // Abort + remove all buffered data.
-                            // Use duration (or 0) as the end bound — some
-                            // browsers reject extremely large values.
+                            // Analogous to dash.js bufferController.clearBuffers().
                             let _ = sb.abort();
                             let remove_end = {
                                 let borrow = mse_state_c.borrow();
@@ -1319,6 +1407,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 TimeoutFuture::new(5).await;
                             }
 
+                            // Re-check again after the remove await.
+                            {
+                                let borrow = mse_state_c.borrow();
+                                if !matches!(borrow.as_ref(), Some(s) if s.pump_gen == my_gen) {
+                                    return;
+                                }
+                            }
+
                             // Set timestampOffset so Sequence mode places the
                             // next appended fragment at the target position.
                             let ts_offset = target_seg as f64 * SEGMENT_DURATION_F;
@@ -1326,7 +1422,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             log::info!("seek: timestampOffset = {ts_offset}s, restarting pump from segment {target_seg}");
 
                             // Restart the pump.
-                            start_pump(&mse_state_c, &video_c);
+                            // Analogous to dash.js scheduleController.startScheduleTimer().
+                            force_start_pump(&mse_state_c, &video_c);
                         });
                     }
                 });

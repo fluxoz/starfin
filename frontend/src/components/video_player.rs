@@ -196,14 +196,28 @@ fn parse_mpd(text: &str) -> (String, Vec<SegmentInfo>) {
                     if let Ok(d) = rest[..end].parse::<f64>() {
                         let duration_secs = d / timescale;
 
-                        // Resolve segment URL from template
-                        let url = media_template.replace("$Number%05d$", &format!("{:05}", seg_index));
+                        // Extract optional repeat count "r" attribute.
+                        // r=N means N additional repetitions (N+1 segments total).
+                        let repeat_count: usize = if let Some(r_pos) = tag.find("r=\"") {
+                            let r_rest = &tag[r_pos + 3..];
+                            if let Some(r_end) = r_rest.find('"') {
+                                r_rest[..r_end].parse().unwrap_or(0)
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
 
-                        segments.push(SegmentInfo {
-                            url,
-                            duration: duration_secs,
-                        });
-                        seg_index += 1;
+                        // Generate (1 + repeat_count) segment entries.
+                        for _ in 0..=repeat_count {
+                            let url = media_template.replace("$Number%05d$", &format!("{:05}", seg_index));
+                            segments.push(SegmentInfo {
+                                url,
+                                duration: duration_secs,
+                            });
+                            seg_index += 1;
+                        }
                     }
                 }
             }

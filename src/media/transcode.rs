@@ -439,6 +439,10 @@ fn encode_audio_frame(
 /// - `default_base_moof` — make every moof self-contained (DASH/CMAF required).
 const FMP4_MOVFLAGS: &str = "empty_moov+frag_keyframe+default_base_moof";
 
+/// FFmpeg `AV_OPT_SEARCH_CHILDREN` flag — search child objects (e.g. muxer
+/// priv_data) through the AVClass hierarchy.
+const AV_OPT_SEARCH_CHILDREN: i32 = 0x0001;
+
 /// Create an fMP4 (CMAF) output context with `movflags` applied.
 ///
 /// Uses three redundant methods to ensure the mp4 muxer enters fragmented
@@ -460,18 +464,22 @@ fn create_fmp4_output(tmp_path: &Path) -> Result<ffmpeg_next::format::context::O
         // ── Method 1: set directly on priv_data ──────────────────────────
         let pd = (*octx.as_mut_ptr()).priv_data;
         if !pd.is_null() {
-            ffmpeg_next::ffi::av_opt_set(pd, key.as_ptr(), val.as_ptr(), 0);
+            let ret = ffmpeg_next::ffi::av_opt_set(pd, key.as_ptr(), val.as_ptr(), 0);
+            if ret < 0 {
+                eprintln!("[fmp4] av_opt_set movflags on priv_data returned {ret}");
+            }
         }
 
         // ── Method 2: set via format context with AV_OPT_SEARCH_CHILDREN ─
-        // AV_OPT_SEARCH_CHILDREN = 0x0001 — searches child objects
-        // (includes priv_data) through the AVClass hierarchy.
-        ffmpeg_next::ffi::av_opt_set(
+        let ret = ffmpeg_next::ffi::av_opt_set(
             octx.as_mut_ptr() as *mut std::ffi::c_void,
             key.as_ptr(),
             val.as_ptr(),
-            1, // AV_OPT_SEARCH_CHILDREN
+            AV_OPT_SEARCH_CHILDREN,
         );
+        if ret < 0 {
+            eprintln!("[fmp4] av_opt_set movflags via AV_OPT_SEARCH_CHILDREN returned {ret}");
+        }
     }
 
     Ok(octx)

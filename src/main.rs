@@ -2027,8 +2027,10 @@ async fn get_manifest(
     mpd.push_str("          <SegmentTimeline>\n");
     let normal_duration_ms = (SEGMENT_DURATION * 1000.0) as u64;
     if num_segments > 1 {
-        // All segments except the last share the same duration.
-        let repeats = num_segments - 2; // r= means (repeats) additional occurrences
+        // First (num_segments - 1) segments all have the same duration.
+        // r= gives additional repetitions beyond the first occurrence, so
+        // r=(num_segments - 2) encodes (num_segments - 1) segments total.
+        let repeats = num_segments - 2; // r=N → N+1 segments of this duration
         mpd.push_str(&format!(
             "            <S d=\"{normal_duration_ms}\" r=\"{repeats}\"/>\n"
         ));

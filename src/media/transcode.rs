@@ -432,27 +432,40 @@ fn encode_audio_frame(
 
 // ── fMP4 muxer helper ────────────────────────────────────────────────────────
 
-/// Create an fMP4 (CMAF) output context with the correct movflags.
+/// Create an fMP4 (CMAF) output context.
 ///
-/// Flags: `empty_moov` produces ftyp+moov with no sample tables,
-/// `frag_keyframe` starts a new moof at each keyframe, and
-/// `default_base_moof` makes every moof self-contained (required for DASH/CMAF).
+/// Returns a plain mp4 output context.  The actual fragmented-MP4 flags
+/// (`empty_moov`, `frag_keyframe`, `default_base_moof`) are applied later
+/// by [`write_fmp4_header`] which passes them through the
+/// `avformat_write_header` options dictionary — the only fully reliable
+/// method across all FFmpeg / ffmpeg-next versions.
 fn create_fmp4_output(tmp_path: &Path) -> Result<ffmpeg_next::format::context::Output, String> {
-    let mut octx = ffmpeg_next::format::output_as(tmp_path, "mp4")
-        .map_err(|e| format!("output context: {e}"))?;
+    ffmpeg_next::format::output_as(tmp_path, "mp4")
+        .map_err(|e| format!("output context: {e}"))
+}
 
+/// Write the fMP4 header with the correct movflags via `avformat_write_header`.
+///
+/// This passes `movflags=empty_moov+frag_keyframe+default_base_moof` through
+/// the options dictionary so the mp4 muxer initialises in fragmented mode.
+/// Must be called exactly once after all streams have been added.
+fn write_fmp4_header(octx: &mut ffmpeg_next::format::context::Output) -> Result<(), String> {
     unsafe {
+        let mut dict: *mut ffmpeg_next::ffi::AVDictionary = std::ptr::null_mut();
+
         let key = std::ffi::CString::new("movflags").unwrap();
         let val = std::ffi::CString::new("empty_moov+frag_keyframe+default_base_moof").unwrap();
-        ffmpeg_next::ffi::av_opt_set(
-            (*octx.as_mut_ptr()).priv_data,
-            key.as_ptr(),
-            val.as_ptr(),
-            0,
-        );
-    }
+        ffmpeg_next::ffi::av_dict_set(&mut dict, key.as_ptr(), val.as_ptr(), 0);
 
-    Ok(octx)
+        let ret = ffmpeg_next::ffi::avformat_write_header(octx.as_mut_ptr(), &mut dict);
+        ffmpeg_next::ffi::av_dict_free(&mut dict);
+
+        if ret < 0 {
+            Err(format!("write header (fMP4): error {ret}"))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 // ── Init segment extraction ──────────────────────────────────────────────────
@@ -556,8 +569,7 @@ pub fn create_init_segment(abs_path: &str, quality: Quality, hwaccel: &HwAccel) 
         }
     }
 
-    octx.write_header()
-        .map_err(|e| format!("write header: {e}"))?;
+    write_fmp4_header(&mut octx)?;
     octx.write_trailer()
         .map_err(|e| format!("write trailer: {e}"))?;
 
@@ -726,8 +738,7 @@ fn remux_segment(
         }
     }
 
-    octx.write_header()
-        .map_err(|e| format!("write header: {e}"))?;
+    write_fmp4_header(&mut octx)?;
 
     // Re-read output time bases after write_header (muxer may adjust them).
     let out_video_tb = octx.stream(out_video_idx).unwrap().time_base();
@@ -983,8 +994,7 @@ fn hybrid_segment(
         }
     }
 
-    octx.write_header()
-        .map_err(|e| format!("write header: {e}"))?;
+    write_fmp4_header(&mut octx)?;
 
     // Re-read output time bases after write_header (muxer may adjust them).
     let out_video_tb = octx.stream(out_video_idx).unwrap().time_base();
@@ -1462,8 +1472,7 @@ fn transcode_segment_body(
             }
         }
 
-        octx.write_header()
-            .map_err(|e| format!("write header: {e}"))?;
+        write_fmp4_header(&mut octx)?;
 
         // Re-read output time bases after write_header.
         let out_video_tb = octx.stream(out_video_idx).unwrap().time_base();

@@ -439,20 +439,12 @@ fn encode_audio_frame(
 /// - `default_base_moof` — make every moof self-contained (DASH/CMAF required).
 const FMP4_MOVFLAGS: &str = "empty_moov+frag_keyframe+default_base_moof";
 
-/// FFmpeg `AV_OPT_SEARCH_CHILDREN` flag — search child objects (e.g. muxer
-/// priv_data) through the AVClass hierarchy.
-const AV_OPT_SEARCH_CHILDREN: i32 = 0x0001;
-
 /// Create an fMP4 (CMAF) output context with `movflags` applied.
 ///
-/// Uses three redundant methods to ensure the mp4 muxer enters fragmented
-/// mode — production FFmpeg configurations vary in which method they respect:
-///
-/// 1. `av_opt_set` directly on `priv_data` (MOVMuxContext)
-/// 2. `av_opt_set` on the `AVFormatContext` with `AV_OPT_SEARCH_CHILDREN`
-///
-/// The subsequent [`write_fmp4_header`] provides a third method: passing the
-/// flags through the `avformat_write_header` options dictionary.
+/// Uses `av_opt_set` on the `AVFormatContext` with `AV_OPT_SEARCH_CHILDREN`
+/// to set movflags on the mp4 muxer's private data (MOVMuxContext).
+/// This is the same pattern used by production Rust FFmpeg projects
+/// (e.g. lite-nvr, video-rs).
 fn create_fmp4_output(tmp_path: &Path) -> Result<ffmpeg_next::format::context::Output, String> {
     let mut octx = ffmpeg_next::format::output_as(tmp_path, "mp4")
         .map_err(|e| format!("output context: {e}"))?;
@@ -461,81 +453,50 @@ fn create_fmp4_output(tmp_path: &Path) -> Result<ffmpeg_next::format::context::O
         let key = std::ffi::CString::new("movflags").unwrap();
         let val = std::ffi::CString::new(FMP4_MOVFLAGS).unwrap();
 
-        // ── Method 1: set directly on priv_data ──────────────────────────
-        let pd = (*octx.as_mut_ptr()).priv_data;
-        if !pd.is_null() {
-            let ret = ffmpeg_next::ffi::av_opt_set(pd, key.as_ptr(), val.as_ptr(), 0);
-            if ret < 0 {
-                eprintln!("[fmp4] av_opt_set movflags on priv_data returned {ret}");
-            }
-        }
-
-        // ── Method 2: set via format context with AV_OPT_SEARCH_CHILDREN ─
         let ret = ffmpeg_next::ffi::av_opt_set(
             octx.as_mut_ptr() as *mut std::ffi::c_void,
             key.as_ptr(),
             val.as_ptr(),
-            AV_OPT_SEARCH_CHILDREN,
+            ffmpeg_next::ffi::AV_OPT_SEARCH_CHILDREN as i32,
         );
         if ret < 0 {
-            eprintln!("[fmp4] av_opt_set movflags via AV_OPT_SEARCH_CHILDREN returned {ret}");
+            return Err(format!(
+                "av_opt_set movflags failed (ret={ret}) — mp4 muxer not available?"
+            ));
         }
     }
 
     Ok(octx)
 }
 
-/// Write the fMP4 header, passing `movflags` through the dictionary as well.
+/// Write the fMP4 header via raw FFI.
 ///
-/// Belt-and-suspenders: even though [`create_fmp4_output`] already set the
-/// flags on `priv_data`, we also pass them via the `avformat_write_header`
-/// options dictionary so `init_muxer` can apply them a second time.
-///
-/// After writing, reads back the movflags value to verify fragmented mode
-/// is active and logs a diagnostic if it isn't.
+/// Uses `avformat_write_header` directly instead of the safe `write_header()`
+/// wrapper because the latter treats return code 1 (`AVSTREAM_INIT_IN_WRITE_HEADER`)
+/// as an error.  Return code >= 0 means success.
 fn write_fmp4_header(octx: &mut ffmpeg_next::format::context::Output) -> Result<(), String> {
     unsafe {
-        let mut dict: *mut ffmpeg_next::ffi::AVDictionary = std::ptr::null_mut();
-
-        let key = std::ffi::CString::new("movflags").unwrap();
-        let val = std::ffi::CString::new(FMP4_MOVFLAGS).unwrap();
-        ffmpeg_next::ffi::av_dict_set(&mut dict, key.as_ptr(), val.as_ptr(), 0);
-
-        let ret = ffmpeg_next::ffi::avformat_write_header(octx.as_mut_ptr(), &mut dict);
-        ffmpeg_next::ffi::av_dict_free(&mut dict);
-
+        let ret = ffmpeg_next::ffi::avformat_write_header(
+            octx.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
         if ret < 0 {
             return Err(format!("write header (fMP4): error {ret}"));
         }
+        Ok(())
+    }
+}
 
-        // ── Diagnostic: verify movflags were applied ─────────────────────
-        let pd = (*octx.as_mut_ptr()).priv_data;
-        if !pd.is_null() {
-            let mut out_val: *mut u8 = std::ptr::null_mut();
-            let probe_key = std::ffi::CString::new("movflags").unwrap();
-            let get_ret = ffmpeg_next::ffi::av_opt_get(
-                pd,
-                probe_key.as_ptr(),
-                0,
-                &mut out_val,
-            );
-            if get_ret >= 0 && !out_val.is_null() {
-                let flags_str = std::ffi::CStr::from_ptr(out_val as *const std::os::raw::c_char)
-                    .to_string_lossy();
-                if !flags_str.contains("empty_moov") {
-                    eprintln!(
-                        "[fmp4] WARNING: movflags readback = '{}' — empty_moov NOT set!",
-                        flags_str
-                    );
-                }
-                ffmpeg_next::ffi::av_free(out_val as *mut std::ffi::c_void);
-            } else {
-                eprintln!(
-                    "[fmp4] WARNING: av_opt_get movflags failed (ret={get_ret})"
-                );
-            }
+/// Write the fMP4 trailer via raw FFI.
+///
+/// Uses `av_write_trailer` directly instead of the safe `write_trailer()`
+/// wrapper for consistency with [`write_fmp4_header`].
+fn write_fmp4_trailer(octx: &mut ffmpeg_next::format::context::Output) -> Result<(), String> {
+    unsafe {
+        let ret = ffmpeg_next::ffi::av_write_trailer(octx.as_mut_ptr());
+        if ret < 0 {
+            return Err(format!("write trailer (fMP4): error {ret}"));
         }
-
         Ok(())
     }
 }
@@ -642,8 +603,7 @@ pub fn create_init_segment(abs_path: &str, quality: Quality, hwaccel: &HwAccel) 
     }
 
     write_fmp4_header(&mut octx)?;
-    octx.write_trailer()
-        .map_err(|e| format!("write trailer: {e}"))?;
+    write_fmp4_trailer(&mut octx)?;
 
     drop(octx);
     let data = std::fs::read(&tmp_path)
@@ -903,8 +863,7 @@ fn remux_segment(
         let _ = packet.write_interleaved(&mut octx);
     }
 
-    octx.write_trailer()
-        .map_err(|e| format!("write trailer: {e}"))?;
+    write_fmp4_trailer(&mut octx)?;
 
     Ok(())
 }
@@ -1238,8 +1197,7 @@ fn hybrid_segment(
         }
     }
 
-    octx.write_trailer()
-        .map_err(|e| format!("write trailer: {e}"))?;
+    write_fmp4_trailer(&mut octx)?;
 
     Ok(())
 }
@@ -1777,8 +1735,7 @@ fn transcode_segment_body(
             }
         }
 
-        octx.write_trailer()
-            .map_err(|e| format!("write trailer: {e}"))?;
+        write_fmp4_trailer(&mut octx)?;
     }
 
     Ok(())

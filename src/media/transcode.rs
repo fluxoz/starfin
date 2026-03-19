@@ -1,11 +1,11 @@
-//! HLS segment creation — direct remux when possible, transcode as fallback.
+//! DASH fMP4 segment creation — direct remux when possible, transcode as fallback.
 //!
-//! Each segment is a 6-second MPEG-TS chunk.  For **Original** quality with
-//! browser-compatible codecs (H.264 video + stereo AAC/MP3 audio) the segment
-//! is created by **remuxing** — copying compressed packets directly from the
-//! source file without decoding or re-encoding.  This is near-instant (pure
-//! I/O, like VLC playback) and gives performance parity with direct file
-//! access.
+//! Each segment is a 6-second fMP4 (fragmented MP4 / CMAF) chunk.  For
+//! **Original** quality with browser-compatible codecs (H.264 video + stereo
+//! AAC/MP3 audio) the segment is created by **remuxing** — copying compressed
+//! packets directly from the source file without decoding or re-encoding.
+//! This is near-instant (pure I/O, like VLC playback) and gives performance
+//! parity with direct file access.
 //!
 //! When the video is H.264 but the audio isn't directly usable in browsers
 //! (e.g. multi-channel 5.1/7.1 AAC, or a non-AAC codec like FLAC/AC-3) the
@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use super::hwaccel::HwAccel;
 
-/// Duration of each HLS segment in seconds.
+/// Duration of each DASH segment in seconds.
 pub const SEGMENT_DURATION: f64 = 6.0;
 
 /// Error message returned when a background operation is cancelled by a kill
@@ -37,7 +37,7 @@ pub const CANCELLED: &str = "cancelled";
 /// 256 kbps stereo AAC-LC is transparent quality for music and dialogue.
 const AAC_ENCODE_BITRATE: usize = 256_000;
 
-/// Create a single MPEG-TS segment — remux if possible, transcode otherwise.
+/// Create a single fMP4 segment — remux if possible, transcode otherwise.
 ///
 /// For **Original** quality with H.264 + stereo AAC/MP3 source, packets are
 /// copied directly (remux).  For H.264 video with multi-channel or
@@ -48,13 +48,13 @@ const AAC_ENCODE_BITRATE: usize = 256_000;
 /// Writes to a temporary file first, then atomically renames.
 pub async fn transcode_segment(
     abs_path: &str,
-    hls_dir: &Path,
+    seg_dir: &Path,
     seg_index: usize,
     hwaccel: &HwAccel,
     quality: super::transcode::Quality,
 ) -> Result<(), String> {
-    let filename = format!("seg_{:05}.ts", seg_index);
-    let seg_path = hls_dir.join(&filename);
+    let filename = format!("seg_{:05}.m4s", seg_index);
+    let seg_path = seg_dir.join(&filename);
 
     if seg_path.exists() {
         return Ok(());
@@ -66,10 +66,10 @@ pub async fn transcode_segment(
     // Run the I/O or CPU-intensive work on a blocking thread so we don't
     // starve the tokio runtime.
     let abs_path = abs_path.to_owned();
-    let hls_dir = hls_dir.to_owned();
+    let seg_dir = seg_dir.to_owned();
     let hwaccel = hwaccel.clone();
     tokio::task::spawn_blocking(move || {
-        create_segment(&abs_path, &hls_dir, seg_index, &hwaccel, quality, None)
+        create_segment(&abs_path, &seg_dir, seg_index, &hwaccel, quality, None)
     })
     .await
     .map_err(|e| format!("transcode task panicked: {e}"))?
@@ -80,14 +80,14 @@ pub async fn transcode_segment(
 /// background pre-caching yields CPU and disk to on-demand playback.
 pub async fn transcode_segment_with_kill(
     abs_path: &str,
-    hls_dir: &Path,
+    seg_dir: &Path,
     seg_index: usize,
     hwaccel: &HwAccel,
     quality: super::transcode::Quality,
     kill: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let filename = format!("seg_{:05}.ts", seg_index);
-    let seg_path = hls_dir.join(&filename);
+    let filename = format!("seg_{:05}.m4s", seg_index);
+    let seg_path = seg_dir.join(&filename);
 
     if seg_path.exists() {
         return Ok(());
@@ -97,10 +97,10 @@ pub async fn transcode_segment_with_kill(
     debug_assert!(start_time >= 0.0 && start_time.is_finite());
 
     let abs_path = abs_path.to_owned();
-    let hls_dir = hls_dir.to_owned();
+    let seg_dir = seg_dir.to_owned();
     let hwaccel = hwaccel.clone();
     tokio::task::spawn_blocking(move || {
-        create_segment(&abs_path, &hls_dir, seg_index, &hwaccel, quality, Some(&kill))
+        create_segment(&abs_path, &seg_dir, seg_index, &hwaccel, quality, Some(&kill))
     })
     .await
     .map_err(|e| format!("transcode task panicked: {e}"))?
@@ -430,11 +430,178 @@ fn encode_audio_frame(
     written
 }
 
+// ── fMP4 muxer helper ────────────────────────────────────────────────────────
+
+/// Create an fMP4 (CMAF) output context with the correct movflags.
+///
+/// Flags: `empty_moov` produces ftyp+moov with no sample tables,
+/// `frag_keyframe` starts a new moof at each keyframe, and
+/// `default_base_moof` makes every moof self-contained (required for DASH/CMAF).
+fn create_fmp4_output(tmp_path: &Path) -> Result<ffmpeg_next::format::context::Output, String> {
+    let mut octx = ffmpeg_next::format::output_as(tmp_path, "mp4")
+        .map_err(|e| format!("output context: {e}"))?;
+
+    unsafe {
+        let key = std::ffi::CString::new("movflags").unwrap();
+        let val = std::ffi::CString::new("empty_moov+frag_keyframe+default_base_moof").unwrap();
+        ffmpeg_next::ffi::av_opt_set(
+            (*octx.as_mut_ptr()).priv_data,
+            key.as_ptr(),
+            val.as_ptr(),
+            0,
+        );
+    }
+
+    Ok(octx)
+}
+
+// ── Init segment extraction ──────────────────────────────────────────────────
+
+/// Extract the fMP4 init segment (ftyp + moov atoms) from a source video.
+///
+/// The init segment contains the codec configuration (SPS/PPS for H.264,
+/// channel layout for AAC) that the browser's MSE SourceBuffer needs before
+/// any media segments can be appended.  It is generated by muxing zero frames
+/// into an fMP4 container — the resulting file contains only ftyp+moov.
+pub fn create_init_segment(abs_path: &str, quality: Quality, hwaccel: &HwAccel) -> Result<Vec<u8>, String> {
+    super::ensure_init();
+
+    let mut ictx = ffmpeg_next::format::input(&abs_path)
+        .map_err(|e| format!("failed to open input: {e}"))?;
+
+    // If we need to transcode (non-remux quality or incompatible codecs),
+    // we generate a short transcode to get the init segment with proper
+    // encoder parameters.  For remux-compatible sources, we can extract
+    // codec params directly from the input.
+    let needs_transcode = if quality.can_remux() {
+        !source_is_remuxable(&ictx) && !video_is_remuxable(&ictx)
+    } else {
+        true
+    };
+
+    if needs_transcode {
+        // For transcode paths, generate segment 0 and extract init from it.
+        // The fMP4 segment 0 already contains ftyp+moov at the start.
+        drop(ictx);
+        let tmp_dir = std::env::temp_dir().join(format!("starfin_init_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
+
+        // Create a minimal segment to extract the init from.
+        let tmp_seg = tmp_dir.join("init_extract.mp4");
+        let mut ictx2 = ffmpeg_next::format::input(&abs_path)
+            .map_err(|e| format!("failed to open input for init: {e}"))?;
+
+        if source_is_remuxable(&ictx2) || video_is_remuxable(&ictx2) {
+            // Even though quality requires transcode, generate init from remux path
+            // for codec params — but actually we need the transcode codec params.
+            // Fall through to remux-based extraction and let the actual segment
+            // transcode handle the rest.
+            drop(ictx2);
+        } else {
+            drop(ictx2);
+        }
+
+        // Generate segment 0 to get the init segment
+        let seg0_path = tmp_dir.join("seg_00000.m4s");
+        if !seg0_path.exists() {
+            create_segment(abs_path, &tmp_dir, 0, hwaccel, quality, None)?;
+        }
+
+        // Read the segment and extract ftyp+moov boxes
+        let data = std::fs::read(&seg0_path)
+            .map_err(|e| format!("failed to read segment 0: {e}"))?;
+        let init = extract_ftyp_moov(&data)?;
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        return Ok(init);
+    }
+
+    // Remux-compatible: create an fMP4 output and write header only.
+    // This produces ftyp + moov with the correct codec parameters.
+    let tmp_path = std::env::temp_dir().join(format!("starfin_init_{}.mp4", std::process::id()));
+
+    let mut octx = create_fmp4_output(&tmp_path)?;
+
+    // Add video stream.
+    let video_stream = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Video)
+        .ok_or("no video stream")?;
+    let in_video_params = video_stream.parameters();
+
+    let out_video = octx.add_stream(ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::H264))
+        .map_err(|e| format!("add video stream: {e}"))?;
+    unsafe {
+        ffmpeg_next::ffi::avcodec_parameters_copy(
+            out_video.parameters().as_mut_ptr(),
+            in_video_params.as_ptr(),
+        );
+    }
+
+    // Add audio stream if present.
+    if let Some(audio_stream) = ictx.streams().best(ffmpeg_next::media::Type::Audio) {
+        let in_audio_params = audio_stream.parameters();
+        let audio_codec_id = in_audio_params.id();
+        let enc = ffmpeg_next::encoder::find(audio_codec_id);
+        if let Ok(out_audio) = octx.add_stream(enc) {
+            unsafe {
+                ffmpeg_next::ffi::avcodec_parameters_copy(
+                    out_audio.parameters().as_mut_ptr(),
+                    in_audio_params.as_ptr(),
+                );
+            }
+        }
+    }
+
+    octx.write_header()
+        .map_err(|e| format!("write header: {e}"))?;
+    octx.write_trailer()
+        .map_err(|e| format!("write trailer: {e}"))?;
+
+    drop(octx);
+    let data = std::fs::read(&tmp_path)
+        .map_err(|e| format!("failed to read init segment: {e}"))?;
+    let _ = std::fs::remove_file(&tmp_path);
+
+    // The file may contain ftyp+moov+moof+mdat — we only want ftyp+moov.
+    extract_ftyp_moov(&data)
+}
+
+/// Extract ftyp and moov boxes from an fMP4 byte buffer.
+///
+/// Parses MP4 box headers (4-byte size + 4-byte type) and copies only the
+/// ftyp and moov boxes, discarding any moof/mdat/other boxes.
+fn extract_ftyp_moov(data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut result = Vec::new();
+    let mut pos = 0usize;
+
+    while pos + 8 <= data.len() {
+        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        if size < 8 || pos + size > data.len() {
+            break;
+        }
+        let box_type = &data[pos + 4..pos + 8];
+        if box_type == b"ftyp" || box_type == b"moov" {
+            result.extend_from_slice(&data[pos..pos + size]);
+        }
+        pos += size;
+    }
+
+    if result.is_empty() {
+        return Err("no ftyp/moov boxes found in fMP4 data".into());
+    }
+
+    Ok(result)
+}
+
 // ── Segment creation: decide remux vs transcode ─────────────────────────────
 
 fn create_segment(
     abs_path: &str,
-    hls_dir: &Path,
+    seg_dir: &Path,
     seg_index: usize,
     hwaccel: &HwAccel,
     quality: Quality,
@@ -443,10 +610,10 @@ fn create_segment(
     super::ensure_init();
 
     let start_time = seg_index as f64 * SEGMENT_DURATION;
-    let tmp_filename = format!(".seg_{:05}.ts.tmp", seg_index);
-    let tmp_path = hls_dir.join(&tmp_filename);
-    let filename = format!("seg_{:05}.ts", seg_index);
-    let seg_path = hls_dir.join(&filename);
+    let tmp_filename = format!(".seg_{:05}.m4s.tmp", seg_index);
+    let tmp_path = seg_dir.join(&tmp_filename);
+    let filename = format!("seg_{:05}.m4s", seg_index);
+    let seg_path = seg_dir.join(&filename);
 
     // Open input.
     let mut ictx = ffmpeg_next::format::input(&abs_path)
@@ -476,9 +643,9 @@ fn create_segment(
 
 // ── Remux path (direct packet copy — near-instant) ──────────────────────────
 
-/// Copy compressed packets from the source into an MPEG-TS segment without
+/// Copy compressed packets from the source into an fMP4 segment without
 /// decoding or re-encoding.  This is the equivalent of
-/// `ffmpeg -ss <t> -i input -t 6 -c copy -f mpegts output.ts`
+/// `ffmpeg -ss <t> -i input -t 6 -c copy -f mp4 -movflags empty_moov+frag_keyframe+default_base_moof output.m4s`
 /// and gives VLC-like performance.
 fn remux_segment(
     ictx: &mut ffmpeg_next::format::context::Input,
@@ -521,9 +688,8 @@ fn remux_segment(
         in_audio_params = None;
     }
 
-    // Create output muxer.
-    let mut octx = ffmpeg_next::format::output_as(tmp_path, "mpegts")
-        .map_err(|e| format!("output context: {e}"))?;
+    // Create output muxer — fMP4 for DASH.
+    let mut octx = create_fmp4_output(tmp_path)?;
 
     // Add output video stream, copying codec parameters from input.
     let out_video = octx.add_stream(ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::H264))
@@ -569,7 +735,7 @@ fn remux_segment(
 
     let mut got_video_keyframe = false;
     // PTS offsets (in output time base) used to rebase timestamps so each
-    // segment starts near PTS 0, preventing A/V desync in HLS players.
+    // segment starts near PTS 0, preventing A/V desync in DASH players.
     let mut video_pts_offset: Option<i64> = None;
     let mut audio_pts_offset: Option<i64> = None;
 
@@ -665,7 +831,7 @@ fn remux_segment(
 /// Copy video packets directly while decoding and re-encoding the audio
 /// stream to stereo AAC.  This is used when the video is H.264 (browser-
 /// compatible) but the audio cannot be remuxed — typically because it is
-/// multi-channel (5.1/7.1) AAC which browsers don't support in HLS/MPEG-TS.
+/// multi-channel (5.1/7.1) AAC which browsers don't support.
 ///
 /// Gives the best quality+speed trade-off: lossless video copy (like remux)
 /// with only lightweight audio transcoding.
@@ -710,9 +876,8 @@ fn hybrid_segment(
         in_audio_params = None;
     }
 
-    // Create output muxer.
-    let mut octx = ffmpeg_next::format::output_as(tmp_path, "mpegts")
-        .map_err(|e| format!("output context: {e}"))?;
+    // Create output muxer — fMP4 for DASH.
+    let mut octx = create_fmp4_output(tmp_path)?;
 
     // Add output video stream — parameters copied directly from input.
     let out_video = octx.add_stream(ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::H264))
@@ -1195,9 +1360,8 @@ fn transcode_segment_body(
 
         let mut video_encoder = enc.open_with(opts).map_err(|e| format!("open video encoder: {e}"))?;
 
-        // ── Output muxer ─────────────────────────────────────────────────
-        let mut octx = ffmpeg_next::format::output_as(tmp_path, "mpegts")
-            .map_err(|e| format!("output context: {e}"))?;
+        // ── Output muxer — fMP4 for DASH ─────────────────────────────────
+        let mut octx = create_fmp4_output(tmp_path)?;
 
         let mut out_video_stream = octx.add_stream(video_encoder_codec)
             .map_err(|e| format!("add video stream: {e}"))?;
@@ -1567,7 +1731,7 @@ mod tests {
         assert!(video_is_remuxable(&ictx));
         assert!(!audio_is_remuxable(&ictx), "6ch audio should not be directly remuxable");
 
-        let out = Path::new("/tmp/test_media/test_hybrid_6ch.ts");
+        let out = Path::new("/tmp/test_media/test_hybrid_6ch.m4s");
         hybrid_segment(&mut ictx, 0.0, out, None).expect("hybrid segment failed");
         verify_segment(out, true);
     }
@@ -1579,7 +1743,7 @@ mod tests {
         super::super::ensure_init();
 
         let mut ictx = ffmpeg_next::format::input(&test_file).unwrap();
-        let out = Path::new("/tmp/test_media/test_hybrid_6ch_seg1.ts");
+        let out = Path::new("/tmp/test_media/test_hybrid_6ch_seg1.m4s");
         hybrid_segment(&mut ictx, 6.0, out, None).expect("hybrid segment at t=6s failed");
         verify_segment(out, true);
     }
@@ -1593,7 +1757,7 @@ mod tests {
         let mut ictx = ffmpeg_next::format::input(&test_file).unwrap();
         assert!(source_is_remuxable(&ictx));
 
-        let out = Path::new("/tmp/test_media/test_remux_stereo.ts");
+        let out = Path::new("/tmp/test_media/test_remux_stereo.m4s");
         remux_segment(&mut ictx, 0.0, out, None).expect("remux segment failed");
         verify_segment(out, true);
     }
@@ -1619,7 +1783,7 @@ mod tests {
         assert!(video_is_remuxable(&ictx));
         assert!(!audio_is_remuxable(&ictx), "FLAC is not browser-remuxable");
 
-        let out = Path::new("/tmp/test_media/test_hybrid_flac.ts");
+        let out = Path::new("/tmp/test_media/test_hybrid_flac.m4s");
         hybrid_segment(&mut ictx, 0.0, out, None).expect("hybrid segment with FLAC failed");
         verify_segment(out, true);
     }

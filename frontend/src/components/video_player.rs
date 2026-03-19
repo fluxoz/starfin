@@ -14,34 +14,12 @@ use yew::prelude::*;
 const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
 
 // ── Seek-anchor constants ────────────────────────────────────────────────────
-// These must stay in sync with SEGMENT_DURATION, PRECACHE_SEGMENTS, and
-// SPARSE_CACHE_STRIDE in `src/main.rs`.
+// Segment duration must stay in sync with SEGMENT_DURATION in `src/main.rs`.
 const SEGMENT_DURATION_F: f64 = 6.0;
-const PRECACHE_SEGMENTS_F: f64 = 20.0;
-const SPARSE_CACHE_STRIDE_F: f64 = 3.0;
 
-/// Snaps a seek time to the **start** of the cached segment at or before `time`.
-///
-/// Within the dense pre-cache window every segment is cached, so we just
-/// snap to the segment boundary.  Beyond that window only every
-/// `SPARSE_CACHE_STRIDE_F`-th segment is cached, so we round down to the
-/// nearest anchor start.  The same logic applies whether the user is
-/// clicking forward or backward.
-fn snap_to_cached_segment(time: f64) -> f64 {
-    if time <= 0.0 {
-        return 0.0;
-    }
-    let dense_window = PRECACHE_SEGMENTS_F * SEGMENT_DURATION_F; // 120 seconds
-    if time < dense_window {
-        // Within the dense window — every segment is cached; snap to segment start.
-        let seg_index = (time / SEGMENT_DURATION_F) as usize;
-        return seg_index as f64 * SEGMENT_DURATION_F;
-    }
-    // Beyond the dense window — snap down to the nearest sparse anchor start.
-    let stride = SPARSE_CACHE_STRIDE_F as usize;
-    let seg_index = (time / SEGMENT_DURATION_F) as usize;
-    let anchor_index = (seg_index / stride) * stride;
-    anchor_index as f64 * SEGMENT_DURATION_F
+/// Compute the segment index for a given time position.
+fn segment_for_time(t: f64) -> usize {
+    if t <= 0.0 { 0 } else { (t / SEGMENT_DURATION_F) as usize }
 }
 
 // ── Stream quality options ────────────────────────────────────────────────────
@@ -142,70 +120,142 @@ struct MseState {
     source_buffer: web_sys::SourceBuffer,
     /// Blob URL created for this MediaSource; revoked on cleanup.
     object_url: String,
-    /// Parsed segment list from the M3U8 playlist.
+    /// Parsed segment list from the DASH MPD manifest.
     segments: Vec<SegmentInfo>,
+    /// Init segment URL for the fMP4 stream.
+    init_url: String,
     /// Index of the next segment to fetch.
     next_seg: usize,
     /// True while `SourceBuffer.appendBuffer` is in progress.
     is_appending: bool,
+    /// Total number of segments (from MPD).
+    total_segments: usize,
 }
 
-/// Resolve a relative segment path against the playlist URL.
+/// Parse a DASH MPD manifest and return the list of segment URLs with durations.
 ///
-/// Strips the filename from `playlist_url`, keeps the query string, and
-/// prepends the base to `segment_path`.  Example:
-///   playlist:  /api/videos/42/playlist.m3u8?quality=original
-///   segment:   seg_00000.ts
-///   →          /api/videos/42/seg_00000.ts?quality=original
-fn resolve_segment_url(playlist_url: &str, segment_path: &str) -> String {
-    if segment_path.starts_with("http://")
-        || segment_path.starts_with("https://")
-        || segment_path.starts_with('/')
-    {
-        return segment_path.to_string();
-    }
-    let (path_part, query_part) = if let Some(q) = playlist_url.find('?') {
-        (&playlist_url[..q], &playlist_url[q..])
-    } else {
-        (playlist_url, "")
-    };
-    let base = if let Some(slash) = path_part.rfind('/') {
-        &path_part[..=slash]
-    } else {
-        "/"
-    };
-    format!("{base}{segment_path}{query_part}")
-}
-
-/// Parse an HLS M3U8 playlist and return the list of segments.
+/// This is a minimal parser that handles the specific MPD format our server
+/// emits: a single Period with a single AdaptationSet containing a
+/// SegmentTemplate with a SegmentTimeline.
 ///
-/// Only handles `#EXTINF` + segment URL pairs (the format the server emits).
-/// Relative segment URLs are resolved against `playlist_url`.
-fn parse_m3u8(text: &str, playlist_url: &str) -> Vec<SegmentInfo> {
+/// Returns `(init_url, segments)`.
+fn parse_mpd(text: &str) -> (String, Vec<SegmentInfo>) {
+    let mut init_url = String::new();
+    let mut media_template = String::new();
+    let mut start_number: usize = 0;
+    let mut timescale: f64 = 1000.0;
     let mut segments = Vec::new();
-    let mut pending_duration: Option<f64> = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("#EXTINF:") {
-            let duration = rest
-                .split(',')
-                .next()
-                .and_then(|d| d.parse::<f64>().ok())
-                .unwrap_or(0.0);
-            pending_duration = Some(duration);
-        } else if !line.starts_with('#') && !line.is_empty() {
-            if let Some(duration) = pending_duration.take() {
-                segments.push(SegmentInfo {
-                    url: resolve_segment_url(playlist_url, line),
-                    duration,
-                });
+
+    // Extract SegmentTemplate attributes
+    if let Some(st_start) = text.find("<SegmentTemplate") {
+        if let Some(st_end) = text[st_start..].find('>') {
+            let tag = &text[st_start..st_start + st_end + 1];
+
+            // Extract initialization URL
+            if let Some(i) = tag.find("initialization=\"") {
+                let rest = &tag[i + 16..];
+                if let Some(end) = rest.find('"') {
+                    init_url = rest[..end].to_string();
+                }
+            }
+
+            // Extract media template
+            if let Some(i) = tag.find("media=\"") {
+                let rest = &tag[i + 7..];
+                if let Some(end) = rest.find('"') {
+                    media_template = rest[..end].to_string();
+                }
+            }
+
+            // Extract startNumber
+            if let Some(i) = tag.find("startNumber=\"") {
+                let rest = &tag[i + 13..];
+                if let Some(end) = rest.find('"') {
+                    start_number = rest[..end].parse().unwrap_or(0);
+                }
+            }
+
+            // Extract timescale
+            if let Some(i) = tag.find("timescale=\"") {
+                let rest = &tag[i + 11..];
+                if let Some(end) = rest.find('"') {
+                    timescale = rest[..end].parse().unwrap_or(1000.0);
+                }
             }
         }
     }
-    segments
+
+    // Parse SegmentTimeline <S> elements
+    let mut seg_index = start_number;
+    let mut search_pos = 0;
+    while let Some(s_start) = text[search_pos..].find("<S ") {
+        let abs_start = search_pos + s_start;
+        if let Some(s_end) = text[abs_start..].find("/>") {
+            let tag = &text[abs_start..abs_start + s_end + 2];
+
+            // Extract duration "d" attribute
+            if let Some(d_pos) = tag.find("d=\"") {
+                let rest = &tag[d_pos + 3..];
+                if let Some(end) = rest.find('"') {
+                    if let Ok(d) = rest[..end].parse::<f64>() {
+                        let duration_secs = d / timescale;
+
+                        // Resolve segment URL from template
+                        let url = media_template.replace("$Number%05d$", &format!("{:05}", seg_index));
+
+                        segments.push(SegmentInfo {
+                            url,
+                            duration: duration_secs,
+                        });
+                        seg_index += 1;
+                    }
+                }
+            }
+
+            search_pos = abs_start + s_end + 2;
+        } else {
+            break;
+        }
+    }
+
+    (init_url, segments)
 }
 
-/// Pump the next HLS segment into the MSE SourceBuffer.
+/// Strip ftyp and moov boxes from an fMP4 segment, keeping only moof+mdat.
+///
+/// Each fMP4 segment produced by `ffmpeg -movflags empty_moov+frag_keyframe+default_base_moof`
+/// contains [ftyp][moov][moof][mdat].  The init segment (ftyp+moov) has already
+/// been appended to the SourceBuffer, so media segments must only contain
+/// moof+mdat to avoid confusing the browser's MSE implementation.
+fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut pos = 0usize;
+
+    while pos + 8 <= data.len() {
+        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        if size < 8 || pos + size > data.len() {
+            // Copy remaining bytes as-is (shouldn't happen with well-formed fMP4).
+            result.extend_from_slice(&data[pos..]);
+            break;
+        }
+        let box_type = &data[pos + 4..pos + 8];
+        // Keep moof, mdat, and any other non-init boxes.
+        // Skip ftyp and moov (already sent as init segment).
+        if box_type != b"ftyp" && box_type != b"moov" {
+            result.extend_from_slice(&data[pos..pos + size]);
+        }
+        pos += size;
+    }
+
+    if result.is_empty() {
+        // Fallback: return original data if no boxes were parsed.
+        data.to_vec()
+    } else {
+        result
+    }
+}
+
+/// Pump the next DASH fMP4 segment into the MSE SourceBuffer.
 ///
 /// Returns immediately if:
 /// - `state` is `None` (not yet initialised),
@@ -259,6 +309,10 @@ fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) 
             }
         };
 
+        // Strip ftyp+moov from fMP4 segments — only moof+mdat should be
+        // appended after the init segment has been loaded.
+        let media_bytes = strip_init_boxes(&bytes);
+
         let source_buffer = {
             let borrow = state_clone.borrow();
             match borrow.as_ref() {
@@ -292,7 +346,7 @@ fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) 
             .ok();
         updateend_cb.forget();
 
-        let uint8_array = js_sys::Uint8Array::from(bytes.as_slice());
+        let uint8_array = js_sys::Uint8Array::from(media_bytes.as_slice());
         let array_buffer = uint8_array.buffer();
         if source_buffer
             .append_buffer_with_array_buffer(&array_buffer)
@@ -373,7 +427,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
     // Stores the video position to resume at when quality is changed
     // mid-playback.  Updated by `on_quality_select` before triggering a
-    // re-initialisation of HLS.
+    // re-initialisation of the DASH stream.
     let resume_position = use_mut_ref(|| 0.0_f64);
 
     // Thumbnail sprite info
@@ -489,27 +543,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     }
                 };
 
-                // Embed the selected quality in the playlist URL so the server
+                // Embed the selected quality in the manifest URL so the server
                 // returns segment URLs for the correct quality level.
-                let playlist_url = format!(
-                    "/api/videos/{}/playlist.m3u8?quality={}",
+                let manifest_url = format!(
+                    "/api/videos/{}/manifest.mpd?quality={}",
                     video_id, quality
                 );
-
-                // Check if the browser has native HLS support (Safari)
-                if !video
-                    .can_play_type("application/vnd.apple.mpegurl")
-                    .is_empty()
-                {
-                    // Safari: use native HLS
-                    video.set_src(&playlist_url);
-                    status_clone.set(String::new());
-                    if start_pos > 0.0 {
-                        video.set_current_time(start_pos);
-                    }
-                    let _ = video.play();
-                    return;
-                }
 
                 // Create a MediaSource (also verifies MSE is available in this browser).
                 let media_source = match web_sys::MediaSource::new() {
@@ -537,7 +576,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 status_clone.set("Loading stream…".to_string());
 
                 // All SourceBuffer setup must happen inside the sourceopen callback.
-                let playlist_url_for_open = playlist_url.clone();
+                let manifest_url_for_open = manifest_url.clone();
                 let video_for_open = video.clone();
                 let status_for_open = status_clone.clone();
                 let error_for_open = error_clone.clone();
@@ -546,7 +585,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 let object_url_for_open = object_url.clone();
 
                 let sourceopen_cb = Closure::once(Box::new(move || {
-                    let playlist_url = playlist_url_for_open;
+                    let manifest_url = manifest_url_for_open;
                     let video = video_for_open;
                     let status = status_for_open;
                     let error = error_for_open;
@@ -555,45 +594,39 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     let object_url = object_url_for_open;
 
                     spawn_local(async move {
-                        // Fetch the M3U8 playlist.
-                        let resp = match Request::get(&playlist_url).send().await {
+                        // Fetch the DASH MPD manifest.
+                        let resp = match Request::get(&manifest_url).send().await {
                             Ok(r) => r,
                             Err(e) => {
-                                error.set(Some(format!("Failed to fetch playlist: {e:?}")));
+                                error.set(Some(format!("Failed to fetch manifest: {e:?}")));
                                 return;
                             }
                         };
                         let text = match resp.text().await {
                             Ok(t) => t,
                             Err(e) => {
-                                error.set(Some(format!("Failed to read playlist: {e:?}")));
+                                error.set(Some(format!("Failed to read manifest: {e:?}")));
                                 return;
                             }
                         };
 
-                        // Parse segment list.
-                        let segments = parse_m3u8(&text, &playlist_url);
+                        // Parse segment list from MPD.
+                        let (init_url, segments) = parse_mpd(&text);
                         if segments.is_empty() {
-                            error.set(Some("Playlist contains no segments.".to_string()));
+                            error.set(Some("Manifest contains no segments.".to_string()));
+                            return;
+                        }
+                        if init_url.is_empty() {
+                            error.set(Some("Manifest missing init segment URL.".to_string()));
                             return;
                         }
 
-                        // Pick a MIME type. Chrome/Firefox do not support video/mp2t
-                        // via MSE, so we check first and fall back to video/mp4.
-                        // The codec string matches the server's output: H.264 Baseline
-                        // profile (avc1.42E01E) + AAC-LC (mp4a.40.2), which covers
-                        // all three server paths (remux, hybrid, transcode).
-                        let ts_mime = "video/mp2t; codecs=\"avc1.42E01E,mp4a.40.2\"";
-                        let mime = if segments[0].url.contains(".ts")
-                            && web_sys::MediaSource::is_type_supported(ts_mime)
-                        {
-                            ts_mime.to_string()
-                        } else {
-                            "video/mp4".to_string()
-                        };
+                        // fMP4 segments use video/mp4 MIME type with codecs.
+                        // H.264 High Profile (avc1.64001F) + AAC-LC (mp4a.40.2).
+                        let mime = "video/mp4; codecs=\"avc1.64001F,mp4a.40.2\"";
 
                         // Create the SourceBuffer.
-                        let source_buffer = match media_source.add_source_buffer(&mime) {
+                        let source_buffer = match media_source.add_source_buffer(mime) {
                             Ok(sb) => sb,
                             Err(e) => {
                                 error.set(Some(format!(
@@ -603,10 +636,60 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
                         };
 
+                        // Fetch and append the init segment (ftyp+moov) first.
+                        let init_bytes = match Request::get(&init_url).send().await {
+                            Ok(r) => match r.binary().await {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    error.set(Some(format!("Failed to read init segment: {e:?}")));
+                                    return;
+                                }
+                            },
+                            Err(e) => {
+                                error.set(Some(format!("Failed to fetch init segment: {e:?}")));
+                                return;
+                            }
+                        };
+
+                        // Append the init segment to the SourceBuffer.
+                        let uint8_array = js_sys::Uint8Array::from(init_bytes.as_slice());
+                        let array_buffer = uint8_array.buffer();
+                        if source_buffer
+                            .append_buffer_with_array_buffer(&array_buffer)
+                            .is_err()
+                        {
+                            error.set(Some("Failed to append init segment.".to_string()));
+                            return;
+                        }
+
+                        // Wait for the init segment to be appended before proceeding.
+                        let sb_for_wait = source_buffer.clone();
+                        let init_done = Rc::new(Cell::new(false));
+                        let init_done_for_cb = init_done.clone();
+                        let updateend_cb = Closure::once(Box::new(move || {
+                            init_done_for_cb.set(true);
+                        }) as Box<dyn FnOnce()>);
+                        sb_for_wait
+                            .add_event_listener_with_callback(
+                                "updateend",
+                                updateend_cb.as_ref().unchecked_ref(),
+                            )
+                            .ok();
+                        updateend_cb.forget();
+
+                        // Poll until init segment is appended.
+                        for _ in 0..100 {
+                            if init_done.get() {
+                                break;
+                            }
+                            TimeoutFuture::new(10).await;
+                        }
+
+                        let total_segments = segments.len();
+
                         // Calculate which segment to start from when resuming.
                         let start_seg = if start_pos > 0.0 {
-                            let snapped = snap_to_cached_segment(start_pos);
-                            (snapped / SEGMENT_DURATION_F) as usize
+                            segment_for_time(start_pos)
                         } else {
                             0
                         };
@@ -617,13 +700,15 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             source_buffer,
                             object_url,
                             segments,
+                            init_url,
                             next_seg: start_seg,
                             is_appending: false,
+                            total_segments,
                         });
 
                         status.set(String::new());
                         if start_pos > 0.0 {
-                            video.set_current_time(snap_to_cached_segment(start_pos));
+                            video.set_current_time(start_pos);
                         }
 
                         // Kick off the segment pump.
@@ -782,8 +867,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                     let _ = mse.source_buffer.remove(0.0, remove_end);
                                 }
                             }
-                            let snapped = snap_to_cached_segment(current_time);
-                            mse.next_seg = (snapped / SEGMENT_DURATION_F) as usize;
+                            mse.next_seg = segment_for_time(current_time);
                             mse.is_appending = false;
                         }
                     }
@@ -893,7 +977,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         e.prevent_default();
                         let skip = if e.shift_key() { 10.0 } else { 5.0 };
                         let current = video.current_time();
-                        video.set_current_time(snap_to_cached_segment((current - skip).max(0.0)));
+                        video.set_current_time((current - skip).max(0.0));
                         skip_indicator.set(Some(("backward".to_string(), 25.0)));
                         let skip_indicator_clone = skip_indicator.clone();
                         spawn_local(async move {
@@ -904,7 +988,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     "j" | "J" => {
                         e.prevent_default();
                         let current = video.current_time();
-                        video.set_current_time(snap_to_cached_segment((current - 10.0).max(0.0)));
+                        video.set_current_time((current - 10.0).max(0.0));
                         skip_indicator.set(Some(("backward".to_string(), 25.0)));
                         let skip_indicator_clone = skip_indicator.clone();
                         spawn_local(async move {
@@ -918,7 +1002,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         let skip = if e.shift_key() { 10.0 } else { 5.0 };
                         let dur = video.duration();
                         if dur.is_finite() {
-                            video.set_current_time(snap_to_cached_segment((video.current_time() + skip).min(dur)));
+                            video.set_current_time((video.current_time() + skip).min(dur));
                         }
                         skip_indicator.set(Some(("forward".to_string(), 75.0)));
                         let skip_indicator_clone = skip_indicator.clone();
@@ -931,7 +1015,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         e.prevent_default();
                         let dur = video.duration();
                         if dur.is_finite() {
-                            video.set_current_time(snap_to_cached_segment((video.current_time() + 10.0).min(dur)));
+                            video.set_current_time((video.current_time() + 10.0).min(dur));
                         }
                         skip_indicator.set(Some(("forward".to_string(), 75.0)));
                         let skip_indicator_clone = skip_indicator.clone();
@@ -992,7 +1076,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         let num: f64 = key.parse().unwrap_or(0.0);
                         let dur = video.duration();
                         if dur.is_finite() {
-                            video.set_current_time(snap_to_cached_segment(dur * (num / 10.0)));
+                            video.set_current_time(dur * (num / 10.0));
                         }
                     }
                     // < and > - Decrease/Increase playback speed
@@ -1213,7 +1297,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     };
 
     // Quality selection — saves preference to localStorage and reinitialises
-    // HLS at the new quality level, resuming from the current playback position.
+    // the DASH stream at the new quality level, resuming from the current playback position.
     let on_quality_select = {
         let selected_quality = selected_quality.clone();
         let quality_menu_open = quality_menu_open.clone();
@@ -1379,7 +1463,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 let seek_time = shared_seek_time_up.get();
 
                 if let Some(video) = video_ref_up.cast::<HtmlVideoElement>() {
-                    video.set_current_time(snap_to_cached_segment(seek_time));
+                    video.set_current_time(seek_time);
                 }
 
                 if let Some((mousemove_closure, mouseup_closure)) =
@@ -1429,7 +1513,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     if let Some((seek_time, _)) =
                         calculate_seek_time(&e, &progress_el, video_duration)
                     {
-                        video.set_current_time(snap_to_cached_segment(seek_time));
+                        video.set_current_time(seek_time);
                     }
                 }
             }
@@ -1475,7 +1559,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     if relative_x < width / 3.0 {
                         // Left third - seek backward 10 seconds
                         let current = video.current_time();
-                        video.set_current_time(snap_to_cached_segment((current - 10.0).max(0.0)));
+                        video.set_current_time((current - 10.0).max(0.0));
                         skip_indicator.set(Some(("backward".to_string(), 25.0)));
                         let skip_indicator_clone = skip_indicator.clone();
                         spawn_local(async move {
@@ -1486,7 +1570,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         // Right third - seek forward 10 seconds
                         let dur = video.duration();
                         if dur.is_finite() {
-                            video.set_current_time(snap_to_cached_segment((video.current_time() + 10.0).min(dur)));
+                            video.set_current_time((video.current_time() + 10.0).min(dur));
                         }
                         skip_indicator.set(Some(("forward".to_string(), 75.0)));
                         let skip_indicator_clone = skip_indicator.clone();

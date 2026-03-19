@@ -623,11 +623,6 @@ async fn pump_loop(
         // This avoids the issue where video.buffered() returns empty
         // ranges immediately after a seek, causing the pump to fetch all
         // segments at once.
-        // if we should sleep or fetch the next segment.
-        //
-        // This avoids the issue where video.buffered() returns empty
-        // ranges immediately after a seek+flush, causing the pump to
-        // hammer the server with all remaining segments.
         if let Some(last_seg) = last_appended {
             let buffered_to = (last_seg as f64 + 1.0) * SEGMENT_DURATION_F;
             let current = video.current_time();

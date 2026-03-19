@@ -544,10 +544,15 @@ pub fn create_init_segment(abs_path: &str, quality: Quality, hwaccel: &HwAccel) 
         let _ = std::fs::create_dir_all(&tmp_dir);
 
         // Generate segment 0 to get the init segment.
-        // `create_segment` picks the correct path (remux / hybrid /
-        // transcode) based on the quality and source compatibility,
-        // so the resulting ftyp+moov will have the exact codec params
-        // that all subsequent media segments will use.
+        // `create_segment` picks the correct path based on quality and
+        // source compatibility:
+        //   - pure remux  (source_is_remuxable) — copies all packets
+        //   - hybrid      (video_is_remuxable)  — copies video, AAC audio
+        //   - transcode   (otherwise)           — re-encodes everything
+        // The resulting ftyp+moov will have the exact codec params that
+        // all subsequent media segments will use, avoiding the mismatch
+        // that previously occurred in the hybrid case (init had original
+        // audio params but media segments had AAC stereo).
         let seg0_path = tmp_dir.join("seg_00000.m4s");
         if !seg0_path.exists() {
             create_segment(abs_path, &tmp_dir, 0, hwaccel, quality, None)?;

@@ -43,14 +43,42 @@ const CONTROL_HIDE_TIMEOUT_MS: f64 = 5000.0;
 const CONTROLS_VICINITY_PX: f64 = 80.0;
 
 // ── MSE player constants ─────────────────────────────────────────────────────
+//
+// These constants mirror the defaults used by well-known DASH/MSE reference
+// implementations:
+//
+//  • dash.js (DASH-IF reference client)
+//    ScheduleController — bufferTimeDefault = 12 s, stableBufferTime = 12 s,
+//    bufferToKeep = 20 s.  Buffer gate: fetch when
+//    `bufferLevel + segmentDuration < bufferTarget`.
+//    Source: https://github.com/Dash-Industry-Forum/dash.js
+//    Docs:   https://dashif.org/dash.js/pages/usage/buffer-management.html
+//
+//  • Shaka Player (Google)
+//    StreamingEngine — bufferingGoal = 10 s, bufferBehind = 30 s,
+//    rebufferingGoal = 2 s.  Buffer gate via `getBufferAhead_()`.
+//    Source: https://github.com/shaka-project/shaka-player
+//    Docs:   https://shaka-player-demo.appspot.com/docs/api/tutorial-network-and-buffering-config.html
+//
+//  • hls.js (video-dev)
+//    BufferController — maxBufferLength = 30 s, maxBufferHole = 0.1 s,
+//    backBufferLength = 30 s.
+//    Source: https://github.com/video-dev/hls.js
+//    Docs:   https://github.com/video-dev/hls.js/blob/master/docs/API.md
+//
+//  • DASH-IF IOP v4.3 §3.2.3 (buffer model), §3.2.4 (seeking), §3.2.8
+//    (buffer management & eviction).
+//    Spec:   https://dashif.org/docs/DASH-IF-IOP-v4.3.pdf
+
 /// Target seconds of video to keep buffered ahead of the playback position.
-/// Per DASH-IF IOP v4.3 §3.2.3 the client should maintain a buffer of
-/// at least a few segments ahead; 30 s is a comfortable default.
+/// dash.js uses 12 s by default; Shaka Player 10 s; hls.js 30 s.
+/// 30 s gives a comfortable margin for VOD content.
 const MSE_TARGET_BUFFER_S: f64 = 30.0;
 
 /// Maximum seconds of already-played data to keep behind the playhead.
 /// Data older than this is evicted via `SourceBuffer.remove()` to bound
-/// memory usage (DASH-IF IOP v4.3 §3.2.8 — buffer management).
+/// memory usage.  Shaka Player's `bufferBehind` default is 30 s; hls.js's
+/// `backBufferLength` is also 30 s.  dash.js's `bufferToKeep` is 20 s.
 const MSE_BACK_BUFFER_S: f64 = 30.0;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -294,6 +322,11 @@ fn parse_iso8601_duration(s: &str) -> f64 {
 /// contains [ftyp][moov][moof][mdat].  The init segment (ftyp+moov) has already
 /// been appended to the SourceBuffer, so media segments must only contain
 /// moof+mdat to avoid confusing the browser's MSE implementation.
+///
+/// This is the same pattern used by all major DASH clients — dash.js, Shaka
+/// Player, and hls.js all separate init segments from media segments before
+/// appending to the SourceBuffer.  Per ISO BMFF (ISO 14496-12), the moov box
+/// must only appear once in the SourceBuffer initialization.
 fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
     let mut result = Vec::new();
     let mut pos = 0usize;
@@ -326,6 +359,11 @@ fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
 /// the SourceBuffer's buffered time ranges.  Used by the pump to skip segments
 /// that don't need to be re-fetched (e.g. after a backward seek or Firefox's
 /// multiple `seeking` events).
+///
+/// Shaka Player's `StreamingEngine` performs a similar check via
+/// `getBufferAhead_()` before scheduling a segment fetch — if the data is
+/// already buffered, the fetch is skipped.  dash.js's `BufferController`
+/// also checks `getBufferRange()` before requesting segments.
 fn is_seg_buffered(sb: &web_sys::SourceBuffer, seg_idx: usize) -> bool {
     let mid = (seg_idx as f64 + 0.5) * SEGMENT_DURATION_F;
     let ranges = match sb.buffered() {
@@ -368,9 +406,17 @@ async fn wait_for_sb(
 
 /// Evict played data behind the playhead to bound memory usage.
 ///
-/// Per DASH-IF IOP v4.3 §3.2.8 the client should manage its buffer to
-/// avoid unbounded growth.  We keep up to `MSE_BACK_BUFFER_S` seconds
-/// behind the current playback position and remove everything before that.
+/// All major DASH clients implement back-buffer eviction:
+///   • Shaka Player: `bufferBehind` (default 30 s) — evicts via
+///     `MediaSourceEngine.remove()` in `StreamingEngine.evict_()`.
+///   • dash.js: `bufferToKeep` (default 20 s) — evicts in
+///     `BufferController.pruneBuffer()`.
+///   • hls.js: `backBufferLength` (default 30 s) — evicts in
+///     `BufferController.onBufferFlushing()`.
+///   • DASH-IF IOP v4.3 §3.2.8 recommends proactive buffer management.
+///
+/// We keep up to `MSE_BACK_BUFFER_S` seconds behind the current playback
+/// position and remove everything before that via `SourceBuffer.remove()`.
 async fn evict_back_buffer(
     sb: &web_sys::SourceBuffer,
     video: &HtmlVideoElement,
@@ -413,7 +459,9 @@ async fn evict_back_buffer(
 /// Start (or restart) the async segment-pump loop.
 ///
 /// Bumps `pump_gen` so any previously-running `pump_loop` detects the
-/// mismatch on its next generation check and exits cleanly.
+/// mismatch on its next generation check and exits cleanly.  This is
+/// analogous to dash.js aborting in-flight XHR requests on seek, and
+/// Shaka Player's `StreamingEngine.seeked()` which resets the update cycle.
 ///
 /// Call sites:
 /// - MSE initialisation (after the init segment is appended)
@@ -445,7 +493,15 @@ fn start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElement) {
 
 /// Sequential async loop that fetches and appends DASH fMP4 segments.
 ///
-/// Implements the DASH-IF IOP v4.3 §3.2 client model:
+/// This is the core scheduling loop, analogous to:
+///   • dash.js `ScheduleController.schedule()` — decides when to fetch the
+///     next segment based on buffer level vs. target.
+///   • Shaka Player `StreamingEngine.update_()` — periodically checks buffer
+///     and fetches segments to keep `bufferingGoal` seconds ahead.
+///   • hls.js `StreamController.doTick()` — main loop that drives segment
+///     fetching and appending.
+///
+/// Steps per iteration (per DASH-IF IOP v4.3 §3.2):
 ///   1. Determine the next segment needed (skip already-buffered ones).
 ///   2. Enforce a forward buffer limit — sleep when enough data is buffered.
 ///   3. Evict old played data behind the playhead to bound memory.
@@ -500,9 +556,15 @@ async fn pump_loop(
         };
 
         // ── 3. Buffer-ahead gate ─────────────────────────────────────
-        // Use the segment's timeline position to throttle fetching.
-        // This is deterministic and doesn't depend on PTS correctness
-        // or `video.buffered()` reflecting appended data accurately.
+        // Modelled after dash.js ScheduleController's check:
+        //   `if (bufferLevel + segmentDuration > bufferTarget) sleep`
+        // and Shaka Player's StreamingEngine `getBufferAhead_()`.
+        //
+        // We use the segment's timeline position rather than querying
+        // `video.buffered()` because the buffered ranges may not
+        // accurately reflect appended data when PTS offsets are wrong
+        // (a known issue with fMP4 in MSE Segments mode).  The
+        // segment-index approach is deterministic.
         //
         // The segment at `seg_idx` covers approximately
         // [seg_idx × 6, (seg_idx + 1) × 6).  If the END of this segment
@@ -841,12 +903,15 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         }
 
                         // fMP4 segments use video/mp4 MIME type with codecs.
-                        // Try multiple H.264 profile/level + audio codec
-                        // combinations via isTypeSupported() to find one this
-                        // browser accepts.  The init segment provides the real
-                        // codec parameters; the MIME string here just needs to
-                        // be permissive enough for the browser to create the
-                        // decoder pipeline.
+                        // dash.js and Shaka Player read the codec string from
+                        // the MPD's Representation@codecs attribute.  Since our
+                        // MPD doesn't include codecs, we probe the browser with
+                        // isTypeSupported() — similar to how hls.js probes
+                        // codec support in BufferController before creating
+                        // SourceBuffers.
+                        //
+                        // Ref: https://github.com/video-dev/hls.js/blob/master/src/controller/buffer-controller.ts
+                        // Ref: https://github.com/Dash-Industry-Forum/dash.js (TextController codec probing)
                         let mime_candidates = [
                             "video/mp4; codecs=\"avc1.640029,mp4a.40.2\"",  // H.264 High L4.1, AAC-LC
                             "video/mp4; codecs=\"avc1.64001F,mp4a.40.2\"",  // H.264 High L3.1, AAC-LC
@@ -858,7 +923,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         ];
                         let mime = mime_candidates.iter()
                             .find(|m| web_sys::MediaSource::is_type_supported(m))
-                            .unwrap_or(&"video/mp4");
+                            .or(mime_candidates.last())
+                            .unwrap();
+                        log::info!("MSE: using MIME type: {mime}");
 
                         // Create the SourceBuffer.
                         let source_buffer = match media_source.add_source_buffer(mime) {
@@ -871,11 +938,15 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
                         };
 
-                        // Use default "segments" mode: the browser places
+                        // Use default "segments" mode — the browser places
                         // each fragment at the position indicated by its PTS.
-                        // The backend produces continuous PTS (seg N starts at
-                        // N × 6s) which enables random-access seeking per
-                        // DASH-IF IOP v4.3 §3.2.
+                        // This is the same mode used by dash.js, Shaka Player,
+                        // and hls.js for fMP4/CMAF content.  The backend
+                        // produces continuous PTS (seg N starts at N × 6s)
+                        // which enables random-access seeking per DASH-IF IOP
+                        // v4.3 §3.2.  Do NOT use "sequence" mode — it breaks
+                        // random-access seeking since the browser ignores PTS
+                        // and chains fragments end-to-end.
 
                         // Set the total presentation duration from the MPD so
                         // the browser knows the full video length.
@@ -1135,13 +1206,22 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         });
     }
 
-    // Handle seeks — per DASH-IF IOP v4.3 §3.2.4 the client should:
-    // 1. React on the `seeking` event (not `seeked` — reacting earlier
-    //    avoids loading intermediate segments).
-    // 2. If the seek target is already buffered, let normal playback
-    //    continue and just ensure the pump will keep filling ahead.
-    // 3. If the seek target is NOT buffered, cancel the current pump,
-    //    point `next_seg` at the target, and start a fresh pump.
+    // Handle seeks — modelled after how major DASH clients react to seeks:
+    //
+    //  • dash.js: PlaybackController listens for the `seeking` event, aborts
+    //    any in-flight segment requests, resets BufferController, and
+    //    reschedules downloads from the new position.
+    //    Source: dash.js/src/streaming/controllers/PlaybackController.js
+    //
+    //  • Shaka Player: `Player.onSeeking_()` cancels outstanding segment
+    //    requests and calls `StreamingEngine.seeked()` which clears its
+    //    internal state and restarts the update cycle from the new position.
+    //    Source: shaka-player/lib/player.js
+    //
+    //  • DASH-IF IOP v4.3 §3.2.4 — the client should react on the `seeking`
+    //    event (not `seeked` — reacting earlier avoids fetching intermediate
+    //    segments).  If the target is already buffered, continue; otherwise
+    //    cancel the current download and start from the target segment.
     //
     // Firefox fires `seeking` up to 7 times for a single user seek, so
     // we only bump the pump generation when `next_seg` actually changes.

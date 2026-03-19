@@ -122,14 +122,10 @@ struct MseState {
     object_url: String,
     /// Parsed segment list from the DASH MPD manifest.
     segments: Vec<SegmentInfo>,
-    /// Init segment URL for the fMP4 stream.
-    init_url: String,
     /// Index of the next segment to fetch.
     next_seg: usize,
     /// True while `SourceBuffer.appendBuffer` is in progress.
     is_appending: bool,
-    /// Total number of segments (from MPD).
-    total_segments: usize,
 }
 
 /// Parse a DASH MPD manifest and return the list of segment URLs with durations.
@@ -685,8 +681,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             TimeoutFuture::new(10).await;
                         }
 
-                        let total_segments = segments.len();
-
                         // Calculate which segment to start from when resuming.
                         let start_seg = if start_pos > 0.0 {
                             segment_for_time(start_pos)
@@ -700,10 +694,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             source_buffer,
                             object_url,
                             segments,
-                            init_url,
                             next_seg: start_seg,
                             is_appending: false,
-                            total_segments,
                         });
 
                         status.set(String::new());

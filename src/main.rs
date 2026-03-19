@@ -1996,7 +1996,7 @@ async fn get_manifest(
     mpd.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     mpd.push_str(&format!(
         "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" \
-         profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\" \
+         profiles=\"urn:mpeg:dash:profile:isoff-live:2011\" \
          type=\"static\" \
          mediaPresentationDuration=\"{pt_duration}\" \
          minBufferTime=\"PT2S\">\n"
@@ -2022,15 +2022,24 @@ async fn get_manifest(
         quality = quality.as_str()
     ));
 
-    // Build SegmentTimeline
+    // Build SegmentTimeline — use the `r` (repeat) attribute per DASH-IF IOP
+    // to compress identical-duration segments into a single <S> element.
     mpd.push_str("          <SegmentTimeline>\n");
-    for i in 0..num_segments {
-        let seg_start = i as f64 * SEGMENT_DURATION;
-        let seg_duration_ms = if i == num_segments - 1 {
-            ((duration - seg_start) * 1000.0) as u64
-        } else {
-            (SEGMENT_DURATION * 1000.0) as u64
-        };
+    let normal_duration_ms = (SEGMENT_DURATION * 1000.0) as u64;
+    if num_segments > 1 {
+        // All segments except the last share the same duration.
+        let repeats = num_segments - 2; // r= means (repeats) additional occurrences
+        mpd.push_str(&format!(
+            "            <S d=\"{normal_duration_ms}\" r=\"{repeats}\"/>\n"
+        ));
+        // Last segment may be shorter.
+        let last_start = (num_segments - 1) as f64 * SEGMENT_DURATION;
+        let last_duration_ms = ((duration - last_start) * 1000.0).max(1.0) as u64;
+        mpd.push_str(&format!(
+            "            <S d=\"{last_duration_ms}\"/>\n"
+        ));
+    } else if num_segments == 1 {
+        let seg_duration_ms = (duration * 1000.0).max(1.0) as u64;
         mpd.push_str(&format!(
             "            <S d=\"{seg_duration_ms}\"/>\n"
         ));

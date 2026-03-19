@@ -432,39 +432,102 @@ fn encode_audio_frame(
 
 // ── fMP4 muxer helper ────────────────────────────────────────────────────────
 
-/// Create an fMP4 (CMAF) output context.
+/// movflags value for fragmented MP4 / CMAF output.
 ///
-/// Returns a plain mp4 output context.  The actual fragmented-MP4 flags
-/// (`empty_moov`, `frag_keyframe`, `default_base_moof`) are applied later
-/// by [`write_fmp4_header`] which passes them through the
-/// `avformat_write_header` options dictionary — the only fully reliable
-/// method across all FFmpeg / ffmpeg-next versions.
+/// - `empty_moov`  — write ftyp+moov with no sample tables (init segment).
+/// - `frag_keyframe` — start a new moof at each keyframe.
+/// - `default_base_moof` — make every moof self-contained (DASH/CMAF required).
+const FMP4_MOVFLAGS: &str = "empty_moov+frag_keyframe+default_base_moof";
+
+/// Create an fMP4 (CMAF) output context with `movflags` applied.
+///
+/// Uses three redundant methods to ensure the mp4 muxer enters fragmented
+/// mode — production FFmpeg configurations vary in which method they respect:
+///
+/// 1. `av_opt_set` directly on `priv_data` (MOVMuxContext)
+/// 2. `av_opt_set` on the `AVFormatContext` with `AV_OPT_SEARCH_CHILDREN`
+///
+/// The subsequent [`write_fmp4_header`] provides a third method: passing the
+/// flags through the `avformat_write_header` options dictionary.
 fn create_fmp4_output(tmp_path: &Path) -> Result<ffmpeg_next::format::context::Output, String> {
-    ffmpeg_next::format::output_as(tmp_path, "mp4")
-        .map_err(|e| format!("output context: {e}"))
+    let mut octx = ffmpeg_next::format::output_as(tmp_path, "mp4")
+        .map_err(|e| format!("output context: {e}"))?;
+
+    unsafe {
+        let key = std::ffi::CString::new("movflags").unwrap();
+        let val = std::ffi::CString::new(FMP4_MOVFLAGS).unwrap();
+
+        // ── Method 1: set directly on priv_data ──────────────────────────
+        let pd = (*octx.as_mut_ptr()).priv_data;
+        if !pd.is_null() {
+            ffmpeg_next::ffi::av_opt_set(pd, key.as_ptr(), val.as_ptr(), 0);
+        }
+
+        // ── Method 2: set via format context with AV_OPT_SEARCH_CHILDREN ─
+        // AV_OPT_SEARCH_CHILDREN = 0x0001 — searches child objects
+        // (includes priv_data) through the AVClass hierarchy.
+        ffmpeg_next::ffi::av_opt_set(
+            octx.as_mut_ptr() as *mut std::ffi::c_void,
+            key.as_ptr(),
+            val.as_ptr(),
+            1, // AV_OPT_SEARCH_CHILDREN
+        );
+    }
+
+    Ok(octx)
 }
 
-/// Write the fMP4 header with the correct movflags via `avformat_write_header`.
+/// Write the fMP4 header, passing `movflags` through the dictionary as well.
 ///
-/// This passes `movflags=empty_moov+frag_keyframe+default_base_moof` through
-/// the options dictionary so the mp4 muxer initialises in fragmented mode.
-/// Must be called exactly once after all streams have been added.
+/// Belt-and-suspenders: even though [`create_fmp4_output`] already set the
+/// flags on `priv_data`, we also pass them via the `avformat_write_header`
+/// options dictionary so `init_muxer` can apply them a second time.
+///
+/// After writing, reads back the movflags value to verify fragmented mode
+/// is active and logs a diagnostic if it isn't.
 fn write_fmp4_header(octx: &mut ffmpeg_next::format::context::Output) -> Result<(), String> {
     unsafe {
         let mut dict: *mut ffmpeg_next::ffi::AVDictionary = std::ptr::null_mut();
 
         let key = std::ffi::CString::new("movflags").unwrap();
-        let val = std::ffi::CString::new("empty_moov+frag_keyframe+default_base_moof").unwrap();
+        let val = std::ffi::CString::new(FMP4_MOVFLAGS).unwrap();
         ffmpeg_next::ffi::av_dict_set(&mut dict, key.as_ptr(), val.as_ptr(), 0);
 
         let ret = ffmpeg_next::ffi::avformat_write_header(octx.as_mut_ptr(), &mut dict);
         ffmpeg_next::ffi::av_dict_free(&mut dict);
 
         if ret < 0 {
-            Err(format!("write header (fMP4): error {ret}"))
-        } else {
-            Ok(())
+            return Err(format!("write header (fMP4): error {ret}"));
         }
+
+        // ── Diagnostic: verify movflags were applied ─────────────────────
+        let pd = (*octx.as_mut_ptr()).priv_data;
+        if !pd.is_null() {
+            let mut out_val: *mut std::os::raw::c_char = std::ptr::null_mut();
+            let probe_key = std::ffi::CString::new("movflags").unwrap();
+            let get_ret = ffmpeg_next::ffi::av_opt_get(
+                pd,
+                probe_key.as_ptr(),
+                0,
+                &mut out_val,
+            );
+            if get_ret >= 0 && !out_val.is_null() {
+                let flags_str = std::ffi::CStr::from_ptr(out_val).to_string_lossy();
+                if !flags_str.contains("empty_moov") {
+                    eprintln!(
+                        "[fmp4] WARNING: movflags readback = '{}' — empty_moov NOT set!",
+                        flags_str
+                    );
+                }
+                ffmpeg_next::ffi::av_free(out_val as *mut std::ffi::c_void);
+            } else {
+                eprintln!(
+                    "[fmp4] WARNING: av_opt_get movflags failed (ret={get_ret})"
+                );
+            }
+        }
+
+        Ok(())
     }
 }
 

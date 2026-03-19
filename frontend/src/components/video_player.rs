@@ -576,7 +576,7 @@ async fn pump_loop(
         // ── 6. Strip init boxes & append ─────────────────────────────
         let media_bytes = strip_init_boxes(&bytes);
         if media_bytes.is_empty() {
-            log::warn!("segment {seg_idx}: no media data after stripping init boxes ({} bytes in)", bytes.len());
+            log::warn!("segment {seg_idx}: no media data after stripping init boxes (original size: {} bytes)", bytes.len());
             // Advance past this empty segment and try the next one.
             if let Some(s) = state.borrow_mut().as_mut() {
                 if s.pump_gen == pump_id {
@@ -1294,16 +1294,28 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             };
 
                             // Wait for SourceBuffer to finish any pending op.
-                            while sb.updating() {
+                            // Timeout after 2 seconds to avoid infinite loops.
+                            for _ in 0..400 {
+                                if !sb.updating() { break; }
                                 TimeoutFuture::new(5).await;
                             }
 
                             // Abort + remove all buffered data.
+                            // Use duration (or 0) as the end bound — some
+                            // browsers reject extremely large values.
                             let _ = sb.abort();
-                            let _ = sb.remove(0.0, f64::MAX);
+                            let remove_end = {
+                                let borrow = mse_state_c.borrow();
+                                borrow.as_ref()
+                                    .map(|s| s.media_source.duration())
+                                    .filter(|d| d.is_finite() && *d > 0.0)
+                                    .unwrap_or(86400.0)
+                            };
+                            let _ = sb.remove(0.0, remove_end);
 
-                            // Wait for the remove to complete.
-                            while sb.updating() {
+                            // Wait for the remove to complete (timeout 2 s).
+                            for _ in 0..400 {
+                                if !sb.updating() { break; }
                                 TimeoutFuture::new(5).await;
                             }
 

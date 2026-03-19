@@ -1,6 +1,6 @@
 # Starfin
 
-A self-hosted media server written in Rust, inspired by Jellyfin. Built for performance — hardware-accelerated transcoding, adaptive HLS streaming, and a WebAssembly frontend served from a single binary.
+A self-hosted media server written in Rust, inspired by Jellyfin. Built for performance — hardware-accelerated transcoding, adaptive DASH streaming, and a WebAssembly frontend served from a single binary.
 
 ---
 

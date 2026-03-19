@@ -376,7 +376,7 @@ fn pump_segments(state: Rc<RefCell<Option<MseState>>>, video: HtmlVideoElement) 
         };
 
         // Wait until the SourceBuffer is not updating (previous remove may
-        // still be in progress after a seek).
+        // still be in progress after a seek).  200 iterations × 5ms = 1s max.
         for _ in 0..200 {
             if !source_buffer.updating() {
                 break;
@@ -979,14 +979,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
 
                             // Unbuffered seek: point the pump at the seek target.
-                            // Only reset is_appending if nothing is in flight —
-                            // the persistent updateend listener will handle it.
                             mse.next_seg = target_seg;
-                            if !mse.is_appending {
-                                // Safe to kick the pump immediately.
-                            }
                         }
                     }
+                    // Kick the pump — if an append is in flight, pump_segments
+                    // will return immediately and the persistent updateend
+                    // listener will chain the next fetch at the new next_seg.
                     pump_segments(mse_state_for_seeked.clone(), video_for_seeked.clone());
                 });
 

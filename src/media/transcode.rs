@@ -512,41 +512,33 @@ fn write_fmp4_trailer(octx: &mut ffmpeg_next::format::context::Output) -> Result
 pub fn create_init_segment(abs_path: &str, quality: Quality, hwaccel: &HwAccel) -> Result<Vec<u8>, String> {
     super::ensure_init();
 
-    let mut ictx = ffmpeg_next::format::input(&abs_path)
+    let ictx = ffmpeg_next::format::input(&abs_path)
         .map_err(|e| format!("failed to open input: {e}"))?;
 
-    // If we need to transcode (non-remux quality or incompatible codecs),
-    // we generate a short transcode to get the init segment with proper
-    // encoder parameters.  For remux-compatible sources, we can extract
-    // codec params directly from the input.
-    let needs_transcode = if quality.can_remux() {
-        !source_is_remuxable(&ictx) && !video_is_remuxable(&ictx)
+    // If the source can be fully remuxed (both video and audio are
+    // browser-compatible), we can extract codec params directly from
+    // the input file header.  Otherwise we must generate segment 0
+    // and extract ftyp+moov from it so the init segment's codec params
+    // match what the media segments actually contain.
+    //
+    // The "hybrid" case (video_is_remuxable but NOT source_is_remuxable)
+    // needs segment-0 extraction because hybrid_segment() re-encodes
+    // audio to stereo AAC — the source file's audio params (e.g. 5.1
+    // AC3) would mismatch, causing Chrome's NotSupportedError.
+    let needs_transcode = if quality.can_remux() && source_is_remuxable(&ictx) {
+        false  // pure remux — codec params come from source
     } else {
-        true
+        true   // hybrid or full transcode — extract from segment 0
     };
 
     if needs_transcode {
-        // For transcode paths, generate segment 0 and extract init from it.
-        // The fMP4 segment 0 already contains ftyp+moov at the start.
+        // Generate segment 0 and extract ftyp+moov from it.
+        // This ensures the init segment's codec params match the media
+        // segments exactly (critical for the hybrid path where audio
+        // is re-encoded to stereo AAC).
         drop(ictx);
         let tmp_dir = std::env::temp_dir().join(format!("starfin_init_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp_dir);
-        let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
-
-        // Create a minimal segment to extract the init from.
-        let tmp_seg = tmp_dir.join("init_extract.mp4");
-        let mut ictx2 = ffmpeg_next::format::input(&abs_path)
-            .map_err(|e| format!("failed to open input for init: {e}"))?;
-
-        if source_is_remuxable(&ictx2) || video_is_remuxable(&ictx2) {
-            // Even though quality requires transcode, generate init from remux path
-            // for codec params — but actually we need the transcode codec params.
-            // Fall through to remux-based extraction and let the actual segment
-            // transcode handle the rest.
-            drop(ictx2);
-        } else {
-            drop(ictx2);
-        }
 
         // Generate segment 0 to get the init segment
         let seg0_path = tmp_dir.join("seg_00000.m4s");

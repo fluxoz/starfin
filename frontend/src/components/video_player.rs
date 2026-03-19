@@ -81,6 +81,12 @@ const MSE_TARGET_BUFFER_S: f64 = 30.0;
 /// `backBufferLength` is also 30 s.  dash.js's `bufferToKeep` is 20 s.
 const MSE_BACK_BUFFER_S: f64 = 30.0;
 
+/// Maximum gap size (in seconds) that will be automatically jumped over.
+/// dash.js GapController uses `smallGapLimit = 0.8` by default.
+/// Shaka Player uses 0.5 s.  We use 0.8 to match dash.js.
+/// Ref: dash.js/src/streaming/controllers/GapController.js `_jumpGap()`
+const SMALL_GAP_LIMIT_S: f64 = 0.8;
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn format_time(seconds: f64) -> String {
@@ -118,6 +124,43 @@ fn is_time_buffered(video: &HtmlVideoElement, time: f64) -> bool {
     for i in 0..buffered.length() {
         if let (Ok(s), Ok(e)) = (buffered.start(i), buffered.end(i)) {
             if time >= s && time <= e {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Gap-jumping helper modelled after dash.js `GapController._jumpGap()`.
+///
+/// When the playhead is stalled just before a small gap between buffered
+/// ranges, this function nudges `currentTime` past the gap so playback
+/// resumes without a visible stutter.
+///
+/// dash.js `GapController._jumpGap()`:
+///   1. Finds the first buffered range whose start is ahead of `currentTime`.
+///   2. If the gap (range.start − currentTime) is ≤ `smallGapLimit`, seeks
+///      past it.
+///
+/// Returns `true` if a gap was jumped, `false` otherwise.
+fn try_jump_gap(video: &HtmlVideoElement) -> bool {
+    let current = video.current_time();
+    let buffered = video.buffered();
+    let len = buffered.length();
+    for i in 0..len {
+        if let (Ok(start), Ok(_end)) = (buffered.start(i), buffered.end(i)) {
+            // Ignore ranges that start before/at the current position and
+            // gaps smaller than 1 ms (floating-point rounding noise).
+            let gap = start - current;
+            if gap > 0.001 && gap <= SMALL_GAP_LIMIT_S {
+                // Seek just past the gap boundary to avoid landing exactly
+                // on the edge (some browsers treat the exact boundary as
+                // still in the gap).
+                let target = start + 0.001;
+                log::info!(
+                    "GapController: jumping {gap:.3}s gap at {current:.3}s → {target:.3}s"
+                );
+                video.set_current_time(target);
                 return true;
             }
         }
@@ -1174,6 +1217,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     // Check if video ended
                     video_ended.set(video.ended());
 
+                    // Periodic gap-jump safety net (dash.js GapController
+                    // runs on a similar periodic interval).  Catches gaps
+                    // that don't always trigger the `waiting` event.
+                    if !video.paused() && !video.ended() && video.ready_state() <= 2 {
+                        try_jump_gap(&video);
+                    }
+
                     // Safety-net: restart the pump when it has exited
                     // (pump_running == false) but there are still segments
                     // to fetch and the buffer is below target.
@@ -1213,6 +1263,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
     // Detect buffering via waiting/playing events (NOT readyState polling,
     // which gives false positives during appendBuffer operations).
+    //
+    // The `waiting` handler also implements gap-jumping — modelled after
+    // dash.js `GapController`.  When playback stalls at a small gap between
+    // segments, we nudge the playhead past it.
     {
         let video_ref = video_ref.clone();
         let is_buffering = is_buffering.clone();
@@ -1222,8 +1276,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
             let waiting_cb = video_opt.as_ref().map(|video| {
                 let is_buffering = is_buffering.clone();
+                let video_for_gap = video.clone();
                 let cb = Closure::<dyn Fn()>::new(move || {
-                    is_buffering.set(true);
+                    // Try to jump over a small gap first (dash.js
+                    // GapController pattern).  Only show buffering spinner
+                    // if there's no jumpable gap.
+                    if !try_jump_gap(&video_for_gap) {
+                        is_buffering.set(true);
+                    }
                 });
                 video
                     .add_event_listener_with_callback("waiting", cb.as_ref().unchecked_ref())

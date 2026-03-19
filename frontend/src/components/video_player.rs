@@ -773,11 +773,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
                         };
 
-                        // Use "sequence" mode: the browser chains each appended
-                        // fragment at the end of the previous one, regardless of
-                        // in-fragment PTS values.  This is necessary because the
-                        // fMP4 segments may have per-segment PTS starting at 0.
-                        source_buffer.set_mode(web_sys::SourceBufferAppendMode::Sequence);
+                        // Use default "segments" mode: the browser places
+                        // each fragment at the position indicated by its PTS.
+                        // The backend produces continuous PTS (seg N starts at
+                        // N × 6s) which enables random-access seeking per
+                        // DASH-IF IOP v4.3 §3.2.
 
                         // Set the total presentation duration from the MPD so
                         // the browser knows the full video length.

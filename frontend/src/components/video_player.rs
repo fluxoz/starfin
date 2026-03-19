@@ -585,7 +585,7 @@ async fn pump_loop(
         if let Some(last_seg) = last_appended {
             let buffered_to = (last_seg as f64 + 1.0) * SEGMENT_DURATION_F;
             let current = video.current_time();
-            let buf_ahead = buffered_to - current;
+            let buf_ahead = (buffered_to - current).max(0.0);
             if buf_ahead >= MSE_TARGET_BUFFER_S {
                 // Enough data buffered ahead — sleep and re-check.
                 TimeoutFuture::new(500).await;
@@ -1192,7 +1192,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 let buf_ahead = match s.last_appended_seg {
                                     Some(last) => {
                                         let buffered_to = (last as f64 + 1.0) * SEGMENT_DURATION_F;
-                                        buffered_to - video.current_time()
+                                        (buffered_to - video.current_time()).max(0.0)
                                     }
                                     None => 0.0, // no segments appended yet → needs data
                                 };

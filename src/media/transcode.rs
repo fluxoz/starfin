@@ -989,17 +989,6 @@ fn remux_segment(
     let mut got_video_keyframe = false;
     // Actual PTS (in seconds) of the first video keyframe in this segment.
     let mut keyframe_pts_secs: f64 = start_time;
-    // PTS offsets (in output time base) used to rebase timestamps so that
-    // first-packet PTS is subtracted, then a segment-start offset is added,
-    // producing continuous PTS across the presentation (seg N starts at
-    // N × 6s).  This allows the browser to use MSE Segments mode for
-    // random-access seeking per DASH-IF IOP v4.3 §3.2.
-    let mut video_pts_offset: Option<i64> = None;
-    let mut audio_pts_offset: Option<i64> = None;
-
-    // Segment-start offsets in each output time base so PTS is continuous.
-    let seg_video_start = (start_time * out_video_tb.1 as f64 / out_video_tb.0 as f64) as i64;
-    let seg_audio_start = (start_time * out_audio_tb.1 as f64 / out_audio_tb.0 as f64) as i64;
 
     for (stream, mut packet) in ictx.packets() {
         if let Some(k) = kill {
@@ -1021,32 +1010,36 @@ fn remux_segment(
         let pts = packet.pts().unwrap_or(0);
         let pts_secs = pts as f64 * f64::from(in_tb.0) / f64::from(in_tb.1);
 
-        // Past segment end → done.
-        if pts_secs >= end_time {
-            break;
-        }
-
         if is_video {
-            // Accept the first keyframe found after the seek — this is the
-            // keyframe at or before start_time (placed there by the seek
-            // call above).  Including this keyframe and all subsequent
-            // frames through end_time ensures the segment has content that
-            // overlaps with the previous segment, eliminating timeline gaps.
+            // ── SAP-aligned segmentation (matches DASH packager behaviour) ──
             //
-            // In MSE Segments mode the browser de-duplicates overlapping
-            // data from consecutive segments via baseMediaDecodeTime, so
-            // the redundant frames are harmless.  The alternative (waiting
-            // for a keyframe >= start_time) creates gaps whenever the
-            // source keyframe interval doesn't divide evenly into 6 s.
+            // Each segment starts at the first keyframe (SAP) with PTS ≥
+            // start_time, and runs until the next keyframe with PTS ≥
+            // end_time (exclusive).  This produces non-overlapping segments
+            // that tile the timeline with no gaps, exactly like a real DASH
+            // packager (MP4Box, Bento4, Shaka Packager).
             //
-            // Ref: dash.js ScheduleController — real DASH packagers always
-            //      start each segment from a SAP (Stream Access Point).
+            // Previous approach started from the keyframe BEFORE start_time,
+            // causing multi-second overlap between consecutive segments.  The
+            // browser replaced already-buffered data on each append, creating
+            // visual stutter and timekeeping drift.
+            //
+            // Ref: DASH-IF IOP v4.3 §3.2.3 — "Each Segment shall start
+            //      with a Stream Access Point".
+            // Ref: dash.js ScheduleController — expects SAP-aligned segments.
             if !got_video_keyframe {
                 if !packet.is_key() {
                     continue;
                 }
+                // Skip keyframes before the nominal segment start.
+                if pts_secs < start_time {
+                    continue;
+                }
                 got_video_keyframe = true;
                 keyframe_pts_secs = pts_secs;
+            } else if packet.is_key() && pts_secs >= end_time {
+                // This keyframe starts the NEXT segment — stop here.
+                break;
             }
         } else {
             // Skip audio packets before the video keyframe region.
@@ -1056,35 +1049,16 @@ fn remux_segment(
         }
 
         // Map to the output stream and rescale timestamps.
+        // No PTS rebasing — original absolute PTS flows through.
+        // FFmpeg's fMP4 muxer normalises the first DTS to 0 internally;
+        // patch_segment_tfdt() then sets baseMediaDecodeTime to the actual
+        // keyframe position so the browser places content correctly.
         if is_video {
             packet.set_stream(out_video_idx);
             packet.rescale_ts(in_video_tb, out_video_tb);
-            // Record the first video DTS (or PTS) as the offset to rebase
-            // to zero, then add the segment-start offset for continuous PTS.
-            // Using DTS prevents negative DTS values for B-frame content
-            // where DTS < PTS on the first packet.
-            if video_pts_offset.is_none() {
-                video_pts_offset = packet.dts().or(packet.pts());
-            }
-            if let (Some(offset), Some(p)) = (video_pts_offset, packet.pts()) {
-                packet.set_pts(Some(p - offset + seg_video_start));
-            }
-            if let (Some(offset), Some(d)) = (video_pts_offset, packet.dts()) {
-                packet.set_dts(Some(d - offset + seg_video_start));
-            }
         } else if let Some(out_ai) = out_audio_idx_val {
             packet.set_stream(out_ai);
             packet.rescale_ts(in_audio_tb.unwrap(), out_audio_tb);
-            // Same rebase + segment-start offset for audio.
-            if audio_pts_offset.is_none() {
-                audio_pts_offset = packet.dts().or(packet.pts());
-            }
-            if let (Some(offset), Some(p)) = (audio_pts_offset, packet.pts()) {
-                packet.set_pts(Some(p - offset + seg_audio_start));
-            }
-            if let (Some(offset), Some(d)) = (audio_pts_offset, packet.dts()) {
-                packet.set_dts(Some(d - offset + seg_audio_start));
-            }
         } else {
             continue;
         }
@@ -1262,11 +1236,6 @@ fn hybrid_segment(
 
     let mut got_video_keyframe = false;
     let mut keyframe_pts_secs: f64 = start_time;
-    let mut video_pts_offset: Option<i64> = None;
-
-    // Segment-start offset for video in the output time base so PTS is
-    // continuous across segments (matches the audio_ts_offset below).
-    let seg_video_start = (start_time * out_video_tb.1 as f64 / out_video_tb.0 as f64) as i64;
 
     // Audio synthetic PTS (in 1/sample_rate time base).
     // Overwritten when the first video keyframe is found (below) so that
@@ -1295,40 +1264,30 @@ fn hybrid_segment(
         let pts = packet.pts().unwrap_or(0);
         let pts_secs = pts as f64 * f64::from(in_tb.0) / f64::from(in_tb.1);
 
-        // Past segment end → done.
-        if pts_secs >= end_time {
-            break;
-        }
-
         if is_video {
-            // Accept the first keyframe found after the seek — same
-            // rationale as remux_segment above.
+            // ── SAP-aligned segmentation (same as remux_segment) ────────
             if !got_video_keyframe {
                 if !packet.is_key() {
+                    continue;
+                }
+                if pts_secs < start_time {
                     continue;
                 }
                 got_video_keyframe = true;
                 keyframe_pts_secs = pts_secs;
                 // Recompute audio_ts_offset to match the actual keyframe
                 // position so audio and video share the same timeline
-                // origin.  This prevents the audio desync that occurs
-                // when keyframes land before the nominal segment boundary.
+                // origin.
                 audio_ts_offset =
                     (keyframe_pts_secs * audio_sample_rate as f64) as i64;
+            } else if packet.is_key() && pts_secs >= end_time {
+                // This keyframe starts the NEXT segment — stop here.
+                break;
             }
 
-            // Copy video packet directly (remux), adding continuous PTS.
+            // Copy video packet directly (remux) — no PTS rebasing.
             packet.set_stream(out_video_idx);
             packet.rescale_ts(in_video_tb, out_video_tb);
-            if video_pts_offset.is_none() {
-                video_pts_offset = packet.dts().or(packet.pts());
-            }
-            if let (Some(offset), Some(p)) = (video_pts_offset, packet.pts()) {
-                packet.set_pts(Some(p - offset + seg_video_start));
-            }
-            if let (Some(offset), Some(d)) = (video_pts_offset, packet.dts()) {
-                packet.set_dts(Some(d - offset + seg_video_start));
-            }
             let _ = packet.write_interleaved(&mut octx);
         } else if is_audio {
             // Skip audio before the video keyframe.
@@ -1349,16 +1308,16 @@ fn hybrid_segment(
                 }
                 let mut audio_frame = ffmpeg_next::util::frame::Audio::empty();
                 while adec.receive_frame(&mut audio_frame).is_ok() {
-                    // Time-range filter — use keyframe_pts_secs (not
-                    // start_time) as the lower bound so that audio begins
-                    // at the same point as the video keyframe.  This keeps
-                    // audio and video in sync when the keyframe precedes
-                    // the nominal segment boundary.
+                    // Time-range filter — use keyframe_pts_secs as the
+                    // lower bound so that audio begins at the same point
+                    // as the video keyframe.  No upper bound here; the
+                    // loop exits when the next video keyframe ≥ end_time
+                    // is encountered, which naturally limits audio too.
                     if let Some(apts) = audio_frame.pts() {
                         let apts_secs = apts as f64
                             * f64::from(audio_time_base.0)
                             / f64::from(audio_time_base.1);
-                        if apts_secs < keyframe_pts_secs || apts_secs >= end_time {
+                        if apts_secs < keyframe_pts_secs {
                             continue;
                         }
                     }

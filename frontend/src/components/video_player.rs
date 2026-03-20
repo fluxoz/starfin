@@ -86,7 +86,7 @@ const MSE_BACK_BUFFER_S: f64 = 30.0;
 /// dash.js GapController uses `smallGapLimit = 0.8` by default.
 /// Shaka Player uses 0.5 s.  We use 0.8 to match dash.js.
 /// Ref: dash.js/src/streaming/controllers/GapController.js `_jumpGap()`
-const SMALL_GAP_LIMIT_S: f64 = 0.8;
+const SMALL_GAP_LIMIT_S: f64 = 10.0;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 

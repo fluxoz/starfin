@@ -501,6 +501,125 @@ fn write_fmp4_trailer(octx: &mut ffmpeg_next::format::context::Output) -> Result
     }
 }
 
+// ── Post-processing: patch baseMediaDecodeTime in fMP4 segments ──────────────
+
+/// Patch the `tfdt` (Track Fragment Decode Time) boxes inside an fMP4 segment
+/// so that `baseMediaDecodeTime` contains the correct absolute presentation
+/// time for each track.
+///
+/// FFmpeg's mp4 muxer always normalises the first DTS in each fragment to 0
+/// (it subtracts `start_dts` internally).  This means every segment written
+/// by `write_interleaved` will have `baseMediaDecodeTime == 0` in the
+/// `moof/traf/tfdt` box, regardless of what PTS values we set on the packets.
+///
+/// DASH in MSE Segments mode relies on `baseMediaDecodeTime` (relative to the
+/// `moov.mdhd.timescale`) to position each fragment on the browser's media
+/// timeline.  Without patching, all segments stack at time 0 and playback is
+/// completely desynced.
+///
+/// `track_bmdt` maps track_id (1-based, matching `traf/tfhd`) to the desired
+/// `baseMediaDecodeTime` value in that track's timescale.
+fn patch_segment_tfdt(
+    path: &Path,
+    track_bmdt: &[(u32, i64)],
+) -> Result<(), String> {
+    let mut data = std::fs::read(path)
+        .map_err(|e| format!("patch_tfdt: read {}: {e}", path.display()))?;
+
+    let mut pos = 0usize;
+    while pos + 8 <= data.len() {
+        let box_size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        if box_size < 8 || pos + box_size > data.len() {
+            break;
+        }
+        let box_type = &data[pos + 4..pos + 8];
+
+        if box_type == b"moof" {
+            // Walk inside the moof to find each traf.
+            patch_moof(&mut data, pos + 8, pos + box_size, track_bmdt);
+        }
+
+        pos += box_size;
+    }
+
+    std::fs::write(path, &data)
+        .map_err(|e| format!("patch_tfdt: write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Walk through a `moof` box and patch `tfdt` inside each `traf`.
+fn patch_moof(data: &mut [u8], start: usize, end: usize, track_bmdt: &[(u32, i64)]) {
+    let mut pos = start;
+    while pos + 8 <= end {
+        let box_size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        if box_size < 8 || pos + box_size > end {
+            break;
+        }
+        let box_type = &data[pos + 4..pos + 8];
+
+        if box_type == b"traf" {
+            patch_traf(data, pos + 8, pos + box_size, track_bmdt);
+        }
+
+        pos += box_size;
+    }
+}
+
+/// Inside a `traf` box: read the `tfhd` to get track_id, then patch the `tfdt`.
+fn patch_traf(data: &mut [u8], start: usize, end: usize, track_bmdt: &[(u32, i64)]) {
+    // First pass: find track_id from tfhd.
+    let mut track_id: Option<u32> = None;
+    let mut pos = start;
+    while pos + 8 <= end {
+        let box_size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        if box_size < 8 || pos + box_size > end {
+            break;
+        }
+        if &data[pos + 4..pos + 8] == b"tfhd" && pos + 16 <= end {
+            // tfhd: 4-byte size, 4-byte type, 1-byte version, 3-byte flags, 4-byte track_id
+            track_id = Some(u32::from_be_bytes([
+                data[pos + 12], data[pos + 13], data[pos + 14], data[pos + 15],
+            ]));
+            break;
+        }
+        pos += box_size;
+    }
+
+    let tid = match track_id {
+        Some(t) => t,
+        None => return,
+    };
+
+    // Look up the desired baseMediaDecodeTime for this track.
+    let bmdt = match track_bmdt.iter().find(|(id, _)| *id == tid) {
+        Some((_, v)) => *v,
+        None => return,
+    };
+
+    // Second pass: find and patch tfdt.
+    pos = start;
+    while pos + 8 <= end {
+        let box_size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        if box_size < 8 || pos + box_size > end {
+            break;
+        }
+        if &data[pos + 4..pos + 8] == b"tfdt" {
+            let version = data[pos + 8];
+            if version == 1 && pos + 20 <= end {
+                // version 1: 8-byte baseMediaDecodeTime at offset 12
+                let bytes = (bmdt as u64).to_be_bytes();
+                data[pos + 12..pos + 20].copy_from_slice(&bytes);
+            } else if version == 0 && pos + 16 <= end {
+                // version 0: 4-byte baseMediaDecodeTime at offset 12
+                let bytes = (bmdt as u32).to_be_bytes();
+                data[pos + 12..pos + 16].copy_from_slice(&bytes);
+            }
+            return; // only one tfdt per traf
+        }
+        pos += box_size;
+    }
+}
+
 // ── Init segment extraction ──────────────────────────────────────────────────
 
 /// Extract the fMP4 init segment (ftyp + moov atoms) from a source video.
@@ -717,18 +836,12 @@ fn remux_segment(
     let out_audio_tb = out_audio_idx_val.map(|i| octx.stream(i).unwrap().time_base()).unwrap_or(out_audio_tb);
 
     let mut got_video_keyframe = false;
-    // PTS offsets (in output time base) used to rebase timestamps so that
-    // first-packet PTS is subtracted, then a segment-start offset is added,
-    // producing continuous PTS across the presentation (seg N starts at
-    // N × 6s).  This allows the browser to use MSE Segments mode for
-    // random-access seeking per DASH-IF IOP v4.3 §3.2.
-    let mut video_pts_offset: Option<i64> = None;
-    let mut audio_pts_offset: Option<i64> = None;
-
-    // Segment-start offsets in each output time base so PTS is continuous.
-    // Use round() to avoid accumulated truncation errors at non-integer boundaries.
-    let seg_video_start = (start_time * out_video_tb.1 as f64 / out_video_tb.0 as f64).round() as i64;
-    let seg_audio_start = (start_time * out_audio_tb.1 as f64 / out_audio_tb.0 as f64).round() as i64;
+    // Record the first DTS of each track (in the output time base) so we can
+    // patch the tfdt baseMediaDecodeTime after the muxer normalises to 0.
+    // We keep ABSOLUTE timestamps from the source — no rebasing — so that
+    // the frame content matches the player's timeline position exactly.
+    let mut video_first_dts: Option<i64> = None;
+    let mut audio_first_dts: Option<i64> = None;
 
     for (stream, mut packet) in ictx.packets() {
         if let Some(k) = kill {
@@ -757,11 +870,6 @@ fn remux_segment(
 
         if is_video {
             // Wait for the first keyframe at or after start_time.
-            // Only accept keyframes whose PTS is at or after the declared
-            // segment start so consecutive segments never share overlapping
-            // content.  Accepting a keyframe from *before* start_time would
-            // cause the player to replay already-seen frames at every segment
-            // boundary, producing the "stutter every 6 seconds" symptom.
             if !got_video_keyframe {
                 if !packet.is_key() || pts_secs < start_time {
                     continue;
@@ -776,34 +884,19 @@ fn remux_segment(
         }
 
         // Map to the output stream and rescale timestamps.
+        // Keep ABSOLUTE timestamps — the muxer will normalise the first DTS
+        // to 0, and we patch baseMediaDecodeTime in the tfdt after writing.
         if is_video {
             packet.set_stream(out_video_idx);
             packet.rescale_ts(in_video_tb, out_video_tb);
-            // Record the first video DTS (or PTS) as the offset to rebase
-            // to zero, then add the segment-start offset for continuous PTS.
-            // Using DTS prevents negative DTS values for B-frame content
-            // where DTS < PTS on the first packet.
-            if video_pts_offset.is_none() {
-                video_pts_offset = packet.dts().or(packet.pts());
-            }
-            if let (Some(offset), Some(p)) = (video_pts_offset, packet.pts()) {
-                packet.set_pts(Some(p - offset + seg_video_start));
-            }
-            if let (Some(offset), Some(d)) = (video_pts_offset, packet.dts()) {
-                packet.set_dts(Some(d - offset + seg_video_start));
+            if video_first_dts.is_none() {
+                video_first_dts = packet.dts().or(packet.pts());
             }
         } else if let Some(out_ai) = out_audio_idx_val {
             packet.set_stream(out_ai);
             packet.rescale_ts(in_audio_tb.unwrap(), out_audio_tb);
-            // Same rebase + segment-start offset for audio.
-            if audio_pts_offset.is_none() {
-                audio_pts_offset = packet.dts().or(packet.pts());
-            }
-            if let (Some(offset), Some(p)) = (audio_pts_offset, packet.pts()) {
-                packet.set_pts(Some(p - offset + seg_audio_start));
-            }
-            if let (Some(offset), Some(d)) = (audio_pts_offset, packet.dts()) {
-                packet.set_dts(Some(d - offset + seg_audio_start));
+            if audio_first_dts.is_none() {
+                audio_first_dts = packet.dts().or(packet.pts());
             }
         } else {
             continue;
@@ -813,6 +906,24 @@ fn remux_segment(
     }
 
     write_fmp4_trailer(&mut octx)?;
+
+    // FFmpeg's mp4 muxer normalises the first DTS to 0, so every fragment
+    // ends up with baseMediaDecodeTime == 0.  Patch the tfdt boxes to carry
+    // the correct absolute presentation time for MSE Segments mode.
+    // Use the actual first DTS (not the nominal segment start) so the
+    // browser positions each frame at its true source time.
+    let mut track_bmdt: Vec<(u32, i64)> = Vec::new();
+    if let Some(dts) = video_first_dts {
+        track_bmdt.push((out_video_idx as u32 + 1, dts));
+    }
+    if let Some(dts) = audio_first_dts {
+        if let Some(ai) = out_audio_idx_val {
+            track_bmdt.push((ai as u32 + 1, dts));
+        }
+    }
+    if !track_bmdt.is_empty() {
+        patch_segment_tfdt(tmp_path, &track_bmdt)?;
+    }
 
     Ok(())
 }
@@ -985,12 +1096,8 @@ fn hybrid_segment(
     let out_audio_tb = out_audio_idx.map(|i| octx.stream(i).unwrap().time_base());
 
     let mut got_video_keyframe = false;
-    let mut video_pts_offset: Option<i64> = None;
-
-    // Segment-start offset for video in the output time base so PTS is
-    // continuous across segments (matches the audio_ts_offset below).
-    // Use round() to avoid accumulated truncation errors at non-integer boundaries.
-    let seg_video_start = (start_time * out_video_tb.1 as f64 / out_video_tb.0 as f64).round() as i64;
+    // Record the first video DTS (absolute, in output timebase) for tfdt patching.
+    let mut video_first_dts: Option<i64> = None;
 
     // Audio synthetic PTS (in 1/sample_rate time base).
     let mut audio_sample_count: i64 = 0;
@@ -1023,9 +1130,6 @@ fn hybrid_segment(
 
         if is_video {
             // Wait for the first keyframe at or after start_time.
-            // See the same comment in remux_segment — accepting a keyframe
-            // from before start_time causes content overlap between segments
-            // and the resulting duplicate frames appear as stuttering.
             if !got_video_keyframe {
                 if !packet.is_key() || pts_secs < start_time {
                     continue;
@@ -1033,17 +1137,13 @@ fn hybrid_segment(
                 got_video_keyframe = true;
             }
 
-            // Copy video packet directly (remux), adding continuous PTS.
+            // Copy video packet directly (remux), keeping absolute timestamps.
+            // The muxer will normalise the first DTS to 0; we patch the tfdt
+            // baseMediaDecodeTime after writing.
             packet.set_stream(out_video_idx);
             packet.rescale_ts(in_video_tb, out_video_tb);
-            if video_pts_offset.is_none() {
-                video_pts_offset = packet.dts().or(packet.pts());
-            }
-            if let (Some(offset), Some(p)) = (video_pts_offset, packet.pts()) {
-                packet.set_pts(Some(p - offset + seg_video_start));
-            }
-            if let (Some(offset), Some(d)) = (video_pts_offset, packet.dts()) {
-                packet.set_dts(Some(d - offset + seg_video_start));
+            if video_first_dts.is_none() {
+                video_first_dts = packet.dts().or(packet.pts());
             }
             let _ = packet.write_interleaved(&mut octx);
         } else if is_audio {
@@ -1156,6 +1256,21 @@ fn hybrid_segment(
     }
 
     write_fmp4_trailer(&mut octx)?;
+
+    // FFmpeg's mp4 muxer normalises the first DTS to 0, so every fragment
+    // ends up with baseMediaDecodeTime == 0.  Patch the tfdt boxes to carry
+    // the correct absolute presentation time for MSE Segments mode.
+    // Video uses actual first DTS (absolute); audio uses synthesized offset.
+    let mut track_bmdt: Vec<(u32, i64)> = Vec::new();
+    if let Some(dts) = video_first_dts {
+        track_bmdt.push((out_video_idx as u32 + 1, dts));
+    }
+    if let Some(ai) = out_audio_idx {
+        track_bmdt.push((ai as u32 + 1, audio_ts_offset));
+    }
+    if !track_bmdt.is_empty() {
+        patch_segment_tfdt(tmp_path, &track_bmdt)?;
+    }
 
     Ok(())
 }
@@ -1694,6 +1809,17 @@ fn transcode_segment_body(
         }
 
         write_fmp4_trailer(&mut octx)?;
+
+        // FFmpeg's mp4 muxer normalises the first DTS to 0, so every fragment
+        // ends up with baseMediaDecodeTime == 0.  Patch the tfdt boxes to carry
+        // the correct absolute presentation time for MSE Segments mode.
+        let mut track_bmdt: Vec<(u32, i64)> = vec![
+            (out_video_idx as u32 + 1, ts_offset_90k),
+        ];
+        if let Some(ai) = out_audio_idx {
+            track_bmdt.push((ai as u32 + 1, audio_ts_offset));
+        }
+        patch_segment_tfdt(tmp_path, &track_bmdt)?;
     }
 
     Ok(())

@@ -612,7 +612,9 @@ fn patch_segment_tfdt(path: &Path, start_time_secs: f64) -> Result<(), String> {
     // Step 1: Parse moov to build track_id -> timescale map.
     let timescales = parse_moov_timescales(&data)?;
 
-    // Step 2: Find the moof box and patch tfdt in each traf.
+    // Step 2: Find all moof boxes and patch tfdt in each traf.
+    // With frag_keyframe, FFmpeg may produce multiple moof boxes per segment
+    // (one per keyframe).  We must patch ALL of them.
     let mut pos = 0usize;
     while pos + 8 <= data.len() {
         let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
@@ -622,7 +624,6 @@ fn patch_segment_tfdt(path: &Path, start_time_secs: f64) -> Result<(), String> {
         }
         if &data[pos + 4..pos + 8] == b"moof" {
             patch_moof_tfdts(&mut data, pos + 8, pos + size, start_time_secs, &timescales);
-            break; // Only one moof per segment.
         }
         pos += size;
     }
@@ -798,14 +799,27 @@ fn patch_traf_tfdt(
 
     if let (Some(tid), Some(tp)) = (track_id, tfdt_pos) {
         if let Some(&ts) = timescales.get(&tid) {
-            let base_media_decode_time = (start_time_secs * ts as f64).round() as u64;
+            // FFmpeg's frag_keyframe may produce multiple moof boxes per
+            // segment (one per keyframe).  FFmpeg normalizes the FIRST
+            // fragment's DTS to 0 but preserves correct relative offsets
+            // for subsequent fragments.  We ADD the keyframe offset to
+            // each existing value so all fragments end up at their correct
+            // absolute position on the presentation timeline.
+            let offset = (start_time_secs * ts as f64).round() as u64;
             if tfdt_version == 0 {
                 // 32-bit baseMediaDecodeTime at box_start + 12
-                let val = (base_media_decode_time as u32).to_be_bytes();
+                let existing = u32::from_be_bytes([
+                    data[tp + 12], data[tp + 13], data[tp + 14], data[tp + 15],
+                ]) as u64;
+                let val = ((existing + offset) as u32).to_be_bytes();
                 data[tp + 12..tp + 16].copy_from_slice(&val);
             } else {
                 // 64-bit baseMediaDecodeTime at box_start + 12
-                let val = base_media_decode_time.to_be_bytes();
+                let existing = u64::from_be_bytes([
+                    data[tp + 12], data[tp + 13], data[tp + 14], data[tp + 15],
+                    data[tp + 16], data[tp + 17], data[tp + 18], data[tp + 19],
+                ]);
+                let val = (existing + offset).to_be_bytes();
                 data[tp + 12..tp + 20].copy_from_slice(&val);
             }
         }
@@ -1003,14 +1017,22 @@ fn remux_segment(
         }
 
         if is_video {
-            // Wait for the first keyframe at or after start_time.
-            // Only accept keyframes whose PTS is at or after the declared
-            // segment start so consecutive segments never share overlapping
-            // content.  Accepting a keyframe from *before* start_time would
-            // cause the player to replay already-seen frames at every segment
-            // boundary, producing the "stutter every 6 seconds" symptom.
+            // Accept the first keyframe found after the seek — this is the
+            // keyframe at or before start_time (placed there by the seek
+            // call above).  Including this keyframe and all subsequent
+            // frames through end_time ensures the segment has content that
+            // overlaps with the previous segment, eliminating timeline gaps.
+            //
+            // In MSE Segments mode the browser de-duplicates overlapping
+            // data from consecutive segments via baseMediaDecodeTime, so
+            // the redundant frames are harmless.  The alternative (waiting
+            // for a keyframe >= start_time) creates gaps whenever the
+            // source keyframe interval doesn't divide evenly into 6 s.
+            //
+            // Ref: dash.js ScheduleController — real DASH packagers always
+            //      start each segment from a SAP (Stream Access Point).
             if !got_video_keyframe {
-                if !packet.is_key() || pts_secs < start_time {
+                if !packet.is_key() {
                     continue;
                 }
                 got_video_keyframe = true;
@@ -1266,12 +1288,10 @@ fn hybrid_segment(
         }
 
         if is_video {
-            // Wait for the first keyframe at or after start_time.
-            // See the same comment in remux_segment — accepting a keyframe
-            // from before start_time causes content overlap between segments
-            // and the resulting duplicate frames appear as stuttering.
+            // Accept the first keyframe found after the seek — same
+            // rationale as remux_segment above.
             if !got_video_keyframe {
-                if !packet.is_key() || pts_secs < start_time {
+                if !packet.is_key() {
                     continue;
                 }
                 got_video_keyframe = true;

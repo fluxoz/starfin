@@ -580,8 +580,8 @@ fn extract_ftyp_moov(data: &[u8]) -> Result<Vec<u8>, String> {
 // ── tfdt patching ────────────────────────────────────────────────────────────
 
 /// Patch the `baseMediaDecodeTime` in all `tfdt` boxes within an fMP4 segment
-/// so that segment N's samples start at `N × SEGMENT_DURATION` on the
-/// presentation timeline.
+/// so that each segment's samples appear at the correct absolute position on
+/// the presentation timeline.
 ///
 /// FFmpeg's fragmented MP4 muxer always normalizes the first DTS to 0
 /// (in `mov_write_single_packet`), so `baseMediaDecodeTime` in the `tfdt`
@@ -589,14 +589,20 @@ fn extract_ftyp_moov(data: &[u8]) -> Result<Vec<u8>, String> {
 /// This post-processing step restores the correct absolute timeline position
 /// required for MSE Segments mode (used by dash.js and Shaka Player).
 ///
+/// `start_time_secs` is the actual presentation time (in seconds) where this
+/// segment's content should begin.  For the remux/hybrid paths this is the
+/// PTS of the first video keyframe; for the transcode path it equals
+/// `seg_index × SEGMENT_DURATION` because the encoder forces a keyframe at
+/// the segment boundary.
+///
 /// The function:
 ///   1. Parses the `moov` box to build a track_id → timescale map.
 ///   2. Walks each `traf` inside the `moof` box, reads the `track_id`
 ///      from `tfhd`, and patches the `tfdt` with
-///      `seg_index × SEGMENT_DURATION × timescale`.
-fn patch_segment_tfdt(path: &Path, seg_index: usize) -> Result<(), String> {
-    if seg_index == 0 {
-        return Ok(()); // Segment 0 starts at time 0 — no patch needed.
+///      `start_time_secs × timescale`.
+fn patch_segment_tfdt(path: &Path, start_time_secs: f64) -> Result<(), String> {
+    if start_time_secs < 0.001 {
+        return Ok(()); // First segment starts at time 0 — no patch needed.
     }
 
     let mut data = std::fs::read(path)
@@ -614,7 +620,7 @@ fn patch_segment_tfdt(path: &Path, seg_index: usize) -> Result<(), String> {
             break;
         }
         if &data[pos + 4..pos + 8] == b"moof" {
-            patch_moof_tfdts(&mut data, pos + 8, pos + size, seg_index, &timescales);
+            patch_moof_tfdts(&mut data, pos + 8, pos + size, start_time_secs, &timescales);
             break; // Only one moof per segment.
         }
         pos += size;
@@ -735,7 +741,7 @@ fn patch_moof_tfdts(
     data: &mut [u8],
     start: usize,
     end: usize,
-    seg_index: usize,
+    start_time_secs: f64,
     timescales: &std::collections::HashMap<u32, u32>,
 ) {
     let mut pos = start;
@@ -746,7 +752,7 @@ fn patch_moof_tfdts(
             break;
         }
         if &data[pos + 4..pos + 8] == b"traf" {
-            patch_traf_tfdt(data, pos + 8, pos + size, seg_index, timescales);
+            patch_traf_tfdt(data, pos + 8, pos + size, start_time_secs, timescales);
         }
         pos += size;
     }
@@ -758,7 +764,7 @@ fn patch_traf_tfdt(
     data: &mut [u8],
     start: usize,
     end: usize,
-    seg_index: usize,
+    start_time_secs: f64,
     timescales: &std::collections::HashMap<u32, u32>,
 ) {
     let mut track_id: Option<u32> = None;
@@ -793,7 +799,7 @@ fn patch_traf_tfdt(
         if let Some(&ts) = timescales.get(&tid) {
             // SEGMENT_DURATION is an integer number of seconds (6) and
             // timescale fits in u32, so integer arithmetic is exact here.
-            let bdt = (seg_index as u64) * (SEGMENT_DURATION as u64) * (ts as u64);
+            let bdt = (start_time_secs * ts as f64).round() as u64;
             if tfdt_version == 0 {
                 // 32-bit baseMediaDecodeTime at box_start + 12
                 let val = (bdt as u32).to_be_bytes();
@@ -830,25 +836,30 @@ fn create_segment(
         .map_err(|e| format!("failed to open input: {e}"))?;
 
     // Decide: remux (fast copy) or transcode (re-encode).
-    if quality.can_remux() && source_is_remuxable(&ictx) {
+    // The remux and hybrid paths return the actual PTS (in seconds) of the
+    // first video keyframe so that patch_segment_tfdt can place the segment
+    // at its true position on the presentation timeline.  The transcode path
+    // forces a keyframe at the segment boundary, so start_time is exact.
+    let actual_start = if quality.can_remux() && source_is_remuxable(&ictx) {
         // Pure remux — both video and audio packets copied directly.
-        remux_segment(&mut ictx, start_time, &tmp_path, kill)?;
+        remux_segment(&mut ictx, start_time, &tmp_path, kill)?
     } else if quality.can_remux() && video_is_remuxable(&ictx) {
         // Hybrid — video packets copied, audio transcoded to stereo AAC.
         // This handles multi-channel AAC, non-AAC/MP3 codecs, etc.
-        hybrid_segment(&mut ictx, start_time, &tmp_path, kill)?;
+        hybrid_segment(&mut ictx, start_time, &tmp_path, kill)?
     } else {
         // For Original quality with incompatible codecs, fall back to the
         // same settings as High (native resolution, best quality).
         let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
         transcode_segment_inprocess(&mut ictx, start_time, hwaccel, effective_quality, &tmp_path, kill)?;
-    }
+        start_time
+    };
 
     // Patch tfdt baseMediaDecodeTime so each segment is positioned at the
     // correct absolute time on the presentation timeline.  FFmpeg's fMP4
-    // muxer always normalises DTS to 0, so without this patch all segments
+    // muxer always normalizes DTS to 0, so without this patch all segments
     // would overlap at time 0 and MSE Segments mode would show only ~6 s.
-    patch_segment_tfdt(&tmp_path, seg_index)?;
+    patch_segment_tfdt(&tmp_path, actual_start)?;
 
     // Atomic rename.
     std::fs::rename(&tmp_path, &seg_path)
@@ -863,12 +874,16 @@ fn create_segment(
 /// decoding or re-encoding.  This is the equivalent of
 /// `ffmpeg -ss <t> -i input -t 6 -c copy -f mp4 -movflags empty_moov+frag_keyframe+default_base_moof output.m4s`
 /// and gives VLC-like performance.
+///
+/// Returns the actual PTS (in seconds) of the first video keyframe included
+/// in the segment.  This may be later than `start_time` when the source
+/// keyframe interval doesn't align with the segment duration.
 fn remux_segment(
     ictx: &mut ffmpeg_next::format::context::Input,
     start_time: f64,
     tmp_path: &Path,
     kill: Option<&AtomicBool>,
-) -> Result<(), String> {
+) -> Result<f64, String> {
     let end_time = start_time + SEGMENT_DURATION;
 
     // Find best video/audio streams.
@@ -949,6 +964,8 @@ fn remux_segment(
     let out_audio_tb = out_audio_idx_val.map(|i| octx.stream(i).unwrap().time_base()).unwrap_or(out_audio_tb);
 
     let mut got_video_keyframe = false;
+    // Actual PTS (in seconds) of the first video keyframe in this segment.
+    let mut keyframe_pts_secs: f64 = start_time;
     // PTS offsets (in output time base) used to rebase timestamps so that
     // first-packet PTS is subtracted, then a segment-start offset is added,
     // producing continuous PTS across the presentation (seg N starts at
@@ -998,6 +1015,7 @@ fn remux_segment(
                     continue;
                 }
                 got_video_keyframe = true;
+                keyframe_pts_secs = pts_secs;
             }
         } else {
             // Skip audio packets before the video keyframe region.
@@ -1045,7 +1063,7 @@ fn remux_segment(
 
     write_fmp4_trailer(&mut octx)?;
 
-    Ok(())
+    Ok(keyframe_pts_secs)
 }
 
 // ── Hybrid path (video remux + audio transcode to stereo AAC) ───────────────
@@ -1062,7 +1080,7 @@ fn hybrid_segment(
     start_time: f64,
     tmp_path: &Path,
     kill: Option<&AtomicBool>,
-) -> Result<(), String> {
+) -> Result<f64, String> {
     let end_time = start_time + SEGMENT_DURATION;
 
     // Find best video/audio streams.
@@ -1212,6 +1230,7 @@ fn hybrid_segment(
     let out_audio_tb = out_audio_idx.map(|i| octx.stream(i).unwrap().time_base());
 
     let mut got_video_keyframe = false;
+    let mut keyframe_pts_secs: f64 = start_time;
     let mut video_pts_offset: Option<i64> = None;
 
     // Segment-start offset for video in the output time base so PTS is
@@ -1257,6 +1276,7 @@ fn hybrid_segment(
                     continue;
                 }
                 got_video_keyframe = true;
+                keyframe_pts_secs = pts_secs;
             }
 
             // Copy video packet directly (remux), adding continuous PTS.
@@ -1383,7 +1403,7 @@ fn hybrid_segment(
 
     write_fmp4_trailer(&mut octx)?;
 
-    Ok(())
+    Ok(keyframe_pts_secs)
 }
 
 // ── Transcode path (re-encode — used for incompatible codecs or scaling) ────

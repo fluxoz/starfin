@@ -93,7 +93,7 @@ fn format_time(seconds: f64) -> String {
     if !seconds.is_finite() || seconds < 0.0 {
         return "0:00".to_string();
     }
-    let total_secs = seconds as u64;
+    let total_secs = seconds.round() as u64;
     let hours = total_secs / 3600;
     let mins = (total_secs % 3600) / 60;
     let secs = total_secs % 60;

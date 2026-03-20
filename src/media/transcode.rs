@@ -583,7 +583,7 @@ fn extract_ftyp_moov(data: &[u8]) -> Result<Vec<u8>, String> {
 /// so that segment N's samples start at `N × SEGMENT_DURATION` on the
 /// presentation timeline.
 ///
-/// FFmpeg's fragmented MP4 muxer always normalises the first DTS to 0
+/// FFmpeg's fragmented MP4 muxer always normalizes the first DTS to 0
 /// (in `mov_write_single_packet`), so `baseMediaDecodeTime` in the `tfdt`
 /// boxes is always 0 regardless of the PTS values written to the packets.
 /// This post-processing step restores the correct absolute timeline position
@@ -791,7 +791,9 @@ fn patch_traf_tfdt(
 
     if let (Some(tid), Some(tp)) = (track_id, tfdt_pos) {
         if let Some(&ts) = timescales.get(&tid) {
-            let bdt = (seg_index as f64 * SEGMENT_DURATION * ts as f64) as u64;
+            // SEGMENT_DURATION is an integer number of seconds (6) and
+            // timescale fits in u32, so integer arithmetic is exact here.
+            let bdt = (seg_index as u64) * (SEGMENT_DURATION as u64) * (ts as u64);
             if tfdt_version == 0 {
                 // 32-bit baseMediaDecodeTime at box_start + 12
                 let val = (bdt as u32).to_be_bytes();

@@ -171,7 +171,7 @@ fn try_jump_gap(video: &HtmlVideoElement) -> bool {
                     return true;
                 }
                 // Track the nearest buffered range ahead for large-gap jump.
-                if nearest_ahead.is_none() || start < nearest_ahead.unwrap() {
+                if nearest_ahead.map_or(true, |n| start < n) {
                     nearest_ahead = Some(start);
                 }
             }

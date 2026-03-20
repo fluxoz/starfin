@@ -882,6 +882,9 @@ fn create_segment(
     // correct absolute time on the presentation timeline.  FFmpeg's fMP4
     // muxer always normalizes DTS to 0, so without this patch all segments
     // would overlap at time 0 and MSE Segments mode would show only ~6 s.
+    eprintln!(
+        "[segment] seg {seg_index}: nominal_start={start_time:.3}s, actual_keyframe={actual_start:.3}s",
+    );
     patch_segment_tfdt(&tmp_path, actual_start)?;
 
     // Atomic rename.

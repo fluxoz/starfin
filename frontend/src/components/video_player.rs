@@ -615,6 +615,14 @@ async fn pump_loop(
     video: HtmlVideoElement,
     pump_id: u32,
 ) {
+    // ── Prefetch state ──────────────────────────────────────────────
+    // Start fetching the next segment while the current one is being
+    // appended, so the bytes are already available by the time we need
+    // them.  This eliminates the fetch latency between segment appends
+    // and matches how dash.js ScheduleController prefetches upcoming
+    // segments.
+    let mut prefetched: Option<(usize, Vec<u8>)> = None;
+
     loop {
         // ── 1. Generation check ──────────────────────────────────────
         if !is_pump_current(&state, pump_id) {
@@ -673,21 +681,46 @@ async fn pump_loop(
             return;
         }
 
-        // ── 5. Fetch the segment ─────────────────────────────────────
-        log::info!("pump[{pump_id}]: fetching segment {seg_idx}");
-        let bytes = match Request::get(&seg_url).send().await {
-            Ok(r) => match r.binary().await {
-                Ok(b) => b,
+        // ── 5. Fetch the segment (use prefetched data if available) ──
+        let bytes = if let Some((pre_idx, pre_bytes)) = prefetched.take() {
+            if pre_idx == seg_idx {
+                log::info!("pump[{pump_id}]: using prefetched segment {seg_idx}");
+                pre_bytes
+            } else {
+                // Prefetched segment doesn't match (e.g. after seek) — discard and fetch fresh.
+                log::info!("pump[{pump_id}]: fetching segment {seg_idx} (prefetch was for {pre_idx})");
+                match Request::get(&seg_url).send().await {
+                    Ok(r) => match r.binary().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            log::error!("segment {seg_idx}: body read error: {e:?}");
+                            TimeoutFuture::new(1000).await;
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        log::error!("segment {seg_idx}: fetch error: {e:?}");
+                        TimeoutFuture::new(1000).await;
+                        continue;
+                    }
+                }
+            }
+        } else {
+            log::info!("pump[{pump_id}]: fetching segment {seg_idx}");
+            match Request::get(&seg_url).send().await {
+                Ok(r) => match r.binary().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        log::error!("segment {seg_idx}: body read error: {e:?}");
+                        TimeoutFuture::new(1000).await;
+                        continue;
+                    }
+                },
                 Err(e) => {
-                    log::error!("segment {seg_idx}: body read error: {e:?}");
+                    log::error!("segment {seg_idx}: fetch error: {e:?}");
                     TimeoutFuture::new(1000).await;
                     continue;
                 }
-            },
-            Err(e) => {
-                log::error!("segment {seg_idx}: fetch error: {e:?}");
-                TimeoutFuture::new(1000).await;
-                continue;
             }
         };
 
@@ -749,13 +782,81 @@ async fn pump_loop(
             continue;
         }
 
-        // ── 7. Wait for append to complete ───────────────────────────
-        if !wait_for_sb(&sb, &state, pump_id).await {
+        // ── 7. Wait for append + prefetch next segment in parallel ───
+        // While the SourceBuffer processes the current append, start
+        // fetching the next segment.  The browser handles the HTTP
+        // request on its I/O thread; by the time updateend fires, the
+        // next segment's bytes are already (or nearly) in memory.
+        //
+        // Ref: dash.js ScheduleController fires the next request before
+        //      the current append's updateend completes.
+        let next_url = {
+            let next_seg_idx = seg_idx + 1;
+            let borrow = state.borrow();
+            borrow.as_ref().and_then(|s| {
+                if s.pump_gen == pump_id && next_seg_idx < s.segments.len() {
+                    Some((next_seg_idx, s.segments[next_seg_idx].url.clone()))
+                } else {
+                    None
+                }
+            })
+        };
+
+        // Run updateend wait and prefetch concurrently.
+        let sb_ok;
+        if let Some((next_idx, url)) = next_url {
+            // Both futures run concurrently: the browser handles the
+            // SourceBuffer update and the HTTP fetch on separate threads.
+            let (wait_result, fetch_result) = futures::join!(
+                wait_for_sb(&sb, &state, pump_id),
+                async {
+                    match Request::get(&url).send().await {
+                        Ok(r) => match r.binary().await {
+                            Ok(b) => Some(b),
+                            Err(e) => {
+                                log::warn!("prefetch seg {next_idx}: body error: {e:?}");
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            log::warn!("prefetch seg {next_idx}: fetch error: {e:?}");
+                            None
+                        }
+                    }
+                }
+            );
+            sb_ok = wait_result;
+            if let Some(bytes) = fetch_result {
+                prefetched = Some((next_idx, bytes));
+                log::info!("pump[{pump_id}]: prefetched segment {next_idx}");
+            }
+        } else {
+            sb_ok = wait_for_sb(&sb, &state, pump_id).await;
+        }
+
+        if !sb_ok {
             return;
         }
 
         // ── 8. Advance to next segment ───────────────────────────────
         {
+            // Log buffered ranges after append for diagnostics.
+            if let Ok(buffered) = sb.buffered() {
+                let len = buffered.length();
+                let mut ranges = String::new();
+                for i in 0..len {
+                    if let (Ok(s), Ok(e)) = (buffered.start(i), buffered.end(i)) {
+                        if !ranges.is_empty() {
+                            ranges.push_str(", ");
+                        }
+                        ranges.push_str(&format!("[{s:.3}–{e:.3}]"));
+                    }
+                }
+                log::info!(
+                    "pump[{pump_id}]: seg {seg_idx} appended → buffered: {ranges}"
+                );
+            }
+
             let mut borrow = state.borrow_mut();
             if let Some(s) = borrow.as_mut() {
                 if s.pump_gen != pump_id {

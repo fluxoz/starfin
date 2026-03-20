@@ -672,13 +672,17 @@ fn remux_segment(
     let mut octx = create_fmp4_output(tmp_path)?;
 
     // Add output video stream, copying codec parameters from input.
-    let out_video = octx.add_stream(ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::H264))
+    let mut out_video = octx.add_stream(ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::H264))
         .map_err(|e| format!("add video stream: {e}"))?;
     unsafe {
         ffmpeg_next::ffi::avcodec_parameters_copy(
             out_video.parameters().as_mut_ptr(),
             in_video_params.as_ptr(),
         );
+        // Pin the video stream to 90000 Hz so baseMediaDecodeTime is always
+        // in a well-known timescale, independent of the source container.
+        let stream_ptr = out_video.as_mut_ptr();
+        (*stream_ptr).time_base = ffmpeg_next::ffi::AVRational { num: 1, den: 90000 };
     }
     let out_video_idx = out_video.index();
 
@@ -722,8 +726,9 @@ fn remux_segment(
     let mut audio_pts_offset: Option<i64> = None;
 
     // Segment-start offsets in each output time base so PTS is continuous.
-    let seg_video_start = (start_time * out_video_tb.1 as f64 / out_video_tb.0 as f64) as i64;
-    let seg_audio_start = (start_time * out_audio_tb.1 as f64 / out_audio_tb.0 as f64) as i64;
+    // Use round() to avoid accumulated truncation errors at non-integer boundaries.
+    let seg_video_start = (start_time * out_video_tb.1 as f64 / out_video_tb.0 as f64).round() as i64;
+    let seg_audio_start = (start_time * out_audio_tb.1 as f64 / out_audio_tb.0 as f64).round() as i64;
 
     for (stream, mut packet) in ictx.packets() {
         if let Some(k) = kill {
@@ -866,13 +871,17 @@ fn hybrid_segment(
     let mut octx = create_fmp4_output(tmp_path)?;
 
     // Add output video stream — parameters copied directly from input.
-    let out_video = octx.add_stream(ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::H264))
+    let mut out_video = octx.add_stream(ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::H264))
         .map_err(|e| format!("add video stream: {e}"))?;
     unsafe {
         ffmpeg_next::ffi::avcodec_parameters_copy(
             out_video.parameters().as_mut_ptr(),
             in_video_params.as_ptr(),
         );
+        // Pin the video stream to 90000 Hz so baseMediaDecodeTime is always
+        // in a well-known timescale, independent of the source container.
+        let stream_ptr = out_video.as_mut_ptr();
+        (*stream_ptr).time_base = ffmpeg_next::ffi::AVRational { num: 1, den: 90000 };
     }
     let out_video_idx = out_video.index();
 
@@ -980,11 +989,12 @@ fn hybrid_segment(
 
     // Segment-start offset for video in the output time base so PTS is
     // continuous across segments (matches the audio_ts_offset below).
-    let seg_video_start = (start_time * out_video_tb.1 as f64 / out_video_tb.0 as f64) as i64;
+    // Use round() to avoid accumulated truncation errors at non-integer boundaries.
+    let seg_video_start = (start_time * out_video_tb.1 as f64 / out_video_tb.0 as f64).round() as i64;
 
     // Audio synthetic PTS (in 1/sample_rate time base).
     let mut audio_sample_count: i64 = 0;
-    let audio_ts_offset = (start_time * audio_sample_rate as f64) as i64;
+    let audio_ts_offset = (start_time * audio_sample_rate as f64).round() as i64;
 
     for (stream, mut packet) in ictx.packets() {
         if let Some(k) = kill {
@@ -1479,10 +1489,10 @@ fn transcode_segment_body(
 
         // ── Main encode loop ─────────────────────────────────────────────
         let end_time = start_time + SEGMENT_DURATION;
-        let ts_offset_90k = (start_time * 90000.0) as i64;
+        let ts_offset_90k = (start_time * 90000.0).round() as i64;
         let mut video_frame_count: i64 = 0;
         let mut audio_sample_count: i64 = 0;
-        let audio_ts_offset = (start_time * audio_sample_rate as f64) as i64;
+        let audio_ts_offset = (start_time * audio_sample_rate as f64).round() as i64;
         let mut done = false;
 
         for (pkt_stream, packet) in ictx.packets() {

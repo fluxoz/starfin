@@ -403,12 +403,10 @@ fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
         pos += size;
     }
 
-    if result.is_empty() {
-        // Fallback: return original data if no boxes were parsed.
-        data.to_vec()
-    } else {
-        result
-    }
+    // Return the collected media boxes. If empty, the caller handles the empty
+    // case by skipping the segment (never append raw data that may contain
+    // moov/ftyp init boxes into the SourceBuffer a second time).
+    result
 }
 
 /// Check whether `pump_gen` inside `MseState` still matches the expected
@@ -1078,11 +1076,24 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
                         // Wait for the init segment append to complete
                         // (simple polling — no leaked event listeners).
-                        for _ in 0..200 {
+                        for _ in 0..400 {
                             if !source_buffer.updating() {
                                 break;
                             }
                             TimeoutFuture::new(5).await;
+                        }
+
+                        // CRITICAL: verify the append actually completed before
+                        // starting the pump. If still updating after 2s the init
+                        // segment is likely malformed or the MIME type unsupported.
+                        if source_buffer.updating() {
+                            error.set(Some(
+                                "Init segment append timed out after 2s. The browser's \
+                                 SourceBuffer did not become idle. The init segment may be \
+                                 malformed or the MIME type is not supported."
+                                    .to_string(),
+                            ));
+                            return;
                         }
 
                         // Calculate which segment to start from when resuming.

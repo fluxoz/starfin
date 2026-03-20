@@ -2026,6 +2026,9 @@ async fn get_manifest(
 
     // Build SegmentTimeline — use the `r` (repeat) attribute per DASH-IF IOP
     // to compress identical-duration segments into a single <S> element.
+    // Add `t` (presentation time) on the first and last <S> per DASH-IF IOP
+    // v4.3 §4.3.3.2 to provide an authoritative timeline anchor and eliminate
+    // accumulated rounding drift across many segments.
     mpd.push_str("          <SegmentTimeline>\n");
     let normal_duration_ms = (SEGMENT_DURATION * 1000.0) as u64;
     if num_segments > 1 {
@@ -2034,18 +2037,19 @@ async fn get_manifest(
         // r=(num_segments - 2) encodes (num_segments - 1) segments total.
         let repeats = num_segments - 2; // r=N → N+1 segments of this duration
         mpd.push_str(&format!(
-            "            <S d=\"{normal_duration_ms}\" r=\"{repeats}\"/>\n"
+            "            <S t=\"0\" d=\"{normal_duration_ms}\" r=\"{repeats}\"/>\n"
         ));
-        // Last segment may be shorter.
+        // Last segment may be shorter — anchor its presentation time explicitly.
         let last_start = (num_segments - 1) as f64 * SEGMENT_DURATION;
+        let last_start_ms = (last_start * 1000.0).round() as u64;
         let last_duration_ms = ((duration - last_start) * 1000.0).max(1.0) as u64;
         mpd.push_str(&format!(
-            "            <S d=\"{last_duration_ms}\"/>\n"
+            "            <S t=\"{last_start_ms}\" d=\"{last_duration_ms}\"/>\n"
         ));
     } else if num_segments == 1 {
         let seg_duration_ms = (duration * 1000.0).max(1.0) as u64;
         mpd.push_str(&format!(
-            "            <S d=\"{seg_duration_ms}\"/>\n"
+            "            <S t=\"0\" d=\"{seg_duration_ms}\"/>\n"
         ));
     }
     mpd.push_str("          </SegmentTimeline>\n");

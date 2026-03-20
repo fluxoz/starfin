@@ -71,15 +71,21 @@ const CONTROLS_VICINITY_PX: f64 = 80.0;
 //    Spec:   https://dashif.org/docs/DASH-IF-IOP-v4.3.pdf
 
 /// Target seconds of video to keep buffered ahead of the playback position.
-/// dash.js uses 12 s by default; Shaka Player 10 s; hls.js 30 s.
-/// 30 s gives a comfortable margin for VOD content.
+/// dash.js uses 12 s by default (`bufferTimeAtTopQuality`);
+/// Shaka Player uses 10 s; hls.js uses 30 s.
+/// We use 30 s for comfortable VOD buffering.
 const MSE_TARGET_BUFFER_S: f64 = 30.0;
 
 /// Maximum seconds of already-played data to keep behind the playhead.
 /// Data older than this is evicted via `SourceBuffer.remove()` to bound
-/// memory usage.  Shaka Player's `bufferBehind` default is 30 s; hls.js's
-/// `backBufferLength` is also 30 s.  dash.js's `bufferToKeep` is 20 s.
-const MSE_BACK_BUFFER_S: f64 = 30.0;
+/// memory usage and prevent the browser from hitting its SourceBuffer
+/// quota (which triggers emergency eviction near the playhead — the
+/// root cause of audio dropout at segment boundaries).
+///
+/// dash.js `bufferToKeep` defaults to 20 s; Shaka Player `bufferBehind`
+/// defaults to 30 s.  We use 20 s to match dash.js and keep total buffer
+/// size well within browser quotas.
+const MSE_BACK_BUFFER_S: f64 = 20.0;
 
 /// Maximum gap size (in seconds) that will be automatically jumped over.
 /// dash.js GapController uses `smallGapLimit = 0.8` by default.
@@ -471,6 +477,11 @@ async fn wait_for_sb(
 ///
 /// We keep up to `MSE_BACK_BUFFER_S` seconds behind the current playback
 /// position and remove everything before that via `SourceBuffer.remove()`.
+///
+/// Additionally, we cap the total buffer duration at
+/// `MSE_BACK_BUFFER_S + MSE_TARGET_BUFFER_S` to prevent the browser from
+/// hitting its SourceBuffer quota and performing emergency eviction near
+/// the playhead (which causes audio dropout stutter).
 async fn evict_back_buffer(
     sb: &web_sys::SourceBuffer,
     video: &HtmlVideoElement,
@@ -478,12 +489,8 @@ async fn evict_back_buffer(
     pump_id: u32,
 ) {
     let current = video.current_time();
-    let evict_before = current - MSE_BACK_BUFFER_S;
-    if evict_before <= 0.5 {
-        return; // nothing worth evicting
-    }
 
-    // Check if there's actually data before evict_before
+    // Check if there's actually buffered data.
     let ranges = match sb.buffered() {
         Ok(r) => r,
         Err(_) => return,
@@ -495,8 +502,29 @@ async fn evict_back_buffer(
         Ok(s) => s,
         Err(_) => return,
     };
-    if buf_start >= evict_before {
-        return; // nothing to evict
+    let buf_end = match ranges.end(ranges.length() - 1) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    // Compute how far back to evict.  Two constraints:
+    // 1. Keep at most MSE_BACK_BUFFER_S behind the playhead.
+    // 2. Cap total buffer duration to prevent browser quota eviction.
+    let max_total = MSE_BACK_BUFFER_S + MSE_TARGET_BUFFER_S;
+    let total_buffered = buf_end - buf_start;
+    let evict_before = if total_buffered > max_total {
+        // Total buffer exceeds limit — evict more aggressively from front.
+        // Keep MSE_TARGET_BUFFER_S ahead of playhead + MSE_BACK_BUFFER_S behind.
+        let target_start = (current - MSE_BACK_BUFFER_S).max(buf_start);
+        // At minimum, trim enough to bring total under the cap.
+        let min_evict = buf_start + (total_buffered - max_total);
+        target_start.max(min_evict)
+    } else {
+        current - MSE_BACK_BUFFER_S
+    };
+
+    if evict_before <= buf_start + 0.5 {
+        return; // nothing worth evicting
     }
 
     // Wait for SourceBuffer to be idle before removing.
@@ -504,6 +532,9 @@ async fn evict_back_buffer(
         return;
     }
 
+    log::info!(
+        "evict: removing [{buf_start:.3}–{evict_before:.3}] (total was {total_buffered:.1}s, current={current:.3})"
+    );
     let _ = sb.remove(buf_start, evict_before);
 
     // Wait for the remove operation to complete.
@@ -652,22 +683,42 @@ async fn pump_loop(
             )
         };
 
-        // ── 3. Buffer-ahead gate (segment-index based) ───────────────
-        // Compute how much data is buffered ahead of the current playhead
-        // using segment indices rather than video.buffered() ranges.
+        // ── 3. Buffer-ahead gate ─────────────────────────────────────
+        // Check how much data is buffered ahead of the playhead using the
+        // actual SourceBuffer.buffered() ranges.  If we have enough data,
+        // sleep instead of appending more — this prevents over-buffering
+        // which causes the browser to hit its SourceBuffer quota and
+        // emergency-evict data near the playhead (the root cause of the
+        // audio dropout stutter).
         //
-        // In Sequence mode, after appending segment N, the buffer extends
-        // to approximately (N + 1) × SEGMENT_DURATION on the timeline.
-        // We compare that against the current playhead position to decide
-        // if we should sleep or fetch the next segment.
+        // dash.js uses `bufferLevel` (actual buffered time ahead of
+        // playhead) compared against `bufferTimeAtTopQuality` (12 s).
+        // We use 30 s for VOD.
         //
-        // This avoids the issue where video.buffered() returns empty
-        // ranges immediately after a seek+flush, causing the pump to
-        // hammer the server with all remaining segments.
-        if let Some(last_seg) = last_appended {
-            let buffered_to = (last_seg as f64 + 1.0) * SEGMENT_DURATION_F;
+        // Falls back to segment-index estimation when buffered() is
+        // unavailable (e.g. immediately after seek+flush).
+        {
             let current = video.current_time();
-            let buf_ahead = (buffered_to - current).max(0.0);
+            let buf_ahead = if let Ok(ranges) = sb.buffered() {
+                // Find the buffered range containing the playhead.
+                let mut ahead = 0.0_f64;
+                for i in 0..ranges.length() {
+                    if let (Ok(s), Ok(e)) = (ranges.start(i), ranges.end(i)) {
+                        if current >= s - 0.1 && current <= e + 0.1 {
+                            ahead = (e - current).max(0.0);
+                            break;
+                        }
+                    }
+                }
+                ahead
+            } else if let Some(last_seg) = last_appended {
+                // Fallback: estimate from segment indices.
+                let buffered_to = (last_seg as f64 + 1.0) * SEGMENT_DURATION_F;
+                (buffered_to - current).max(0.0)
+            } else {
+                0.0
+            };
+
             if buf_ahead >= MSE_TARGET_BUFFER_S {
                 // Enough data buffered ahead — sleep and re-check.
                 TimeoutFuture::new(500).await;
@@ -676,6 +727,13 @@ async fn pump_loop(
         }
 
         // ── 4. Evict old data behind the playhead ────────────────────
+        // Proactively evict BEFORE appending to prevent the browser from
+        // hitting its SourceBuffer quota.  Browser emergency eviction
+        // removes data unpredictably (sometimes near the playhead),
+        // causing audio dropout at segment transitions.
+        //
+        // Ref: dash.js BufferController.pruneBuffer() — runs before
+        //      each append, not after.
         evict_back_buffer(&sb, &video, &state, pump_id).await;
         if !is_pump_current(&state, pump_id) {
             return;
@@ -1378,23 +1436,35 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     // (pump_running == false) but there are still segments
                     // to fetch and the buffer is below target.
                     //
-                    // Uses segment-index-based check (not video.buffered())
-                    // to avoid false-positive restarts when buffered ranges
-                    // are temporarily empty after a seek.  This mirrors
-                    // dash.js ScheduleController's periodic buffer check.
+                    // Uses actual buffered() ranges when available, with
+                    // segment-index fallback.  This mirrors dash.js
+                    // ScheduleController's periodic buffer check.
                     let needs_restart = {
                         let borrow = mse_state.borrow();
                         if let Some(s) = borrow.as_ref() {
                             if s.pump_running || s.next_seg >= s.segments.len() {
                                 false
                             } else {
-                                // Use segment-index-based buffer check
-                                let buf_ahead = match s.last_appended_seg {
-                                    Some(last) => {
-                                        let buffered_to = (last as f64 + 1.0) * SEGMENT_DURATION_F;
-                                        (buffered_to - video.current_time()).max(0.0)
+                                let current = video.current_time();
+                                let buf_ahead = if let Ok(ranges) = s.source_buffer.buffered() {
+                                    let mut ahead = 0.0_f64;
+                                    for i in 0..ranges.length() {
+                                        if let (Ok(rs), Ok(re)) = (ranges.start(i), ranges.end(i)) {
+                                            if current >= rs - 0.1 && current <= re + 0.1 {
+                                                ahead = (re - current).max(0.0);
+                                                break;
+                                            }
+                                        }
                                     }
-                                    None => 0.0, // no segments appended yet → needs data
+                                    ahead
+                                } else {
+                                    match s.last_appended_seg {
+                                        Some(last) => {
+                                            let buffered_to = (last as f64 + 1.0) * SEGMENT_DURATION_F;
+                                            (buffered_to - current).max(0.0)
+                                        }
+                                        None => 0.0,
+                                    }
                                 };
                                 buf_ahead < MSE_TARGET_BUFFER_S
                             }

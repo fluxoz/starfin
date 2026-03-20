@@ -1810,7 +1810,13 @@ fn transcode_segment_body(
                         continue;
                     }
 
-                    let pts_increment = (90000.0 / effective_fps) as i64;
+                    // Compute the frame PTS in 90 kHz ticks.  Use
+                    // `round()` (not truncation) to avoid accumulating a
+                    // sub-tick error across a 6-second segment, which
+                    // would shift the last frame's PTS by a few
+                    // milliseconds and create a tiny gap at the segment
+                    // boundary.
+                    let pts_increment = (90000.0 / effective_fps).round() as i64;
                     let new_pts = video_frame_count * pts_increment + ts_offset_90k;
                     let sw_frame = if let Some(ref mut sws) = scaler {
                         let mut scaled = ffmpeg_next::util::frame::Video::empty();

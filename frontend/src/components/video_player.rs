@@ -87,6 +87,17 @@ const MSE_BACK_BUFFER_S: f64 = 30.0;
 /// Ref: dash.js/src/streaming/controllers/GapController.js `_jumpGap()`
 const SMALL_GAP_LIMIT_S: f64 = 0.8;
 
+/// Extra seconds added past the nominal segment end when setting
+/// appendWindowEnd.  Without this, the browser clips the last video frame's
+/// effective duration to the exact segment boundary, which can create a
+/// sub-frame gap (0–33 ms) before the first frame of the following segment —
+/// the perceptible ms-level stutter at every segment transition.
+/// 0.1 s is enough to cover one frame at any frame rate ≥ 10 fps.
+/// The next segment's appendWindowStart discards anything past its own
+/// nominal start, so the overlap is harmless.
+/// Ref: dash.js SourceBufferSink.js uses `end + 0.1` for the same reason.
+const APPEND_WINDOW_END_OVERLAP: f64 = 0.1;
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn format_time(seconds: f64) -> String {
@@ -421,10 +432,15 @@ fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
         pos += size;
     }
 
-    if result.is_empty() {
-        // Fallback: return original data if no boxes were parsed.
+    if result.is_empty() && pos == 0 {
+        // No valid box header was found at all (data too short or starts
+        // with a malformed box) — return the raw bytes unchanged so the
+        // caller can decide what to do.
         data.to_vec()
     } else {
+        // `result` may be empty when every box was ftyp/moov (init-only
+        // segment with no media data).  The caller's `media_bytes.is_empty()`
+        // check will catch this and skip the segment correctly.
         result
     }
 }
@@ -721,6 +737,16 @@ async fn pump_loop(
         //      appendWindowStart / appendWindowEnd before every append.
         // Ref: DASH-IF IOP v4.3 §3.2.8 (buffer management).
         //
+        // appendWindowEnd is extended by APPEND_WINDOW_END_OVERLAP (0.1 s)
+        // past the nominal segment end.  Without this, the browser clips
+        // the last video frame's effective duration to the exact boundary,
+        // which can leave a sub-frame gap (≈ 0–33 ms) before the first
+        // frame of the next segment — the perceptible ms-level stutter at
+        // every segment transition.  The small overlap is safe because the
+        // next segment's appendWindowStart trims anything it doesn't own.
+        // Ref: dash.js uses the same "end + epsilon" pattern in
+        //      SourceBufferSink.js to avoid identical gaps.
+        //
         // Order matters: the spec throws TypeError if appendWindowStart
         // >= appendWindowEnd.  To safely move the window forward (or
         // backward after a seek), reset start to 0 first, update end,
@@ -729,7 +755,7 @@ async fn pump_loop(
             let total_segments = state.borrow().as_ref().map_or(0, |s| s.segments.len());
             let window_start = seg_idx as f64 * SEGMENT_DURATION_F;
             let window_end = if seg_idx + 1 < total_segments {
-                (seg_idx + 1) as f64 * SEGMENT_DURATION_F
+                (seg_idx + 1) as f64 * SEGMENT_DURATION_F + APPEND_WINDOW_END_OVERLAP
             } else {
                 f64::INFINITY
             };

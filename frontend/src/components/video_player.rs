@@ -708,6 +708,30 @@ async fn pump_loop(
             return;
         }
 
+        // ── 6b. Set appendWindow to trim segment to its nominal
+        //        boundaries — matching dash.js SourceBufferSink
+        //        behaviour.  When keyframes don't align with segment
+        //        boundaries, the backend includes content starting from
+        //        the previous keyframe.  The appendWindow trims it so
+        //        only the [start, end) slice is presented, eliminating
+        //        overlap between consecutive segments and giving clean
+        //        transitions.
+        //
+        // Ref: dash.js SourceBufferSink.appendBuffer() — sets
+        //      appendWindowStart / appendWindowEnd before every append.
+        // Ref: DASH-IF IOP v4.3 §3.2.8 (buffer management).
+        {
+            let total_segments = state.borrow().as_ref().map_or(0, |s| s.segments.len());
+            let window_start = seg_idx as f64 * SEGMENT_DURATION_F;
+            let window_end = if seg_idx + 1 < total_segments {
+                (seg_idx + 1) as f64 * SEGMENT_DURATION_F
+            } else {
+                f64::INFINITY
+            };
+            let _ = sb.set_append_window_start(window_start);
+            let _ = sb.set_append_window_end(window_end);
+        }
+
         let uint8_array = js_sys::Uint8Array::from(media_bytes.as_slice());
         let array_buffer = uint8_array.buffer();
         if sb.append_buffer_with_array_buffer(&array_buffer).is_err() {

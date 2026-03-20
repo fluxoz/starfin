@@ -963,6 +963,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "chrono",
+ "console_error_panic_hook",
  "futures",
  "gloo-net 0.6.0",
  "gloo-storage 0.3.0",
@@ -973,6 +974,7 @@ dependencies = [
  "serde_json",
  "urlencoding",
  "wasm-bindgen",
+ "wasm-bindgen-console-logger",
  "wasm-bindgen-futures",
  "wasm-logger",
  "web-sys",
@@ -1123,6 +1125,16 @@ dependencies = [
  "rustversion",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
+]
+
+[[package]]
+name = "wasm-bindgen-console-logger"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7530a275e7faf7b5b83aabdf78244fb8d9a68a2ec4b26935a05ecc0c9b0185ed"
+dependencies = [
+ "log",
+ "wasm-bindgen",
 ]
 
 [[package]]

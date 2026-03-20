@@ -75,3 +75,5 @@ urlencoding = "2"
 gloo-timers = { version = "0.3.0", features = ["futures"] }
 chrono = { version = "0.4", features = ["serde", "wasmbind"] }
 futures = { version = "0.3.32", default-features = false, features = ["std"] }
+wasm-bindgen-console-logger = "0.1.1"
+console_error_panic_hook = "0.1.7"

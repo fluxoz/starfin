@@ -7,7 +7,7 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{window, HtmlVideoElement, KeyboardEvent, MouseEvent, SourceBufferAppendMode};
+use web_sys::{window, HtmlVideoElement, KeyboardEvent, MouseEvent};
 use yew::prelude::*;
 
 // ── Playback speed options ───────────────────────────────────────────────────
@@ -1013,21 +1013,22 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
                         };
 
-                        // Use "sequence" mode — the browser ignores in-fragment
-                        // PTS and chains fragments end-to-end starting from
-                        // `timestampOffset`.  This approach is used by hls.js
-                        // for fMP4/CMAF content (see hls.js
-                        // `BufferController.createSourceBuffers()`).  It is
-                        // more robust than "segments" mode because it doesn't
-                        // depend on the backend producing correct continuous
-                        // PTS values.
+                        // Use the default "segments" mode — the browser
+                        // positions each appended fragment on the timeline
+                        // using the baseMediaDecodeTime from the moof/tfdt
+                        // boxes, with no automatic timestampOffset adjustment.
+                        // This is the mode used by dash.js's SourceBufferSink
+                        // (it never calls set_mode()) and by Shaka Player.
                         //
-                        // For seeking to unbuffered positions, we flush the
-                        // buffer and set timestampOffset to the target time
-                        // before restarting the pump (matching hls.js's
-                        // `onBufferFlushing` + timestampOffset reset pattern).
-                        source_buffer.set_mode(SourceBufferAppendMode::Sequence);
-                        log::info!("MSE: SourceBuffer created in Sequence mode");
+                        // The backend rebases PTS so segment N starts at
+                        // N × 6 s (continuous PTS), which means Segments mode
+                        // places each fragment at the correct absolute time
+                        // without any client-side offset management.
+                        //
+                        // Ref: dash.js SourceBufferSink.initializeForFirstUse()
+                        //      — never calls sourceBuffer.mode = 'sequence'
+                        // Ref: DASH-IF IOP v4.3 §3.2
+                        log::info!("MSE: SourceBuffer created in Segments mode (default)");
 
                         // Set the total presentation duration from the MPD so
                         // the browser knows the full video length.
@@ -1076,15 +1077,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         } else {
                             0
                         };
-
-                        // In Sequence mode, set timestampOffset to the start
-                        // position so segments are placed at the correct
-                        // timeline position.
-                        if start_seg > 0 {
-                            let ts_offset = start_seg as f64 * SEGMENT_DURATION_F;
-                            source_buffer.set_timestamp_offset(ts_offset);
-                            log::info!("MSE: initial timestampOffset = {ts_offset}s (segment {start_seg})");
-                        }
 
                         // Store MSE state.
                         *mse_state.borrow_mut() = Some(MseState {
@@ -1328,10 +1320,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
     // Handle seeks — modelled after how major DASH clients react to seeks:
     //
-    //  • hls.js: On seek, flushes the SourceBuffer, resets timestampOffset,
-    //    and restarts segment loading from the target position.
-    //    Source: hls.js/src/controller/stream-controller.ts
-    //
     //  • dash.js: PlaybackController listens for the `seeking` event, aborts
     //    any in-flight segment requests, resets BufferController, and
     //    reschedules downloads from the new position.
@@ -1347,11 +1335,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     //    segments).  If the target is already buffered, continue; otherwise
     //    cancel the current download and start from the target segment.
     //
-    // In Sequence mode, seeking to an unbuffered position requires:
-    //   1. Abort any pending SourceBuffer operation
-    //   2. Remove all buffered data
-    //   3. Set timestampOffset to the target segment's start time
-    //   4. Restart the pump from the target segment
+    // In Segments mode, the browser uses baseMediaDecodeTime from each
+    // segment's moof/tfdt to place fragments on the timeline.  No
+    // timestampOffset adjustment or buffer flush is needed — just cancel
+    // the pump and restart from the target segment.
     //
     // Firefox fires `seeking` up to 7 times for a single user seek, so
     // we only bump the pump generation when `next_seg` actually changes.
@@ -1386,105 +1373,30 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             start_pump(&mse_state_for_seek, &video_for_seek);
                         }
                     } else {
-                        // Seek target is NOT buffered.  In Sequence mode we
-                        // must flush the buffer and reset timestampOffset.
+                        // Seek target is NOT buffered.  In Segments mode the
+                        // browser places fragments via baseMediaDecodeTime, so
+                        // we just cancel the pump and restart from the target
+                        // segment — no buffer flush or timestampOffset needed.
                         //
-                        // Modelled after dash.js StreamProcessor.prepareInnerPeriodPlaybackSeeking():
+                        // Modelled after dash.js PlaybackController.onPlaybackSeeking():
                         //   → clearScheduleTimer() + fragmentModel.abortRequests()
-                        //   → bufferController.prepareForPlaybackSeek()
-                        //   → bufferController.clearBuffers(clearRanges)
                         //   → setExplicitBufferingTime(targetTime)
                         //   → scheduleController.startScheduleTimer()
-                        //
-                        // Also matches hls.js: flush buffer → set timestampOffset → restart loading.
-                        log::info!("seek: target {seek_time:.1}s not buffered, flushing and restarting from segment {target_seg}");
+                        log::info!("seek: target {seek_time:.1}s not buffered, restarting from segment {target_seg}");
 
-                        // Cancel the current pump immediately (synchronous),
-                        // analogous to dash.js clearScheduleTimer() +
-                        // fragmentModel.abortRequests().
-                        // Capture the generation BEFORE spawning async work
-                        // so that concurrent seeking events (Firefox fires up
-                        // to 7) can be detected and abandoned.
-                        let my_gen = {
+                        {
                             let mut borrow = mse_state_for_seek.borrow_mut();
                             if let Some(mse) = borrow.as_mut() {
                                 mse.pump_gen = mse.pump_gen.wrapping_add(1);
                                 mse.pump_running = false;
                                 mse.next_seg = target_seg;
                                 mse.last_appended_seg = None;
-                                mse.pump_gen
                             } else {
                                 return;
                             }
-                        };
+                        }
 
-                        let mse_state_c = mse_state_for_seek.clone();
-                        let video_c = video_for_seek.clone();
-                        spawn_local(async move {
-                            // Get SourceBuffer reference, but only if our
-                            // generation is still current (no newer seek).
-                            let sb = {
-                                let borrow = mse_state_c.borrow();
-                                match borrow.as_ref() {
-                                    Some(s) if s.pump_gen == my_gen => {
-                                        s.source_buffer.clone()
-                                    }
-                                    _ => return, // another seek superseded us
-                                }
-                            };
-
-                            // Wait for SourceBuffer to finish any pending op.
-                            // Timeout after 2 seconds to avoid infinite loops.
-                            for _ in 0..400 {
-                                if !sb.updating() { break; }
-                                TimeoutFuture::new(5).await;
-                            }
-
-                            // Re-check: if another seek happened while we
-                            // waited, abandon (Firefox multiple-seeking guard).
-                            {
-                                let borrow = mse_state_c.borrow();
-                                if !matches!(borrow.as_ref(), Some(s) if s.pump_gen == my_gen) {
-                                    return;
-                                }
-                            }
-
-                            // Abort + remove all buffered data.
-                            // Analogous to dash.js bufferController.clearBuffers().
-                            let _ = sb.abort();
-                            let remove_end = {
-                                let borrow = mse_state_c.borrow();
-                                borrow.as_ref()
-                                    .map(|s| s.media_source.duration())
-                                    .filter(|d| d.is_finite() && *d > 0.0)
-                                    .unwrap_or(86400.0)
-                            };
-                            let _ = sb.remove(0.0, remove_end);
-
-                            // Wait for the remove to complete (timeout 2 s).
-                            for _ in 0..400 {
-                                if !sb.updating() { break; }
-                                TimeoutFuture::new(5).await;
-                            }
-
-                            // Re-check again after the remove await.
-                            {
-                                let borrow = mse_state_c.borrow();
-                                if !matches!(borrow.as_ref(), Some(s) if s.pump_gen == my_gen) {
-                                    return;
-                                }
-                            }
-
-                            // Set timestampOffset so Sequence mode places the
-                            // next appended fragment at the target position.
-                            let ts_offset = target_seg as f64 * SEGMENT_DURATION_F;
-                            sb.set_timestamp_offset(ts_offset);
-                            log::info!("seek: timestampOffset = {ts_offset}s, restarting pump from segment {target_seg}");
-
-                            // Restart the pump.
-                            // Analogous to dash.js scheduleController.startScheduleTimer().
-                            force_start_pump(&mse_state_c, &video_c);
-                        });
+                        force_start_pump(&mse_state_for_seek, &video_for_seek);
                     }
                 });
 

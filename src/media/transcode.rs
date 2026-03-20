@@ -1269,8 +1269,11 @@ fn hybrid_segment(
     let seg_video_start = (start_time * out_video_tb.1 as f64 / out_video_tb.0 as f64) as i64;
 
     // Audio synthetic PTS (in 1/sample_rate time base).
+    // Overwritten when the first video keyframe is found (below) so that
+    // audio and video share the same timeline origin.  The initial value
+    // is never used because audio processing is gated on got_video_keyframe.
     let mut audio_sample_count: i64 = 0;
-    let audio_ts_offset = (start_time * audio_sample_rate as f64) as i64;
+    let mut audio_ts_offset: i64 = 0;
 
     for (stream, mut packet) in ictx.packets() {
         if let Some(k) = kill {
@@ -1306,6 +1309,12 @@ fn hybrid_segment(
                 }
                 got_video_keyframe = true;
                 keyframe_pts_secs = pts_secs;
+                // Recompute audio_ts_offset to match the actual keyframe
+                // position so audio and video share the same timeline
+                // origin.  This prevents the audio desync that occurs
+                // when keyframes land before the nominal segment boundary.
+                audio_ts_offset =
+                    (keyframe_pts_secs * audio_sample_rate as f64) as i64;
             }
 
             // Copy video packet directly (remux), adding continuous PTS.
@@ -1340,12 +1349,16 @@ fn hybrid_segment(
                 }
                 let mut audio_frame = ffmpeg_next::util::frame::Audio::empty();
                 while adec.receive_frame(&mut audio_frame).is_ok() {
-                    // Time-range filter.
+                    // Time-range filter — use keyframe_pts_secs (not
+                    // start_time) as the lower bound so that audio begins
+                    // at the same point as the video keyframe.  This keeps
+                    // audio and video in sync when the keyframe precedes
+                    // the nominal segment boundary.
                     if let Some(apts) = audio_frame.pts() {
                         let apts_secs = apts as f64
                             * f64::from(audio_time_base.0)
                             / f64::from(audio_time_base.1);
-                        if apts_secs < start_time || apts_secs >= end_time {
+                        if apts_secs < keyframe_pts_secs || apts_secs >= end_time {
                             continue;
                         }
                     }

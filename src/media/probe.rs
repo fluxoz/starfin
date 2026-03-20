@@ -16,21 +16,26 @@ pub struct ProbeMeta {
 
 /// Probe a media file and return `(duration_secs, metadata)`.
 ///
-/// Returns `(0, ProbeMeta::default())` on any error (file not found, corrupt
+/// Returns `(0.0, ProbeMeta::default())` on any error (file not found, corrupt
 /// header, etc.) — mirroring the old ffprobe-based fallback behaviour.
-pub fn probe_video(path: &Path) -> (u32, ProbeMeta) {
+///
+/// The duration is returned as `f64` (fractional seconds) so that DASH
+/// manifests and MSE `MediaSource.duration` get sub-second precision.
+/// Callers that only need integer seconds for display (e.g. grid cards)
+/// should truncate with `as u32`.
+pub fn probe_video(path: &Path) -> (f64, ProbeMeta) {
     super::ensure_init();
 
     let input = match ffmpeg_next::format::input(path) {
         Ok(ctx) => ctx,
-        Err(_) => return (0, ProbeMeta::default()),
+        Err(_) => return (0.0, ProbeMeta::default()),
     };
 
     // Duration: libavformat stores it in AV_TIME_BASE (1 000 000) units.
-    let duration_secs = if input.duration() >= 0 {
-        (input.duration() as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as u32
+    let duration_secs: f64 = if input.duration() >= 0 {
+        input.duration() as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE)
     } else {
-        0
+        0.0
     };
 
     let meta = input.metadata();

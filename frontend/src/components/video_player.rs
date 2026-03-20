@@ -87,17 +87,6 @@ const MSE_BACK_BUFFER_S: f64 = 30.0;
 /// Ref: dash.js/src/streaming/controllers/GapController.js `_jumpGap()`
 const SMALL_GAP_LIMIT_S: f64 = 0.8;
 
-/// Extra seconds added past the nominal segment end when setting
-/// appendWindowEnd.  Without this, the browser clips the last video frame's
-/// effective duration to the exact segment boundary, which can create a
-/// sub-frame gap (0–33 ms) before the first frame of the following segment —
-/// the perceptible ms-level stutter at every segment transition.
-/// 0.1 s is enough to cover one frame at any frame rate ≥ 10 fps.
-/// The next segment's appendWindowStart discards anything past its own
-/// nominal start, so the overlap is harmless.
-/// Ref: dash.js SourceBufferSink.js uses `end + 0.1` for the same reason.
-const APPEND_WINDOW_END_OVERLAP: f64 = 0.1;
-
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn format_time(seconds: f64) -> String {
@@ -724,49 +713,31 @@ async fn pump_loop(
             return;
         }
 
-        // ── 6b. Set appendWindow to trim segment to its nominal
-        //        boundaries — matching dash.js SourceBufferSink
-        //        behaviour.  When keyframes don't align with segment
-        //        boundaries, the backend includes content starting from
-        //        the previous keyframe.  The appendWindow trims it so
-        //        only the [start, end) slice is presented, eliminating
-        //        overlap between consecutive segments and giving clean
-        //        transitions.
+        // ── 6b. Append without per-segment appendWindow ──────────────
         //
-        // Ref: dash.js SourceBufferSink.appendBuffer() — sets
-        //      appendWindowStart / appendWindowEnd before every append.
-        // Ref: DASH-IF IOP v4.3 §3.2.8 (buffer management).
+        // dash.js (SourceBufferSink.js) only uses appendWindow for
+        // multi-period transitions.  For single-period VOD content the
+        // window covers the entire presentation [0, duration], so no
+        // per-segment clipping is performed.
         //
-        // appendWindowEnd is extended by APPEND_WINDOW_END_OVERLAP (0.1 s)
-        // past the nominal segment end.  Without this, the browser clips
-        // the last video frame's effective duration to the exact boundary,
-        // which can leave a sub-frame gap (≈ 0–33 ms) before the first
-        // frame of the next segment — the perceptible ms-level stutter at
-        // every segment transition.  The small overlap is safe because the
-        // next segment's appendWindowStart trims anything it doesn't own.
-        // Ref: dash.js uses the same "end + epsilon" pattern in
-        //      SourceBufferSink.js to avoid identical gaps.
+        // We follow the same approach: segments are positioned on the
+        // timeline via baseMediaDecodeTime (patched by the backend), and
+        // MSE Segments mode's coded-frame processing algorithm handles
+        // overlapping content automatically.
         //
-        // Order matters: the spec throws TypeError if appendWindowStart
-        // >= appendWindowEnd.  To safely move the window forward (or
-        // backward after a seek), reset start to 0 first, update end,
-        // then set start.
-        {
-            let total_segments = state.borrow().as_ref().map_or(0, |s| s.segments.len());
-            let window_start = seg_idx as f64 * SEGMENT_DURATION_F;
-            let window_end = if seg_idx + 1 < total_segments {
-                (seg_idx + 1) as f64 * SEGMENT_DURATION_F + APPEND_WINDOW_END_OVERLAP
-            } else {
-                f64::INFINITY
-            };
-            // Property setters are void in web_sys; JS exceptions surface
-            // as console errors but don't propagate to Rust.  The 3-step
-            // ordering (reset→end→start) prevents the TypeError that would
-            // occur if start >= end.
-            sb.set_append_window_start(0.0);
-            sb.set_append_window_end(window_end);
-            sb.set_append_window_start(window_start);
-        }
+        // Setting appendWindowStart to the nominal segment boundary was
+        // the root cause of the large gaps: the MSE spec requires
+        //   need_random_access_point = true
+        // when frames are trimmed by appendWindowStart, which discards
+        // all non-keyframe content between the window start and the next
+        // in-window keyframe.  For sources with keyframes every 8 s but
+        // 6 s segments, this created 2–8 s gaps at every boundary.
+        //
+        // Ref: dash.js SourceBufferSink.js — updateAppendWindow() sets
+        //      window to [periodStart − 0.1, periodEnd + 0.01], NOT to
+        //      individual segment boundaries.
+        // Ref: DASH-IF IOP v4.3 §3.2 — segments start at SAPs; the
+        //      browser de-duplicates overlapping data via baseMediaDecodeTime.
 
         let uint8_array = js_sys::Uint8Array::from(media_bytes.as_slice());
         let array_buffer = uint8_array.buffer();

@@ -9,7 +9,6 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{window, HtmlVideoElement, KeyboardEvent, MouseEvent};
 use yew::prelude::*;
-use log::info;
 
 // ── Playback speed options ───────────────────────────────────────────────────
 const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
@@ -91,7 +90,6 @@ const SMALL_GAP_LIMIT_S: f64 = 0.8;
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn format_time(seconds: f64) -> String {
-    info!("format_time");
     if !seconds.is_finite() || seconds < 0.0 {
         return "0:00".to_string();
     }
@@ -109,7 +107,6 @@ fn format_time(seconds: f64) -> String {
 /// Return the end of the buffered range that contains `time`.
 /// If `time` is not inside any buffered range, returns 0.0.
 fn buffered_end_at(video: &HtmlVideoElement, time: f64) -> f64 {
-    info!("buffered end");
     let buffered = video.buffered();
     for i in 0..buffered.length() {
         if let (Ok(start), Ok(end)) = (buffered.start(i), buffered.end(i)) {
@@ -123,7 +120,6 @@ fn buffered_end_at(video: &HtmlVideoElement, time: f64) -> f64 {
 
 /// Check whether `time` falls inside any buffered range of the video element.
 fn is_time_buffered(video: &HtmlVideoElement, time: f64) -> bool {
-    info!("is time buffered");
     let buffered = video.buffered();
     for i in 0..buffered.length() {
         if let (Ok(s), Ok(e)) = (buffered.start(i), buffered.end(i)) {
@@ -145,30 +141,53 @@ fn is_time_buffered(video: &HtmlVideoElement, time: f64) -> bool {
 ///   1. Finds the first buffered range whose start is ahead of `currentTime`.
 ///   2. If the gap (range.start − currentTime) is ≤ `smallGapLimit`, seeks
 ///      past it.
+///   3. If `jumpLargeGaps` is enabled and no small gap was found, jump to
+///      the start of the next buffered range regardless of gap size.
+///
+/// We enable the large-gap behaviour unconditionally because remuxed fMP4
+/// segments can have gaps larger than 0.8 s when keyframes don't align with
+/// segment boundaries (e.g. keyframes every 8 s but segments every 6 s).
+/// Ref: dash.js `settings.streaming.gaps.jumpLargeGaps`
 ///
 /// Returns `true` if a gap was jumped, `false` otherwise.
 fn try_jump_gap(video: &HtmlVideoElement) -> bool {
-    info!("try jump gap");
     let current = video.current_time();
     let buffered = video.buffered();
     let len = buffered.length();
+    let mut nearest_ahead: Option<f64> = None;
     for i in 0..len {
         if let (Ok(start), Ok(_end)) = (buffered.start(i), buffered.end(i)) {
             // Ignore ranges that start before/at the current position and
             // gaps smaller than 1 ms (floating-point rounding noise).
             let gap = start - current;
-            if gap > 0.001 && gap <= SMALL_GAP_LIMIT_S {
-                // Seek just past the gap boundary to avoid landing exactly
-                // on the edge (some browsers treat the exact boundary as
-                // still in the gap).
-                let target = start + 0.001;
-                log::info!(
-                    "GapController: jumping {gap:.3}s gap at {current:.3}s → {target:.3}s"
-                );
-                video.set_current_time(target);
-                return true;
+            if gap > 0.001 {
+                if gap <= SMALL_GAP_LIMIT_S {
+                    // Small gap — jump immediately (dash.js default).
+                    let target = start + 0.001;
+                    log::info!(
+                        "GapController: jumping {gap:.3}s gap at {current:.3}s → {target:.3}s"
+                    );
+                    video.set_current_time(target);
+                    return true;
+                }
+                // Track the nearest buffered range ahead for large-gap jump.
+                if nearest_ahead.is_none() || start < nearest_ahead.unwrap() {
+                    nearest_ahead = Some(start);
+                }
             }
         }
+    }
+    // Large-gap jump (dash.js `jumpLargeGaps`): when the playhead is stalled
+    // between buffered ranges and no small gap was found, jump to the start
+    // of the nearest buffered range ahead.
+    if let Some(start) = nearest_ahead {
+        let target = start + 0.001;
+        log::info!(
+            "GapController: large gap jump at {current:.3}s → {target:.3}s (gap {:.3}s)",
+            start - current
+        );
+        video.set_current_time(target);
+        return true;
     }
     false
 }
@@ -239,7 +258,6 @@ struct MseState {
 ///
 /// Returns `(init_url, total_duration_secs, segments)`.
 fn parse_mpd(text: &str) -> (String, f64, Vec<SegmentInfo>) {
-    info!("parse_mpd");
     let mut init_url = String::new();
     let mut media_template = String::new();
     let mut start_number: usize = 0;
@@ -347,7 +365,6 @@ fn parse_mpd(text: &str) -> (String, f64, Vec<SegmentInfo>) {
 
 /// Parse an ISO 8601 duration like "PT1H23M45S" or "PT0H0M30S" into seconds.
 fn parse_iso8601_duration(s: &str) -> f64 {
-    info!("parse_iso8601_duration");
     let s = s.strip_prefix("PT").unwrap_or(s);
     let mut total = 0.0_f64;
     let mut num_buf = String::new();
@@ -383,7 +400,6 @@ fn parse_iso8601_duration(s: &str) -> f64 {
 /// appending to the SourceBuffer.  Per ISO BMFF (ISO 14496-12), the moov box
 /// must only appear once in the SourceBuffer initialization.
 fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
-    info!("strip init boxes");
     let mut result = Vec::new();
     let mut pos = 0usize;
 
@@ -415,7 +431,6 @@ fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
 /// generation.  Returns `false` (= caller should exit) when the state has
 /// been dropped or a newer pump has been started (e.g. after a seek).
 fn is_pump_current(state: &Rc<RefCell<Option<MseState>>>, pump_id: u32) -> bool {
-    info!("is pump current");
     let borrow = state.borrow();
     matches!(borrow.as_ref(), Some(s) if s.pump_gen == pump_id)
 }
@@ -427,7 +442,6 @@ async fn wait_for_sb(
     state: &Rc<RefCell<Option<MseState>>>,
     pump_id: u32,
 ) -> bool {
-    info!("wait for sb");
     while sb.updating() {
         TimeoutFuture::new(5).await;
         if !is_pump_current(state, pump_id) {
@@ -456,7 +470,6 @@ async fn evict_back_buffer(
     state: &Rc<RefCell<Option<MseState>>>,
     pump_id: u32,
 ) {
-    info!("evict back buffer");
     let current = video.current_time();
     let evict_before = current - MSE_BACK_BUFFER_S;
     if evict_before <= 0.5 {
@@ -502,7 +515,6 @@ async fn evict_back_buffer(
 /// - `seeking` event handler (repoints the pump at the seek target)
 /// - 150 ms timer safety-net (only when `pump_running` is false)
 fn start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElement) {
-    info!("start_pump");
     let pump_id = {
         let mut borrow = state.borrow_mut();
         match borrow.as_mut() {
@@ -537,7 +549,6 @@ fn start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElement) {
 /// spawns a new loop regardless of whether a pump is already running.
 /// Used by the seek handler which must immediately repoint the pump.
 fn force_start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElement) {
-    info!("force_start_pump");
     let pump_id = {
         let mut borrow = state.borrow_mut();
         match borrow.as_mut() {
@@ -597,7 +608,6 @@ async fn pump_loop(
     video: HtmlVideoElement,
     pump_id: u32,
 ) {
-    info!("pump_loop");
     loop {
         // ── 1. Generation check ──────────────────────────────────────
         if !is_pump_current(&state, pump_id) {
@@ -1876,7 +1886,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         progress_el: &web_sys::HtmlElement,
         video_duration: f64,
     ) -> Option<(f64, f64)> {
-        info!("calculate_seek_time");
         let rect = progress_el.get_bounding_client_rect();
         let click_x = e.client_x() as f64 - rect.left();
         let width = rect.width();
@@ -2571,7 +2580,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 // ── Thumbnail Info Fetching ──────────────────────────────────────────────────
 
 async fn fetch_thumbnail_info(video_id: &str) -> Result<ThumbnailInfo, String> {
-    info!("fetch_thumbnail_info");
     let url = format!("/api/videos/{video_id}/thumbnails/info");
     let resp = Request::get(&url)
         .send()
@@ -2592,7 +2600,6 @@ async fn fetch_thumbnail_info(video_id: &str) -> Result<ThumbnailInfo, String> {
 // ── Subtitle Track Fetching ──────────────────────────────────────────────────
 
 async fn fetch_subtitle_tracks(video_id: &str) -> Result<Vec<SubtitleTrack>, String> {
-    info!("fetch_subtitle_tracks");
     let url = format!("/api/videos/{video_id}/subtitles");
     let resp = Request::get(&url)
         .send()
@@ -2622,7 +2629,6 @@ async fn fetch_subtitle_tracks(video_id: &str) -> Result<Vec<SubtitleTrack>, Str
 /// In the unlikely event the request is lost (e.g. network error), the
 /// server's idle-eviction sweep will clear the cache after 10 minutes.
 async fn clear_video_cache(video_id: &str) {
-    info!("clear_video_cache");
     let url = format!("/api/videos/{video_id}/cache");
     if let Err(e) = Request::delete(&url).send().await {
         web_sys::console::warn_1(

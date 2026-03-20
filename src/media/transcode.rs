@@ -577,6 +577,234 @@ fn extract_ftyp_moov(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(result)
 }
 
+// ── tfdt patching ────────────────────────────────────────────────────────────
+
+/// Patch the `baseMediaDecodeTime` in all `tfdt` boxes within an fMP4 segment
+/// so that segment N's samples start at `N × SEGMENT_DURATION` on the
+/// presentation timeline.
+///
+/// FFmpeg's fragmented MP4 muxer always normalises the first DTS to 0
+/// (in `mov_write_single_packet`), so `baseMediaDecodeTime` in the `tfdt`
+/// boxes is always 0 regardless of the PTS values written to the packets.
+/// This post-processing step restores the correct absolute timeline position
+/// required for MSE Segments mode (used by dash.js and Shaka Player).
+///
+/// The function:
+///   1. Parses the `moov` box to build a track_id → timescale map.
+///   2. Walks each `traf` inside the `moof` box, reads the `track_id`
+///      from `tfhd`, and patches the `tfdt` with
+///      `seg_index × SEGMENT_DURATION × timescale`.
+fn patch_segment_tfdt(path: &Path, seg_index: usize) -> Result<(), String> {
+    if seg_index == 0 {
+        return Ok(()); // Segment 0 starts at time 0 — no patch needed.
+    }
+
+    let mut data = std::fs::read(path)
+        .map_err(|e| format!("patch_tfdt: read segment: {e}"))?;
+
+    // Step 1: Parse moov to build track_id -> timescale map.
+    let timescales = parse_moov_timescales(&data)?;
+
+    // Step 2: Find the moof box and patch tfdt in each traf.
+    let mut pos = 0usize;
+    while pos + 8 <= data.len() {
+        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+            as usize;
+        if size < 8 || pos + size > data.len() {
+            break;
+        }
+        if &data[pos + 4..pos + 8] == b"moof" {
+            patch_moof_tfdts(&mut data, pos + 8, pos + size, seg_index, &timescales);
+            break; // Only one moof per segment.
+        }
+        pos += size;
+    }
+
+    std::fs::write(path, &data)
+        .map_err(|e| format!("patch_tfdt: write segment: {e}"))?;
+
+    Ok(())
+}
+
+/// Parse the `moov` box to extract a track_id → timescale mapping.
+///
+/// Walks `moov → trak → tkhd` (for `track_id`) and
+/// `moov → trak → mdia → mdhd` (for `timescale`).
+fn parse_moov_timescales(data: &[u8]) -> Result<std::collections::HashMap<u32, u32>, String> {
+    use std::collections::HashMap;
+    let mut timescales = HashMap::new();
+
+    // Find moov box.
+    let mut pos = 0usize;
+    while pos + 8 <= data.len() {
+        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+            as usize;
+        if size < 8 || pos + size > data.len() {
+            break;
+        }
+        if &data[pos + 4..pos + 8] == b"moov" {
+            let moov_end = pos + size;
+            let mut child = pos + 8;
+            while child + 8 <= moov_end {
+                let cs =
+                    u32::from_be_bytes([data[child], data[child + 1], data[child + 2], data[child + 3]])
+                        as usize;
+                if cs < 8 || child + cs > moov_end {
+                    break;
+                }
+                if &data[child + 4..child + 8] == b"trak" {
+                    if let Some((tid, ts)) = parse_trak_timescale(data, child + 8, child + cs) {
+                        timescales.insert(tid, ts);
+                    }
+                }
+                child += cs;
+            }
+            break;
+        }
+        pos += size;
+    }
+
+    if timescales.is_empty() {
+        return Err("patch_tfdt: no tracks found in moov".into());
+    }
+    Ok(timescales)
+}
+
+/// Extract `(track_id, timescale)` from a single `trak` box's children.
+fn parse_trak_timescale(data: &[u8], start: usize, end: usize) -> Option<(u32, u32)> {
+    let mut track_id: Option<u32> = None;
+    let mut timescale: Option<u32> = None;
+
+    let mut pos = start;
+    while pos + 8 <= end {
+        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+            as usize;
+        if size < 8 || pos + size > end {
+            break;
+        }
+        let btype = &data[pos + 4..pos + 8];
+
+        if btype == b"tkhd" && size >= 24 {
+            let version = data[pos + 8];
+            let offset = if version == 0 { 20 } else { 28 };
+            if pos + offset + 4 <= data.len() {
+                track_id = Some(u32::from_be_bytes([
+                    data[pos + offset],
+                    data[pos + offset + 1],
+                    data[pos + offset + 2],
+                    data[pos + offset + 3],
+                ]));
+            }
+        } else if btype == b"mdia" {
+            // Walk mdia children to find mdhd.
+            let mdia_end = pos + size;
+            let mut m = pos + 8;
+            while m + 8 <= mdia_end {
+                let ms =
+                    u32::from_be_bytes([data[m], data[m + 1], data[m + 2], data[m + 3]]) as usize;
+                if ms < 8 || m + ms > mdia_end {
+                    break;
+                }
+                if &data[m + 4..m + 8] == b"mdhd" && ms >= 24 {
+                    let version = data[m + 8];
+                    let offset = if version == 0 { 20 } else { 28 };
+                    if m + offset + 4 <= data.len() {
+                        timescale = Some(u32::from_be_bytes([
+                            data[m + offset],
+                            data[m + offset + 1],
+                            data[m + offset + 2],
+                            data[m + offset + 3],
+                        ]));
+                    }
+                    break;
+                }
+                m += ms;
+            }
+        }
+        pos += size;
+    }
+
+    match (track_id, timescale) {
+        (Some(t), Some(s)) => Some((t, s)),
+        _ => None,
+    }
+}
+
+/// Walk all `traf` children inside a `moof` box and patch each `tfdt`.
+fn patch_moof_tfdts(
+    data: &mut [u8],
+    start: usize,
+    end: usize,
+    seg_index: usize,
+    timescales: &std::collections::HashMap<u32, u32>,
+) {
+    let mut pos = start;
+    while pos + 8 <= end {
+        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+            as usize;
+        if size < 8 || pos + size > end {
+            break;
+        }
+        if &data[pos + 4..pos + 8] == b"traf" {
+            patch_traf_tfdt(data, pos + 8, pos + size, seg_index, timescales);
+        }
+        pos += size;
+    }
+}
+
+/// Inside a single `traf`, find the `tfhd` (for `track_id`) and `tfdt`
+/// (for `baseMediaDecodeTime`) and overwrite the latter.
+fn patch_traf_tfdt(
+    data: &mut [u8],
+    start: usize,
+    end: usize,
+    seg_index: usize,
+    timescales: &std::collections::HashMap<u32, u32>,
+) {
+    let mut track_id: Option<u32> = None;
+    let mut tfdt_pos: Option<usize> = None;
+    let mut tfdt_version: u8 = 0;
+
+    let mut pos = start;
+    while pos + 8 <= end {
+        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+            as usize;
+        if size < 8 || pos + size > end {
+            break;
+        }
+        let btype = &data[pos + 4..pos + 8];
+
+        if btype == b"tfhd" && size >= 16 {
+            // tfhd: size(4) + type(4) + version(1) + flags(3) + track_id(4)
+            track_id = Some(u32::from_be_bytes([
+                data[pos + 12],
+                data[pos + 13],
+                data[pos + 14],
+                data[pos + 15],
+            ]));
+        } else if btype == b"tfdt" {
+            tfdt_version = data[pos + 8];
+            tfdt_pos = Some(pos);
+        }
+        pos += size;
+    }
+
+    if let (Some(tid), Some(tp)) = (track_id, tfdt_pos) {
+        if let Some(&ts) = timescales.get(&tid) {
+            let bdt = (seg_index as f64 * SEGMENT_DURATION * ts as f64) as u64;
+            if tfdt_version == 0 {
+                // 32-bit baseMediaDecodeTime at box_start + 12
+                let val = (bdt as u32).to_be_bytes();
+                data[tp + 12..tp + 16].copy_from_slice(&val);
+            } else {
+                // 64-bit baseMediaDecodeTime at box_start + 12
+                let val = bdt.to_be_bytes();
+                data[tp + 12..tp + 20].copy_from_slice(&val);
+            }
+        }
+    }
+}
+
 // ── Segment creation: decide remux vs transcode ─────────────────────────────
 
 fn create_segment(
@@ -613,6 +841,12 @@ fn create_segment(
         let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
         transcode_segment_inprocess(&mut ictx, start_time, hwaccel, effective_quality, &tmp_path, kill)?;
     }
+
+    // Patch tfdt baseMediaDecodeTime so each segment is positioned at the
+    // correct absolute time on the presentation timeline.  FFmpeg's fMP4
+    // muxer always normalises DTS to 0, so without this patch all segments
+    // would overlap at time 0 and MSE Segments mode would show only ~6 s.
+    patch_segment_tfdt(&tmp_path, seg_index)?;
 
     // Atomic rename.
     std::fs::rename(&tmp_path, &seg_path)

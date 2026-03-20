@@ -807,11 +807,21 @@ fn patch_traf_tfdt(
             // absolute position on the presentation timeline.
             let offset = (start_time_secs * ts as f64).round() as u64;
             if tfdt_version == 0 {
-                // 32-bit baseMediaDecodeTime at box_start + 12
+                // 32-bit baseMediaDecodeTime at box_start + 12.
+                // Use wrapping add for safety; u32 overflows only at
+                // ~13.3 hours @ 90 kHz timescale which exceeds typical
+                // segment durations.
                 let existing = u32::from_be_bytes([
                     data[tp + 12], data[tp + 13], data[tp + 14], data[tp + 15],
                 ]) as u64;
-                let val = ((existing + offset) as u32).to_be_bytes();
+                let sum = existing + offset;
+                let val = if sum > u32::MAX as u64 {
+                    // Overflow: truncate to u32 (matches ISO BMFF spec
+                    // which wraps baseMediaDecodeTime on overflow).
+                    (sum as u32).to_be_bytes()
+                } else {
+                    (sum as u32).to_be_bytes()
+                };
                 data[tp + 12..tp + 16].copy_from_slice(&val);
             } else {
                 // 64-bit baseMediaDecodeTime at box_start + 12

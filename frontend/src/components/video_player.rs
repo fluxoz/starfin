@@ -733,9 +733,13 @@ async fn pump_loop(
             } else {
                 f64::INFINITY
             };
-            let _ = sb.set_append_window_start(0.0);
-            let _ = sb.set_append_window_end(window_end);
-            let _ = sb.set_append_window_start(window_start);
+            // Property setters are void in web_sys; JS exceptions surface
+            // as console errors but don't propagate to Rust.  The 3-step
+            // ordering (reset→end→start) prevents the TypeError that would
+            // occur if start >= end.
+            sb.set_append_window_start(0.0);
+            sb.set_append_window_end(window_end);
+            sb.set_append_window_start(window_start);
         }
 
         let uint8_array = js_sys::Uint8Array::from(media_bytes.as_slice());

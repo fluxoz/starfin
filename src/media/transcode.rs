@@ -1269,14 +1269,11 @@ fn hybrid_segment(
     let seg_video_start = (start_time * out_video_tb.1 as f64 / out_video_tb.0 as f64) as i64;
 
     // Audio synthetic PTS (in 1/sample_rate time base).
-    // Computed lazily from keyframe_pts_secs once the first video keyframe
-    // is found, so that audio and video share the same timeline origin.
-    // Using start_time instead of keyframe_pts_secs would shift audio
-    // relative to video by (start_time − keyframe_pts_secs) seconds,
-    // causing audible desync when keyframes don't align with segment
-    // boundaries.
+    // Overwritten when the first video keyframe is found (below) so that
+    // audio and video share the same timeline origin.  The initial value
+    // is never used because audio processing is gated on got_video_keyframe.
     let mut audio_sample_count: i64 = 0;
-    let mut audio_ts_offset: i64 = (start_time * audio_sample_rate as f64) as i64;
+    let mut audio_ts_offset: i64 = 0;
 
     for (stream, mut packet) in ictx.packets() {
         if let Some(k) = kill {

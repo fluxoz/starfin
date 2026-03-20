@@ -577,6 +577,265 @@ fn extract_ftyp_moov(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(result)
 }
 
+// ── tfdt patching ────────────────────────────────────────────────────────────
+
+/// Patch the `baseMediaDecodeTime` in all `tfdt` boxes within an fMP4 segment
+/// so that each segment's samples appear at the correct absolute position on
+/// the presentation timeline.
+///
+/// FFmpeg's fragmented MP4 muxer always normalizes the first DTS to 0
+/// (in `mov_write_single_packet`), so `baseMediaDecodeTime` in the `tfdt`
+/// boxes is always 0 regardless of the PTS values written to the packets.
+/// This post-processing step restores the correct absolute timeline position
+/// required for MSE Segments mode (used by dash.js and Shaka Player).
+///
+/// `start_time_secs` is the actual presentation time (in seconds) where this
+/// segment's content should begin.  For the remux/hybrid paths this is the
+/// PTS of the first video keyframe; for the transcode path it equals
+/// `seg_index × SEGMENT_DURATION` because the encoder forces a keyframe at
+/// the segment boundary.
+///
+/// The function:
+///   1. Parses the `moov` box to build a track_id → timescale map.
+///   2. Walks each `traf` inside the `moof` box, reads the `track_id`
+///      from `tfhd`, and patches the `tfdt` with
+///      `start_time_secs × timescale`.
+fn patch_segment_tfdt(path: &Path, start_time_secs: f64) -> Result<(), String> {
+    // Segment 0 (start ≈ 0) needs no patch — baseMediaDecodeTime 0 is correct.
+    if start_time_secs < 1e-3 {
+        return Ok(());
+    }
+
+    let mut data = std::fs::read(path)
+        .map_err(|e| format!("patch_tfdt: read segment: {e}"))?;
+
+    // Step 1: Parse moov to build track_id -> timescale map.
+    let timescales = parse_moov_timescales(&data)?;
+
+    // Step 2: Find all moof boxes and patch tfdt in each traf.
+    // With frag_keyframe, FFmpeg may produce multiple moof boxes per segment
+    // (one per keyframe).  We must patch ALL of them.
+    let mut pos = 0usize;
+    while pos + 8 <= data.len() {
+        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+            as usize;
+        if size < 8 || pos + size > data.len() {
+            break;
+        }
+        if &data[pos + 4..pos + 8] == b"moof" {
+            patch_moof_tfdts(&mut data, pos + 8, pos + size, start_time_secs, &timescales);
+        }
+        pos += size;
+    }
+
+    std::fs::write(path, &data)
+        .map_err(|e| format!("patch_tfdt: write segment: {e}"))?;
+
+    Ok(())
+}
+
+/// Parse the `moov` box to extract a track_id → timescale mapping.
+///
+/// Walks `moov → trak → tkhd` (for `track_id`) and
+/// `moov → trak → mdia → mdhd` (for `timescale`).
+fn parse_moov_timescales(data: &[u8]) -> Result<std::collections::HashMap<u32, u32>, String> {
+    use std::collections::HashMap;
+    let mut timescales = HashMap::new();
+
+    // Find moov box.
+    let mut pos = 0usize;
+    while pos + 8 <= data.len() {
+        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+            as usize;
+        if size < 8 || pos + size > data.len() {
+            break;
+        }
+        if &data[pos + 4..pos + 8] == b"moov" {
+            let moov_end = pos + size;
+            let mut child = pos + 8;
+            while child + 8 <= moov_end {
+                let cs =
+                    u32::from_be_bytes([data[child], data[child + 1], data[child + 2], data[child + 3]])
+                        as usize;
+                if cs < 8 || child + cs > moov_end {
+                    break;
+                }
+                if &data[child + 4..child + 8] == b"trak" {
+                    if let Some((tid, ts)) = parse_trak_timescale(data, child + 8, child + cs) {
+                        timescales.insert(tid, ts);
+                    }
+                }
+                child += cs;
+            }
+            break;
+        }
+        pos += size;
+    }
+
+    if timescales.is_empty() {
+        return Err("patch_tfdt: no tracks found in moov".into());
+    }
+    Ok(timescales)
+}
+
+/// Extract `(track_id, timescale)` from a single `trak` box's children.
+fn parse_trak_timescale(data: &[u8], start: usize, end: usize) -> Option<(u32, u32)> {
+    let mut track_id: Option<u32> = None;
+    let mut timescale: Option<u32> = None;
+
+    let mut pos = start;
+    while pos + 8 <= end {
+        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+            as usize;
+        if size < 8 || pos + size > end {
+            break;
+        }
+        let btype = &data[pos + 4..pos + 8];
+
+        if btype == b"tkhd" && size >= 24 {
+            let version = data[pos + 8];
+            let offset = if version == 0 { 20 } else { 28 };
+            if pos + offset + 4 <= data.len() {
+                track_id = Some(u32::from_be_bytes([
+                    data[pos + offset],
+                    data[pos + offset + 1],
+                    data[pos + offset + 2],
+                    data[pos + offset + 3],
+                ]));
+            }
+        } else if btype == b"mdia" {
+            // Walk mdia children to find mdhd.
+            let mdia_end = pos + size;
+            let mut m = pos + 8;
+            while m + 8 <= mdia_end {
+                let ms =
+                    u32::from_be_bytes([data[m], data[m + 1], data[m + 2], data[m + 3]]) as usize;
+                if ms < 8 || m + ms > mdia_end {
+                    break;
+                }
+                if &data[m + 4..m + 8] == b"mdhd" && ms >= 24 {
+                    let version = data[m + 8];
+                    let offset = if version == 0 { 20 } else { 28 };
+                    if m + offset + 4 <= data.len() {
+                        timescale = Some(u32::from_be_bytes([
+                            data[m + offset],
+                            data[m + offset + 1],
+                            data[m + offset + 2],
+                            data[m + offset + 3],
+                        ]));
+                    }
+                    break;
+                }
+                m += ms;
+            }
+        }
+        pos += size;
+    }
+
+    match (track_id, timescale) {
+        (Some(t), Some(s)) => Some((t, s)),
+        _ => None,
+    }
+}
+
+/// Walk all `traf` children inside a `moof` box and patch each `tfdt`.
+fn patch_moof_tfdts(
+    data: &mut [u8],
+    start: usize,
+    end: usize,
+    start_time_secs: f64,
+    timescales: &std::collections::HashMap<u32, u32>,
+) {
+    let mut pos = start;
+    while pos + 8 <= end {
+        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+            as usize;
+        if size < 8 || pos + size > end {
+            break;
+        }
+        if &data[pos + 4..pos + 8] == b"traf" {
+            patch_traf_tfdt(data, pos + 8, pos + size, start_time_secs, timescales);
+        }
+        pos += size;
+    }
+}
+
+/// Inside a single `traf`, find the `tfhd` (for `track_id`) and `tfdt`
+/// (for `baseMediaDecodeTime`) and overwrite the latter.
+fn patch_traf_tfdt(
+    data: &mut [u8],
+    start: usize,
+    end: usize,
+    start_time_secs: f64,
+    timescales: &std::collections::HashMap<u32, u32>,
+) {
+    let mut track_id: Option<u32> = None;
+    let mut tfdt_pos: Option<usize> = None;
+    let mut tfdt_version: u8 = 0;
+
+    let mut pos = start;
+    while pos + 8 <= end {
+        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+            as usize;
+        if size < 8 || pos + size > end {
+            break;
+        }
+        let btype = &data[pos + 4..pos + 8];
+
+        if btype == b"tfhd" && size >= 16 {
+            // tfhd: size(4) + type(4) + version(1) + flags(3) + track_id(4)
+            track_id = Some(u32::from_be_bytes([
+                data[pos + 12],
+                data[pos + 13],
+                data[pos + 14],
+                data[pos + 15],
+            ]));
+        } else if btype == b"tfdt" {
+            tfdt_version = data[pos + 8];
+            tfdt_pos = Some(pos);
+        }
+        pos += size;
+    }
+
+    if let (Some(tid), Some(tp)) = (track_id, tfdt_pos) {
+        if let Some(&ts) = timescales.get(&tid) {
+            // FFmpeg's frag_keyframe may produce multiple moof boxes per
+            // segment (one per keyframe).  FFmpeg normalizes the FIRST
+            // fragment's DTS to 0 but preserves correct relative offsets
+            // for subsequent fragments.  We ADD the keyframe offset to
+            // each existing value so all fragments end up at their correct
+            // absolute position on the presentation timeline.
+            let offset = (start_time_secs * ts as f64).round() as u64;
+            if tfdt_version == 0 {
+                // 32-bit baseMediaDecodeTime at box_start + 12.
+                // Use wrapping add for safety; u32 overflows only at
+                // ~13.3 hours @ 90 kHz timescale which exceeds typical
+                // segment durations.
+                let existing = u32::from_be_bytes([
+                    data[tp + 12], data[tp + 13], data[tp + 14], data[tp + 15],
+                ]) as u64;
+                let sum = existing + offset;
+                let val = if sum > u32::MAX as u64 {
+                    // Overflow: truncate to u32 (matches ISO BMFF spec
+                    // which wraps baseMediaDecodeTime on overflow).
+                    (sum as u32).to_be_bytes()
+                } else {
+                    (sum as u32).to_be_bytes()
+                };
+                data[tp + 12..tp + 16].copy_from_slice(&val);
+            } else {
+                // 64-bit baseMediaDecodeTime at box_start + 12
+                let existing = u64::from_be_bytes([
+                    data[tp + 12], data[tp + 13], data[tp + 14], data[tp + 15],
+                    data[tp + 16], data[tp + 17], data[tp + 18], data[tp + 19],
+                ]);
+                let val = (existing + offset).to_be_bytes();
+                data[tp + 12..tp + 20].copy_from_slice(&val);
+            }
+        }
+    }
+}
+
 // ── Segment creation: decide remux vs transcode ─────────────────────────────
 
 fn create_segment(
@@ -600,19 +859,30 @@ fn create_segment(
         .map_err(|e| format!("failed to open input: {e}"))?;
 
     // Decide: remux (fast copy) or transcode (re-encode).
-    if quality.can_remux() && source_is_remuxable(&ictx) {
+    // The remux and hybrid paths return the actual PTS (in seconds) of the
+    // first video keyframe so that patch_segment_tfdt can place the segment
+    // at its true position on the presentation timeline.  The transcode path
+    // forces a keyframe at the segment boundary, so start_time is exact.
+    let actual_start = if quality.can_remux() && source_is_remuxable(&ictx) {
         // Pure remux — both video and audio packets copied directly.
-        remux_segment(&mut ictx, start_time, &tmp_path, kill)?;
+        remux_segment(&mut ictx, start_time, &tmp_path, kill)?
     } else if quality.can_remux() && video_is_remuxable(&ictx) {
         // Hybrid — video packets copied, audio transcoded to stereo AAC.
         // This handles multi-channel AAC, non-AAC/MP3 codecs, etc.
-        hybrid_segment(&mut ictx, start_time, &tmp_path, kill)?;
+        hybrid_segment(&mut ictx, start_time, &tmp_path, kill)?
     } else {
         // For Original quality with incompatible codecs, fall back to the
         // same settings as High (native resolution, best quality).
         let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
         transcode_segment_inprocess(&mut ictx, start_time, hwaccel, effective_quality, &tmp_path, kill)?;
-    }
+        start_time
+    };
+
+    // Patch tfdt baseMediaDecodeTime so each segment is positioned at the
+    // correct absolute time on the presentation timeline.  FFmpeg's fMP4
+    // muxer always normalizes DTS to 0, so without this patch all segments
+    // would overlap at time 0 and MSE Segments mode would show only ~6 s.
+    patch_segment_tfdt(&tmp_path, actual_start)?;
 
     // Atomic rename.
     std::fs::rename(&tmp_path, &seg_path)
@@ -627,12 +897,16 @@ fn create_segment(
 /// decoding or re-encoding.  This is the equivalent of
 /// `ffmpeg -ss <t> -i input -t 6 -c copy -f mp4 -movflags empty_moov+frag_keyframe+default_base_moof output.m4s`
 /// and gives VLC-like performance.
+///
+/// Returns the actual PTS (in seconds) of the first video keyframe included
+/// in the segment.  This may be later than `start_time` when the source
+/// keyframe interval doesn't align with the segment duration.
 fn remux_segment(
     ictx: &mut ffmpeg_next::format::context::Input,
     start_time: f64,
     tmp_path: &Path,
     kill: Option<&AtomicBool>,
-) -> Result<(), String> {
+) -> Result<f64, String> {
     let end_time = start_time + SEGMENT_DURATION;
 
     // Find best video/audio streams.
@@ -713,6 +987,8 @@ fn remux_segment(
     let out_audio_tb = out_audio_idx_val.map(|i| octx.stream(i).unwrap().time_base()).unwrap_or(out_audio_tb);
 
     let mut got_video_keyframe = false;
+    // Actual PTS (in seconds) of the first video keyframe in this segment.
+    let mut keyframe_pts_secs: f64 = start_time;
     // PTS offsets (in output time base) used to rebase timestamps so that
     // first-packet PTS is subtracted, then a segment-start offset is added,
     // producing continuous PTS across the presentation (seg N starts at
@@ -751,17 +1027,26 @@ fn remux_segment(
         }
 
         if is_video {
-            // Wait for the first keyframe at or after start_time.
-            // Only accept keyframes whose PTS is at or after the declared
-            // segment start so consecutive segments never share overlapping
-            // content.  Accepting a keyframe from *before* start_time would
-            // cause the player to replay already-seen frames at every segment
-            // boundary, producing the "stutter every 6 seconds" symptom.
+            // Accept the first keyframe found after the seek — this is the
+            // keyframe at or before start_time (placed there by the seek
+            // call above).  Including this keyframe and all subsequent
+            // frames through end_time ensures the segment has content that
+            // overlaps with the previous segment, eliminating timeline gaps.
+            //
+            // In MSE Segments mode the browser de-duplicates overlapping
+            // data from consecutive segments via baseMediaDecodeTime, so
+            // the redundant frames are harmless.  The alternative (waiting
+            // for a keyframe >= start_time) creates gaps whenever the
+            // source keyframe interval doesn't divide evenly into 6 s.
+            //
+            // Ref: dash.js ScheduleController — real DASH packagers always
+            //      start each segment from a SAP (Stream Access Point).
             if !got_video_keyframe {
-                if !packet.is_key() || pts_secs < start_time {
+                if !packet.is_key() {
                     continue;
                 }
                 got_video_keyframe = true;
+                keyframe_pts_secs = pts_secs;
             }
         } else {
             // Skip audio packets before the video keyframe region.
@@ -809,7 +1094,7 @@ fn remux_segment(
 
     write_fmp4_trailer(&mut octx)?;
 
-    Ok(())
+    Ok(keyframe_pts_secs)
 }
 
 // ── Hybrid path (video remux + audio transcode to stereo AAC) ───────────────
@@ -826,7 +1111,7 @@ fn hybrid_segment(
     start_time: f64,
     tmp_path: &Path,
     kill: Option<&AtomicBool>,
-) -> Result<(), String> {
+) -> Result<f64, String> {
     let end_time = start_time + SEGMENT_DURATION;
 
     // Find best video/audio streams.
@@ -976,6 +1261,7 @@ fn hybrid_segment(
     let out_audio_tb = out_audio_idx.map(|i| octx.stream(i).unwrap().time_base());
 
     let mut got_video_keyframe = false;
+    let mut keyframe_pts_secs: f64 = start_time;
     let mut video_pts_offset: Option<i64> = None;
 
     // Segment-start offset for video in the output time base so PTS is
@@ -1012,15 +1298,14 @@ fn hybrid_segment(
         }
 
         if is_video {
-            // Wait for the first keyframe at or after start_time.
-            // See the same comment in remux_segment — accepting a keyframe
-            // from before start_time causes content overlap between segments
-            // and the resulting duplicate frames appear as stuttering.
+            // Accept the first keyframe found after the seek — same
+            // rationale as remux_segment above.
             if !got_video_keyframe {
-                if !packet.is_key() || pts_secs < start_time {
+                if !packet.is_key() {
                     continue;
                 }
                 got_video_keyframe = true;
+                keyframe_pts_secs = pts_secs;
             }
 
             // Copy video packet directly (remux), adding continuous PTS.
@@ -1147,7 +1432,7 @@ fn hybrid_segment(
 
     write_fmp4_trailer(&mut octx)?;
 
-    Ok(())
+    Ok(keyframe_pts_secs)
 }
 
 // ── Transcode path (re-encode — used for incompatible codecs or scaling) ────

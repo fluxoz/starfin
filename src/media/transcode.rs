@@ -601,8 +601,9 @@ fn extract_ftyp_moov(data: &[u8]) -> Result<Vec<u8>, String> {
 ///      from `tfhd`, and patches the `tfdt` with
 ///      `start_time_secs × timescale`.
 fn patch_segment_tfdt(path: &Path, start_time_secs: f64) -> Result<(), String> {
-    if start_time_secs < 0.001 {
-        return Ok(()); // First segment starts at time 0 — no patch needed.
+    // Segment 0 (start ≈ 0) needs no patch — baseMediaDecodeTime 0 is correct.
+    if start_time_secs < 1e-3 {
+        return Ok(());
     }
 
     let mut data = std::fs::read(path)
@@ -797,16 +798,14 @@ fn patch_traf_tfdt(
 
     if let (Some(tid), Some(tp)) = (track_id, tfdt_pos) {
         if let Some(&ts) = timescales.get(&tid) {
-            // SEGMENT_DURATION is an integer number of seconds (6) and
-            // timescale fits in u32, so integer arithmetic is exact here.
-            let bdt = (start_time_secs * ts as f64).round() as u64;
+            let base_media_decode_time = (start_time_secs * ts as f64).round() as u64;
             if tfdt_version == 0 {
                 // 32-bit baseMediaDecodeTime at box_start + 12
-                let val = (bdt as u32).to_be_bytes();
+                let val = (base_media_decode_time as u32).to_be_bytes();
                 data[tp + 12..tp + 16].copy_from_slice(&val);
             } else {
                 // 64-bit baseMediaDecodeTime at box_start + 12
-                let val = bdt.to_be_bytes();
+                let val = base_media_decode_time.to_be_bytes();
                 data[tp + 12..tp + 20].copy_from_slice(&val);
             }
         }

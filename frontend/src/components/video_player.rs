@@ -170,7 +170,9 @@ fn try_jump_gap(video: &HtmlVideoElement) -> bool {
                     video.set_current_time(target);
                     return true;
                 }
-                // Track the nearest buffered range ahead for large-gap jump.
+                // Track the closest buffered-range start ahead of the
+                // current position (minimum of all candidates) so the
+                // large-gap path below can jump to it.
                 if nearest_ahead.map_or(true, |n| start < n) {
                     nearest_ahead = Some(start);
                 }

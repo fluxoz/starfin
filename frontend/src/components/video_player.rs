@@ -720,6 +720,11 @@ async fn pump_loop(
         // Ref: dash.js SourceBufferSink.appendBuffer() — sets
         //      appendWindowStart / appendWindowEnd before every append.
         // Ref: DASH-IF IOP v4.3 §3.2.8 (buffer management).
+        //
+        // Order matters: the spec throws TypeError if appendWindowStart
+        // >= appendWindowEnd.  To safely move the window forward (or
+        // backward after a seek), reset start to 0 first, update end,
+        // then set start.
         {
             let total_segments = state.borrow().as_ref().map_or(0, |s| s.segments.len());
             let window_start = seg_idx as f64 * SEGMENT_DURATION_F;
@@ -728,8 +733,9 @@ async fn pump_loop(
             } else {
                 f64::INFINITY
             };
-            let _ = sb.set_append_window_start(window_start);
+            let _ = sb.set_append_window_start(0.0);
             let _ = sb.set_append_window_end(window_end);
+            let _ = sb.set_append_window_start(window_start);
         }
 
         let uint8_array = js_sys::Uint8Array::from(media_bytes.as_slice());

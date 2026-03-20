@@ -524,23 +524,30 @@ pub fn create_init_segment(abs_path: &str, quality: Quality, hwaccel: &HwAccel) 
     // This ensures the init segment's codec params AND timescale match
     // the media segments exactly — critical for correct MSE playback
     // timing in both Segments and Sequence SourceBuffer modes.
-    let tmp_dir = std::env::temp_dir().join(format!("starfin_init_{}", std::process::id()));
+    //
+    // Use a unique temp directory per call (thread ID + timestamp) to
+    // avoid races when concurrent requests create the init for the same
+    // video simultaneously.
+    let unique = format!(
+        "starfin_init_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    );
+    let tmp_dir = std::env::temp_dir().join(unique);
     let _ = std::fs::create_dir_all(&tmp_dir);
 
-    let seg0_path = tmp_dir.join("seg_00000.m4s");
-    if !seg0_path.exists() {
+    let result = (|| -> Result<Vec<u8>, String> {
         create_segment(abs_path, &tmp_dir, 0, hwaccel, quality, None)?;
-    }
+        let seg0_path = tmp_dir.join("seg_00000.m4s");
+        let data = std::fs::read(&seg0_path)
+            .map_err(|e| format!("failed to read segment 0: {e}"))?;
+        extract_ftyp_moov(&data)
+    })();
 
-    // Read the segment and extract ftyp+moov boxes.
-    let data = std::fs::read(&seg0_path)
-        .map_err(|e| format!("failed to read segment 0: {e}"))?;
-    let init = extract_ftyp_moov(&data)?;
-
-    // Cleanup.
+    // Cleanup regardless of success or failure.
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
-    Ok(init)
+    result
 }
 
 /// Extract ftyp and moov boxes from an fMP4 byte buffer.

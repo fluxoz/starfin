@@ -1021,9 +1021,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         // (it never calls set_mode()) and by Shaka Player.
                         //
                         // The backend rebases PTS so segment N starts at
-                        // N × 6 s (continuous PTS), which means Segments mode
-                        // places each fragment at the correct absolute time
-                        // without any client-side offset management.
+                        // N × SEGMENT_DURATION_F (6 s), which means Segments
+                        // mode places each fragment at the correct absolute
+                        // time without any client-side offset management.
                         //
                         // Ref: dash.js SourceBufferSink.initializeForFirstUse()
                         //      — never calls sourceBuffer.mode = 'sequence'

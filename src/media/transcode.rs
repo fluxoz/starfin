@@ -1050,7 +1050,7 @@ fn remux_segment(
 
         // Map to the output stream and rescale timestamps.
         // No PTS rebasing — original absolute PTS flows through.
-        // FFmpeg's fMP4 muxer normalises the first DTS to 0 internally;
+        // FFmpeg's fMP4 muxer normalizes the first DTS to 0 internally;
         // patch_segment_tfdt() then sets baseMediaDecodeTime to the actual
         // keyframe position so the browser places content correctly.
         if is_video {

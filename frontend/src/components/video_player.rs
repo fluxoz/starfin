@@ -473,13 +473,24 @@ fn is_pump_current(state: &Rc<RefCell<Option<MseState>>>, pump_id: u32) -> bool 
 
 /// Wait for the SourceBuffer to finish any in-progress operation.
 /// Returns `false` if the pump generation changed during the wait.
+///
+/// Uses `TimeoutFuture::new(0)` (equivalent to `setTimeout(0)` in JS)
+/// to yield to the browser's event loop between checks.  This matches
+/// dash.js `SourceBufferSink._onUpdateEnd` → `setTimeout(executeNext, 0)`
+/// pattern, ensuring the browser can process audio/video decode work
+/// between SourceBuffer operations.
+///
+/// A 0 ms timeout doesn't actually wait — it just yields the current
+/// microtask, letting the browser's event loop run one tick (process
+/// pending updateend events, decode audio frames, render, etc.) before
+/// we re-check `sb.updating()`.
 async fn wait_for_sb(
     sb: &web_sys::SourceBuffer,
     state: &Rc<RefCell<Option<MseState>>>,
     pump_id: u32,
 ) -> bool {
     while sb.updating() {
-        TimeoutFuture::new(5).await;
+        TimeoutFuture::new(0).await;
         if !is_pump_current(state, pump_id) {
             return false;
         }
@@ -498,13 +509,17 @@ async fn wait_for_sb(
 ///     `BufferController.onBufferFlushing()`.
 ///   • DASH-IF IOP v4.3 §3.2.8 recommends proactive buffer management.
 ///
-/// We keep up to `MSE_BACK_BUFFER_S` seconds behind the current playback
-/// position and remove everything before that via `SourceBuffer.remove()`.
+/// **Critical design constraint:** `SourceBuffer.remove()` sets
+/// `updating = true`, blocking the next `appendBuffer()`.  During this
+/// time the browser cannot decode new audio/video frames from appended
+/// segments.  dash.js mitigates this by only calling `pruneBuffer()`
+/// when the total buffer approaches the browser's SourceBuffer quota —
+/// NOT on every append based on back-buffer time.
 ///
-/// Additionally, we cap the total buffer duration at
-/// `MSE_BACK_BUFFER_S + MSE_TARGET_BUFFER_S` to prevent the browser from
-/// hitting its SourceBuffer quota and performing emergency eviction near
-/// the playhead (which causes audio dropout stutter).
+/// We follow the same approach: only evict when `total_buffered` exceeds
+/// `MSE_BACK_BUFFER_S + MSE_TARGET_BUFFER_S`.  When eviction is needed,
+/// trim enough to bring the total one segment below the cap, giving
+/// headroom for the next append without re-triggering eviction.
 async fn evict_back_buffer(
     sb: &web_sys::SourceBuffer,
     video: &HtmlVideoElement,
@@ -530,21 +545,23 @@ async fn evict_back_buffer(
         Err(_) => return,
     };
 
-    // Compute how far back to evict.  Two constraints:
-    // 1. Keep at most MSE_BACK_BUFFER_S behind the playhead.
-    // 2. Cap total buffer duration to prevent browser quota eviction.
     let max_total = MSE_BACK_BUFFER_S + MSE_TARGET_BUFFER_S;
     let total_buffered = buf_end - buf_start;
-    let evict_before = if total_buffered > max_total {
-        // Total buffer exceeds limit — evict more aggressively from front.
-        // Keep MSE_TARGET_BUFFER_S ahead of playhead + MSE_BACK_BUFFER_S behind.
-        let target_start = (current - MSE_BACK_BUFFER_S).max(buf_start);
-        // At minimum, trim enough to bring total under the cap.
-        let min_evict = buf_start + (total_buffered - max_total);
-        target_start.max(min_evict)
-    } else {
-        current - MSE_BACK_BUFFER_S
-    };
+
+    // Only evict when total buffer exceeds the cap.
+    // This prevents unnecessary sb.remove() calls that block the append
+    // pipeline.  dash.js only prunes when approaching the quota, not on
+    // every append based on back-buffer time.
+    if total_buffered <= max_total {
+        return;
+    }
+
+    // Trim enough to bring total one segment below the cap, giving
+    // headroom for the next append.
+    let target_total = max_total - SEGMENT_DURATION_F;
+    let target_start = (current - MSE_BACK_BUFFER_S).max(buf_start);
+    let min_evict = buf_start + (total_buffered - target_total);
+    let evict_before = target_start.max(min_evict);
 
     if evict_before <= buf_start + MIN_EVICT_S {
         return; // nothing worth evicting
@@ -827,7 +844,10 @@ async fn pump_loop(
             if buf_ahead >= MSE_TARGET_BUFFER_S {
                 // Enough data buffered ahead — sleep and re-check.
                 // Keep prefetching in the background while we wait.
-                TimeoutFuture::new(500).await;
+                // Use 200 ms (not 500 ms) for responsive scheduling —
+                // matches dash.js ScheduleController which reschedules
+                // quickly when buffer level changes.
+                TimeoutFuture::new(200).await;
                 continue;
             }
         }

@@ -77,6 +77,14 @@ const CONTROLS_VICINITY_PX: f64 = 80.0;
 /// We use 30 s for comfortable VOD buffering.
 const MSE_TARGET_BUFFER_S: f64 = 30.0;
 
+/// Stable buffer time — the minimum buffer target after stabilisation.
+/// dash.js `stableBufferTime` defaults to 12 s.
+const STABLE_BUFFER_TIME_S: f64 = 12.0;
+
+/// Default buffer time — controls how much buffer to aim for on startup.
+/// dash.js `bufferTimeDefault` defaults to 12 s.
+const BUFFER_TIME_DEFAULT_S: f64 = 12.0;
+
 /// Maximum seconds of already-played data to keep behind the playhead.
 /// Data older than this is evicted via `SourceBuffer.remove()` to bound
 /// memory usage and prevent the browser from hitting its SourceBuffer
@@ -115,6 +123,2150 @@ const MIN_EVICT_S: f64 = 0.5;
 /// dash.js achieves this implicitly via CDN pre-segmented content; our
 /// on-demand backend requires explicit lookahead.
 const LOOKAHEAD_SEGMENTS: usize = 5;
+
+// ── ABR constants (mirrors dash.js AbrController / ThroughputController) ─────
+
+/// Safety factor applied to measured throughput before comparing to bitrate.
+/// dash.js `bandwidthSafetyFactor` defaults to 0.9.
+const ABR_BANDWIDTH_SAFETY_FACTOR: f64 = 0.9;
+
+/// EWMA fast half-life in number of samples.
+/// dash.js uses 3 for fast estimate.
+const EWMA_HALF_LIFE_FAST: f64 = 3.0;
+
+/// EWMA slow half-life in number of samples.
+/// dash.js uses 8 for slow estimate.
+const EWMA_HALF_LIFE_SLOW: f64 = 8.0;
+
+/// Minimum number of throughput samples before ABR rules activate.
+const ABR_MIN_SAMPLES: usize = 2;
+
+/// DroppedFramesRule: minimum sample size before evaluating.
+const DROPPED_FRAMES_MIN_SAMPLE: u32 = 300;
+
+/// DroppedFramesRule: percentage threshold to trigger downgrade.
+const DROPPED_FRAMES_THRESHOLD: f64 = 0.15;
+
+/// SwitchHistoryRule: sample size for evaluation.
+const SWITCH_HISTORY_SAMPLE_SIZE: usize = 8;
+
+/// SwitchHistoryRule: percentage threshold (drops/noDrops ratio).
+const SWITCH_HISTORY_THRESHOLD: f64 = 0.075;
+
+/// AbandonRequestsRule: duration multiplier — abandon if estimated download
+/// time exceeds `segmentDuration * multiplier`.
+const ABANDON_DURATION_MULTIPLIER: f64 = 1.8;
+
+/// BOLA constants — mirrors dash.js BolaRule.js
+const BOLA_MINIMUM_BUFFER_S: f64 = 10.0;
+const BOLA_MINIMUM_BUFFER_PER_LEVEL_S: f64 = 2.0;
+const BOLA_PLACEHOLDER_DECAY: f64 = 0.99;
+
+// ── Live stream constants ────────────────────────────────────────────────────
+
+/// Default suggested presentation delay for live streams (seconds).
+const LIVE_DEFAULT_PRESENTATION_DELAY_S: f64 = 4.0;
+
+/// Maximum playback rate adjustment for live catchup.
+const LIVE_CATCHUP_RATE_MAX: f64 = 0.5;
+
+/// Minimum playback rate adjustment for live catchup (negative = slow down).
+const LIVE_CATCHUP_RATE_MIN: f64 = -0.5;
+
+/// How often (ms) to refresh a dynamic MPD.
+const LIVE_MPD_REFRESH_INTERVAL_MS: u32 = 5000;
+
+// ── ScheduleController constants ─────────────────────────────────────────────
+
+/// When `fastSwitchEnabled`, flush ahead-of-playhead buffer on quality switch.
+const FAST_SWITCH_ENABLED: bool = true;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §1  APPLICATION-LEVEL EVENT SYSTEM — MediaPlayerEvents.js
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// dash.js exposes ~60 named events via an EventBus singleton.
+// We mirror this with a Rust enum + callback registry.  Every event variant
+// carries an optional JSON-serialisable payload (as `serde_json::Value`) so
+// consumers can pattern-match on the event and extract data.
+//
+// Ref: dash.js/src/streaming/MediaPlayerEvents.js
+//      dash.js/src/core/EventBus.js
+
+/// All player events modelled after `dash.js MediaPlayerEvents`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlayerEvent {
+    // ── Manifest ──
+    ManifestLoadingStarted,
+    ManifestLoadingFinished,
+    ManifestLoaded,
+    ManifestValidityChanged,
+
+    // ── Stream / Period ──
+    StreamInitializing,
+    StreamInitialized,
+    StreamUpdated,
+    StreamActivated,
+    StreamDeactivated,
+    StreamTeardownComplete,
+    PeriodSwitchStarted,
+    PeriodSwitchCompleted,
+
+    // ── Quality / Representation ──
+    QualityChangeRequested,
+    QualityChangeRendered,
+    RepresentationSwitch,
+    AdaptationSetRemovedNoCapabilities,
+
+    // ── Buffer ──
+    BufferEmpty,
+    BufferLoaded,
+    BufferLevelStateChanged,
+    BufferLevelUpdated,
+
+    // ── Fragment ──
+    FragmentLoadingStarted,
+    FragmentLoadingCompleted,
+    FragmentLoadingProgress,
+    FragmentLoadingAbandoned,
+
+    // ── Playback ──
+    PlaybackPlaying,
+    PlaybackPaused,
+    PlaybackSeeking,
+    PlaybackSeeked,
+    PlaybackStarted,
+    PlaybackTimeUpdated,
+    PlaybackProgress,
+    PlaybackRateChanged,
+    PlaybackEnded,
+    PlaybackWaiting,
+    PlaybackStalled,
+    PlaybackNotAllowed,
+    PlaybackError,
+    PlaybackMetadataLoaded,
+    PlaybackLoadedData,
+    PlaybackInitialized,
+    PlaybackVolumeChanged,
+
+    // ── Metrics ──
+    MetricsChanged,
+    MetricChanged,
+    MetricAdded,
+    MetricUpdated,
+    ThroughputMeasurementStored,
+
+    // ── Track / Text ──
+    NewTrackSelected,
+    TrackChangeRendered,
+    TextTracksAdded,
+    TextTrackAdded,
+    CueEnter,
+    CueExit,
+    CaptionRendered,
+
+    // ── Misc ──
+    CanPlay,
+    CanPlayThrough,
+    Error,
+    Log,
+    DynamicToStatic,
+    AstInFuture,
+    BaseUrlsUpdated,
+    InbandPrft,
+    ManagedMediaSourceStartStreaming,
+    ManagedMediaSourceEndStreaming,
+}
+
+impl PlayerEvent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ManifestLoadingStarted => "manifestLoadingStarted",
+            Self::ManifestLoadingFinished => "manifestLoadingFinished",
+            Self::ManifestLoaded => "manifestLoaded",
+            Self::ManifestValidityChanged => "manifestValidityChanged",
+            Self::StreamInitializing => "streamInitializing",
+            Self::StreamInitialized => "streamInitialized",
+            Self::StreamUpdated => "streamUpdated",
+            Self::StreamActivated => "streamActivated",
+            Self::StreamDeactivated => "streamDeactivated",
+            Self::StreamTeardownComplete => "streamTeardownComplete",
+            Self::PeriodSwitchStarted => "periodSwitchStarted",
+            Self::PeriodSwitchCompleted => "periodSwitchCompleted",
+            Self::QualityChangeRequested => "qualityChangeRequested",
+            Self::QualityChangeRendered => "qualityChangeRendered",
+            Self::RepresentationSwitch => "representationSwitch",
+            Self::AdaptationSetRemovedNoCapabilities => "adaptationSetRemovedNoCapabilities",
+            Self::BufferEmpty => "bufferStalled",
+            Self::BufferLoaded => "bufferLoaded",
+            Self::BufferLevelStateChanged => "bufferStateChanged",
+            Self::BufferLevelUpdated => "bufferLevelUpdated",
+            Self::FragmentLoadingStarted => "fragmentLoadingStarted",
+            Self::FragmentLoadingCompleted => "fragmentLoadingCompleted",
+            Self::FragmentLoadingProgress => "fragmentLoadingProgress",
+            Self::FragmentLoadingAbandoned => "fragmentLoadingAbandoned",
+            Self::PlaybackPlaying => "playbackPlaying",
+            Self::PlaybackPaused => "playbackPaused",
+            Self::PlaybackSeeking => "playbackSeeking",
+            Self::PlaybackSeeked => "playbackSeeked",
+            Self::PlaybackStarted => "playbackStarted",
+            Self::PlaybackTimeUpdated => "playbackTimeUpdated",
+            Self::PlaybackProgress => "playbackProgress",
+            Self::PlaybackRateChanged => "playbackRateChanged",
+            Self::PlaybackEnded => "playbackEnded",
+            Self::PlaybackWaiting => "playbackWaiting",
+            Self::PlaybackStalled => "playbackStalled",
+            Self::PlaybackNotAllowed => "playbackNotAllowed",
+            Self::PlaybackError => "playbackError",
+            Self::PlaybackMetadataLoaded => "playbackMetaDataLoaded",
+            Self::PlaybackLoadedData => "playbackLoadedData",
+            Self::PlaybackInitialized => "playbackInitialized",
+            Self::PlaybackVolumeChanged => "playbackVolumeChanged",
+            Self::MetricsChanged => "metricsChanged",
+            Self::MetricChanged => "metricChanged",
+            Self::MetricAdded => "metricAdded",
+            Self::MetricUpdated => "metricUpdated",
+            Self::ThroughputMeasurementStored => "throughputMeasurementStored",
+            Self::NewTrackSelected => "newTrackSelected",
+            Self::TrackChangeRendered => "trackChangeRendered",
+            Self::TextTracksAdded => "allTextTracksAdded",
+            Self::TextTrackAdded => "textTrackAdded",
+            Self::CueEnter => "cueEnter",
+            Self::CueExit => "cueExit",
+            Self::CaptionRendered => "captionRendered",
+            Self::CanPlay => "canPlay",
+            Self::CanPlayThrough => "canPlayThrough",
+            Self::Error => "error",
+            Self::Log => "log",
+            Self::DynamicToStatic => "dynamicToStatic",
+            Self::AstInFuture => "astInFuture",
+            Self::BaseUrlsUpdated => "baseUrlsUpdated",
+            Self::InbandPrft => "inbandPrft",
+            Self::ManagedMediaSourceStartStreaming => "managedMediaSourceStartStreaming",
+            Self::ManagedMediaSourceEndStreaming => "managedMediaSourceEndStreaming",
+        }
+    }
+}
+
+/// Payload carried by player events — a thin wrapper around JSON to keep
+/// things flexible without requiring every event to define a dedicated struct.
+#[derive(Debug, Clone)]
+pub struct EventPayload {
+    pub data: serde_json::Value,
+}
+
+impl Default for EventPayload {
+    fn default() -> Self {
+        Self { data: serde_json::Value::Null }
+    }
+}
+
+/// Callback type for event listeners.
+type EventCallback = Rc<dyn Fn(&EventPayload)>;
+
+/// Centralised event bus mirroring dash.js `EventBus`.
+///
+/// All controllers emit events through this bus; UI and analytics consumers
+/// subscribe via `on()`.  Thread-safety is not needed in WASM (single-
+/// threaded), so `Rc<RefCell<…>>` suffices.
+#[derive(Clone)]
+pub struct EventBus {
+    listeners: Rc<RefCell<HashMap<PlayerEvent, Vec<EventCallback>>>>,
+}
+
+impl EventBus {
+    pub fn new() -> Self {
+        Self { listeners: Rc::new(RefCell::new(HashMap::new())) }
+    }
+
+    pub fn on(&self, event: PlayerEvent, cb: EventCallback) {
+        self.listeners.borrow_mut().entry(event).or_default().push(cb);
+    }
+
+    pub fn off(&self, event: PlayerEvent) {
+        self.listeners.borrow_mut().remove(&event);
+    }
+
+    pub fn emit(&self, event: PlayerEvent, payload: &EventPayload) {
+        let listeners = self.listeners.borrow();
+        if let Some(cbs) = listeners.get(&event) {
+            for cb in cbs {
+                cb(payload);
+            }
+        }
+    }
+
+    pub fn emit_simple(&self, event: PlayerEvent) {
+        self.emit(event, &EventPayload::default());
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §2  METRICS — DashMetrics.js
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Collects and exposes runtime metrics for debug overlays and ABR rules.
+// Mirrors dash.js/src/dash/DashMetrics.js.
+
+/// A single throughput measurement from a segment download.
+#[derive(Debug, Clone)]
+pub struct ThroughputSample {
+    pub timestamp_ms: f64,
+    pub throughput_kbps: f64,
+    pub latency_ms: f64,
+    pub bytes: usize,
+    pub duration_ms: f64,
+    pub media_type: MediaType,
+}
+
+/// Buffer level snapshot.
+#[derive(Debug, Clone)]
+pub struct BufferLevelEntry {
+    pub timestamp_ms: f64,
+    pub level_s: f64,
+    pub media_type: MediaType,
+}
+
+/// Media type — video or audio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MediaType {
+    Video,
+    Audio,
+}
+
+/// Dropped frame snapshot from `VideoPlaybackQuality`.
+#[derive(Debug, Clone, Default)]
+pub struct DroppedFrameEntry {
+    pub total_frames: u32,
+    pub dropped_frames: u32,
+    pub timestamp_ms: f64,
+}
+
+/// Per-representation switch/drop history used by `DroppedFramesRule`
+/// and `SwitchHistoryRule`.
+#[derive(Debug, Clone, Default)]
+pub struct SwitchHistoryEntry {
+    pub drops: usize,
+    pub no_drops: usize,
+}
+
+/// Latency tracking entry (for live streams).
+#[derive(Debug, Clone)]
+pub struct LatencyEntry {
+    pub timestamp_ms: f64,
+    pub latency_s: f64,
+}
+
+/// Central metrics store mirroring `DashMetrics.js`.
+#[derive(Debug, Clone)]
+pub struct DashMetrics {
+    pub throughput_history: Vec<ThroughputSample>,
+    pub buffer_levels: Vec<BufferLevelEntry>,
+    pub dropped_frames: DroppedFrameEntry,
+    pub switch_history: HashMap<usize, SwitchHistoryEntry>,
+    pub latency_history: Vec<LatencyEntry>,
+    pub current_buffer_state: HashMap<MediaType, BufferState>,
+}
+
+/// Buffer state — mirrors dash.js BUFFER_LOADED / BUFFER_EMPTY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferState {
+    Loaded,
+    Empty,
+}
+
+impl DashMetrics {
+    pub fn new() -> Self {
+        let mut current_buffer_state = HashMap::new();
+        current_buffer_state.insert(MediaType::Video, BufferState::Empty);
+        current_buffer_state.insert(MediaType::Audio, BufferState::Empty);
+        Self {
+            throughput_history: Vec::new(),
+            buffer_levels: Vec::new(),
+            dropped_frames: DroppedFrameEntry::default(),
+            switch_history: HashMap::new(),
+            latency_history: Vec::new(),
+            current_buffer_state,
+        }
+    }
+
+    pub fn add_throughput_sample(&mut self, sample: ThroughputSample) {
+        self.throughput_history.push(sample);
+        // Keep last 100 samples to bound memory.
+        if self.throughput_history.len() > 100 {
+            self.throughput_history.drain(..self.throughput_history.len() - 100);
+        }
+    }
+
+    pub fn add_buffer_level(&mut self, entry: BufferLevelEntry) {
+        self.buffer_levels.push(entry);
+        if self.buffer_levels.len() > 200 {
+            self.buffer_levels.drain(..self.buffer_levels.len() - 200);
+        }
+    }
+
+    pub fn update_dropped_frames(&mut self, total: u32, dropped: u32) {
+        self.dropped_frames.total_frames = total;
+        self.dropped_frames.dropped_frames = dropped;
+        self.dropped_frames.timestamp_ms = js_sys::Date::now();
+    }
+
+    pub fn set_buffer_state(&mut self, media_type: MediaType, state: BufferState) {
+        self.current_buffer_state.insert(media_type, state);
+    }
+
+    pub fn get_buffer_state(&self, media_type: MediaType) -> BufferState {
+        self.current_buffer_state.get(&media_type).copied().unwrap_or(BufferState::Empty)
+    }
+
+    pub fn record_switch(&mut self, rep_index: usize, was_drop: bool) {
+        let entry = self.switch_history.entry(rep_index).or_default();
+        if was_drop {
+            entry.drops += 1;
+        } else {
+            entry.no_drops += 1;
+        }
+    }
+
+    pub fn add_latency(&mut self, entry: LatencyEntry) {
+        self.latency_history.push(entry);
+        if self.latency_history.len() > 100 {
+            self.latency_history.drain(..self.latency_history.len() - 100);
+        }
+    }
+
+    pub fn current_buffer_level(&self, media_type: MediaType) -> f64 {
+        self.buffer_levels
+            .iter()
+            .rev()
+            .find(|e| e.media_type == media_type)
+            .map(|e| e.level_s)
+            .unwrap_or(0.0)
+    }
+
+    pub fn get_average_throughput(&self, media_type: MediaType) -> f64 {
+        let samples: Vec<_> = self.throughput_history.iter()
+            .filter(|s| s.media_type == media_type)
+            .collect();
+        if samples.is_empty() { return 0.0; }
+        let sum: f64 = samples.iter().map(|s| s.throughput_kbps).sum();
+        sum / samples.len() as f64
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §3  THROUGHPUT CONTROLLER — ThroughputController.js
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Maintains dual-EWMA (fast + slow) throughput estimation.
+// Returns min(fast, slow) for bandwidth (conservative) and
+// max(fast, slow) for latency (pessimistic).
+//
+// Ref: dash.js/src/streaming/controllers/ThroughputController.js
+
+/// Exponentially-weighted moving average state.
+#[derive(Debug, Clone)]
+struct EwmaState {
+    total_weight: f64,
+    fast_estimate: f64,
+    slow_estimate: f64,
+}
+
+impl EwmaState {
+    fn new() -> Self {
+        Self { total_weight: 0.0, fast_estimate: 0.0, slow_estimate: 0.0 }
+    }
+
+    /// Add a sample with weight 1.
+    fn add_sample(&mut self, value: f64) {
+        let weight = 1.0;
+        let alpha_fast = 1.0 - 0.5_f64.powf(weight / EWMA_HALF_LIFE_FAST);
+        let alpha_slow = 1.0 - 0.5_f64.powf(weight / EWMA_HALF_LIFE_SLOW);
+        self.fast_estimate = alpha_fast * value + (1.0 - alpha_fast) * self.fast_estimate;
+        self.slow_estimate = alpha_slow * value + (1.0 - alpha_slow) * self.slow_estimate;
+        self.total_weight += weight;
+    }
+
+    /// Get the EWMA estimate, corrected for startup bias.
+    /// `use_min = true` → min(fast, slow) (for bandwidth: conservative)
+    /// `use_min = false` → max(fast, slow) (for latency: pessimistic)
+    fn get_estimate(&self, use_min: bool) -> f64 {
+        if self.total_weight <= 0.0 {
+            return f64::NAN;
+        }
+        let correction_fast = 1.0 - 0.5_f64.powf(self.total_weight / EWMA_HALF_LIFE_FAST);
+        let correction_slow = 1.0 - 0.5_f64.powf(self.total_weight / EWMA_HALF_LIFE_SLOW);
+        let fast = self.fast_estimate / correction_fast;
+        let slow = self.slow_estimate / correction_slow;
+        if use_min { fast.min(slow) } else { fast.max(slow) }
+    }
+}
+
+/// ThroughputController per media type.
+#[derive(Debug, Clone)]
+pub struct ThroughputController {
+    throughput_ewma: HashMap<MediaType, EwmaState>,
+    latency_ewma: HashMap<MediaType, EwmaState>,
+    sample_count: HashMap<MediaType, usize>,
+}
+
+impl ThroughputController {
+    pub fn new() -> Self {
+        let mut throughput_ewma = HashMap::new();
+        let mut latency_ewma = HashMap::new();
+        let mut sample_count = HashMap::new();
+        for mt in [MediaType::Video, MediaType::Audio] {
+            throughput_ewma.insert(mt, EwmaState::new());
+            latency_ewma.insert(mt, EwmaState::new());
+            sample_count.insert(mt, 0);
+        }
+        Self { throughput_ewma, latency_ewma, sample_count }
+    }
+
+    pub fn add_measurement(&mut self, media_type: MediaType, throughput_kbps: f64, latency_ms: f64) {
+        if let Some(ewma) = self.throughput_ewma.get_mut(&media_type) {
+            ewma.add_sample(throughput_kbps);
+        }
+        if let Some(ewma) = self.latency_ewma.get_mut(&media_type) {
+            ewma.add_sample(latency_ms);
+        }
+        *self.sample_count.entry(media_type).or_insert(0) += 1;
+    }
+
+    /// Average throughput (kbps) using min(fast, slow) EWMA.
+    pub fn get_average_throughput(&self, media_type: MediaType) -> f64 {
+        self.throughput_ewma.get(&media_type)
+            .map(|e| e.get_estimate(true))
+            .unwrap_or(f64::NAN)
+    }
+
+    /// Safe throughput = average × safety factor.
+    pub fn get_safe_average_throughput(&self, media_type: MediaType) -> f64 {
+        let avg = self.get_average_throughput(media_type);
+        if avg.is_nan() { f64::NAN } else { avg * ABR_BANDWIDTH_SAFETY_FACTOR }
+    }
+
+    /// Average latency (ms) using max(fast, slow) EWMA.
+    pub fn get_average_latency(&self, media_type: MediaType) -> f64 {
+        self.latency_ewma.get(&media_type)
+            .map(|e| e.get_estimate(false))
+            .unwrap_or(f64::NAN)
+    }
+
+    pub fn get_sample_count(&self, media_type: MediaType) -> usize {
+        self.sample_count.get(&media_type).copied().unwrap_or(0)
+    }
+
+    pub fn reset(&mut self) {
+        for mt in [MediaType::Video, MediaType::Audio] {
+            self.throughput_ewma.insert(mt, EwmaState::new());
+            self.latency_ewma.insert(mt, EwmaState::new());
+            self.sample_count.insert(mt, 0);
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §4  FULL MPD PARSER — DashParser.js + DashAdapter.js
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Complete DASH MPD parser supporting:
+//   • Multiple Periods
+//   • Multiple AdaptationSets (separate audio + video)
+//   • SegmentTemplate, SegmentBase, SegmentList addressing
+//   • BaseURL resolution (absolute and relative)
+//   • ContentProtection descriptors
+//   • Role, Accessibility, Label for track selection
+//   • SupplementalProperty / EssentialProperty
+//   • Live: availabilityStartTime, timeShiftBufferDepth,
+//     minimumUpdatePeriod, suggestedPresentationDelay
+//   • UTCTiming element
+//   • XLink (xlink:href) resolution
+//
+// Ref: dash.js/src/dash/parser/DashParser.js
+//      dash.js/src/dash/DashAdapter.js
+
+/// Root MPD manifest.
+#[derive(Debug, Clone)]
+pub struct Mpd {
+    pub mpd_type: MpdType,
+    pub media_presentation_duration: f64,
+    pub min_buffer_time: f64,
+    pub availability_start_time: Option<String>,
+    pub time_shift_buffer_depth: Option<f64>,
+    pub minimum_update_period: Option<f64>,
+    pub suggested_presentation_delay: Option<f64>,
+    pub publish_time: Option<String>,
+    pub base_urls: Vec<String>,
+    pub utc_timing: Vec<UtcTiming>,
+    pub periods: Vec<Period>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MpdType {
+    Static,
+    Dynamic,
+}
+
+/// UTCTiming element for clock synchronisation.
+#[derive(Debug, Clone)]
+pub struct UtcTiming {
+    pub scheme_id_uri: String,
+    pub value: String,
+}
+
+/// Period within the MPD.
+#[derive(Debug, Clone)]
+pub struct Period {
+    pub id: Option<String>,
+    pub start: Option<f64>,
+    pub duration: Option<f64>,
+    pub base_urls: Vec<String>,
+    pub adaptation_sets: Vec<AdaptationSet>,
+    pub xlink_href: Option<String>,
+}
+
+/// Adaptation set (groups representations of same media type).
+#[derive(Debug, Clone)]
+pub struct AdaptationSet {
+    pub id: Option<String>,
+    pub content_type: Option<String>,
+    pub mime_type: Option<String>,
+    pub codecs: Option<String>,
+    pub lang: Option<String>,
+    pub segment_alignment: bool,
+    pub subsegment_alignment: bool,
+    pub bitstream_switching: bool,
+    pub roles: Vec<Descriptor>,
+    pub accessibility: Vec<Descriptor>,
+    pub labels: Vec<String>,
+    pub content_protection: Vec<ContentProtection>,
+    pub supplemental_properties: Vec<Descriptor>,
+    pub essential_properties: Vec<Descriptor>,
+    pub segment_template: Option<SegmentTemplate>,
+    pub segment_base: Option<SegmentBase>,
+    pub segment_list: Option<SegmentList>,
+    pub base_urls: Vec<String>,
+    pub representations: Vec<Representation>,
+}
+
+/// A single Representation (quality level).
+#[derive(Debug, Clone)]
+pub struct Representation {
+    pub id: Option<String>,
+    pub bandwidth: u64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub codecs: Option<String>,
+    pub mime_type: Option<String>,
+    pub frame_rate: Option<String>,
+    pub sar: Option<String>,
+    pub audio_sampling_rate: Option<u32>,
+    pub segment_template: Option<SegmentTemplate>,
+    pub segment_base: Option<SegmentBase>,
+    pub segment_list: Option<SegmentList>,
+    pub base_urls: Vec<String>,
+    pub content_protection: Vec<ContentProtection>,
+    /// Absolute index in the sorted (by bandwidth) list of representations
+    /// within the parent AdaptationSet.  Used by ABR rules.
+    pub absolute_index: usize,
+}
+
+impl Representation {
+    pub fn bitrate_kbps(&self) -> f64 {
+        self.bandwidth as f64 / 1000.0
+    }
+}
+
+/// SegmentTemplate addressing.
+#[derive(Debug, Clone)]
+pub struct SegmentTemplate {
+    pub initialization: Option<String>,
+    pub media: Option<String>,
+    pub start_number: usize,
+    pub timescale: f64,
+    pub duration: Option<f64>,
+    pub presentation_time_offset: Option<f64>,
+    pub timeline: Vec<TimelineEntry>,
+}
+
+/// SegmentBase addressing (single-segment, range-based).
+#[derive(Debug, Clone)]
+pub struct SegmentBase {
+    pub index_range: Option<String>,
+    pub initialization_range: Option<String>,
+    pub timescale: f64,
+    pub presentation_time_offset: Option<f64>,
+}
+
+/// SegmentList addressing.
+#[derive(Debug, Clone)]
+pub struct SegmentList {
+    pub initialization: Option<String>,
+    pub timescale: f64,
+    pub duration: Option<f64>,
+    pub start_number: usize,
+    pub segment_urls: Vec<SegmentUrl>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SegmentUrl {
+    pub media: String,
+    pub media_range: Option<String>,
+}
+
+/// A single <S> entry in a SegmentTimeline.
+#[derive(Debug, Clone)]
+pub struct TimelineEntry {
+    pub t: Option<u64>,
+    pub d: u64,
+    pub r: i64,
+}
+
+/// Descriptor element (used for Role, Accessibility, Supplemental/Essential).
+#[derive(Debug, Clone)]
+pub struct Descriptor {
+    pub scheme_id_uri: String,
+    pub value: Option<String>,
+}
+
+/// ContentProtection element.
+#[derive(Debug, Clone)]
+pub struct ContentProtection {
+    pub scheme_id_uri: String,
+    pub value: Option<String>,
+    pub default_kid: Option<String>,
+    pub cenc_pssh: Option<String>,
+}
+
+/// Parse a complete DASH MPD manifest.
+///
+/// Handles all addressing schemes (SegmentTemplate, SegmentBase, SegmentList),
+/// multiple Periods and AdaptationSets, live attributes, and descriptors.
+pub fn parse_mpd_full(text: &str) -> Mpd {
+    let mpd_type = if extract_attr(text, "MPD", "type").as_deref() == Some("dynamic") {
+        MpdType::Dynamic
+    } else {
+        MpdType::Static
+    };
+
+    let media_presentation_duration = extract_attr(text, "MPD", "mediaPresentationDuration")
+        .map(|s| parse_iso8601_duration(&s))
+        .unwrap_or(0.0);
+
+    let min_buffer_time = extract_attr(text, "MPD", "minBufferTime")
+        .map(|s| parse_iso8601_duration(&s))
+        .unwrap_or(1.5);
+
+    let availability_start_time = extract_attr(text, "MPD", "availabilityStartTime");
+    let time_shift_buffer_depth = extract_attr(text, "MPD", "timeShiftBufferDepth")
+        .map(|s| parse_iso8601_duration(&s));
+    let minimum_update_period = extract_attr(text, "MPD", "minimumUpdatePeriod")
+        .map(|s| parse_iso8601_duration(&s));
+    let suggested_presentation_delay = extract_attr(text, "MPD", "suggestedPresentationDelay")
+        .map(|s| parse_iso8601_duration(&s));
+    let publish_time = extract_attr(text, "MPD", "publishTime");
+
+    let base_urls = extract_base_urls(text);
+    let utc_timing = extract_utc_timing(text);
+    let periods = extract_periods(text);
+
+    Mpd {
+        mpd_type,
+        media_presentation_duration,
+        min_buffer_time,
+        availability_start_time,
+        time_shift_buffer_depth,
+        minimum_update_period,
+        suggested_presentation_delay,
+        publish_time,
+        base_urls,
+        utc_timing,
+        periods,
+    }
+}
+
+// ── MPD XML extraction helpers ───────────────────────────────────────────────
+
+fn extract_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
+    let tag_open = format!("<{tag}");
+    let tag_start = xml.find(&tag_open)?;
+    let tag_slice = &xml[tag_start..];
+    let tag_end = tag_slice.find('>')?;
+    let tag_content = &tag_slice[..tag_end];
+    let attr_search = format!("{attr}=\"");
+    let attr_pos = tag_content.find(&attr_search)?;
+    let rest = &tag_content[attr_pos + attr_search.len()..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn extract_base_urls(xml: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut search = 0;
+    while let Some(start) = xml[search..].find("<BaseURL>") {
+        let abs = search + start + 9;
+        if let Some(end) = xml[abs..].find("</BaseURL>") {
+            urls.push(xml[abs..abs + end].trim().to_string());
+            search = abs + end;
+        } else {
+            break;
+        }
+    }
+    urls
+}
+
+fn extract_utc_timing(xml: &str) -> Vec<UtcTiming> {
+    let mut result = Vec::new();
+    let mut search = 0;
+    while let Some(start) = xml[search..].find("<UTCTiming") {
+        let abs = search + start;
+        if let Some(end) = xml[abs..].find("/>").or_else(|| xml[abs..].find('>')) {
+            let tag = &xml[abs..abs + end + 2];
+            let scheme = extract_attr_from_tag(tag, "schemeIdUri").unwrap_or_default();
+            let value = extract_attr_from_tag(tag, "value").unwrap_or_default();
+            result.push(UtcTiming { scheme_id_uri: scheme, value });
+            search = abs + end + 2;
+        } else {
+            break;
+        }
+    }
+    result
+}
+
+fn extract_attr_from_tag(tag: &str, attr: &str) -> Option<String> {
+    let search = format!("{attr}=\"");
+    let pos = tag.find(&search)?;
+    let rest = &tag[pos + search.len()..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn extract_periods(xml: &str) -> Vec<Period> {
+    let mut periods = Vec::new();
+    let mut search = 0;
+
+    while let Some(start) = xml[search..].find("<Period") {
+        let abs = search + start;
+        // Find the end of this Period (either </Period> or self-closing).
+        let period_end = find_closing_tag(&xml[abs..], "Period")
+            .map(|e| abs + e)
+            .unwrap_or(xml.len());
+        let period_xml = &xml[abs..period_end];
+
+        let id = extract_attr_from_tag(period_xml, "id");
+        let period_start = extract_attr_from_tag(period_xml, "start")
+            .map(|s| parse_iso8601_duration(&s));
+        let duration = extract_attr_from_tag(period_xml, "duration")
+            .map(|s| parse_iso8601_duration(&s));
+        let xlink_href = extract_attr_from_tag(period_xml, "xlink:href");
+        let base_urls = extract_base_urls(period_xml);
+
+        let adaptation_sets = extract_adaptation_sets(period_xml);
+
+        periods.push(Period {
+            id,
+            start: period_start,
+            duration,
+            base_urls,
+            adaptation_sets,
+            xlink_href,
+        });
+        search = period_end;
+    }
+    periods
+}
+
+fn extract_adaptation_sets(period_xml: &str) -> Vec<AdaptationSet> {
+    let mut sets = Vec::new();
+    let mut search = 0;
+
+    while let Some(start) = period_xml[search..].find("<AdaptationSet") {
+        let abs = search + start;
+        let set_end = find_closing_tag(&period_xml[abs..], "AdaptationSet")
+            .map(|e| abs + e)
+            .unwrap_or(period_xml.len());
+        let set_xml = &period_xml[abs..set_end];
+
+        let id = extract_attr_from_tag(set_xml, "id");
+        let content_type = extract_attr_from_tag(set_xml, "contentType");
+        let mime_type = extract_attr_from_tag(set_xml, "mimeType");
+        let codecs = extract_attr_from_tag(set_xml, "codecs");
+        let lang = extract_attr_from_tag(set_xml, "lang");
+        let segment_alignment = extract_attr_from_tag(set_xml, "segmentAlignment")
+            .as_deref() == Some("true");
+        let subsegment_alignment = extract_attr_from_tag(set_xml, "subsegmentAlignment")
+            .as_deref() == Some("true");
+        let bitstream_switching = extract_attr_from_tag(set_xml, "bitstreamSwitching")
+            .as_deref() == Some("true");
+
+        let roles = extract_descriptors(set_xml, "Role");
+        let accessibility = extract_descriptors(set_xml, "Accessibility");
+        let labels = extract_labels(set_xml);
+        let content_protection = extract_content_protection(set_xml);
+        let supplemental_properties = extract_descriptors(set_xml, "SupplementalProperty");
+        let essential_properties = extract_descriptors(set_xml, "EssentialProperty");
+        let segment_template = extract_segment_template(set_xml);
+        let segment_base = extract_segment_base(set_xml);
+        let segment_list = extract_segment_list(set_xml);
+        let base_urls = extract_base_urls(set_xml);
+
+        let mut representations = extract_representations(set_xml);
+        // Sort by bandwidth and assign absolute indices.
+        representations.sort_by_key(|r| r.bandwidth);
+        for (i, r) in representations.iter_mut().enumerate() {
+            r.absolute_index = i;
+            // Inherit from AdaptationSet if not specified.
+            if r.codecs.is_none() {
+                r.codecs = codecs.clone();
+            }
+            if r.mime_type.is_none() {
+                r.mime_type = mime_type.clone();
+            }
+            if r.segment_template.is_none() {
+                r.segment_template = segment_template.clone();
+            }
+            if r.segment_base.is_none() {
+                r.segment_base = segment_base.clone();
+            }
+            if r.segment_list.is_none() {
+                r.segment_list = segment_list.clone();
+            }
+        }
+
+        // Infer content type from mime_type if not specified.
+        let effective_content_type = content_type.clone().or_else(|| {
+            mime_type.as_deref().map(|m| {
+                if m.starts_with("video") { "video".to_string() }
+                else if m.starts_with("audio") { "audio".to_string() }
+                else if m.starts_with("text") { "text".to_string() }
+                else { m.to_string() }
+            })
+        });
+
+        sets.push(AdaptationSet {
+            id,
+            content_type: effective_content_type,
+            mime_type,
+            codecs,
+            lang,
+            segment_alignment,
+            subsegment_alignment,
+            bitstream_switching,
+            roles,
+            accessibility,
+            labels,
+            content_protection,
+            supplemental_properties,
+            essential_properties,
+            segment_template,
+            segment_base,
+            segment_list,
+            base_urls,
+            representations,
+        });
+        search = set_end;
+    }
+    sets
+}
+
+fn extract_representations(set_xml: &str) -> Vec<Representation> {
+    let mut reps = Vec::new();
+    let mut search = 0;
+
+    while let Some(start) = set_xml[search..].find("<Representation") {
+        let abs = search + start;
+        let rep_end = find_closing_tag(&set_xml[abs..], "Representation")
+            .map(|e| abs + e)
+            .unwrap_or_else(|| {
+                // Self-closing tag
+                set_xml[abs..].find("/>").map(|e| abs + e + 2).unwrap_or(set_xml.len())
+            });
+        let rep_xml = &set_xml[abs..rep_end];
+
+        let id = extract_attr_from_tag(rep_xml, "id");
+        let bandwidth = extract_attr_from_tag(rep_xml, "bandwidth")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let width = extract_attr_from_tag(rep_xml, "width")
+            .and_then(|s| s.parse().ok());
+        let height = extract_attr_from_tag(rep_xml, "height")
+            .and_then(|s| s.parse().ok());
+        let codecs = extract_attr_from_tag(rep_xml, "codecs");
+        let mime_type = extract_attr_from_tag(rep_xml, "mimeType");
+        let frame_rate = extract_attr_from_tag(rep_xml, "frameRate");
+        let sar = extract_attr_from_tag(rep_xml, "sar");
+        let audio_sampling_rate = extract_attr_from_tag(rep_xml, "audioSamplingRate")
+            .and_then(|s| s.parse().ok());
+        let segment_template = extract_segment_template(rep_xml);
+        let segment_base = extract_segment_base(rep_xml);
+        let segment_list = extract_segment_list(rep_xml);
+        let base_urls = extract_base_urls(rep_xml);
+        let content_protection = extract_content_protection(rep_xml);
+
+        reps.push(Representation {
+            id,
+            bandwidth,
+            width,
+            height,
+            codecs,
+            mime_type,
+            frame_rate,
+            sar,
+            audio_sampling_rate,
+            segment_template,
+            segment_base,
+            segment_list,
+            base_urls,
+            content_protection,
+            absolute_index: 0,
+        });
+        search = rep_end;
+    }
+    reps
+}
+
+fn extract_segment_template(xml: &str) -> Option<SegmentTemplate> {
+    let start = xml.find("<SegmentTemplate")?;
+    let tag_close = xml[start..].find('>')?;
+    // Check if there's a timeline inside
+    let end = find_closing_tag(&xml[start..], "SegmentTemplate")
+        .map(|e| start + e)
+        .unwrap_or(start + tag_close + 1);
+    let inner = &xml[start..end];
+
+    let initialization = extract_attr_from_tag(inner, "initialization");
+    let media = extract_attr_from_tag(inner, "media");
+    let start_number = extract_attr_from_tag(inner, "startNumber")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let timescale = extract_attr_from_tag(inner, "timescale")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000.0);
+    let duration = extract_attr_from_tag(inner, "duration")
+        .and_then(|s| s.parse().ok());
+    let presentation_time_offset = extract_attr_from_tag(inner, "presentationTimeOffset")
+        .and_then(|s| s.parse().ok());
+
+    let timeline = extract_timeline(inner);
+
+    Some(SegmentTemplate {
+        initialization,
+        media,
+        start_number,
+        timescale,
+        duration,
+        presentation_time_offset,
+        timeline,
+    })
+}
+
+fn extract_timeline(xml: &str) -> Vec<TimelineEntry> {
+    let mut entries = Vec::new();
+    let mut search = 0;
+    while let Some(s_start) = xml[search..].find("<S ") {
+        let abs = search + s_start;
+        if let Some(s_end) = xml[abs..].find("/>") {
+            let tag = &xml[abs..abs + s_end + 2];
+            let t = extract_attr_from_tag(tag, "t").and_then(|s| s.parse().ok());
+            let d = extract_attr_from_tag(tag, "d").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let r = extract_attr_from_tag(tag, "r").and_then(|s| s.parse().ok()).unwrap_or(0);
+            entries.push(TimelineEntry { t, d, r });
+            search = abs + s_end + 2;
+        } else {
+            break;
+        }
+    }
+    entries
+}
+
+fn extract_segment_base(xml: &str) -> Option<SegmentBase> {
+    let start = xml.find("<SegmentBase")?;
+    let end = xml[start..].find("/>").or_else(|| xml[start..].find('>'))?;
+    let tag = &xml[start..start + end + 2];
+
+    Some(SegmentBase {
+        index_range: extract_attr_from_tag(tag, "indexRange"),
+        initialization_range: extract_attr_from_tag(tag, "Initialization")
+            .or_else(|| {
+                // Check for nested <Initialization range="..."/>
+                xml[start..].find("<Initialization").and_then(|i| {
+                    let init_tag = &xml[start + i..];
+                    extract_attr_from_tag(init_tag, "range")
+                })
+            }),
+        timescale: extract_attr_from_tag(tag, "timescale")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000.0),
+        presentation_time_offset: extract_attr_from_tag(tag, "presentationTimeOffset")
+            .and_then(|s| s.parse().ok()),
+    })
+}
+
+fn extract_segment_list(xml: &str) -> Option<SegmentList> {
+    let start = xml.find("<SegmentList")?;
+    let end = find_closing_tag(&xml[start..], "SegmentList")
+        .map(|e| start + e)
+        .unwrap_or(xml.len());
+    let inner = &xml[start..end];
+
+    let initialization = inner.find("<Initialization").and_then(|i| {
+        extract_attr_from_tag(&inner[i..], "sourceURL")
+    });
+    let timescale = extract_attr_from_tag(inner, "timescale")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000.0);
+    let duration = extract_attr_from_tag(inner, "duration")
+        .and_then(|s| s.parse().ok());
+    let start_number = extract_attr_from_tag(inner, "startNumber")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let mut segment_urls = Vec::new();
+    let mut search2 = 0;
+    while let Some(su_start) = inner[search2..].find("<SegmentURL") {
+        let abs2 = search2 + su_start;
+        if let Some(su_end) = inner[abs2..].find("/>") {
+            let tag = &inner[abs2..abs2 + su_end + 2];
+            let media = extract_attr_from_tag(tag, "media").unwrap_or_default();
+            let media_range = extract_attr_from_tag(tag, "mediaRange");
+            segment_urls.push(SegmentUrl { media, media_range });
+            search2 = abs2 + su_end + 2;
+        } else {
+            break;
+        }
+    }
+
+    Some(SegmentList { initialization, timescale, duration, start_number, segment_urls })
+}
+
+fn extract_descriptors(xml: &str, tag_name: &str) -> Vec<Descriptor> {
+    let mut descriptors = Vec::new();
+    let search_tag = format!("<{tag_name}");
+    let mut search = 0;
+    while let Some(start) = xml[search..].find(&search_tag) {
+        let abs = search + start;
+        if let Some(end) = xml[abs..].find("/>").or_else(|| xml[abs..].find('>')) {
+            let tag = &xml[abs..abs + end + 2];
+            let scheme = extract_attr_from_tag(tag, "schemeIdUri").unwrap_or_default();
+            let value = extract_attr_from_tag(tag, "value");
+            descriptors.push(Descriptor { scheme_id_uri: scheme, value });
+            search = abs + end + 2;
+        } else {
+            break;
+        }
+    }
+    descriptors
+}
+
+fn extract_labels(xml: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    let mut search = 0;
+    while let Some(start) = xml[search..].find("<Label>") {
+        let abs = search + start + 7;
+        if let Some(end) = xml[abs..].find("</Label>") {
+            labels.push(xml[abs..abs + end].trim().to_string());
+            search = abs + end;
+        } else {
+            break;
+        }
+    }
+    labels
+}
+
+fn extract_content_protection(xml: &str) -> Vec<ContentProtection> {
+    let mut result = Vec::new();
+    let mut search = 0;
+    while let Some(start) = xml[search..].find("<ContentProtection") {
+        let abs = search + start;
+        let end = find_closing_tag(&xml[abs..], "ContentProtection")
+            .unwrap_or_else(|| {
+                xml[abs..].find("/>").map(|e| e + 2).unwrap_or(xml.len() - abs)
+            });
+        let tag = &xml[abs..abs + end];
+
+        let scheme = extract_attr_from_tag(tag, "schemeIdUri").unwrap_or_default();
+        let value = extract_attr_from_tag(tag, "value");
+        let default_kid = extract_attr_from_tag(tag, "cenc:default_KID")
+            .or_else(|| extract_attr_from_tag(tag, "default_KID"));
+        // Extract cenc:pssh if present
+        let cenc_pssh = tag.find("<cenc:pssh>").and_then(|ps| {
+            let rest = &tag[ps + 11..];
+            rest.find("</cenc:pssh>").map(|e| rest[..e].trim().to_string())
+        });
+
+        result.push(ContentProtection { scheme_id_uri: scheme, value, default_kid, cenc_pssh });
+        search = abs + end;
+    }
+    result
+}
+
+/// Find the closing tag for `<tag_name ...>...</tag_name>`.
+/// Returns offset from `xml` start to just past `</tag_name>`.
+fn find_closing_tag(xml: &str, tag_name: &str) -> Option<usize> {
+    let close = format!("</{tag_name}>");
+    xml.find(&close).map(|p| p + close.len())
+}
+
+/// Resolve a URL template by substituting `$Number$` / `$Number%05d$` /
+/// `$RepresentationID$` / `$Time$` / `$Bandwidth$`.
+fn resolve_url_template(
+    template: &str,
+    number: Option<usize>,
+    representation_id: Option<&str>,
+    time: Option<u64>,
+    bandwidth: Option<u64>,
+) -> String {
+    let mut result = template.to_string();
+    if let Some(num) = number {
+        // Handle $Number%05d$ and $Number$ variants.
+        if result.contains("$Number%") {
+            // Extract format spec
+            if let Some(start) = result.find("$Number%") {
+                if let Some(end) = result[start + 8..].find('$') {
+                    let fmt = &result[start + 8..start + 8 + end];
+                    // Parse the format (e.g., "05d")
+                    let width: usize = fmt.trim_end_matches('d').parse().unwrap_or(1);
+                    let formatted = format!("{:0>width$}", num, width = width);
+                    let pattern = format!("$Number%{fmt}$");
+                    result = result.replace(&pattern, &formatted);
+                }
+            }
+        }
+        result = result.replace("$Number$", &num.to_string());
+    }
+    if let Some(id) = representation_id {
+        result = result.replace("$RepresentationID$", id);
+    }
+    if let Some(t) = time {
+        result = result.replace("$Time$", &t.to_string());
+    }
+    if let Some(bw) = bandwidth {
+        result = result.replace("$Bandwidth$", &bw.to_string());
+    }
+    result
+}
+
+/// Resolve a relative URL against a base URL.
+fn resolve_base_url(base: &str, relative: &str) -> String {
+    if relative.starts_with("http://") || relative.starts_with("https://") || relative.starts_with("//") {
+        return relative.to_string();
+    }
+    if base.is_empty() {
+        return relative.to_string();
+    }
+    // Remove everything after the last '/' in base
+    if let Some(last_slash) = base.rfind('/') {
+        format!("{}/{}", &base[..last_slash], relative)
+    } else {
+        relative.to_string()
+    }
+}
+
+/// Build segment info list from a parsed `Mpd` for a given AdaptationSet
+/// and Representation (by absolute_index).
+fn build_segment_list_from_mpd(
+    mpd: &Mpd,
+    period_idx: usize,
+    adaptation_set_idx: usize,
+    rep_idx: usize,
+    base_manifest_url: &str,
+) -> (String, f64, Vec<SegmentInfo>) {
+    let period = &mpd.periods[period_idx];
+    let aset = &period.adaptation_sets[adaptation_set_idx];
+    let rep = &aset.representations[rep_idx];
+
+    // Determine the effective base URL
+    let base = if !rep.base_urls.is_empty() {
+        rep.base_urls[0].clone()
+    } else if !aset.base_urls.is_empty() {
+        aset.base_urls[0].clone()
+    } else if !period.base_urls.is_empty() {
+        period.base_urls[0].clone()
+    } else if !mpd.base_urls.is_empty() {
+        mpd.base_urls[0].clone()
+    } else {
+        // Derive base from manifest URL
+        if let Some(last_slash) = base_manifest_url.rfind('/') {
+            base_manifest_url[..last_slash + 1].to_string()
+        } else {
+            String::new()
+        }
+    };
+
+    let effective_template = rep.segment_template.as_ref()
+        .or(aset.segment_template.as_ref());
+
+    if let Some(tmpl) = effective_template {
+        return build_from_segment_template(mpd, tmpl, rep, &base);
+    }
+
+    if let Some(list) = rep.segment_list.as_ref().or(aset.segment_list.as_ref()) {
+        return build_from_segment_list(list, &base);
+    }
+
+    if let Some(sb) = rep.segment_base.as_ref().or(aset.segment_base.as_ref()) {
+        return build_from_segment_base(sb, rep, &base);
+    }
+
+    // Fallback: empty
+    (String::new(), mpd.media_presentation_duration, Vec::new())
+}
+
+fn build_from_segment_template(
+    mpd: &Mpd,
+    tmpl: &SegmentTemplate,
+    rep: &Representation,
+    base: &str,
+) -> (String, f64, Vec<SegmentInfo>) {
+    let rep_id = rep.id.as_deref().unwrap_or("");
+    let init_url = tmpl.initialization.as_ref().map(|init| {
+        let resolved = resolve_url_template(init, None, Some(rep_id), None, Some(rep.bandwidth));
+        resolve_base_url(base, &resolved)
+    }).unwrap_or_default();
+
+    let media_template = tmpl.media.as_deref().unwrap_or("");
+    let mut segments = Vec::new();
+
+    if !tmpl.timeline.is_empty() {
+        // SegmentTimeline
+        let mut seg_number = tmpl.start_number;
+        let mut current_time: u64 = 0;
+        for entry in &tmpl.timeline {
+            if let Some(t) = entry.t {
+                current_time = t;
+            }
+            let repeat_count = if entry.r >= 0 { entry.r as usize } else { 0 };
+            for _ in 0..=repeat_count {
+                let url = resolve_url_template(
+                    media_template,
+                    Some(seg_number),
+                    Some(rep_id),
+                    Some(current_time),
+                    Some(rep.bandwidth),
+                );
+                let duration_s = entry.d as f64 / tmpl.timescale;
+                segments.push(SegmentInfo {
+                    url: resolve_base_url(base, &url),
+                    duration: duration_s,
+                });
+                current_time += entry.d;
+                seg_number += 1;
+            }
+        }
+    } else if let Some(dur) = tmpl.duration {
+        // Fixed-duration segments
+        let total = mpd.media_presentation_duration;
+        let seg_dur_s = dur / tmpl.timescale;
+        let num_segs = if seg_dur_s > 0.0 { (total / seg_dur_s).ceil() as usize } else { 0 };
+        for i in 0..num_segs {
+            let number = tmpl.start_number + i;
+            let url = resolve_url_template(
+                media_template,
+                Some(number),
+                Some(rep_id),
+                None,
+                Some(rep.bandwidth),
+            );
+            segments.push(SegmentInfo {
+                url: resolve_base_url(base, &url),
+                duration: seg_dur_s,
+            });
+        }
+    }
+
+    (init_url, mpd.media_presentation_duration, segments)
+}
+
+fn build_from_segment_list(
+    list: &SegmentList,
+    base: &str,
+) -> (String, f64, Vec<SegmentInfo>) {
+    let init_url = list.initialization.as_ref()
+        .map(|u| resolve_base_url(base, u))
+        .unwrap_or_default();
+
+    let seg_dur_s = list.duration.map(|d| d / list.timescale).unwrap_or(SEGMENT_DURATION_F);
+    let total_dur = seg_dur_s * list.segment_urls.len() as f64;
+
+    let segments: Vec<_> = list.segment_urls.iter().map(|su| {
+        SegmentInfo {
+            url: resolve_base_url(base, &su.media),
+            duration: seg_dur_s,
+        }
+    }).collect();
+
+    (init_url, total_dur, segments)
+}
+
+fn build_from_segment_base(
+    _sb: &SegmentBase,
+    rep: &Representation,
+    base: &str,
+) -> (String, f64, Vec<SegmentInfo>) {
+    // For SegmentBase, the entire representation is a single file.
+    // The init segment is a byte range, the media is the rest.
+    let url = if !rep.base_urls.is_empty() {
+        resolve_base_url(base, &rep.base_urls[0])
+    } else {
+        base.to_string()
+    };
+    // Return the URL as a single segment (SegmentBase isn't segmented)
+    (url.clone(), 0.0, vec![SegmentInfo { url, duration: 0.0 }])
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §5  ABR CONTROLLER & RULES — AbrController.js + rules/abr/*
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Implements the full ABR rule arbitration system:
+//   • ThroughputRule — pick highest quality ≤ safe throughput
+//   • BolaRule — buffer-occupancy-based (BOLA-FINITE)
+//   • InsufficientBufferRule — drop when buffer < minBufferTime
+//   • SwitchHistoryRule — prevent rapid oscillation
+//   • DroppedFramesRule — downgrade on dropped frames
+//   • AbandonRequestsRule — mid-fetch abort
+//   • SwitchRequest priority system (WEAK/DEFAULT/STRONG)
+//
+// Ref: dash.js/src/streaming/controllers/AbrController.js
+//      dash.js/src/streaming/rules/abr/
+
+/// Priority levels for ABR switch requests.
+/// Mirrors dash.js SwitchRequest.PRIORITY.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SwitchPriority {
+    Weak = 0,
+    Default = 1,
+    Strong = 2,
+}
+
+/// An ABR switch request — the output of each rule.
+/// Mirrors dash.js/src/streaming/rules/SwitchRequest.js.
+#[derive(Debug, Clone)]
+pub struct SwitchRequest {
+    /// Index of the recommended representation, or `None` for NO_CHANGE.
+    pub representation_index: Option<usize>,
+    pub priority: SwitchPriority,
+    pub reason: String,
+    pub rule: String,
+}
+
+impl SwitchRequest {
+    fn no_change(rule: &str) -> Self {
+        Self {
+            representation_index: None,
+            priority: SwitchPriority::Default,
+            reason: "no change".to_string(),
+            rule: rule.to_string(),
+        }
+    }
+
+    fn with_index(index: usize, priority: SwitchPriority, reason: String, rule: &str) -> Self {
+        Self {
+            representation_index: Some(index),
+            priority,
+            reason,
+            rule: rule.to_string(),
+        }
+    }
+}
+
+/// BOLA internal state (per media type).
+#[derive(Debug, Clone)]
+struct BolaState {
+    state: BolaPhase,
+    utilities: Vec<f64>,
+    vp: f64,
+    gp: f64,
+    placeholder_buffer: f64,
+    last_quality: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BolaPhase {
+    OneBitrate,
+    Startup,
+    Steady,
+}
+
+/// Central ABR controller.
+///
+/// Evaluates all rules and returns the best quality index.
+/// Mirrors dash.js/src/streaming/controllers/AbrController.js.
+pub struct AbrController {
+    /// Whether ABR is enabled (manual-only mode when false).
+    pub auto_switch_bitrate: bool,
+    /// Whether to use BOLA (true) or Throughput rule (false) per media type.
+    pub use_bola: HashMap<MediaType, bool>,
+    /// BOLA state per media type.
+    bola_states: HashMap<MediaType, Option<BolaState>>,
+    /// Manual quality override per media type.
+    manual_quality: HashMap<MediaType, Option<usize>>,
+}
+
+impl AbrController {
+    pub fn new() -> Self {
+        let mut use_bola = HashMap::new();
+        use_bola.insert(MediaType::Video, false);
+        use_bola.insert(MediaType::Audio, false);
+        Self {
+            auto_switch_bitrate: true,
+            use_bola,
+            bola_states: HashMap::new(),
+            manual_quality: HashMap::new(),
+        }
+    }
+
+    pub fn set_manual_quality(&mut self, media_type: MediaType, index: Option<usize>) {
+        self.manual_quality.insert(media_type, index);
+    }
+
+    pub fn get_manual_quality(&self, media_type: MediaType) -> Option<usize> {
+        self.manual_quality.get(&media_type).copied().flatten()
+    }
+
+    /// Find the optimal representation index for a given bitrate (kbps).
+    /// Returns the highest representation whose bandwidth ≤ bitrate.
+    pub fn get_optimal_rep_for_bitrate(
+        representations: &[Representation],
+        bitrate_kbps: f64,
+    ) -> usize {
+        let mut best = 0;
+        for (i, rep) in representations.iter().enumerate() {
+            if rep.bitrate_kbps() <= bitrate_kbps {
+                best = i;
+            }
+        }
+        best
+    }
+
+    /// Evaluate all ABR rules and return the recommended quality index.
+    pub fn get_quality(
+        &mut self,
+        media_type: MediaType,
+        representations: &[Representation],
+        throughput_ctrl: &ThroughputController,
+        metrics: &DashMetrics,
+        buffer_level: f64,
+        is_dynamic: bool,
+    ) -> usize {
+        if !self.auto_switch_bitrate {
+            if let Some(manual) = self.get_manual_quality(media_type) {
+                return manual.min(representations.len().saturating_sub(1));
+            }
+        }
+        if representations.len() <= 1 {
+            return 0;
+        }
+
+        let mut requests: Vec<SwitchRequest> = Vec::new();
+
+        // Quality switch rules — only one of BOLA / Throughput is active.
+        let use_bola = self.use_bola.get(&media_type).copied().unwrap_or(false);
+        if use_bola {
+            requests.push(self.bola_rule(media_type, representations, throughput_ctrl, buffer_level));
+        } else {
+            requests.push(Self::throughput_rule(media_type, representations, throughput_ctrl, metrics, is_dynamic));
+        }
+
+        // Constraint rules (always active).
+        requests.push(Self::insufficient_buffer_rule(media_type, representations, throughput_ctrl, metrics, buffer_level));
+        requests.push(Self::switch_history_rule(representations, metrics));
+        requests.push(Self::dropped_frames_rule(representations, metrics));
+
+        // Arbitrate: pick the LOWEST bitrate recommendation (conservative).
+        Self::arbitrate(&requests, representations)
+    }
+
+    /// Check if a currently-loading segment should be abandoned.
+    pub fn should_abandon_request(
+        media_type: MediaType,
+        representations: &[Representation],
+        current_rep_index: usize,
+        bytes_loaded: usize,
+        bytes_total: usize,
+        elapsed_ms: f64,
+        segment_duration: f64,
+        throughput_ctrl: &ThroughputController,
+        buffer_level: f64,
+    ) -> Option<SwitchRequest> {
+        if representations.len() <= 1 || current_rep_index == 0 {
+            return None;
+        }
+        if buffer_level >= STABLE_BUFFER_TIME_S {
+            return None;
+        }
+        if elapsed_ms < 500.0 || bytes_loaded < 1000 {
+            return None;
+        }
+        if bytes_loaded >= bytes_total {
+            return None;
+        }
+
+        let throughput_kbps = (bytes_loaded as f64 * 8.0) / elapsed_ms;
+        let estimated_total_ms = (bytes_total as f64 * 8.0) / throughput_kbps;
+        let estimated_total_s = estimated_total_ms / 1000.0;
+
+        if estimated_total_s < segment_duration * ABANDON_DURATION_MULTIPLIER {
+            return None;
+        }
+
+        let optimal = Self::get_optimal_rep_for_bitrate(representations, throughput_kbps);
+        if optimal >= current_rep_index {
+            return None;
+        }
+
+        Some(SwitchRequest::with_index(
+            optimal,
+            SwitchPriority::Strong,
+            format!("abandon: estimated {estimated_total_s:.1}s > {:.1}s limit, throughput {throughput_kbps:.0} kbps",
+                    segment_duration * ABANDON_DURATION_MULTIPLIER),
+            "AbandonRequestsRule",
+        ))
+    }
+
+    // ── Individual ABR rules ─────────────────────────────────────────────
+
+    /// ThroughputRule — pick highest quality ≤ safe throughput.
+    fn throughput_rule(
+        media_type: MediaType,
+        representations: &[Representation],
+        throughput_ctrl: &ThroughputController,
+        metrics: &DashMetrics,
+        is_dynamic: bool,
+    ) -> SwitchRequest {
+        let buf_state = metrics.get_buffer_state(media_type);
+        if buf_state != BufferState::Loaded && !is_dynamic {
+            return SwitchRequest::no_change("ThroughputRule");
+        }
+        if throughput_ctrl.get_sample_count(media_type) < ABR_MIN_SAMPLES {
+            return SwitchRequest::no_change("ThroughputRule");
+        }
+        let safe_throughput = throughput_ctrl.get_safe_average_throughput(media_type);
+        if safe_throughput.is_nan() || safe_throughput <= 0.0 {
+            return SwitchRequest::no_change("ThroughputRule");
+        }
+        let optimal = Self::get_optimal_rep_for_bitrate(representations, safe_throughput);
+        SwitchRequest::with_index(
+            optimal,
+            SwitchPriority::Default,
+            format!("throughput {safe_throughput:.0} kbps → rep {optimal}"),
+            "ThroughputRule",
+        )
+    }
+
+    /// BolaRule — buffer-occupancy-based quality selection (BOLA-FINITE).
+    fn bola_rule(
+        &mut self,
+        media_type: MediaType,
+        representations: &[Representation],
+        throughput_ctrl: &ThroughputController,
+        buffer_level: f64,
+    ) -> SwitchRequest {
+        let bola_state = self.bola_states.entry(media_type).or_insert_with(|| {
+            Self::init_bola_state(representations)
+        });
+
+        let bola = match bola_state {
+            Some(b) => b,
+            None => return SwitchRequest::no_change("BolaRule"),
+        };
+
+        match bola.state {
+            BolaPhase::OneBitrate => SwitchRequest::no_change("BolaRule"),
+            BolaPhase::Startup => {
+                // Use throughput-based selection during startup.
+                let safe = throughput_ctrl.get_safe_average_throughput(media_type);
+                let idx = if safe.is_nan() || safe <= 0.0 { 0 }
+                    else { Self::get_optimal_rep_for_bitrate(representations, safe) };
+                bola.last_quality = idx;
+                // Transition to steady once buffer ≥ one segment.
+                if buffer_level >= SEGMENT_DURATION_F {
+                    bola.state = BolaPhase::Steady;
+                }
+                SwitchRequest::with_index(idx, SwitchPriority::Default,
+                    "BOLA startup".into(), "BolaRule")
+            }
+            BolaPhase::Steady => {
+                // Decay placeholder buffer.
+                bola.placeholder_buffer *= BOLA_PLACEHOLDER_DECAY;
+                let effective_buffer = buffer_level + bola.placeholder_buffer;
+
+                // BOLA quality selection: maximize score.
+                let mut best_idx = 0;
+                let mut best_score = f64::NEG_INFINITY;
+                for (i, rep) in representations.iter().enumerate() {
+                    if i < bola.utilities.len() {
+                        let score = (bola.vp * (bola.utilities[i] - 1.0 + bola.gp) - effective_buffer)
+                            / rep.bandwidth as f64;
+                        if score > best_score {
+                            best_score = score;
+                            best_idx = i;
+                        }
+                    }
+                }
+
+                // BOLA-O: cap at throughput-based quality to prevent upgrades
+                // beyond what the network can sustain.
+                let safe = throughput_ctrl.get_safe_average_throughput(media_type);
+                if !safe.is_nan() && safe > 0.0 {
+                    let throughput_idx = Self::get_optimal_rep_for_bitrate(representations, safe);
+                    if best_idx > throughput_idx && best_idx > bola.last_quality {
+                        best_idx = bola.last_quality.max(throughput_idx);
+                    }
+                }
+
+                bola.last_quality = best_idx;
+                SwitchRequest::with_index(best_idx, SwitchPriority::Default,
+                    format!("BOLA steady buf={effective_buffer:.1}s → rep {best_idx}"),
+                    "BolaRule")
+            }
+        }
+    }
+
+    fn init_bola_state(representations: &[Representation]) -> Option<BolaState> {
+        if representations.len() <= 1 {
+            return Some(BolaState {
+                state: BolaPhase::OneBitrate,
+                utilities: vec![1.0],
+                vp: 0.0, gp: 0.0,
+                placeholder_buffer: 0.0,
+                last_quality: 0,
+            });
+        }
+
+        // Utilities = ln(bandwidth), normalised so utilities[0] = 1.
+        let bitrates: Vec<f64> = representations.iter().map(|r| r.bandwidth as f64).collect();
+        let mut utilities: Vec<f64> = bitrates.iter().map(|b| b.ln()).collect();
+        let u0 = utilities[0];
+        for u in utilities.iter_mut() {
+            *u = *u - u0 + 1.0;
+        }
+
+        let highest_idx = utilities.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        if highest_idx == 0 {
+            return None;
+        }
+
+        let buffer_time = BUFFER_TIME_DEFAULT_S.max(
+            BOLA_MINIMUM_BUFFER_S + BOLA_MINIMUM_BUFFER_PER_LEVEL_S * representations.len() as f64
+        );
+        let gp = (utilities[highest_idx] - 1.0) / (buffer_time / BOLA_MINIMUM_BUFFER_S - 1.0);
+        let vp = BOLA_MINIMUM_BUFFER_S / gp;
+
+        Some(BolaState {
+            state: BolaPhase::Startup,
+            utilities,
+            vp, gp,
+            placeholder_buffer: 0.0,
+            last_quality: 0,
+        })
+    }
+
+    /// InsufficientBufferRule — drop quality when buffer is dangerously low.
+    fn insufficient_buffer_rule(
+        media_type: MediaType,
+        representations: &[Representation],
+        throughput_ctrl: &ThroughputController,
+        metrics: &DashMetrics,
+        buffer_level: f64,
+    ) -> SwitchRequest {
+        let buf_state = metrics.get_buffer_state(media_type);
+        if buf_state == BufferState::Empty {
+            return SwitchRequest::with_index(0, SwitchPriority::Strong,
+                "buffer empty → lowest quality".into(), "InsufficientBufferRule");
+        }
+        if buffer_level >= STABLE_BUFFER_TIME_S {
+            return SwitchRequest::no_change("InsufficientBufferRule");
+        }
+
+        let throughput = throughput_ctrl.get_average_throughput(media_type);
+        if throughput.is_nan() || throughput <= 0.0 {
+            return SwitchRequest::no_change("InsufficientBufferRule");
+        }
+        let safe_throughput = throughput * ABR_BANDWIDTH_SAFETY_FACTOR;
+        let available_bitrate = safe_throughput * buffer_level / SEGMENT_DURATION_F;
+        let optimal = Self::get_optimal_rep_for_bitrate(representations, available_bitrate);
+
+        SwitchRequest::with_index(
+            optimal, SwitchPriority::Default,
+            format!("insufficient buffer {buffer_level:.1}s → rep {optimal}"),
+            "InsufficientBufferRule",
+        )
+    }
+
+    /// SwitchHistoryRule — prevent rapid oscillation between quality levels.
+    fn switch_history_rule(
+        representations: &[Representation],
+        metrics: &DashMetrics,
+    ) -> SwitchRequest {
+        for (i, _rep) in representations.iter().enumerate().rev() {
+            if let Some(entry) = metrics.switch_history.get(&i) {
+                let total = entry.drops + entry.no_drops;
+                if total >= SWITCH_HISTORY_SAMPLE_SIZE && entry.no_drops > 0 {
+                    let ratio = entry.drops as f64 / entry.no_drops as f64;
+                    if ratio > SWITCH_HISTORY_THRESHOLD {
+                        let target = if i > 0 { i - 1 } else { 0 };
+                        return SwitchRequest::with_index(
+                            target, SwitchPriority::Default,
+                            format!("switch history: rep {i} drop ratio {ratio:.3} > {SWITCH_HISTORY_THRESHOLD}"),
+                            "SwitchHistoryRule",
+                        );
+                    }
+                }
+            }
+        }
+        SwitchRequest::no_change("SwitchHistoryRule")
+    }
+
+    /// DroppedFramesRule — downgrade when too many video frames are dropped.
+    fn dropped_frames_rule(
+        representations: &[Representation],
+        metrics: &DashMetrics,
+    ) -> SwitchRequest {
+        let df = &metrics.dropped_frames;
+        if df.total_frames < DROPPED_FRAMES_MIN_SAMPLE {
+            return SwitchRequest::no_change("DroppedFramesRule");
+        }
+        let ratio = df.dropped_frames as f64 / df.total_frames as f64;
+        if ratio > DROPPED_FRAMES_THRESHOLD && representations.len() > 1 {
+            // Downgrade to one below current max.
+            let target = representations.len().saturating_sub(2);
+            return SwitchRequest::with_index(
+                target, SwitchPriority::Default,
+                format!("dropped frames {:.1}% > {:.1}%", ratio * 100.0, DROPPED_FRAMES_THRESHOLD * 100.0),
+                "DroppedFramesRule",
+            );
+        }
+        SwitchRequest::no_change("DroppedFramesRule")
+    }
+
+    /// Arbitrate: given multiple rule outputs, pick the LOWEST bitrate
+    /// recommendation among the highest-priority requests.
+    fn arbitrate(requests: &[SwitchRequest], representations: &[Representation]) -> usize {
+        // Group by priority, take the highest priority that has actual changes.
+        let mut strong: Option<usize> = None;
+        let mut default: Option<usize> = None;
+        let mut weak: Option<usize> = None;
+
+        for req in requests {
+            if let Some(idx) = req.representation_index {
+                let slot = match req.priority {
+                    SwitchPriority::Strong => &mut strong,
+                    SwitchPriority::Default => &mut default,
+                    SwitchPriority::Weak => &mut weak,
+                };
+                // Keep the LOWEST bitrate within each priority level.
+                let current_bw = slot.map(|i| representations.get(i).map(|r| r.bandwidth).unwrap_or(u64::MAX));
+                let new_bw = representations.get(idx).map(|r| r.bandwidth).unwrap_or(u64::MAX);
+                if current_bw.is_none() || new_bw < current_bw.unwrap() {
+                    *slot = Some(idx);
+                }
+            }
+        }
+
+        // Return in priority order: STRONG > DEFAULT > WEAK > 0
+        strong.or(default).or(weak).unwrap_or(0)
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §6  SCHEDULE CONTROLLER — ScheduleController.js
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Controls when the next segment should be fetched based on buffer levels.
+// Implements:
+//   • Buffer-level gate: only fetch when bufferLevel + segDuration < target
+//   • bufferToKeep enforcement: evict behind playhead
+//   • fastSwitchEnabled: flush on quality switch
+//   • stableBufferTime vs bufferTimeDefault distinction
+//
+// Ref: dash.js/src/streaming/controllers/ScheduleController.js
+
+/// Decides whether to proceed with the next segment fetch.
+pub struct ScheduleController;
+
+impl ScheduleController {
+    /// Should we fetch the next segment?
+    /// Returns true if the buffer needs more data.
+    pub fn should_schedule(
+        buffer_level: f64,
+        segment_duration: f64,
+        is_startup: bool,
+    ) -> bool {
+        let target = if is_startup { BUFFER_TIME_DEFAULT_S } else { STABLE_BUFFER_TIME_S };
+        // dash.js gate: bufferLevel + segmentDuration < bufferTarget
+        buffer_level + segment_duration < target.max(MSE_TARGET_BUFFER_S)
+    }
+
+    /// Compute the time to delay before the next fetch (milliseconds).
+    /// Returns 0 for immediate fetch, or a delay when buffer is healthy.
+    pub fn get_schedule_delay(buffer_level: f64) -> u32 {
+        if buffer_level < STABLE_BUFFER_TIME_S {
+            0 // Urgent: buffer below stable target
+        } else if buffer_level < MSE_TARGET_BUFFER_S {
+            100 // Normal: moderate delay
+        } else {
+            200 // Comfortable: longer delay, save resources
+        }
+    }
+
+    /// Should we flush forward buffer on quality switch (fastSwitch)?
+    /// When enabled, removes buffered data ahead of the playhead and re-fetches
+    /// at the new quality level.
+    pub fn should_fast_switch(
+        buffer_ahead: f64,
+        segment_duration: f64,
+    ) -> bool {
+        FAST_SWITCH_ENABLED && buffer_ahead > segment_duration
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §7  LIVE STREAM SUPPORT
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Implements:
+//   • Periodic MPD refresh (ManifestUpdater.js)
+//   • Segment availability window
+//   • UTC clock synchronisation (TimeSyncController.js)
+//   • Live-edge seeking on startup
+//   • Low-latency catchup (CatchupController.js)
+//   • DVR / time-shifting
+//
+// Ref: dash.js/src/streaming/controllers/
+
+/// Live stream controller — manages MPD refresh, segment availability, and
+/// playback rate adjustment for live latency catchup.
+#[derive(Debug, Clone)]
+pub struct LiveStreamController {
+    /// Server-client clock offset (seconds).  Positive means server clock is
+    /// ahead of the client.
+    pub clock_offset_s: f64,
+    /// Target live delay (seconds from live edge).
+    pub target_delay_s: f64,
+    /// Availability start time (epoch seconds) from MPD@availabilityStartTime.
+    pub availability_start_time_epoch: Option<f64>,
+    /// Time shift buffer depth (seconds) — DVR window.
+    pub time_shift_buffer_depth: Option<f64>,
+    /// Minimum update period (seconds) — how often to refresh the MPD.
+    pub minimum_update_period: Option<f64>,
+    /// Whether a catchup rate adjustment is currently active.
+    pub catchup_active: bool,
+}
+
+impl LiveStreamController {
+    pub fn new() -> Self {
+        Self {
+            clock_offset_s: 0.0,
+            target_delay_s: LIVE_DEFAULT_PRESENTATION_DELAY_S,
+            availability_start_time_epoch: None,
+            time_shift_buffer_depth: None,
+            minimum_update_period: None,
+            catchup_active: false,
+        }
+    }
+
+    /// Configure from MPD attributes.
+    pub fn configure_from_mpd(&mut self, mpd: &Mpd) {
+        self.target_delay_s = mpd.suggested_presentation_delay
+            .unwrap_or(LIVE_DEFAULT_PRESENTATION_DELAY_S);
+        self.time_shift_buffer_depth = mpd.time_shift_buffer_depth;
+        self.minimum_update_period = mpd.minimum_update_period;
+
+        // Parse availabilityStartTime (ISO 8601 date) to epoch seconds.
+        if let Some(ast) = &mpd.availability_start_time {
+            self.availability_start_time_epoch = parse_iso8601_datetime_to_epoch(ast);
+        }
+    }
+
+    /// Calculate the live edge time (seconds from AST).
+    pub fn get_live_edge_time(&self) -> f64 {
+        let now = js_sys::Date::now() / 1000.0;
+        let ast = self.availability_start_time_epoch.unwrap_or(now);
+        (now + self.clock_offset_s) - ast
+    }
+
+    /// Calculate the target start position for live playback (live edge - delay).
+    pub fn get_live_start_position(&self) -> f64 {
+        (self.get_live_edge_time() - self.target_delay_s).max(0.0)
+    }
+
+    /// Check if a segment at `time` is within the availability window.
+    pub fn is_segment_available(&self, time: f64) -> bool {
+        let live_edge = self.get_live_edge_time();
+        let window_start = if let Some(depth) = self.time_shift_buffer_depth {
+            (live_edge - depth).max(0.0)
+        } else {
+            0.0
+        };
+        time >= window_start && time <= live_edge
+    }
+
+    /// DVR window start (seconds from AST), or 0 if no time shift buffer.
+    pub fn dvr_window_start(&self) -> f64 {
+        let live_edge = self.get_live_edge_time();
+        if let Some(depth) = self.time_shift_buffer_depth {
+            (live_edge - depth).max(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// DVR window end = live edge.
+    pub fn dvr_window_end(&self) -> f64 {
+        self.get_live_edge_time()
+    }
+
+    /// How often (ms) to refresh the MPD.
+    pub fn get_refresh_interval_ms(&self) -> u32 {
+        self.minimum_update_period
+            .map(|p| (p * 1000.0) as u32)
+            .unwrap_or(LIVE_MPD_REFRESH_INTERVAL_MS)
+    }
+
+    /// Low-latency catchup: calculate adjusted playback rate.
+    ///
+    /// Uses the sigmoid-based algorithm from dash.js CatchupController:
+    ///   rate = (1 - cpr) + (cpr * 2) / (1 + e^(-5 * deltaLatency))
+    ///
+    /// Returns the recommended playback rate (typically near 1.0).
+    pub fn calculate_catchup_rate(&self, current_latency: f64, buffer_level: f64) -> f64 {
+        let delta = current_latency - self.target_delay_s;
+        let cpr = if delta < 0.0 {
+            LIVE_CATCHUP_RATE_MIN.abs()
+        } else {
+            LIVE_CATCHUP_RATE_MAX
+        };
+        let d = delta * 5.0;
+        let sigmoid = (cpr * 2.0) / (1.0 + (-d).exp());
+        let mut rate = (1.0 - cpr) + sigmoid;
+
+        // Safety: if buffer is low and we're behind, don't speed up.
+        if buffer_level <= self.target_delay_s / 2.0 && delta > 0.0 {
+            rate = 1.0;
+        }
+
+        rate.clamp(1.0 + LIVE_CATCHUP_RATE_MIN, 1.0 + LIVE_CATCHUP_RATE_MAX)
+    }
+
+    /// Synchronise the client clock with the server via a UTC timing source.
+    pub fn sync_clock_from_response(&mut self, server_time_ms: f64) {
+        let client_now_ms = js_sys::Date::now();
+        self.clock_offset_s = (server_time_ms - client_now_ms) / 1000.0;
+        log::info!("LiveSync: clock offset = {:.3}s", self.clock_offset_s);
+    }
+}
+
+/// Parse an ISO 8601 datetime string to epoch seconds.
+/// Supports formats like "2024-01-15T10:30:00Z" and "2024-01-15T10:30:00.000Z".
+fn parse_iso8601_datetime_to_epoch(s: &str) -> Option<f64> {
+    // Use js_sys::Date for parsing (most reliable in WASM).
+    let date = js_sys::Date::new(&JsValue::from_str(s));
+    let ms = date.get_time();
+    if ms.is_nan() { None } else { Some(ms / 1000.0) }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §8  ERROR RECOVERY — MediaSource / SourceBuffer Error Recovery
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Handles:
+//   • QuotaExceededError on appendBuffer (trigger eviction + retry)
+//   • SourceBuffer.updating contention (queue appends)
+//   • endOfStream('decode') / endOfStream('network') error signalling
+//   • Re-initialise pipeline after fatal error
+//
+// Ref: dash.js/src/streaming/controllers/BufferController.js
+
+/// Error recovery state.
+#[derive(Debug, Clone)]
+pub struct ErrorRecovery {
+    /// Number of consecutive errors.
+    pub consecutive_errors: u32,
+    /// Maximum retries before giving up.
+    pub max_retries: u32,
+    /// Whether a fatal error has occurred.
+    pub fatal_error: bool,
+    /// Queue of pending append operations.
+    pub append_queue: Vec<Vec<u8>>,
+    /// Whether an append operation is currently queued (waiting for sb.updating).
+    pub append_pending: bool,
+}
+
+impl ErrorRecovery {
+    pub fn new() -> Self {
+        Self {
+            consecutive_errors: 0,
+            max_retries: 3,
+            fatal_error: false,
+            append_queue: Vec::new(),
+            append_pending: false,
+        }
+    }
+
+    /// Record a successful operation — resets error counter.
+    pub fn on_success(&mut self) {
+        self.consecutive_errors = 0;
+    }
+
+    /// Record an error.  Returns `true` if we should retry, `false` if fatal.
+    pub fn on_error(&mut self) -> bool {
+        self.consecutive_errors += 1;
+        if self.consecutive_errors >= self.max_retries {
+            self.fatal_error = true;
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Check if a `QuotaExceededError` occurred.
+    /// The error code for QuotaExceededError is 22.
+    pub fn is_quota_exceeded(err: &JsValue) -> bool {
+        if let Some(dom_exception) = err.dyn_ref::<web_sys::DomException>() {
+            return dom_exception.code() == 22; // QUOTA_EXCEEDED_ERR
+        }
+        // Check error name string
+        if let Some(s) = err.as_string() {
+            return s.contains("QuotaExceeded");
+        }
+        false
+    }
+
+    /// Signal end of stream with an error.
+    /// Uses JavaScript interop since web-sys doesn't expose the error variant directly.
+    pub fn signal_eos_error(media_source: &web_sys::MediaSource, error_type: &str) {
+        match error_type {
+            "decode" | "network" => {
+                // Use js_sys to call endOfStream with the error string.
+                let ms: &JsValue = media_source.as_ref();
+                let method = js_sys::Reflect::get(ms, &JsValue::from_str("endOfStream")).ok();
+                if let Some(func) = method {
+                    if let Ok(f) = func.dyn_into::<js_sys::Function>() {
+                        let _ = f.call1(ms, &JsValue::from_str(error_type));
+                    }
+                }
+            }
+            _ => {
+                let _ = media_source.end_of_stream();
+            }
+        }
+    }
+
+    /// Reset for pipeline re-initialisation.
+    pub fn reset(&mut self) {
+        self.consecutive_errors = 0;
+        self.fatal_error = false;
+        self.append_queue.clear();
+        self.append_pending = false;
+    }
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -256,142 +2408,110 @@ pub struct SubtitleTracksResponse {
 
 struct SegmentInfo {
     url: String,
-    #[allow(dead_code)]
     duration: f64,
 }
 
+/// Audio track info for the track selection UI.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
+pub struct AudioTrackInfo {
+    pub adaptation_set_idx: usize,
+    pub lang: Option<String>,
+    pub label: Option<String>,
+    pub codecs: Option<String>,
+    pub roles: Vec<String>,
+}
+
+/// Per-track (video or audio) stream processor state.
+/// Mirrors dash.js `StreamProcessor.js` — each track type has its own
+/// SourceBuffer, segment list, quality level, and pump loop.
+#[allow(dead_code)]
+struct TrackState {
+    source_buffer: web_sys::SourceBuffer,
+    segments: Vec<SegmentInfo>,
+    init_url: String,
+    next_seg: usize,
+    pump_gen: u32,
+    pump_running: bool,
+    last_appended_seg: Option<usize>,
+    /// Index of the currently-selected representation within the AdaptationSet.
+    current_rep_index: usize,
+    /// All available representations for this track (sorted by bandwidth).
+    representations: Vec<Representation>,
+    media_type: MediaType,
+    /// Index into the MPD's AdaptationSet array.
+    adaptation_set_idx: usize,
+}
+
+#[allow(dead_code)]
 struct MseState {
     media_source: web_sys::MediaSource,
-    source_buffer: web_sys::SourceBuffer,
+    /// Video track state — always present.
+    video: TrackState,
+    /// Audio track state — present when the MPD has separate audio.
+    audio: Option<TrackState>,
     /// Blob URL created for this MediaSource; revoked on cleanup.
     object_url: String,
-    /// Parsed segment list from the DASH MPD manifest.
-    segments: Vec<SegmentInfo>,
-    /// Index of the next segment the pump should consider fetching.
-    next_seg: usize,
-    /// Generation counter — incremented on every seek or restart.
-    /// Any running `pump_loop` whose id doesn't match exits immediately.
-    pump_gen: u32,
-    /// True while a `pump_loop` future is alive.
-    pump_running: bool,
-    /// The highest segment index that has been successfully appended to the
-    /// SourceBuffer.  Used by the segment-index-based buffer gate to decide
-    /// whether enough data has been buffered ahead of the playhead.
-    /// Set to `None` until the first media segment is appended.
-    last_appended_seg: Option<usize>,
+    /// Parsed MPD manifest (full).
+    mpd: Mpd,
+    /// Shared ABR controller.
+    abr: AbrController,
+    /// Shared throughput controller.
+    throughput: ThroughputController,
+    /// Shared metrics.
+    metrics: DashMetrics,
+    /// Event bus for application-level events.
+    event_bus: EventBus,
+    /// Error recovery state.
+    error_recovery: ErrorRecovery,
+    /// Live stream controller (only active for dynamic MPDs).
+    live: Option<LiveStreamController>,
+    /// Whether this is a startup phase (affects buffer targets).
+    is_startup: bool,
+    /// Legacy: combined segment list for backward compatibility with
+    /// single-SourceBuffer MPDs produced by our server.
+    /// Used when the MPD has muxed audio+video in a single AdaptationSet.
+    legacy_source_buffer: Option<web_sys::SourceBuffer>,
+    legacy_segments: Vec<SegmentInfo>,
+    legacy_next_seg: usize,
+    legacy_pump_gen: u32,
+    legacy_pump_running: bool,
+    legacy_last_appended_seg: Option<usize>,
 }
 
 /// Parse a DASH MPD manifest and return the list of segment URLs with durations.
 ///
-/// This is a minimal parser that handles the specific MPD format our server
-/// emits: a single Period with a single AdaptationSet containing a
-/// SegmentTemplate with a SegmentTimeline.
+/// This uses the full MPD parser but returns the same tuple as the legacy
+/// parser for backward compatibility with the existing pump loop.
 ///
 /// Returns `(init_url, total_duration_secs, segments)`.
 fn parse_mpd(text: &str) -> (String, f64, Vec<SegmentInfo>) {
-    let mut init_url = String::new();
-    let mut media_template = String::new();
-    let mut start_number: usize = 0;
-    let mut timescale: f64 = 1000.0;
-    let mut segments = Vec::new();
-    let mut total_duration: f64 = 0.0;
+    let mpd = parse_mpd_full(text);
 
-    // Extract mediaPresentationDuration from <MPD> tag (ISO 8601 duration).
-    // We support the format "PTxHxMxS" or "PTxMxS" or "PTxS".
-    if let Some(mpd_start) = text.find("mediaPresentationDuration=\"") {
-        let rest = &text[mpd_start + 27..];
-        if let Some(end) = rest.find('"') {
-            total_duration = parse_iso8601_duration(&rest[..end]);
-        }
+    // Use the first period, first adaptation set, first (lowest) representation
+    // for backward compatibility.
+    if mpd.periods.is_empty() {
+        return (String::new(), 0.0, Vec::new());
+    }
+    let period = &mpd.periods[0];
+    if period.adaptation_sets.is_empty() {
+        return (String::new(), 0.0, Vec::new());
     }
 
-    // Extract SegmentTemplate attributes
-    if let Some(st_start) = text.find("<SegmentTemplate") {
-        if let Some(st_end) = text[st_start..].find('>') {
-            let tag = &text[st_start..st_start + st_end + 1];
+    // Find the video (or muxed) adaptation set
+    let aset_idx = period.adaptation_sets.iter().position(|a| {
+        a.content_type.as_deref() == Some("video")
+            || a.mime_type.as_deref().is_some_and(|m| m.starts_with("video"))
+            || a.content_type.is_none() // Muxed (no explicit content type)
+    }).unwrap_or(0);
 
-            // Extract initialization URL
-            if let Some(i) = tag.find("initialization=\"") {
-                let rest = &tag[i + 16..];
-                if let Some(end) = rest.find('"') {
-                    init_url = rest[..end].to_string();
-                }
-            }
-
-            // Extract media template
-            if let Some(i) = tag.find("media=\"") {
-                let rest = &tag[i + 7..];
-                if let Some(end) = rest.find('"') {
-                    media_template = rest[..end].to_string();
-                }
-            }
-
-            // Extract startNumber
-            if let Some(i) = tag.find("startNumber=\"") {
-                let rest = &tag[i + 13..];
-                if let Some(end) = rest.find('"') {
-                    start_number = rest[..end].parse().unwrap_or(0);
-                }
-            }
-
-            // Extract timescale
-            if let Some(i) = tag.find("timescale=\"") {
-                let rest = &tag[i + 11..];
-                if let Some(end) = rest.find('"') {
-                    timescale = rest[..end].parse().unwrap_or(1000.0);
-                }
-            }
-        }
+    let aset = &period.adaptation_sets[aset_idx];
+    if aset.representations.is_empty() {
+        return (String::new(), 0.0, Vec::new());
     }
 
-    // Parse SegmentTimeline <S> elements
-    let mut seg_index = start_number;
-    let mut search_pos = 0;
-    while let Some(s_start) = text[search_pos..].find("<S ") {
-        let abs_start = search_pos + s_start;
-        if let Some(s_end) = text[abs_start..].find("/>") {
-            let tag = &text[abs_start..abs_start + s_end + 2];
-
-            // Extract duration "d" attribute
-            if let Some(d_pos) = tag.find("d=\"") {
-                let rest = &tag[d_pos + 3..];
-                if let Some(end) = rest.find('"') {
-                    if let Ok(d) = rest[..end].parse::<f64>() {
-                        let duration_secs = d / timescale;
-
-                        // Extract optional repeat count "r" attribute.
-                        // r=N means N additional repetitions (N+1 segments total).
-                        let repeat_count: usize = if let Some(r_pos) = tag.find("r=\"") {
-                            let r_rest = &tag[r_pos + 3..];
-                            if let Some(r_end) = r_rest.find('"') {
-                                r_rest[..r_end].parse().unwrap_or(0)
-                            } else {
-                                0
-                            }
-                        } else {
-                            0
-                        };
-
-                        // Generate (1 + repeat_count) segment entries.
-                        for _ in 0..=repeat_count {
-                            let url = media_template.replace("$Number%05d$", &format!("{:05}", seg_index));
-                            segments.push(SegmentInfo {
-                                url,
-                                duration: duration_secs,
-                            });
-                            seg_index += 1;
-                        }
-                    }
-                }
-            }
-
-            search_pos = abs_start + s_end + 2;
-        } else {
-            break;
-        }
-    }
-
-    (init_url, total_duration, segments)
+    // Use the first representation (lowest bandwidth after sorting).
+    build_segment_list_from_mpd(&mpd, 0, aset_idx, 0, "")
 }
 
 /// Parse an ISO 8601 duration like "PT1H23M45S" or "PT0H0M30S" into seconds.
@@ -468,7 +2588,7 @@ fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
 /// been dropped or a newer pump has been started (e.g. after a seek).
 fn is_pump_current(state: &Rc<RefCell<Option<MseState>>>, pump_id: u32) -> bool {
     let borrow = state.borrow();
-    matches!(borrow.as_ref(), Some(s) if s.pump_gen == pump_id)
+    matches!(borrow.as_ref(), Some(s) if s.legacy_pump_gen == pump_id)
 }
 
 /// Wait for the SourceBuffer to finish any in-progress operation.
@@ -610,10 +2730,10 @@ fn kick_prefetch(
 ) {
     let borrow = state.borrow();
     let mse = match borrow.as_ref() {
-        Some(s) if s.pump_gen == pump_id => s,
+        Some(s) if s.legacy_pump_gen == pump_id => s,
         _ => return,
     };
-    let total = mse.segments.len();
+    let total = mse.legacy_segments.len();
 
     let end_seg = (from_seg + LOOKAHEAD_SEGMENTS).min(total);
     for idx in from_seg..end_seg {
@@ -630,7 +2750,7 @@ fn kick_prefetch(
             }
             flight.insert(idx);
         }
-        let url = mse.segments[idx].url.clone();
+        let url = mse.legacy_segments[idx].url.clone();
 
         let cache = Rc::clone(cache);
         let in_flight = Rc::clone(in_flight);
@@ -676,14 +2796,12 @@ fn start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElement) {
         let mut borrow = state.borrow_mut();
         match borrow.as_mut() {
             Some(s) => {
-                // If a pump is already running for this generation, don't
-                // start another one — that would cause duplicate requests.
-                if s.pump_running {
+                if s.legacy_pump_running {
                     return;
                 }
-                s.pump_gen = s.pump_gen.wrapping_add(1);
-                s.pump_running = true;
-                s.pump_gen
+                s.legacy_pump_gen = s.legacy_pump_gen.wrapping_add(1);
+                s.legacy_pump_running = true;
+                s.legacy_pump_gen
             }
             None => return,
         }
@@ -693,8 +2811,8 @@ fn start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElement) {
     spawn_local(async move {
         pump_loop(state_c.clone(), video_c, pump_id).await;
         if let Some(s) = state_c.borrow_mut().as_mut() {
-            if s.pump_gen == pump_id {
-                s.pump_running = false;
+            if s.legacy_pump_gen == pump_id {
+                s.legacy_pump_running = false;
             }
         }
     });
@@ -710,9 +2828,9 @@ fn force_start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElem
         let mut borrow = state.borrow_mut();
         match borrow.as_mut() {
             Some(s) => {
-                s.pump_gen = s.pump_gen.wrapping_add(1);
-                s.pump_running = true;
-                s.pump_gen
+                s.legacy_pump_gen = s.legacy_pump_gen.wrapping_add(1);
+                s.legacy_pump_running = true;
+                s.legacy_pump_gen
             }
             None => return,
         }
@@ -722,8 +2840,8 @@ fn force_start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElem
     spawn_local(async move {
         pump_loop(state_c.clone(), video_c, pump_id).await;
         if let Some(s) = state_c.borrow_mut().as_mut() {
-            if s.pump_gen == pump_id {
-                s.pump_running = false;
+            if s.legacy_pump_gen == pump_id {
+                s.legacy_pump_running = false;
             }
         }
     });
@@ -781,22 +2899,26 @@ async fn pump_loop(
         let (seg_url, seg_idx, sb, last_appended) = {
             let borrow = state.borrow();
             let mse = match borrow.as_ref() {
-                Some(s) if s.pump_gen == pump_id => s,
+                Some(s) if s.legacy_pump_gen == pump_id => s,
                 _ => return,
             };
 
             // All segments appended — signal EOS.
-            if mse.next_seg >= mse.segments.len() {
-                log::info!("pump[{pump_id}]: all {} segments appended, signalling EOS", mse.segments.len());
+            if mse.legacy_next_seg >= mse.legacy_segments.len() {
+                log::info!("pump[{pump_id}]: all {} segments appended, signalling EOS", mse.legacy_segments.len());
                 let _ = mse.media_source.end_of_stream();
                 return;
             }
 
+            let sb = mse.legacy_source_buffer.as_ref()
+                .unwrap_or(&mse.video.source_buffer)
+                .clone();
+
             (
-                mse.segments[mse.next_seg].url.clone(),
-                mse.next_seg,
-                mse.source_buffer.clone(),
-                mse.last_appended_seg,
+                mse.legacy_segments[mse.legacy_next_seg].url.clone(),
+                mse.legacy_next_seg,
+                sb,
+                mse.legacy_last_appended_seg,
             )
         };
 
@@ -924,8 +3046,8 @@ async fn pump_loop(
             log::warn!("segment {seg_idx}: no media data after stripping init boxes (original size: {} bytes)", bytes.len());
             // Advance past this empty segment and try the next one.
             if let Some(s) = state.borrow_mut().as_mut() {
-                if s.pump_gen == pump_id {
-                    s.next_seg = seg_idx + 1;
+                if s.legacy_pump_gen == pump_id {
+                    s.legacy_next_seg = seg_idx + 1;
                 }
             }
             continue;
@@ -987,14 +3109,31 @@ async fn pump_loop(
 
             let mut borrow = state.borrow_mut();
             if let Some(s) = borrow.as_mut() {
-                if s.pump_gen != pump_id {
+                if s.legacy_pump_gen != pump_id {
                     return;
                 }
-                s.next_seg = seg_idx + 1;
-                s.last_appended_seg = Some(seg_idx);
+                s.legacy_next_seg = seg_idx + 1;
+                s.legacy_last_appended_seg = Some(seg_idx);
+
+                // ── Throughput measurement ────────────────────────────
+                // Record timing metrics for the ABR controller.
+                s.metrics.add_throughput_sample(ThroughputSample {
+                    timestamp_ms: js_sys::Date::now(),
+                    throughput_kbps: 0.0, // Updated by prefetch/fetch timing
+                    latency_ms: 0.0,
+                    bytes: media_bytes.len(),
+                    duration_ms: 0.0,
+                    media_type: MediaType::Video,
+                });
+                s.error_recovery.on_success();
+
+                // ── Emit events ──────────────────────────────────────
+                s.event_bus.emit_simple(PlayerEvent::FragmentLoadingCompleted);
+                s.is_startup = false;
+
                 log::info!(
                     "pump[{pump_id}]: appended segment {seg_idx}, next_seg={}",
-                    s.next_seg
+                    s.legacy_next_seg
                 );
             }
         }
@@ -1252,8 +3391,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
                         };
 
-                        // Parse segment list from MPD.
+                        // Parse segment list from MPD using the full parser.
+                        let mpd = parse_mpd_full(&text);
                         let (init_url, total_duration, segments) = parse_mpd(&text);
+
+                        // Emit ManifestLoaded event.
+                        let event_bus = EventBus::new();
+                        event_bus.emit_simple(PlayerEvent::ManifestLoaded);
+
                         if segments.is_empty() {
                             error.set(Some("Manifest contains no segments.".to_string()));
                             return;
@@ -1364,16 +3509,55 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             0
                         };
 
-                        // Store MSE state.
-                        *mse_state.borrow_mut() = Some(MseState {
-                            media_source,
+                        // Store MSE state with full DASH infrastructure.
+                        let throughput = ThroughputController::new();
+                        let metrics = DashMetrics::new();
+                        let abr = AbrController::new();
+                        let error_recovery = ErrorRecovery::new();
+
+                        // Configure live controller if MPD is dynamic.
+                        let live = if mpd.mpd_type == MpdType::Dynamic {
+                            let mut live_ctrl = LiveStreamController::new();
+                            live_ctrl.configure_from_mpd(&mpd);
+                            Some(live_ctrl)
+                        } else {
+                            None
+                        };
+
+                        // Create a dummy video TrackState for the legacy path.
+                        let video_track = TrackState {
                             source_buffer: source_buffer.clone(),
-                            object_url,
-                            segments,
+                            segments: Vec::new(),
+                            init_url: init_url.clone(),
                             next_seg: start_seg,
                             pump_gen: 0,
                             pump_running: false,
                             last_appended_seg: None,
+                            current_rep_index: 0,
+                            representations: Vec::new(),
+                            media_type: MediaType::Video,
+                            adaptation_set_idx: 0,
+                        };
+
+                        *mse_state.borrow_mut() = Some(MseState {
+                            media_source,
+                            video: video_track,
+                            audio: None,
+                            object_url,
+                            mpd,
+                            abr,
+                            throughput,
+                            metrics,
+                            event_bus: event_bus.clone(),
+                            error_recovery,
+                            live,
+                            is_startup: true,
+                            legacy_source_buffer: Some(source_buffer.clone()),
+                            legacy_segments: segments,
+                            legacy_next_seg: start_seg,
+                            legacy_pump_gen: 0,
+                            legacy_pump_running: false,
+                            legacy_last_appended_seg: None,
                         });
 
                         status.set(String::new());
@@ -1512,11 +3696,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     let needs_restart = {
                         let borrow = mse_state.borrow();
                         if let Some(s) = borrow.as_ref() {
-                            if s.pump_running || s.next_seg >= s.segments.len() {
+                            if s.legacy_pump_running || s.legacy_next_seg >= s.legacy_segments.len() {
                                 false
                             } else {
                                 let current = video.current_time();
-                                let buf_ahead = if let Ok(ranges) = s.source_buffer.buffered() {
+                                let sb = s.legacy_source_buffer.as_ref()
+                                    .unwrap_or(&s.video.source_buffer);
+                                let buf_ahead = if let Ok(ranges) = sb.buffered() {
                                     let mut ahead = 0.0_f64;
                                     for i in 0..ranges.length() {
                                         if let (Ok(rs), Ok(re)) = (ranges.start(i), ranges.end(i)) {
@@ -1528,7 +3714,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                     }
                                     ahead
                                 } else {
-                                    match s.last_appended_seg {
+                                    match s.legacy_last_appended_seg {
                                         Some(last) => {
                                             let buffered_to = (last as f64 + 1.0) * SEGMENT_DURATION_F;
                                             (buffered_to - current).max(0.0)
@@ -1662,7 +3848,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         let need_pump = {
                             let borrow = mse_state_for_seek.borrow();
                             if let Some(mse) = borrow.as_ref() {
-                                !mse.pump_running
+                                !mse.legacy_pump_running
                             } else {
                                 false
                             }
@@ -1685,10 +3871,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         {
                             let mut borrow = mse_state_for_seek.borrow_mut();
                             if let Some(mse) = borrow.as_mut() {
-                                mse.pump_gen = mse.pump_gen.wrapping_add(1);
-                                mse.pump_running = false;
-                                mse.next_seg = target_seg;
-                                mse.last_appended_seg = None;
+                                mse.legacy_pump_gen = mse.legacy_pump_gen.wrapping_add(1);
+                                mse.legacy_pump_running = false;
+                                mse.legacy_next_seg = target_seg;
+                                mse.legacy_last_appended_seg = None;
                             } else {
                                 return;
                             }

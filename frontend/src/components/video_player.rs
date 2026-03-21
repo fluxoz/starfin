@@ -1435,21 +1435,25 @@ async fn wait_for_sb(
 /// Waits for the SourceBuffer to be idle, calls `sb.remove()`, then waits
 /// for completion.  Because this only fires every 10 s, the blocking cost
 /// is amortized and doesn't cause per-segment stutter.
+///
+/// Returns `true` if eviction actually ran (`sb.remove()` was called and
+/// completed), `false` if skipped (buffer within limits, nothing to evict,
+/// or pump generation changed).
 async fn evict_back_buffer(
     sb: &web_sys::SourceBuffer,
     video: &HtmlVideoElement,
     state: &Rc<RefCell<Option<MseState>>>,
     pump_id: u32,
-) {
+) -> bool {
     let current = video.current_time();
 
     let ranges = match sb.buffered() {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => return false,
     };
     let len = ranges.length();
     if len == 0 {
-        return;
+        return false;
     }
 
     // Calculate total buffered as the SUM of actual range durations,
@@ -1465,7 +1469,7 @@ async fn evict_back_buffer(
 
     // Only evict when total buffer exceeds the cap.
     if total_buffered <= max_total {
-        return;
+        return false;
     }
 
     // Find data strictly behind keep_start (everything older than
@@ -1488,17 +1492,20 @@ async fn evict_back_buffer(
     }
 
     if evict_start >= evict_end {
-        return;
+        return false;
     }
 
     let evict_amount = evict_end - evict_start;
+    // Avoid trivially small removes (< one segment duration) that don't
+    // meaningfully reduce buffer size.  dash.js getClearRanges() has no
+    // minimum, but our 10 s interval means small removes are wasteful.
     if evict_amount < SEGMENT_DURATION_F {
-        return; // too small to bother
+        return false;
     }
 
     // Wait for SB to be idle before removing.
     if !wait_for_sb(sb, state, pump_id).await {
-        return;
+        return false;
     }
 
     log::info!(
@@ -1508,6 +1515,7 @@ async fn evict_back_buffer(
 
     // Wait for the remove operation to complete.
     let _ = wait_for_sb(sb, state, pump_id).await;
+    true
 }
 
 /// Unconditional back-buffer eviction used as a recovery step after a
@@ -2047,14 +2055,20 @@ async fn pump_loop(
                 }
             };
             if now_ms - last_evict >= 10_000.0 {
-                evict_back_buffer(&sb, &video, &state, pump_id).await;
+                let did_evict = evict_back_buffer(&sb, &video, &state, pump_id).await;
                 if !is_pump_current(&state, pump_id) {
                     return;
                 }
-                // Update the last eviction timestamp.
-                if let Some(s) = state.borrow_mut().as_mut() {
-                    if s.pump_gen == pump_id {
-                        s.last_eviction_ms = js_sys::Date::now();
+                // Only update the timer when eviction actually ran.
+                // If evict_back_buffer returned early (buffer within
+                // limits, nothing to remove), we retry on the next
+                // loop iteration so eviction fires promptly once the
+                // buffer does grow past the threshold.
+                if did_evict {
+                    if let Some(s) = state.borrow_mut().as_mut() {
+                        if s.pump_gen == pump_id {
+                            s.last_eviction_ms = js_sys::Date::now();
+                        }
                     }
                 }
             }
@@ -2538,7 +2552,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 error_recovery: ErrorRecovery::new(),
                                 live: live_ctrl,
                             }),
-                            last_eviction_ms: 0.0,
+                            last_eviction_ms: js_sys::Date::now(),
                         });
 
 

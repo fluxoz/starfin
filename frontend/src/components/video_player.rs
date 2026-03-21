@@ -3,6 +3,7 @@ use gloo_timers::callback::Interval;
 use gloo_timers::future::TimeoutFuture;
 use serde::Deserialize;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -71,21 +72,49 @@ const CONTROLS_VICINITY_PX: f64 = 80.0;
 //    Spec:   https://dashif.org/docs/DASH-IF-IOP-v4.3.pdf
 
 /// Target seconds of video to keep buffered ahead of the playback position.
-/// dash.js uses 12 s by default; Shaka Player 10 s; hls.js 30 s.
-/// 30 s gives a comfortable margin for VOD content.
+/// dash.js uses 12 s by default (`bufferTimeAtTopQuality`);
+/// Shaka Player uses 10 s; hls.js uses 30 s.
+/// We use 30 s for comfortable VOD buffering.
 const MSE_TARGET_BUFFER_S: f64 = 30.0;
 
 /// Maximum seconds of already-played data to keep behind the playhead.
 /// Data older than this is evicted via `SourceBuffer.remove()` to bound
-/// memory usage.  Shaka Player's `bufferBehind` default is 30 s; hls.js's
-/// `backBufferLength` is also 30 s.  dash.js's `bufferToKeep` is 20 s.
-const MSE_BACK_BUFFER_S: f64 = 30.0;
+/// memory usage and prevent the browser from hitting its SourceBuffer
+/// quota (which triggers emergency eviction near the playhead — the
+/// root cause of audio dropout at segment boundaries).
+///
+/// dash.js `bufferToKeep` defaults to 20 s; Shaka Player `bufferBehind`
+/// defaults to 30 s.  We use 20 s to match dash.js and keep total buffer
+/// size well within browser quotas.
+const MSE_BACK_BUFFER_S: f64 = 20.0;
 
 /// Maximum gap size (in seconds) that will be automatically jumped over.
 /// dash.js GapController uses `smallGapLimit = 0.8` by default.
 /// Shaka Player uses 0.5 s.  We use 0.8 to match dash.js.
 /// Ref: dash.js/src/streaming/controllers/GapController.js `_jumpGap()`
 const SMALL_GAP_LIMIT_S: f64 = 0.8;
+
+/// Tolerance (in seconds) for matching the playhead to a buffered range.
+/// A small tolerance prevents false negatives when the playhead sits at
+/// the exact edge of a buffered range due to floating-point imprecision.
+const PLAYHEAD_RANGE_TOLERANCE_S: f64 = 0.1;
+
+/// Minimum amount of data (in seconds) worth evicting.  Avoids issuing
+/// tiny SourceBuffer.remove() calls that add overhead without benefit.
+const MIN_EVICT_S: f64 = 0.5;
+
+/// Number of segments to keep pre-fetched ahead of the current append
+/// position.  Background fetch tasks populate a shared segment cache so
+/// that the sequential append loop never blocks on HTTP latency.
+///
+/// This is critical when segments are generated on-demand by the backend —
+/// the first fetch of each segment triggers server-side muxing which can
+/// take hundreds of milliseconds.  With deep prefetch, those generations
+/// happen well before the data is needed.
+///
+/// dash.js achieves this implicitly via CDN pre-segmented content; our
+/// on-demand backend requires explicit lookahead.
+const LOOKAHEAD_SEGMENTS: usize = 5;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -421,10 +450,15 @@ fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
         pos += size;
     }
 
-    if result.is_empty() {
-        // Fallback: return original data if no boxes were parsed.
+    if result.is_empty() && pos == 0 {
+        // No valid box header was found at all (data too short or starts
+        // with a malformed box) — return the raw bytes unchanged so the
+        // caller can decide what to do.
         data.to_vec()
     } else {
+        // `result` may be empty when every box was ftyp/moov (init-only
+        // segment with no media data).  The caller's `media_bytes.is_empty()`
+        // check will catch this and skip the segment correctly.
         result
     }
 }
@@ -439,13 +473,24 @@ fn is_pump_current(state: &Rc<RefCell<Option<MseState>>>, pump_id: u32) -> bool 
 
 /// Wait for the SourceBuffer to finish any in-progress operation.
 /// Returns `false` if the pump generation changed during the wait.
+///
+/// Uses `TimeoutFuture::new(0)` (equivalent to `setTimeout(0)` in JS)
+/// to yield to the browser's event loop between checks.  This matches
+/// dash.js `SourceBufferSink._onUpdateEnd` → `setTimeout(executeNext, 0)`
+/// pattern, ensuring the browser can process audio/video decode work
+/// between SourceBuffer operations.
+///
+/// A 0 ms timeout doesn't actually wait — it just yields the current
+/// microtask, letting the browser's event loop run one tick (process
+/// pending updateend events, decode audio frames, render, etc.) before
+/// we re-check `sb.updating()`.
 async fn wait_for_sb(
     sb: &web_sys::SourceBuffer,
     state: &Rc<RefCell<Option<MseState>>>,
     pump_id: u32,
 ) -> bool {
     while sb.updating() {
-        TimeoutFuture::new(5).await;
+        TimeoutFuture::new(0).await;
         if !is_pump_current(state, pump_id) {
             return false;
         }
@@ -464,8 +509,17 @@ async fn wait_for_sb(
 ///     `BufferController.onBufferFlushing()`.
 ///   • DASH-IF IOP v4.3 §3.2.8 recommends proactive buffer management.
 ///
-/// We keep up to `MSE_BACK_BUFFER_S` seconds behind the current playback
-/// position and remove everything before that via `SourceBuffer.remove()`.
+/// **Critical design constraint:** `SourceBuffer.remove()` sets
+/// `updating = true`, blocking the next `appendBuffer()`.  During this
+/// time the browser cannot decode new audio/video frames from appended
+/// segments.  dash.js mitigates this by only calling `pruneBuffer()`
+/// when the total buffer approaches the browser's SourceBuffer quota —
+/// NOT on every append based on back-buffer time.
+///
+/// We follow the same approach: only evict when `total_buffered` exceeds
+/// `MSE_BACK_BUFFER_S + MSE_TARGET_BUFFER_S`.  When eviction is needed,
+/// trim enough to bring the total one segment below the cap, giving
+/// headroom for the next append without re-triggering eviction.
 async fn evict_back_buffer(
     sb: &web_sys::SourceBuffer,
     video: &HtmlVideoElement,
@@ -473,12 +527,8 @@ async fn evict_back_buffer(
     pump_id: u32,
 ) {
     let current = video.current_time();
-    let evict_before = current - MSE_BACK_BUFFER_S;
-    if evict_before <= 0.5 {
-        return; // nothing worth evicting
-    }
 
-    // Check if there's actually data before evict_before
+    // Check if there's actually buffered data.
     let ranges = match sb.buffered() {
         Ok(r) => r,
         Err(_) => return,
@@ -490,8 +540,31 @@ async fn evict_back_buffer(
         Ok(s) => s,
         Err(_) => return,
     };
-    if buf_start >= evict_before {
-        return; // nothing to evict
+    let buf_end = match ranges.end(ranges.length() - 1) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let max_total = MSE_BACK_BUFFER_S + MSE_TARGET_BUFFER_S;
+    let total_buffered = buf_end - buf_start;
+
+    // Only evict when total buffer exceeds the cap.
+    // This prevents unnecessary sb.remove() calls that block the append
+    // pipeline.  dash.js only prunes when approaching the quota, not on
+    // every append based on back-buffer time.
+    if total_buffered <= max_total {
+        return;
+    }
+
+    // Trim enough to bring total one segment below the cap, giving
+    // headroom for the next append.
+    let target_total = max_total - SEGMENT_DURATION_F;
+    let target_start = (current - MSE_BACK_BUFFER_S).max(buf_start);
+    let min_evict = buf_start + (total_buffered - target_total);
+    let evict_before = target_start.max(min_evict);
+
+    if evict_before <= buf_start + MIN_EVICT_S {
+        return; // nothing worth evicting
     }
 
     // Wait for SourceBuffer to be idle before removing.
@@ -499,10 +572,92 @@ async fn evict_back_buffer(
         return;
     }
 
+    log::info!(
+        "evict: removing [{buf_start:.3}–{evict_before:.3}] (total was {total_buffered:.1}s, current={current:.3})"
+    );
     let _ = sb.remove(buf_start, evict_before);
 
     // Wait for the remove operation to complete.
     let _ = wait_for_sb(sb, state, pump_id).await;
+}
+
+/// Shared segment cache used by the deep prefetch pipeline.
+///
+/// Background fetch tasks (spawned via `spawn_local`) populate this cache
+/// ahead of the append position.  The sequential append loop pulls from
+/// it, so there's always data ready to append without waiting on HTTP.
+///
+/// The cache is keyed by segment index.  Entries are removed after the
+/// append loop consumes them (to bound memory).  The `in_flight` set
+/// prevents duplicate fetch tasks for the same segment.
+type SegmentCache = Rc<RefCell<HashMap<usize, Vec<u8>>>>;
+type InFlightSet = Rc<RefCell<std::collections::HashSet<usize>>>;
+
+/// Kick off background fetch tasks for segments in the lookahead window.
+///
+/// For each segment in `[from_seg, from_seg + LOOKAHEAD_SEGMENTS)` that
+/// is within range, not already cached, and not already being fetched,
+/// spawns an async task to fetch it and store the bytes in `cache`.
+///
+/// This runs on every loop iteration of the pump to keep the pipeline
+/// full.  Tasks self-cancel if the pump generation changes (seek/restart).
+fn kick_prefetch(
+    cache: &SegmentCache,
+    in_flight: &InFlightSet,
+    state: &Rc<RefCell<Option<MseState>>>,
+    pump_id: u32,
+    from_seg: usize,
+) {
+    let borrow = state.borrow();
+    let mse = match borrow.as_ref() {
+        Some(s) if s.pump_gen == pump_id => s,
+        _ => return,
+    };
+    let total = mse.segments.len();
+
+    let end_seg = (from_seg + LOOKAHEAD_SEGMENTS).min(total);
+    for idx in from_seg..end_seg {
+        // Atomically check-and-insert to prevent duplicate fetch tasks.
+        // WASM is single-threaded, so a single borrow_mut scope is sufficient.
+        {
+            let cached = cache.borrow().contains_key(&idx);
+            if cached {
+                continue;
+            }
+            let mut flight = in_flight.borrow_mut();
+            if flight.contains(&idx) {
+                continue;
+            }
+            flight.insert(idx);
+        }
+        let url = mse.segments[idx].url.clone();
+
+        let cache = Rc::clone(cache);
+        let in_flight = Rc::clone(in_flight);
+        let state = Rc::clone(state);
+        spawn_local(async move {
+            // Check generation before starting the fetch.
+            // If stale, leave idx in in_flight to prevent re-spawning
+            // tasks for a cancelled pump.
+            if !is_pump_current(&state, pump_id) {
+                return;
+            }
+            match Request::get(&url).send().await {
+                Ok(r) => match r.binary().await {
+                    Ok(bytes) => {
+                        // Only store if pump is still current.
+                        if is_pump_current(&state, pump_id) {
+                            cache.borrow_mut().insert(idx, bytes);
+                            log::info!("prefetch[{pump_id}]: cached segment {idx}");
+                        }
+                    }
+                    Err(e) => log::warn!("prefetch seg {idx}: body error: {e:?}"),
+                },
+                Err(e) => log::warn!("prefetch seg {idx}: fetch error: {e:?}"),
+            }
+            in_flight.borrow_mut().remove(&idx);
+        });
+    }
 }
 
 /// Start (or restart) the async segment-pump loop.
@@ -584,23 +739,23 @@ fn force_start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElem
 ///   • hls.js `StreamController.doTick()` — main loop that drives segment
 ///     fetching and appending.
 ///
-/// Steps per iteration (per DASH-IF IOP v4.3 §3.2):
-///   1. Determine the next segment needed.
-///   2. Enforce a forward buffer limit — sleep when enough data is buffered.
-///   3. Evict old played data behind the playhead to bound memory.
-///   4. Fetch the segment over HTTP.
-///   5. Strip redundant init boxes (ftyp/moov) from the fMP4 data.
-///   6. Wait for the SourceBuffer to be idle, then `appendBuffer`.
-///   7. Wait for `updateend`, advance to the next segment, repeat.
+/// **Deep prefetch pipeline:** Instead of fetching one segment at a time,
+/// background tasks continuously pre-fetch segments into a shared cache
+/// (`SegmentCache`) up to `LOOKAHEAD_SEGMENTS` ahead of the current
+/// append position.  The sequential append loop pulls from this cache,
+/// so it never blocks on HTTP latency.  This is critical when the backend
+/// generates segments on-demand (each first fetch triggers server-side
+/// muxing which can take hundreds of milliseconds).
 ///
-/// Buffer-ahead gate: uses a segment-index-based calculation rather than
-/// querying `video.buffered()`.  The browser's buffered ranges can be empty
-/// or stale immediately after a seek+flush, which would cause the pump to
-/// fetch all segments at once.  By computing the buffered-ahead duration
-/// from `(last_appended_seg + 1) * SEGMENT_DURATION - current_time`, we
-/// get a deterministic gate that works regardless of browser timing.
-/// This mirrors dash.js ScheduleController:
-///   `if (bufferLevel + segmentDuration > bufferTarget) wait`
+/// Steps per iteration (per DASH-IF IOP v4.3 §3.2):
+///   1. Kick off background prefetch tasks for the lookahead window.
+///   2. Determine the next segment needed.
+///   3. Enforce a forward buffer limit — sleep when enough data is buffered.
+///   4. Evict old played data behind the playhead to bound memory.
+///   5. Pull the segment from the prefetch cache (or fetch inline as fallback).
+///   6. Strip redundant init boxes (ftyp/moov) from the fMP4 data.
+///   7. Wait for the SourceBuffer to be idle, then `appendBuffer`.
+///   8. Wait for `updateend`, advance to the next segment, repeat.
 ///
 /// The loop exits when all segments are appended, the generation counter
 /// no longer matches (a seek started a newer pump), or the MseState has
@@ -610,6 +765,12 @@ async fn pump_loop(
     video: HtmlVideoElement,
     pump_id: u32,
 ) {
+    // ── Deep prefetch pipeline state ─────────────────────────────────
+    // Background fetch tasks populate `segment_cache` ahead of the
+    // append position.  `in_flight` prevents duplicate fetch tasks.
+    let segment_cache: SegmentCache = Rc::new(RefCell::new(HashMap::new()));
+    let in_flight: InFlightSet = Rc::new(RefCell::new(Default::default()));
+
     loop {
         // ── 1. Generation check ──────────────────────────────────────
         if !is_pump_current(&state, pump_id) {
@@ -639,59 +800,125 @@ async fn pump_loop(
             )
         };
 
-        // ── 3. Buffer-ahead gate (segment-index based) ───────────────
-        // Compute how much data is buffered ahead of the current playhead
-        // using segment indices rather than video.buffered() ranges.
+        // ── 3. Kick off deep prefetch for the lookahead window ───────
+        // Ensures background fetches are running for upcoming segments.
+        // Each call is cheap — it only spawns tasks for segments not
+        // already cached or in-flight.
+        kick_prefetch(&segment_cache, &in_flight, &state, pump_id, seg_idx);
+
+        // ── 4. Buffer-ahead gate ─────────────────────────────────────
+        // Check how much data is buffered ahead of the playhead using the
+        // actual SourceBuffer.buffered() ranges.  If we have enough data,
+        // sleep instead of appending more — this prevents over-buffering
+        // which causes the browser to hit its SourceBuffer quota and
+        // emergency-evict data near the playhead.
         //
-        // In Sequence mode, after appending segment N, the buffer extends
-        // to approximately (N + 1) × SEGMENT_DURATION on the timeline.
-        // We compare that against the current playhead position to decide
-        // if we should sleep or fetch the next segment.
+        // dash.js uses `bufferLevel` (actual buffered time ahead of
+        // playhead) compared against `bufferTimeAtTopQuality` (12 s).
+        // We use 30 s for VOD.
         //
-        // This avoids the issue where video.buffered() returns empty
-        // ranges immediately after a seek+flush, causing the pump to
-        // hammer the server with all remaining segments.
-        if let Some(last_seg) = last_appended {
-            let buffered_to = (last_seg as f64 + 1.0) * SEGMENT_DURATION_F;
+        // Falls back to segment-index estimation when buffered() is
+        // unavailable (e.g. immediately after seek+flush).
+        {
             let current = video.current_time();
-            let buf_ahead = (buffered_to - current).max(0.0);
+            let buf_ahead = if let Ok(ranges) = sb.buffered() {
+                // Find the buffered range containing the playhead.
+                let mut ahead = 0.0_f64;
+                for i in 0..ranges.length() {
+                    if let (Ok(s), Ok(e)) = (ranges.start(i), ranges.end(i)) {
+                        if current >= s - PLAYHEAD_RANGE_TOLERANCE_S && current <= e + PLAYHEAD_RANGE_TOLERANCE_S {
+                            ahead = (e - current).max(0.0);
+                            break;
+                        }
+                    }
+                }
+                ahead
+            } else if let Some(last_seg) = last_appended {
+                // Fallback: estimate from segment indices.
+                let buffered_to = (last_seg as f64 + 1.0) * SEGMENT_DURATION_F;
+                (buffered_to - current).max(0.0)
+            } else {
+                0.0
+            };
+
             if buf_ahead >= MSE_TARGET_BUFFER_S {
                 // Enough data buffered ahead — sleep and re-check.
-                TimeoutFuture::new(500).await;
+                // Keep prefetching in the background while we wait.
+                // Use 200 ms (not 500 ms) for responsive scheduling —
+                // matches dash.js ScheduleController which reschedules
+                // quickly when buffer level changes.
+                TimeoutFuture::new(200).await;
                 continue;
             }
         }
 
-        // ── 4. Evict old data behind the playhead ────────────────────
+        // ── 5. Evict old data behind the playhead ────────────────────
+        // Proactively evict BEFORE appending to prevent the browser from
+        // hitting its SourceBuffer quota.  Browser emergency eviction
+        // removes data unpredictably (sometimes near the playhead),
+        // causing audio dropout at segment transitions.
+        //
+        // Ref: dash.js BufferController.pruneBuffer() — runs before
+        //      each append, not after.
         evict_back_buffer(&sb, &video, &state, pump_id).await;
         if !is_pump_current(&state, pump_id) {
             return;
         }
 
-        // ── 5. Fetch the segment ─────────────────────────────────────
-        log::info!("pump[{pump_id}]: fetching segment {seg_idx}");
-        let bytes = match Request::get(&seg_url).send().await {
-            Ok(r) => match r.binary().await {
-                Ok(b) => b,
-                Err(e) => {
-                    log::error!("segment {seg_idx}: body read error: {e:?}");
-                    TimeoutFuture::new(1000).await;
-                    continue;
+        // ── 6. Pull segment from prefetch cache (or fetch inline) ────
+        // The deep prefetch pipeline should have this segment ready.
+        // Poll the cache with yields to give background fetch tasks
+        // time to complete.  Fall back to inline fetch if the cache
+        // doesn't fill within a reasonable time.
+        let bytes = {
+            let mut data = None;
+            // Give the background prefetch up to ~3 s to deliver.
+            // 50 ms intervals × 60 iterations = 3 s max wait.
+            for _ in 0..60 {
+                if let Some(cached) = segment_cache.borrow_mut().remove(&seg_idx) {
+                    data = Some(cached);
+                    break;
                 }
-            },
-            Err(e) => {
-                log::error!("segment {seg_idx}: fetch error: {e:?}");
-                TimeoutFuture::new(1000).await;
-                continue;
+                // Yield to let background fetch tasks run.
+                TimeoutFuture::new(50).await;
+                if !is_pump_current(&state, pump_id) {
+                    return;
+                }
+            }
+            match data {
+                Some(b) => {
+                    log::info!("pump[{pump_id}]: using cached segment {seg_idx}");
+                    b
+                }
+                None => {
+                    // Fallback: fetch inline.  This defeats the purpose of
+                    // prefetching and may cause playback stutter.
+                    log::warn!("pump[{pump_id}]: cache miss for segment {seg_idx} — prefetch did not complete in time, fetching inline");
+                    match Request::get(&seg_url).send().await {
+                        Ok(r) => match r.binary().await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                log::error!("segment {seg_idx}: body read error: {e:?}");
+                                TimeoutFuture::new(1000).await;
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            log::error!("segment {seg_idx}: fetch error: {e:?}");
+                            TimeoutFuture::new(1000).await;
+                            continue;
+                        }
+                    }
+                }
             }
         };
 
-        // Re-check generation after the (potentially slow) network fetch.
+        // Re-check generation after potentially waiting for cache.
         if !is_pump_current(&state, pump_id) {
             return;
         }
 
-        // ── 6. Strip init boxes & append ─────────────────────────────
+        // ── 7. Strip init boxes & append ─────────────────────────────
         let media_bytes = strip_init_boxes(&bytes);
         if media_bytes.is_empty() {
             log::warn!("segment {seg_idx}: no media data after stripping init boxes (original size: {} bytes)", bytes.len());
@@ -708,39 +935,18 @@ async fn pump_loop(
             return;
         }
 
-        // ── 6b. Set appendWindow to trim segment to its nominal
-        //        boundaries — matching dash.js SourceBufferSink
-        //        behaviour.  When keyframes don't align with segment
-        //        boundaries, the backend includes content starting from
-        //        the previous keyframe.  The appendWindow trims it so
-        //        only the [start, end) slice is presented, eliminating
-        //        overlap between consecutive segments and giving clean
-        //        transitions.
+        // ── 7b. Append without per-segment appendWindow ──────────────
         //
-        // Ref: dash.js SourceBufferSink.appendBuffer() — sets
-        //      appendWindowStart / appendWindowEnd before every append.
-        // Ref: DASH-IF IOP v4.3 §3.2.8 (buffer management).
+        // dash.js (SourceBufferSink.js) only uses appendWindow for
+        // multi-period transitions.  For single-period VOD content the
+        // window covers the entire presentation [0, duration], so no
+        // per-segment clipping is performed.
         //
-        // Order matters: the spec throws TypeError if appendWindowStart
-        // >= appendWindowEnd.  To safely move the window forward (or
-        // backward after a seek), reset start to 0 first, update end,
-        // then set start.
-        {
-            let total_segments = state.borrow().as_ref().map_or(0, |s| s.segments.len());
-            let window_start = seg_idx as f64 * SEGMENT_DURATION_F;
-            let window_end = if seg_idx + 1 < total_segments {
-                (seg_idx + 1) as f64 * SEGMENT_DURATION_F
-            } else {
-                f64::INFINITY
-            };
-            // Property setters are void in web_sys; JS exceptions surface
-            // as console errors but don't propagate to Rust.  The 3-step
-            // ordering (reset→end→start) prevents the TypeError that would
-            // occur if start >= end.
-            sb.set_append_window_start(0.0);
-            sb.set_append_window_end(window_end);
-            sb.set_append_window_start(window_start);
-        }
+        // Ref: dash.js SourceBufferSink.js — updateAppendWindow() sets
+        //      window to [periodStart − 0.1, periodEnd + 0.01], NOT to
+        //      individual segment boundaries.
+        // Ref: DASH-IF IOP v4.3 §3.2 — segments start at SAPs; the
+        //      browser de-duplicates overlapping data via baseMediaDecodeTime.
 
         let uint8_array = js_sys::Uint8Array::from(media_bytes.as_slice());
         let array_buffer = uint8_array.buffer();
@@ -752,13 +958,33 @@ async fn pump_loop(
             continue;
         }
 
-        // ── 7. Wait for append to complete ───────────────────────────
+        // ── 8. Wait for updateend ────────────────────────────────────
+        // Background prefetch tasks continue running in parallel — the
+        // browser handles HTTP requests on its I/O thread even while
+        // we're waiting for the SourceBuffer.
         if !wait_for_sb(&sb, &state, pump_id).await {
             return;
         }
 
-        // ── 8. Advance to next segment ───────────────────────────────
+        // ── 9. Advance to next segment ───────────────────────────────
         {
+            // Log buffered ranges after append for diagnostics.
+            if let Ok(buffered) = sb.buffered() {
+                let len = buffered.length();
+                let mut ranges = String::new();
+                for i in 0..len {
+                    if let (Ok(s), Ok(e)) = (buffered.start(i), buffered.end(i)) {
+                        if !ranges.is_empty() {
+                            ranges.push_str(", ");
+                        }
+                        ranges.push_str(&format!("[{s:.3}–{e:.3}]"));
+                    }
+                }
+                log::info!(
+                    "pump[{pump_id}]: seg {seg_idx} appended → buffered: {ranges}"
+                );
+            }
+
             let mut borrow = state.borrow_mut();
             if let Some(s) = borrow.as_mut() {
                 if s.pump_gen != pump_id {
@@ -1280,23 +1506,35 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     // (pump_running == false) but there are still segments
                     // to fetch and the buffer is below target.
                     //
-                    // Uses segment-index-based check (not video.buffered())
-                    // to avoid false-positive restarts when buffered ranges
-                    // are temporarily empty after a seek.  This mirrors
-                    // dash.js ScheduleController's periodic buffer check.
+                    // Uses actual buffered() ranges when available, with
+                    // segment-index fallback.  This mirrors dash.js
+                    // ScheduleController's periodic buffer check.
                     let needs_restart = {
                         let borrow = mse_state.borrow();
                         if let Some(s) = borrow.as_ref() {
                             if s.pump_running || s.next_seg >= s.segments.len() {
                                 false
                             } else {
-                                // Use segment-index-based buffer check
-                                let buf_ahead = match s.last_appended_seg {
-                                    Some(last) => {
-                                        let buffered_to = (last as f64 + 1.0) * SEGMENT_DURATION_F;
-                                        (buffered_to - video.current_time()).max(0.0)
+                                let current = video.current_time();
+                                let buf_ahead = if let Ok(ranges) = s.source_buffer.buffered() {
+                                    let mut ahead = 0.0_f64;
+                                    for i in 0..ranges.length() {
+                                        if let (Ok(rs), Ok(re)) = (ranges.start(i), ranges.end(i)) {
+                                            if current >= rs - PLAYHEAD_RANGE_TOLERANCE_S && current <= re + PLAYHEAD_RANGE_TOLERANCE_S {
+                                                ahead = (re - current).max(0.0);
+                                                break;
+                                            }
+                                        }
                                     }
-                                    None => 0.0, // no segments appended yet → needs data
+                                    ahead
+                                } else {
+                                    match s.last_appended_seg {
+                                        Some(last) => {
+                                            let buffered_to = (last as f64 + 1.0) * SEGMENT_DURATION_F;
+                                            (buffered_to - current).max(0.0)
+                                        }
+                                        None => 0.0,
+                                    }
                                 };
                                 buf_ahead < MSE_TARGET_BUFFER_S
                             }

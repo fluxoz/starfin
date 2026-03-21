@@ -1,1 +1,3 @@
-// Stubbed for future implementation.
+//! DASH model modules.
+
+pub mod dash_manifest_model;

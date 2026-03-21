@@ -167,6 +167,9 @@ const BOLA_PLACEHOLDER_DECAY: f64 = 0.99;
 /// Default suggested presentation delay for live streams (seconds).
 const LIVE_DEFAULT_PRESENTATION_DELAY_S: f64 = 4.0;
 
+/// DOM exception code for `QuotaExceededError`.
+const QUOTA_EXCEEDED_ERR_CODE: u16 = 22;
+
 /// Maximum playback rate adjustment for live catchup.
 const LIVE_CATCHUP_RATE_MAX: f64 = 0.5;
 
@@ -1326,8 +1329,8 @@ fn resolve_url_template(
                 if let Some(end) = result[start + 8..].find('$') {
                     let fmt = &result[start + 8..start + 8 + end];
                     // Parse the format (e.g., "05d")
-                    let width: usize = fmt.trim_end_matches('d').parse().unwrap_or(1);
-                    let formatted = format!("{:0>width$}", num, width = width);
+                    let pad_width: usize = fmt.trim_end_matches('d').parse().unwrap_or(1);
+                    let formatted = format!("{:0>pad_width$}", num, pad_width = pad_width);
                     let pattern = format!("$Number%{fmt}$");
                     result = result.replace(&pattern, &formatted);
                 }
@@ -1486,7 +1489,10 @@ fn build_from_segment_list(
         .map(|u| resolve_base_url(base, u))
         .unwrap_or_default();
 
-    let seg_dur_s = list.duration.map(|d| d / list.timescale).unwrap_or(SEGMENT_DURATION_F);
+    let seg_dur_s = list.duration.map(|d| d / list.timescale).unwrap_or_else(|| {
+        log::warn!("SegmentList missing duration attribute, falling back to default {SEGMENT_DURATION_F}s");
+        SEGMENT_DURATION_F
+    });
     let total_dur = seg_dur_s * list.segment_urls.len() as f64;
 
     let segments: Vec<_> = list.segment_urls.iter().map(|su| {
@@ -2230,7 +2236,7 @@ impl ErrorRecovery {
     /// The error code for QuotaExceededError is 22.
     pub fn is_quota_exceeded(err: &JsValue) -> bool {
         if let Some(dom_exception) = err.dyn_ref::<web_sys::DomException>() {
-            return dom_exception.code() == 22; // QUOTA_EXCEEDED_ERR
+            return dom_exception.code() == QUOTA_EXCEEDED_ERR_CODE;
         }
         // Check error name string
         if let Some(s) = err.as_string() {
@@ -2992,6 +2998,7 @@ async fn pump_loop(
         // Poll the cache with yields to give background fetch tasks
         // time to complete.  Fall back to inline fetch if the cache
         // doesn't fill within a reasonable time.
+        let fetch_start_ms = js_sys::Date::now();
         let bytes = {
             let mut data = None;
             // Give the background prefetch up to ~3 s to deliver.
@@ -3034,6 +3041,7 @@ async fn pump_loop(
                 }
             }
         };
+        let fetch_elapsed_ms = js_sys::Date::now() - fetch_start_ms;
 
         // Re-check generation after potentially waiting for cache.
         if !is_pump_current(&state, pump_id) {
@@ -3117,12 +3125,18 @@ async fn pump_loop(
 
                 // ── Throughput measurement ────────────────────────────
                 // Record timing metrics for the ABR controller.
+                let throughput_kbps = if fetch_elapsed_ms > 0.0 {
+                    (media_bytes.len() as f64 * 8.0) / fetch_elapsed_ms
+                } else {
+                    0.0
+                };
+                s.throughput.add_measurement(MediaType::Video, throughput_kbps, fetch_elapsed_ms);
                 s.metrics.add_throughput_sample(ThroughputSample {
                     timestamp_ms: js_sys::Date::now(),
-                    throughput_kbps: 0.0, // Updated by prefetch/fetch timing
-                    latency_ms: 0.0,
+                    throughput_kbps,
+                    latency_ms: fetch_elapsed_ms,
                     bytes: media_bytes.len(),
-                    duration_ms: 0.0,
+                    duration_ms: fetch_elapsed_ms,
                     media_type: MediaType::Video,
                 });
                 s.error_recovery.on_success();

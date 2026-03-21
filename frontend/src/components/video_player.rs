@@ -1388,20 +1388,24 @@ async fn evict_back_buffer(
         Ok(r) => r,
         Err(_) => return,
     };
-    if ranges.length() == 0 {
+    let len = ranges.length();
+    if len == 0 {
         return;
     }
-    let buf_start = match ranges.start(0) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let buf_end = match ranges.end(ranges.length() - 1) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+
+    // Calculate total buffered as the SUM of actual range durations,
+    // NOT (buf_end − buf_start) which over-counts when ranges are
+    // disjoint (e.g. after a backward seek: [6–12] + [60–102] has
+    // 48 s of data, not 96 s).  Matches dash.js BufferController
+    // getBufferLength() which sums individual ranges.
+    let mut total_buffered = 0.0_f64;
+    for i in 0..len {
+        if let (Ok(s), Ok(e)) = (ranges.start(i), ranges.end(i)) {
+            total_buffered += e - s;
+        }
+    }
 
     let max_total = MSE_BACK_BUFFER_S + MSE_TARGET_BUFFER_S;
-    let total_buffered = buf_end - buf_start;
 
     // Only evict when total buffer exceeds the cap.
     // This prevents unnecessary sb.remove() calls that block the append
@@ -1411,15 +1415,32 @@ async fn evict_back_buffer(
         return;
     }
 
-    // Trim enough to bring total one segment below the cap, giving
-    // headroom for the next append.
-    let target_total = max_total - SEGMENT_DURATION_F;
-    let target_start = (current - MSE_BACK_BUFFER_S).max(buf_start);
-    let min_evict = buf_start + (total_buffered - target_total);
-    let evict_before = target_start.max(min_evict);
+    // Find the buffered range(s) BEHIND the playhead and trim from the
+    // earliest one.  Only remove data behind (current − MSE_BACK_BUFFER_S)
+    // so we never evict data near or ahead of the playhead.
+    //
+    // dash.js BufferController.getClearRanges() computes:
+    //   startRangeToKeep = max(0, currentTime − bufferToKeep)
+    // and only clears ranges with start < startRangeToKeep.
+    let keep_start = (current - MSE_BACK_BUFFER_S).max(0.0);
 
-    if evict_before <= buf_start + MIN_EVICT_S {
-        return; // nothing worth evicting
+    // Walk ranges and find data strictly behind keep_start.
+    let mut evict_start = f64::MAX;
+    let mut evict_end = 0.0_f64;
+    for i in 0..len {
+        if let (Ok(s), Ok(e)) = (ranges.start(i), ranges.end(i)) {
+            if s < keep_start {
+                if s < evict_start {
+                    evict_start = s;
+                }
+                // Only remove the portion behind keep_start.
+                evict_end = evict_end.max(e.min(keep_start));
+            }
+        }
+    }
+
+    if evict_start >= evict_end || (evict_end - evict_start) < MIN_EVICT_S {
+        return; // nothing worth evicting behind the playhead
     }
 
     // Wait for SourceBuffer to be idle before removing.
@@ -1428,9 +1449,9 @@ async fn evict_back_buffer(
     }
 
     log::info!(
-        "evict: removing [{buf_start:.3}–{evict_before:.3}] (total was {total_buffered:.1}s, current={current:.3})"
+        "evict: removing [{evict_start:.3}–{evict_end:.3}] (total was {total_buffered:.1}s, current={current:.3})"
     );
-    let _ = sb.remove(buf_start, evict_before);
+    let _ = sb.remove(evict_start, evict_end);
 
     // Wait for the remove operation to complete.
     let _ = wait_for_sb(sb, state, pump_id).await;

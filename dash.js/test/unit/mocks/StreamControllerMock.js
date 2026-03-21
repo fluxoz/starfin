@@ -1,0 +1,107 @@
+import StreamMock from './StreamMock.js';
+
+class StreamControllerMock {
+
+    constructor() {
+        this.streamId = 'DUMMY_STREAM-01';
+        this.activeStream = new StreamMock();
+    }
+
+    setup() {
+    }
+
+    initialize(streams) {
+        this.streams = streams;
+    }
+
+    refreshManifest() {}
+
+    getStreams() {
+        return this.streams;
+    }
+
+    getActiveStreamCommonEarliestTime() {
+        return 0;
+    }
+
+    getTimeRelativeToStreamId() {
+    }
+
+    isTrackTypePresent(trackType) {
+        let value;
+
+        switch (trackType) {
+            case 'video' :
+                value = true;
+                break;
+        }
+
+        return value;
+    }
+
+    switchToVideoElement() {
+
+    }
+
+    getAutoPlay() {
+        return false;
+    }
+
+    getActiveStreamInfo() {
+        return {
+            id: 'DUMMY_STREAM-01'
+        };
+    }
+
+    setStreamId(id) {
+        this.streamId = id;
+    }
+
+
+    isStreamActive() {
+        return true;
+    }
+
+    getStreamById() {
+        return this.activeStream;
+    }
+
+    load() {
+    }
+
+    loadWithManifest() {
+    }
+
+    setConfig() {
+    }
+
+    reset() {
+    }
+
+    getActiveStreamProcessors() {
+        return [];
+    }
+
+    getActiveStream() {
+        return this.activeStream;
+    }
+
+    hasVideoTrack() {
+        return true;
+    }
+
+    getIsStreamSwitchInProgress() {
+        return false;
+    }
+
+    getHasMediaOrInitialisationError() {
+        return false;
+    }
+
+    getStreamForTime() {
+        return null;
+    }
+
+}
+
+export default StreamControllerMock;

@@ -600,20 +600,29 @@ fn kick_prefetch(
 
     let end_seg = (from_seg + LOOKAHEAD_SEGMENTS).min(total);
     for idx in from_seg..end_seg {
-        // Skip if already cached or fetch in progress.
-        if cache.borrow().contains_key(&idx) || in_flight.borrow().contains(&idx) {
-            continue;
+        // Atomically check-and-insert to prevent duplicate fetch tasks.
+        // WASM is single-threaded, so a single borrow_mut scope is sufficient.
+        {
+            let cached = cache.borrow().contains_key(&idx);
+            if cached {
+                continue;
+            }
+            let mut flight = in_flight.borrow_mut();
+            if flight.contains(&idx) {
+                continue;
+            }
+            flight.insert(idx);
         }
         let url = mse.segments[idx].url.clone();
-        in_flight.borrow_mut().insert(idx);
 
         let cache = Rc::clone(cache);
         let in_flight = Rc::clone(in_flight);
         let state = Rc::clone(state);
         spawn_local(async move {
             // Check generation before starting the fetch.
+            // If stale, leave idx in in_flight to prevent re-spawning
+            // tasks for a cancelled pump.
             if !is_pump_current(&state, pump_id) {
-                in_flight.borrow_mut().remove(&idx);
                 return;
             }
             match Request::get(&url).send().await {
@@ -743,7 +752,7 @@ async fn pump_loop(
     // Background fetch tasks populate `segment_cache` ahead of the
     // append position.  `in_flight` prevents duplicate fetch tasks.
     let segment_cache: SegmentCache = Rc::new(RefCell::new(HashMap::new()));
-    let in_flight: InFlightSet = Rc::new(RefCell::new(std::collections::HashSet::new()));
+    let in_flight: InFlightSet = Rc::new(RefCell::new(Default::default()));
 
     loop {
         // ── 1. Generation check ──────────────────────────────────────
@@ -838,19 +847,20 @@ async fn pump_loop(
 
         // ── 6. Pull segment from prefetch cache (or fetch inline) ────
         // The deep prefetch pipeline should have this segment ready.
-        // Poll the cache with brief yields to give background fetch
-        // tasks time to complete.  Fall back to inline fetch if the
-        // cache doesn't fill within a reasonable time.
+        // Poll the cache with yields to give background fetch tasks
+        // time to complete.  Fall back to inline fetch if the cache
+        // doesn't fill within a reasonable time.
         let bytes = {
             let mut data = None;
-            // Give the background prefetch up to ~2 s to deliver.
-            for _ in 0..200 {
+            // Give the background prefetch up to ~3 s to deliver.
+            // 50 ms intervals × 60 iterations = 3 s max wait.
+            for _ in 0..60 {
                 if let Some(cached) = segment_cache.borrow_mut().remove(&seg_idx) {
                     data = Some(cached);
                     break;
                 }
-                // Brief yield to let background fetch tasks run.
-                TimeoutFuture::new(10).await;
+                // Yield to let background fetch tasks run.
+                TimeoutFuture::new(50).await;
                 if !is_pump_current(&state, pump_id) {
                     return;
                 }
@@ -861,8 +871,9 @@ async fn pump_loop(
                     b
                 }
                 None => {
-                    // Fallback: fetch inline (shouldn't happen normally).
-                    log::warn!("pump[{pump_id}]: cache miss for segment {seg_idx}, fetching inline");
+                    // Fallback: fetch inline.  This defeats the purpose of
+                    // prefetching and may cause playback stutter.
+                    log::warn!("pump[{pump_id}]: cache miss for segment {seg_idx} — prefetch did not complete in time, fetching inline");
                     match Request::get(&seg_url).send().await {
                         Ok(r) => match r.binary().await {
                             Ok(b) => b,

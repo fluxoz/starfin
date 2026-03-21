@@ -1419,22 +1419,39 @@ async fn wait_for_sb(
 ///     `BufferController.onBufferFlushing()`.
 ///   • DASH-IF IOP v4.3 §3.2.8 recommends proactive buffer management.
 ///
-/// **Critical design constraint:** `SourceBuffer.remove()` sets
-/// `updating = true`, blocking the next `appendBuffer()`.  During this
-/// time the browser cannot decode new audio/video frames from appended
-/// segments.  dash.js mitigates this by only calling `pruneBuffer()`
-/// when the total buffer approaches the browser's SourceBuffer quota —
-/// NOT on every append based on back-buffer time.
+/// **Design: fire-and-proceed (non-blocking)**
 ///
-/// We follow the same approach: only evict when `total_buffered` exceeds
-/// `MSE_BACK_BUFFER_S + MSE_TARGET_BUFFER_S`.  When eviction is needed,
-/// trim enough to bring the total one segment below the cap, giving
-/// headroom for the next append without re-triggering eviction.
-async fn evict_back_buffer(
+/// `sb.remove()` sets `updating = true`.  In previous versions this function
+/// waited for `updateend` before returning, serialising removal with the
+/// subsequent fetch+append.  This caused a visible decoder stall at *every*
+/// segment boundary once `MSE_TARGET_BUFFER_S` was reduced to 12 s (because
+/// the 32 s threshold was breached every segment).
+///
+/// Now we fire `sb.remove()` and return immediately.  The pump loop's
+/// pre-append `wait_for_sb` call (step 7a) is the synchronisation point —
+/// it waits for the remove's `updateend` if it hasn't fired yet.  Because the
+/// segment fetch (step 6) runs between the eviction call and step 7a, the
+/// browser's MSE subsystem processes the remove in parallel with the JS fetch,
+/// hiding remove latency entirely for network fetches and for cached fetches
+/// that go through the oneshot-channel path.
+///
+/// This matches the dash.js `SourceBufferSink` queue model: `remove()` is
+/// enqueued, the next `appendBuffer()` waits for the queue — neither blocks
+/// the calling code explicitly.
+///
+/// **Batch-minimum threshold**
+///
+/// We only fire `sb.remove()` when there are at least `2 × SEGMENT_DURATION_F`
+/// seconds of data to evict (≈ 12 s).  With 6 s segments and 20 s of keep-
+/// behind, data accumulates ~6 s per segment behind the eviction boundary.
+/// Without the batch minimum, eviction fired every segment (tiny removes).
+/// With the minimum, it fires every ~2 segments, halving remove() frequency.
+///
+/// `force_evict_back_buffer` (called after a `QuotaExceededError`) is the
+/// emergency variant that always waits for completion and ignores this minimum.
+fn evict_back_buffer(
     sb: &web_sys::SourceBuffer,
     video: &HtmlVideoElement,
-    state: &Rc<RefCell<Option<MseState>>>,
-    pump_id: u32,
 ) {
     let current = video.current_time();
 
@@ -1448,38 +1465,12 @@ async fn evict_back_buffer(
         return;
     }
 
-    // Calculate total buffered as the SUM of actual range durations,
-    // NOT (buf_end − buf_start) which over-counts when ranges are
-    // disjoint (e.g. after a backward seek: [6–12] + [60–102] has
-    // 48 s of data, not 96 s).  Matches dash.js BufferController
-    // getBufferLength() which sums individual ranges.
-    let mut total_buffered = 0.0_f64;
-    for i in 0..len {
-        if let (Ok(s), Ok(e)) = (ranges.start(i), ranges.end(i)) {
-            total_buffered += e - s;
-        }
-    }
-
-    let max_total = MSE_BACK_BUFFER_S + MSE_TARGET_BUFFER_S;
-
-    // Only evict when total buffer exceeds the cap.
-    // This prevents unnecessary sb.remove() calls that block the append
-    // pipeline.  dash.js only prunes when approaching the quota, not on
-    // every append based on back-buffer time.
-    if total_buffered <= max_total {
-        return;
-    }
-
-    // Find the buffered range(s) BEHIND the playhead and trim from the
-    // earliest one.  Only remove data behind (current − MSE_BACK_BUFFER_S)
-    // so we never evict data near or ahead of the playhead.
-    //
-    // dash.js BufferController.getClearRanges() computes:
+    // Find data strictly behind keep_start (everything older than
+    // MSE_BACK_BUFFER_S behind the playhead).  Matches dash.js
+    // BufferController.getClearRanges():
     //   startRangeToKeep = max(0, currentTime − bufferToKeep)
-    // and only clears ranges with start < startRangeToKeep.
     let keep_start = (current - MSE_BACK_BUFFER_S).max(0.0);
 
-    // Walk ranges and find data strictly behind keep_start.
     let mut evict_start = f64::MAX;
     let mut evict_end = 0.0_f64;
     for i in 0..len {
@@ -1488,34 +1479,46 @@ async fn evict_back_buffer(
                 if s < evict_start {
                     evict_start = s;
                 }
-                // Only remove the portion behind keep_start.
                 evict_end = evict_end.max(e.min(keep_start));
             }
         }
     }
 
-    if evict_start >= evict_end || (evict_end - evict_start) < MIN_EVICT_S {
-        return; // nothing worth evicting behind the playhead
-    }
+    let evict_amount = evict_end - evict_start;
 
-    // Wait for SourceBuffer to be idle before removing.
-    if !wait_for_sb(sb, state, pump_id).await {
+    // Batch-minimum guard: only evict when there's at least 2 × SEGMENT_DURATION_F
+    // worth of data to remove (~12 s).  This fires eviction every ~2 segments
+    // rather than every segment, cutting remove() frequency in half and
+    // eliminating the per-segment decoder stall that caused visible stuttering.
+    if evict_start >= evict_end || evict_amount < SEGMENT_DURATION_F * 2.0 {
         return;
     }
 
+    // If the SB is already busy (previous iteration's remove or append is
+    // still in progress), skip eviction this iteration.  The pre-append
+    // wait_for_sb will handle the current operation, and eviction will
+    // fire on the next iteration once data accumulates again.
+    if sb.updating() {
+        return;
+    }
+
+    // Fire remove() and return immediately — DO NOT await completion here.
+    //
+    // The pump loop's pre-append wait_for_sb (step 7a) is the synchronisation
+    // point.  The segment fetch (step 6) runs between this call and step 7a,
+    // so the browser processes the remove concurrently with the JS fetch,
+    // hiding remove latency for both cached and network segments.
     log::info!(
-        "evict: removing [{evict_start:.3}–{evict_end:.3}] (total was {total_buffered:.1}s, current={current:.3})"
+        "evict: removing [{evict_start:.3}–{evict_end:.3}] ({evict_amount:.1}s, current={current:.3})"
     );
     let _ = sb.remove(evict_start, evict_end);
-
-    // Wait for the remove operation to complete.
-    let _ = wait_for_sb(sb, state, pump_id).await;
 }
 
 /// Unconditional back-buffer eviction used as a recovery step after a
-/// `QuotaExceededError`.  Unlike `evict_back_buffer`, this function bypasses
-/// the `total_buffered <= max_total` early-exit guard and always removes
-/// everything before `current_time − 1.0 s`.
+/// `QuotaExceededError`.  Unlike `evict_back_buffer`, this function ignores
+/// the batch-minimum guard and always removes everything before
+/// `current_time − 1.0 s`, then awaits completion so the caller can retry
+/// `appendBuffer` immediately.
 ///
 /// Called from the `appendBuffer` error handler in `pump_loop` so that a
 /// backward seek that leaves stale forward ranges in the SourceBuffer does
@@ -1884,7 +1887,7 @@ async fn pump_loop(
         //
         // Ref: dash.js BufferController.pruneBuffer() — runs before
         //      each append, not after.
-        evict_back_buffer(&sb, &video, &state, pump_id).await;
+        evict_back_buffer(&sb, &video);
         if !is_pump_current(&state, pump_id) {
             return;
         }

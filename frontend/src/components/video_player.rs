@@ -1,8 +1,6 @@
 // New DASH infrastructure types are additive — suppress warnings for code
 // that will be consumed as the player evolves.
 
-use futures::channel::oneshot;
-use futures::FutureExt;
 use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
 use gloo_timers::future::TimeoutFuture;
@@ -10,10 +8,9 @@ use serde::Deserialize;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_bindgen_futures::spawn_local;
 use web_sys::{window, HtmlVideoElement, KeyboardEvent, MouseEvent};
 use yew::prelude::*;
 
@@ -79,8 +76,9 @@ const CONTROLS_VICINITY_PX: f64 = 80.0;
 
 /// Target seconds of video to keep buffered ahead of the playback position.
 /// dash.js uses 12 s by default (`bufferTimeAtTopQuality`);
-/// Shaka Player uses 10 s. 30 s risks QuotaExceededError at HD quality.
-const MSE_TARGET_BUFFER_S: f64 = 12.0;
+/// Shaka Player uses 10 s; hls.js uses 30 s.
+/// We use 30 s for comfortable VOD buffering.
+const MSE_TARGET_BUFFER_S: f64 = 30.0;
 
 /// Maximum seconds of already-played data to keep behind the playhead.
 /// Data older than this is evicted via `SourceBuffer.remove()` to bound
@@ -1224,12 +1222,6 @@ struct MseState {
     last_appended_seg: Option<usize>,
     /// Extended DASH infrastructure (ABR, metrics, throughput, events, etc.)
     dash_ext: Option<DashExtState>,
-    /// Timestamp (ms) of the last successful back-buffer eviction.
-    /// Used to implement the 10 s wallclock pruning interval matching
-    /// dash.js `bufferPruningInterval = 10`.  Eviction runs inside
-    /// `pump_loop` (not a separate timer/task) to avoid competing
-    /// `updateend` listeners on the SourceBuffer.
-    last_eviction_ms: f64,
 }
 
 /// Parse a DASH MPD manifest and return the list of segment URLs with durations.
@@ -1337,81 +1329,28 @@ fn is_pump_current(state: &Rc<RefCell<Option<MseState>>>, pump_id: u32) -> bool 
 /// Wait for the SourceBuffer to finish any in-progress operation.
 /// Returns `false` if the pump generation changed during the wait.
 ///
-/// Mirrors dash.js `SourceBufferSink._waitForUpdateEnd()` which registers
-/// an `updateend` event listener and fires the continuation callback
-/// immediately — zero polling, zero extra macrotask delay.
+/// Uses `TimeoutFuture::new(0)` (equivalent to `setTimeout(0)` in JS)
+/// to yield to the browser's event loop between checks.  This matches
+/// dash.js `SourceBufferSink._onUpdateEnd` → `setTimeout(executeNext, 0)`
+/// pattern, ensuring the browser can process audio/video decode work
+/// between SourceBuffer operations.
 ///
-/// We build a one-shot JS Promise that resolves when `updateend` fires,
-/// then `await` it via `JsFuture`.  The Promise continuation runs in the
-/// JS microtask queue: it fires in the same event-loop tick as `updateend`,
-/// unlike `TimeoutFuture::new(0)` (= `setTimeout(0)`) which queues a new
-/// macrotask with a browser-imposed minimum delay of ≥ 1 ms (typically
-/// 4–15 ms).  Eliminating that per-segment overhead removes the
-/// inter-segment micro-freezes that were visible at segment boundaries.
-///
-/// Note: the Promise creation, event listener registration, and `JsFuture`
-/// await must all occur on the thread that owns the SourceBuffer (the MSE
-/// thread — typically the main browser thread).  `JsFuture` is not `Send`
-/// in the general case; this function is only called from the pump task
-/// which runs on that same thread.
+/// A 0 ms timeout doesn't actually wait — it just yields the current
+/// microtask, letting the browser's event loop run one tick (process
+/// pending updateend events, decode audio frames, render, etc.) before
+/// we re-check `sb.updating()`.
 async fn wait_for_sb(
     sb: &web_sys::SourceBuffer,
     state: &Rc<RefCell<Option<MseState>>>,
     pump_id: u32,
 ) -> bool {
-    if !sb.updating() {
-        return is_pump_current(state, pump_id);
-    }
-
-    // Create a JS Promise that resolves when 'updateend' fires.
-    // `once: true` tells the browser to remove the listener automatically
-    // after the first fire, so there is no memory leak and no risk of the
-    // Closure being invoked a second time (which would panic for FnOnce).
-    //
-    // If attaching the listener fails (e.g. the SourceBuffer is in an
-    // error state), we call `reject` so the JsFuture resolves immediately
-    // rather than hanging indefinitely.  The caller checks `is_pump_current`
-    // on return and will exit cleanly in that case.
-    let sb_ref = sb.clone();
-    let listener_ok = Rc::new(Cell::new(false));
-    let listener_ok_clone = listener_ok.clone();
-    let promise = js_sys::Promise::new(&mut |resolve, reject| {
-        let mut opts = web_sys::AddEventListenerOptions::new();
-        opts.set_once(true);
-        let cb = Closure::once(Box::new(move || {
-            let _ = resolve.call0(&JsValue::UNDEFINED);
-        }) as Box<dyn FnOnce()>);
-        match sb_ref.add_event_listener_with_callback_and_add_event_listener_options(
-            "updateend",
-            cb.as_ref().unchecked_ref(),
-            &opts,
-        ) {
-            Ok(_) => {
-                listener_ok_clone.set(true);
-                // `forget()` hands ownership of the closure to the JS side.
-                // The browser releases it after `updateend` fires (once:true).
-                cb.forget();
-            }
-            Err(e) => {
-                // Listener attachment failed — reject the Promise so the
-                // JsFuture resolves immediately instead of hanging.
-                log::warn!("wait_for_sb: addEventListener failed: {e:?}");
-                let _ = reject.call1(&JsValue::UNDEFINED, &e);
-            }
-        }
-    });
-
-    if !listener_ok.get() {
-        // Listener was not attached; fall back to a single-tick yield so the
-        // caller can re-check pump generation and decide what to do.
+    while sb.updating() {
         TimeoutFuture::new(0).await;
-        return is_pump_current(state, pump_id);
+        if !is_pump_current(state, pump_id) {
+            return false;
+        }
     }
-
-    // Ignore Ok/Err — we only care that the Promise settled (listener fired
-    // or was rejected due to attachment failure handled above).
-    let _ = JsFuture::from(promise).await;
-    is_pump_current(state, pump_id)
+    true
 }
 
 /// Evict played data behind the playhead to bound memory usage.
@@ -1425,39 +1364,40 @@ async fn wait_for_sb(
 ///     `BufferController.onBufferFlushing()`.
 ///   • DASH-IF IOP v4.3 §3.2.8 recommends proactive buffer management.
 ///
-/// **Design: fire-and-proceed (non-blocking)**
-/// Evict played data behind the playhead to bound memory usage.
+/// **Critical design constraint:** `SourceBuffer.remove()` sets
+/// `updating = true`, blocking the next `appendBuffer()`.  During this
+/// time the browser cannot decode new audio/video frames from appended
+/// segments.  dash.js mitigates this by only calling `pruneBuffer()`
+/// when the total buffer approaches the browser's SourceBuffer quota —
+/// NOT on every append based on back-buffer time.
 ///
-/// Matches dash.js `BufferController.pruneBuffer()` → `getClearRanges()`.
-/// Called from `pump_loop` at most once every 10 s (matching dash.js
-/// `bufferPruningInterval = 10`).
-///
-/// Waits for the SourceBuffer to be idle, calls `sb.remove()`, then waits
-/// for completion.  Because this only fires every 10 s, the blocking cost
-/// is amortized and doesn't cause per-segment stutter.
-///
-/// Returns `true` if eviction actually ran (`sb.remove()` was called and
-/// completed), `false` if skipped (buffer within limits, nothing to evict,
-/// or pump generation changed).
+/// We follow the same approach: only evict when `total_buffered` exceeds
+/// `MSE_BACK_BUFFER_S + MSE_TARGET_BUFFER_S`.  When eviction is needed,
+/// trim enough to bring the total one segment below the cap, giving
+/// headroom for the next append without re-triggering eviction.
 async fn evict_back_buffer(
     sb: &web_sys::SourceBuffer,
     video: &HtmlVideoElement,
     state: &Rc<RefCell<Option<MseState>>>,
     pump_id: u32,
-) -> bool {
+) {
     let current = video.current_time();
 
+    // Check if there's actually buffered data.
     let ranges = match sb.buffered() {
         Ok(r) => r,
-        Err(_) => return false,
+        Err(_) => return,
     };
     let len = ranges.length();
     if len == 0 {
-        return false;
+        return;
     }
 
     // Calculate total buffered as the SUM of actual range durations,
-    // matching dash.js BufferController.getBufferLength().
+    // NOT (buf_end − buf_start) which over-counts when ranges are
+    // disjoint (e.g. after a backward seek: [6–12] + [60–102] has
+    // 48 s of data, not 96 s).  Matches dash.js BufferController
+    // getBufferLength() which sums individual ranges.
     let mut total_buffered = 0.0_f64;
     for i in 0..len {
         if let (Ok(s), Ok(e)) = (ranges.start(i), ranges.end(i)) {
@@ -1468,16 +1408,23 @@ async fn evict_back_buffer(
     let max_total = MSE_BACK_BUFFER_S + MSE_TARGET_BUFFER_S;
 
     // Only evict when total buffer exceeds the cap.
+    // This prevents unnecessary sb.remove() calls that block the append
+    // pipeline.  dash.js only prunes when approaching the quota, not on
+    // every append based on back-buffer time.
     if total_buffered <= max_total {
-        return false;
+        return;
     }
 
-    // Find data strictly behind keep_start (everything older than
-    // MSE_BACK_BUFFER_S behind the playhead).  Matches dash.js
-    // BufferController.getClearRanges():
+    // Find the buffered range(s) BEHIND the playhead and trim from the
+    // earliest one.  Only remove data behind (current − MSE_BACK_BUFFER_S)
+    // so we never evict data near or ahead of the playhead.
+    //
+    // dash.js BufferController.getClearRanges() computes:
     //   startRangeToKeep = max(0, currentTime − bufferToKeep)
+    // and only clears ranges with start < startRangeToKeep.
     let keep_start = (current - MSE_BACK_BUFFER_S).max(0.0);
 
+    // Walk ranges and find data strictly behind keep_start.
     let mut evict_start = f64::MAX;
     let mut evict_end = 0.0_f64;
     for i in 0..len {
@@ -1486,102 +1433,41 @@ async fn evict_back_buffer(
                 if s < evict_start {
                     evict_start = s;
                 }
+                // Only remove the portion behind keep_start.
                 evict_end = evict_end.max(e.min(keep_start));
             }
         }
     }
 
-    if evict_start >= evict_end {
-        return false;
+    if evict_start >= evict_end || (evict_end - evict_start) < MIN_EVICT_S {
+        return; // nothing worth evicting behind the playhead
     }
 
-    let evict_amount = evict_end - evict_start;
-    // Avoid trivially small removes (< one segment duration) that don't
-    // meaningfully reduce buffer size.  dash.js getClearRanges() has no
-    // minimum, but our 10 s interval means small removes are wasteful.
-    if evict_amount < SEGMENT_DURATION_F {
-        return false;
-    }
-
-    // Wait for SB to be idle before removing.
+    // Wait for SourceBuffer to be idle before removing.
     if !wait_for_sb(sb, state, pump_id).await {
-        return false;
+        return;
     }
 
     log::info!(
-        "evict: removing [{evict_start:.3}–{evict_end:.3}] ({evict_amount:.1}s, total={total_buffered:.1}s, current={current:.3})"
+        "evict: removing [{evict_start:.3}–{evict_end:.3}] (total was {total_buffered:.1}s, current={current:.3})"
     );
     let _ = sb.remove(evict_start, evict_end);
 
     // Wait for the remove operation to complete.
     let _ = wait_for_sb(sb, state, pump_id).await;
-    true
 }
 
-/// Unconditional back-buffer eviction used as a recovery step after a
-/// `QuotaExceededError`.  Unlike `evict_back_buffer`, this function ignores
-/// the batch-minimum guard and always removes everything before
-/// `current_time − 1.0 s`, then awaits completion so the caller can retry
-/// `appendBuffer` immediately.
+/// Shared segment cache used by the deep prefetch pipeline.
 ///
-/// Called from the `appendBuffer` error handler in `pump_loop` so that a
-/// backward seek that leaves stale forward ranges in the SourceBuffer does
-/// not permanently stall the append pipeline.
-async fn force_evict_back_buffer(
-    sb: &web_sys::SourceBuffer,
-    video: &HtmlVideoElement,
-    state: &Rc<RefCell<Option<MseState>>>,
-    pump_id: u32,
-) {
-    let current = video.current_time();
-    // Keep only 1 s behind the playhead on a forced evict.
-    let keep_start = (current - 1.0_f64).max(0.0);
-
-    let ranges = match sb.buffered() {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-    let len = ranges.length();
-    if len == 0 {
-        return;
-    }
-
-    // Find the earliest buffered start — if it is already at or past
-    // keep_start there is nothing to remove.
-    let start = ranges.start(0).unwrap_or(0.0);
-    if start >= keep_start {
-        return;
-    }
-
-    if !wait_for_sb(sb, state, pump_id).await {
-        return;
-    }
-    log::warn!(
-        "force_evict: removing [0–{keep_start:.3}] to recover from QuotaExceededError (current={current:.3})"
-    );
-    let _ = sb.remove(0.0, keep_start);
-    let _ = wait_for_sb(sb, state, pump_id).await;
-}
-
-/// Thread-safe segment cache used by the deep prefetch pipeline.
+/// Background fetch tasks (spawned via `spawn_local`) populate this cache
+/// ahead of the append position.  The sequential append loop pulls from
+/// it, so there's always data ready to append without waiting on HTTP.
 ///
-/// `Arc<Mutex<...>>` (rather than `Rc<RefCell<...>>`) allows safe access
-/// from both the main pump task and background fetch tasks running on
-/// WASM worker threads.  The lock is held only for microsecond-level
-/// HashMap operations — never across an `.await` point — so `std::sync::Mutex`
-/// is appropriate (no async-aware mutex needed).
-type SegmentCache = Arc<Mutex<HashMap<usize, Vec<u8>>>>;
-type InFlightSet = Arc<Mutex<std::collections::HashSet<usize>>>;
-
-/// Per-segment one-shot notification channels.
-///
-/// When a prefetch task stores a segment it immediately wakes any pump
-/// loop iteration that is waiting for that segment, eliminating the
-/// previous 50 ms polling interval that was the primary cause of
-/// inter-segment micro-freezes.
-///
-/// Thread-safe: `Arc<Mutex<...>>` + `oneshot::Sender` are both `Send`.
-type SegmentNotifiers = Arc<Mutex<HashMap<usize, Vec<oneshot::Sender<()>>>>>;
+/// The cache is keyed by segment index.  Entries are removed after the
+/// append loop consumes them (to bound memory).  The `in_flight` set
+/// prevents duplicate fetch tasks for the same segment.
+type SegmentCache = Rc<RefCell<HashMap<usize, Vec<u8>>>>;
+type InFlightSet = Rc<RefCell<std::collections::HashSet<usize>>>;
 
 /// Kick off background fetch tasks for segments in the lookahead window.
 ///
@@ -1589,16 +1475,11 @@ type SegmentNotifiers = Arc<Mutex<HashMap<usize, Vec<oneshot::Sender<()>>>>>;
 /// is within range, not already cached, and not already being fetched,
 /// spawns an async task to fetch it and store the bytes in `cache`.
 ///
-/// When a fetch completes, any `oneshot::Sender` registered for that
-/// segment index in `notifiers` is consumed and fired, waking the pump
-/// loop immediately instead of waiting for the next 50 ms poll.
-///
 /// This runs on every loop iteration of the pump to keep the pipeline
 /// full.  Tasks self-cancel if the pump generation changes (seek/restart).
 fn kick_prefetch(
     cache: &SegmentCache,
     in_flight: &InFlightSet,
-    notifiers: &SegmentNotifiers,
     state: &Rc<RefCell<Option<MseState>>>,
     pump_id: u32,
     from_seg: usize,
@@ -1612,13 +1493,14 @@ fn kick_prefetch(
 
     let end_seg = (from_seg + LOOKAHEAD_SEGMENTS).min(total);
     for idx in from_seg..end_seg {
-        // Check-and-mark-in-flight atomically.  The Mutex guards against
-        // concurrent access from WASM worker threads.
+        // Atomically check-and-insert to prevent duplicate fetch tasks.
+        // WASM is single-threaded, so a single borrow_mut scope is sufficient.
         {
-            if cache.lock().unwrap().contains_key(&idx) {
+            let cached = cache.borrow().contains_key(&idx);
+            if cached {
                 continue;
             }
-            let mut flight = in_flight.lock().unwrap();
+            let mut flight = in_flight.borrow_mut();
             if flight.contains(&idx) {
                 continue;
             }
@@ -1626,64 +1508,34 @@ fn kick_prefetch(
         }
         let url = mse.segments[idx].url.clone();
 
-        let cache = Arc::clone(cache);
-        let in_flight = Arc::clone(in_flight);
-        let notifiers = Arc::clone(notifiers);
+        let cache = Rc::clone(cache);
+        let in_flight = Rc::clone(in_flight);
         let state = Rc::clone(state);
         spawn_local(async move {
             // Check generation before starting the fetch.
+            // If stale, leave idx in in_flight to prevent re-spawning
+            // tasks for a cancelled pump.
             if !is_pump_current(&state, pump_id) {
                 return;
             }
             match Request::get(&url).send().await {
                 Ok(r) => match r.binary().await {
                     Ok(bytes) => {
+                        // Only store if pump is still current.
                         if is_pump_current(&state, pump_id) {
-                            // Insert into cache and wake any waiting pump
-                            // iteration — both under the same lock scope so
-                            // there is no window between "cache insert" and
-                            // "notifier check" that could lose a wakeup.
-                            {
-                                cache.lock().unwrap().insert(idx, bytes);
-                                let senders =
-                                    notifiers.lock().unwrap().remove(&idx);
-                                if let Some(txs) = senders {
-                                    for tx in txs {
-                                        let _ = tx.send(());
-                                    }
-                                }
-                            }
+                            cache.borrow_mut().insert(idx, bytes);
                             log::info!("prefetch[{pump_id}]: cached segment {idx}");
-                        } else {
-                            // Stale generation — wake any waiters so they can
-                            // detect the generation change and exit promptly.
-                            // Dropping the senders causes the receivers to
-                            // resolve with Err(Canceled), which the select!
-                            // in pump_loop treats as a notification (the pump
-                            // then checks is_pump_current and exits).
-                            drop(notifiers.lock().unwrap().remove(&idx));
                         }
                     }
-                    Err(e) => {
-                        log::warn!("prefetch seg {idx}: body error: {e:?}");
-                        // Wake any waiting pump so it can fall back to inline
-                        // fetch rather than hanging until the 3 s timeout.
-                        drop(notifiers.lock().unwrap().remove(&idx));
-                    }
+                    Err(e) => log::warn!("prefetch seg {idx}: body error: {e:?}"),
                 },
-                Err(e) => {
-                    log::warn!("prefetch seg {idx}: fetch error: {e:?}");
-                    drop(notifiers.lock().unwrap().remove(&idx));
-                }
+                Err(e) => log::warn!("prefetch seg {idx}: fetch error: {e:?}"),
             }
-            in_flight.lock().unwrap().remove(&idx);
+            in_flight.borrow_mut().remove(&idx);
         });
     }
 }
 
-
-/// Start the 10 s wallclock pruning timer.
-///
 /// Start (or restart) the async segment-pump loop.
 ///
 /// Bumps `pump_gen` so any previously-running `pump_loop` detects the
@@ -1772,18 +1624,14 @@ fn force_start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElem
 /// muxing which can take hundreds of milliseconds).
 ///
 /// Steps per iteration (per DASH-IF IOP v4.3 §3.2):
-///   1. Generation check — exit if a newer pump has started.
+///   1. Kick off background prefetch tasks for the lookahead window.
 ///   2. Determine the next segment needed.
-///   3. Kick off background prefetch tasks for the lookahead window.
-///   4. Enforce a forward buffer limit — sleep when enough data is buffered.
+///   3. Enforce a forward buffer limit — sleep when enough data is buffered.
+///   4. Evict old played data behind the playhead to bound memory.
 ///   5. Pull the segment from the prefetch cache (or fetch inline as fallback).
 ///   6. Strip redundant init boxes (ftyp/moov) from the fMP4 data.
-///   7. Evict back-buffer if ≥ 10 s since last eviction (matching dash.js
-///      `bufferPruningInterval = 10 s`).  Eviction runs inline (not in a
-///      separate timer/task) to avoid competing `updateend` listeners.
-///   8. Wait for SB idle, then `appendBuffer`.
-///   9. Wait for `updateend`.
-///  10. Advance to the next segment and repeat.
+///   7. Wait for the SourceBuffer to be idle, then `appendBuffer`.
+///   8. Wait for `updateend`, advance to the next segment, repeat.
 ///
 /// The loop exits when all segments are appended, the generation counter
 /// no longer matches (a seek started a newer pump), or the MseState has
@@ -1796,17 +1644,8 @@ async fn pump_loop(
     // ── Deep prefetch pipeline state ─────────────────────────────────
     // Background fetch tasks populate `segment_cache` ahead of the
     // append position.  `in_flight` prevents duplicate fetch tasks.
-    // All three are Arc<Mutex<...>> for WASM multi-thread compatibility.
-    let segment_cache: SegmentCache = Arc::new(Mutex::new(HashMap::new()));
-    let in_flight: InFlightSet = Arc::new(Mutex::new(Default::default()));
-    let segment_notifiers: SegmentNotifiers = Arc::new(Mutex::new(HashMap::new()));
-
-    // Retry counter for appendBuffer failures (QuotaExceededError / InvalidStateError).
-    // Reset to 0 on each successful append.  If it reaches MAX_APPEND_RETRIES the loop
-    // gives up on the current segment and breaks out so the pump can be restarted by
-    // the seek handler or by the caller rather than spinning indefinitely.
-    let mut retry_count: u32 = 0;
-    const MAX_APPEND_RETRIES: u32 = 3;
+    let segment_cache: SegmentCache = Rc::new(RefCell::new(HashMap::new()));
+    let in_flight: InFlightSet = Rc::new(RefCell::new(Default::default()));
 
     loop {
         // ── 1. Generation check ──────────────────────────────────────
@@ -1841,7 +1680,7 @@ async fn pump_loop(
         // Ensures background fetches are running for upcoming segments.
         // Each call is cheap — it only spawns tasks for segments not
         // already cached or in-flight.
-        kick_prefetch(&segment_cache, &in_flight, &segment_notifiers, &state, pump_id, seg_idx);
+        kick_prefetch(&segment_cache, &in_flight, &state, pump_id, seg_idx);
 
         // ── 4. Buffer-ahead gate ─────────────────────────────────────
         // Check how much data is buffered ahead of the playhead using the
@@ -1889,107 +1728,62 @@ async fn pump_loop(
             }
         }
 
-        // ── 5. Pull segment from prefetch cache (or fetch inline) ────
-        // Fast path: segment is already in the cache (common case for
-        // steady-state playback where the lookahead pipeline is full).
+        // ── 5. Evict old data behind the playhead ────────────────────
+        // Proactively evict BEFORE appending to prevent the browser from
+        // hitting its SourceBuffer quota.  Browser emergency eviction
+        // removes data unpredictably (sometimes near the playhead),
+        // causing audio dropout at segment transitions.
         //
-        // Slow path: register a one-shot wakeup channel *before*
-        // re-checking the cache to close the TOCTOU window:
-        //   T0: pump checks cache → miss
-        //   T1: prefetch inserts into cache, checks notifiers → none yet
-        //   T2: pump registers notifier
-        //   T3: pump re-checks cache → HIT (T1 data found, no wait needed)
-        // If the data arrives after T2 instead, the notifier fires and
-        // wakes us without any polling delay.
-        //
-        // Lock ordering: always segment_cache then segment_notifiers,
-        // matching the order in kick_prefetch.  Locks are never held
-        // across .await points (std::sync::Mutex safe for async use).
+        // Ref: dash.js BufferController.pruneBuffer() — runs before
+        //      each append, not after.
+        evict_back_buffer(&sb, &video, &state, pump_id).await;
+        if !is_pump_current(&state, pump_id) {
+            return;
+        }
+
+        // ── 6. Pull segment from prefetch cache (or fetch inline) ────
+        // The deep prefetch pipeline should have this segment ready.
+        // Poll the cache with yields to give background fetch tasks
+        // time to complete.  Fall back to inline fetch if the cache
+        // doesn't fill within a reasonable time.
         let fetch_start_ms = js_sys::Date::now();
         let bytes = {
-            // ── Fast path ──────────────────────────────────────────────
-            if let Some(b) = segment_cache.lock().unwrap().remove(&seg_idx) {
-                log::info!("pump[{pump_id}]: using cached segment {seg_idx}");
-                b
-            } else {
-                // ── Register wakeup channel then re-check ──────────────
-                let (tx, rx) = oneshot::channel::<()>();
-                segment_notifiers
-                    .lock()
-                    .unwrap()
-                    .entry(seg_idx)
-                    .or_default()
-                    .push(tx);
-
-                // Second check: handles the race where the prefetch task
-                // completed between the first check and registering tx.
-                if let Some(b) = segment_cache.lock().unwrap().remove(&seg_idx) {
-                    log::info!("pump[{pump_id}]: using cached segment {seg_idx} (late-arrive)");
+            let mut data = None;
+            // Give the background prefetch up to ~3 s to deliver.
+            // 50 ms intervals × 60 iterations = 3 s max wait.
+            for _ in 0..60 {
+                if let Some(cached) = segment_cache.borrow_mut().remove(&seg_idx) {
+                    data = Some(cached);
+                    break;
+                }
+                // Yield to let background fetch tasks run.
+                TimeoutFuture::new(50).await;
+                if !is_pump_current(&state, pump_id) {
+                    return;
+                }
+            }
+            match data {
+                Some(b) => {
+                    log::info!("pump[{pump_id}]: using cached segment {seg_idx}");
                     b
-                } else {
-                    // Kick prefetch in case it was not already running for
-                    // this segment (e.g. right after a seek restart).
-                    kick_prefetch(
-                        &segment_cache,
-                        &in_flight,
-                        &segment_notifiers,
-                        &state,
-                        pump_id,
-                        seg_idx,
-                    );
-
-                    // Wait for the prefetch notification or a 3 s timeout
-                    // (after which we fall back to an inline fetch).
-                    // No Mutex is held here — safe to await.
-                    let notified = futures::select! {
-                        _ = rx.fuse() => true,
-                        _ = TimeoutFuture::new(3_000).fuse() => false,
-                    };
-
-                    if !is_pump_current(&state, pump_id) {
-                        return;
-                    }
-
-                    if notified {
-                        if let Some(b) = segment_cache.lock().unwrap().remove(&seg_idx) {
-                            b
-                        } else {
-                            // Notified but cache empty — prefetch may have
-                            // been cancelled by a newer pump gen.  Inline fetch.
-                            log::warn!("pump[{pump_id}]: notified but cache empty for seg {seg_idx}, fetching inline");
-                            match Request::get(&seg_url).send().await {
-                                Ok(r) => match r.binary().await {
-                                    Ok(b) => b,
-                                    Err(e) => {
-                                        log::error!("segment {seg_idx}: body read error: {e:?}");
-                                        TimeoutFuture::new(1000).await;
-                                        continue;
-                                    }
-                                },
-                                Err(e) => {
-                                    log::error!("segment {seg_idx}: fetch error: {e:?}");
-                                    TimeoutFuture::new(1000).await;
-                                    continue;
-                                }
-                            }
-                        }
-                    } else {
-                        // Timeout: fall back to inline fetch.
-                        log::warn!("pump[{pump_id}]: prefetch timeout for seg {seg_idx}, fetching inline");
-                        match Request::get(&seg_url).send().await {
-                            Ok(r) => match r.binary().await {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    log::error!("segment {seg_idx}: body read error: {e:?}");
-                                    TimeoutFuture::new(1000).await;
-                                    continue;
-                                }
-                            },
+                }
+                None => {
+                    // Fallback: fetch inline.  This defeats the purpose of
+                    // prefetching and may cause playback stutter.
+                    log::warn!("pump[{pump_id}]: cache miss for segment {seg_idx} — prefetch did not complete in time, fetching inline");
+                    match Request::get(&seg_url).send().await {
+                        Ok(r) => match r.binary().await {
+                            Ok(b) => b,
                             Err(e) => {
-                                log::error!("segment {seg_idx}: fetch error: {e:?}");
+                                log::error!("segment {seg_idx}: body read error: {e:?}");
                                 TimeoutFuture::new(1000).await;
                                 continue;
                             }
+                        },
+                        Err(e) => {
+                            log::error!("segment {seg_idx}: fetch error: {e:?}");
+                            TimeoutFuture::new(1000).await;
+                            continue;
                         }
                     }
                 }
@@ -2023,7 +1817,7 @@ async fn pump_loop(
             }
         }
 
-        // ── 6. Strip init boxes ──────────────────────────────────────
+        // ── 7. Strip init boxes & append ─────────────────────────────
         let media_bytes = strip_init_boxes(&bytes);
         if media_bytes.is_empty() {
             log::warn!("segment {seg_idx}: no media data after stripping init boxes (original size: {} bytes)", bytes.len());
@@ -2036,50 +1830,11 @@ async fn pump_loop(
             continue;
         }
 
-        // ── 7. Time-based back-buffer eviction ─────────────────────────
-        // Matches dash.js `BufferController._onWallclockTimeUpdated()` +
-        // `bufferPruningInterval = 10 s`: eviction runs at most once every
-        // 10 s of wall-clock time, never on every segment boundary.
-        //
-        // The eviction call is `await`ed (blocking) because the SourceBuffer
-        // can only have one operation at a time.  However, because it only
-        // fires once every 10 s, the impact is negligible — at worst one
-        // stall per 10 s, not per segment.
-        {
-            let now_ms = js_sys::Date::now();
-            let last_evict = {
-                let borrow = state.borrow();
-                match borrow.as_ref() {
-                    Some(s) if s.pump_gen == pump_id => s.last_eviction_ms,
-                    _ => return,
-                }
-            };
-            if now_ms - last_evict >= 10_000.0 {
-                let did_evict = evict_back_buffer(&sb, &video, &state, pump_id).await;
-                if !is_pump_current(&state, pump_id) {
-                    return;
-                }
-                // Only update the timer when eviction actually ran.
-                // If evict_back_buffer returned early (buffer within
-                // limits, nothing to remove), we retry on the next
-                // loop iteration so eviction fires promptly once the
-                // buffer does grow past the threshold.
-                if did_evict {
-                    if let Some(s) = state.borrow_mut().as_mut() {
-                        if s.pump_gen == pump_id {
-                            s.last_eviction_ms = js_sys::Date::now();
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── 7b. Wait for SB idle, then append ───────────────────────
         if !wait_for_sb(&sb, &state, pump_id).await {
             return;
         }
 
-        // ── 7c. Append without per-segment appendWindow ─────────────
+        // ── 7b. Append without per-segment appendWindow ──────────────
         //
         // dash.js (SourceBufferSink.js) only uses appendWindow for
         // multi-period transitions.  For single-period VOD content the
@@ -2096,28 +1851,11 @@ async fn pump_loop(
         let array_buffer = uint8_array.buffer();
         if sb.append_buffer_with_array_buffer(&array_buffer).is_err() {
             log::error!("segment {seg_idx}: appendBuffer failed, evicting and retrying");
-            // Use force_evict_back_buffer (unconditional) here — when quota is
-            // exceeded during a backward seek the stale forward ranges may not
-            // be counted by the normal threshold check, so we need to evict
-            // aggressively regardless of total_buffered.
-            force_evict_back_buffer(&sb, &video, &state, pump_id).await;
-            // Wait for the remove() inside force_evict_back_buffer to fully
-            // finish before retrying — without this the SB is still updating
-            // and the next appendBuffer throws InvalidStateError, causing an
-            // infinite loop.
-            if !wait_for_sb(&sb, &state, pump_id).await {
-                return;
-            }
-            retry_count += 1;
-            if retry_count >= MAX_APPEND_RETRIES {
-                log::error!(
-                    "segment {seg_idx}: appendBuffer failed after {retry_count} retries, giving up"
-                );
-                break;
-            }
+            // Likely QuotaExceededError — evict aggressively and retry.
+            evict_back_buffer(&sb, &video, &state, pump_id).await;
+            TimeoutFuture::new(500).await;
             continue;
         }
-        retry_count = 0; // reset on successful append
 
         // ── 8. Wait for updateend ────────────────────────────────────
         // Background prefetch tasks continue running in parallel — the
@@ -2552,9 +2290,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 error_recovery: ErrorRecovery::new(),
                                 live: live_ctrl,
                             }),
-                            last_eviction_ms: js_sys::Date::now(),
                         });
-
 
                         status.set(String::new());
                         if start_pos > 0.0 {
@@ -2891,48 +2627,25 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         // gap-controller timer sees the [66s–114s] gap and jumps the
                         // playhead to 114s — defeating the backward seek.
                         //
-                        // Mirrors dash.js StreamProcessor.prepareInnerPeriodPlaybackSeeking():
-                        //   1. fragmentModel.abortRequests()           — cancel in-flight XHRs
-                        //   2. sourceBufferSink.abort()                — cancel in-progress SB op
-                        //   3. bufferController.clearBuffers(ranges)   — remove stale data
-                        //   4. scheduleController.startScheduleTimer() — restart the pump
+                        // This mirrors dash.js BufferController.onPlaybackSeeking():
+                        //   this.sourceBuffer.remove(seekTime, this.mediaSource.duration)
                         //
-                        // Doing the abort() + remove() synchronously (before force_start_pump)
-                        // closes the race that the previous spawn_local approach had: the old
-                        // spawn_local flush could fire AFTER the new pump had already appended
-                        // a segment, immediately removing that freshly-appended data and
-                        // creating a buffer hole → decoder stall → post-seek stutter.
-                        //
-                        // After abort(), sb.updating is false synchronously, so remove()
-                        // starts immediately.  The new pump's first wait_for_sb() (at step 7b,
-                        // pre-appendBuffer) will block until the remove() fires updateend.
+                        // The pump's wait_for_sb() at the top of pump_loop handles
+                        // the SB being busy after a remove() — safe to fire-and-forget.
                         {
                             let borrow = mse_state_for_seek.borrow();
                             if let Some(mse) = borrow.as_ref() {
                                 let sb = &mse.source_buffer;
-                                // abort() cancels any in-progress appendBuffer/remove and
-                                // makes the SB immediately idle.  Log but don't fail on
-                                // error — if the MediaSource is not open, we proceed and
-                                // the subsequent remove() will also fail (harmlessly).
-                                if let Err(e) = sb.abort() {
-                                    log::warn!("seek: sb.abort() failed (non-fatal): {e:?}");
-                                }
-                                // Remove everything from the exact seek position to
-                                // media_source.duration().  Using seek_time (not the next
-                                // segment boundary) matches dash.js exactly:
-                                //   this.sourceBuffer.remove(seekTime, mediaSource.duration)
-                                // Using duration() (not f64::INFINITY) is required for
-                                // Firefox/Safari which reject Infinity as the end argument.
-                                let flush_end = mse.media_source.duration();
-                                if flush_end.is_finite() && seek_time < flush_end {
-                                    match sb.remove(seek_time, flush_end) {
+                                // Remove everything from the end of the seek-target segment
+                                // to infinity, clearing all stale ranges ahead.
+                                let flush_start = (target_seg as f64 + 1.0) * SEGMENT_DURATION_F;
+                                if !sb.updating() {
+                                    match sb.remove(flush_start, f64::INFINITY) {
                                         Ok(_) => log::info!(
-                                            "seek: flushing [{seek_time:.1}s, {flush_end:.1}s) \
-                                             ahead of seek target"
+                                            "seek: flushing stale SB data [{flush_start:.1}s, ∞) ahead of seek to {seek_time:.1}s"
                                         ),
                                         Err(e) => log::warn!(
-                                            "seek: sb.remove({seek_time:.1}, {flush_end:.1}) \
-                                             failed: {e:?}"
+                                            "seek: sb.remove({flush_start:.1}, ∞) failed: {e:?}"
                                         ),
                                     }
                                 }

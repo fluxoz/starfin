@@ -1421,23 +1421,15 @@ async fn wait_for_sb(
 ///
 /// **Design: fire-and-proceed (non-blocking)**
 ///
-/// `sb.remove()` sets `updating = true`.  In previous versions this function
-/// waited for `updateend` before returning, serialising removal with the
-/// subsequent fetch+append.  This caused a visible decoder stall at *every*
-/// segment boundary once `MSE_TARGET_BUFFER_S` was reduced to 12 s (because
-/// the 32 s threshold was breached every segment).
-///
-/// Now we fire `sb.remove()` and return immediately.  The pump loop's
-/// pre-append `wait_for_sb` call (step 7a) is the synchronisation point —
-/// it waits for the remove's `updateend` if it hasn't fired yet.  Because the
-/// segment fetch (step 6) runs between the eviction call and step 7a, the
-/// browser's MSE subsystem processes the remove in parallel with the JS fetch,
-/// hiding remove latency entirely for network fetches and for cached fetches
-/// that go through the oneshot-channel path.
+/// `sb.remove()` sets `updating = true`.  This function fires `sb.remove()`
+/// and returns immediately without waiting for `updateend`.  The caller
+/// (`eviction_loop`) waits for completion after the call.  Because the
+/// eviction loop runs independently of the pump, the remove completes during
+/// the pump's idle time (buffer-ahead gate sleep), so it is long done before
+/// the pump's next `appendBuffer` call.
 ///
 /// This matches the dash.js `SourceBufferSink` queue model: `remove()` is
-/// enqueued, the next `appendBuffer()` waits for the queue — neither blocks
-/// the calling code explicitly.
+/// enqueued and the remove/append pipeline never blocks the calling code.
 ///
 /// **Batch-minimum threshold**
 ///
@@ -1445,7 +1437,8 @@ async fn wait_for_sb(
 /// seconds of data to evict (≈ 12 s).  With 6 s segments and 20 s of keep-
 /// behind, data accumulates ~6 s per segment behind the eviction boundary.
 /// Without the batch minimum, eviction fired every segment (tiny removes).
-/// With the minimum, it fires every ~2 segments, halving remove() frequency.
+/// With the minimum, it fires every ~2 timer firings, keeping remove() calls
+/// infrequent.
 ///
 /// `force_evict_back_buffer` (called after a `QuotaExceededError`) is the
 /// emergency variant that always waits for completion and ignores this minimum.
@@ -1502,12 +1495,9 @@ fn evict_back_buffer(
         return;
     }
 
-    // Fire remove() and return immediately — DO NOT await completion here.
-    //
-    // The pump loop's pre-append wait_for_sb (step 7a) is the synchronisation
-    // point.  The segment fetch (step 6) runs between this call and step 7a,
-    // so the browser processes the remove concurrently with the JS fetch,
-    // hiding remove latency for both cached and network segments.
+    // Fire remove() and return immediately — the caller (eviction_loop)
+    // waits for completion.  The remove runs during the pump's idle
+    // time so it is complete before the next appendBuffer.
     log::info!(
         "evict: removing [{evict_start:.3}–{evict_end:.3}] ({evict_amount:.1}s, current={current:.3})"
     );
@@ -1678,6 +1668,73 @@ fn kick_prefetch(
 }
 
 
+/// Independent back-buffer eviction timer, matching dash.js
+/// `BufferController._onWallclockTimeUpdated()` +
+/// `settings.streaming.buffer.bufferPruningInterval = 10 s`.
+///
+/// **Why a separate task instead of inside `pump_loop`?**
+///
+/// dash.js NEVER calls `sb.remove()` inside the segment-loading pipeline.
+/// Pruning runs on its own 10 s wallclock timer so that `sb.remove()` never
+/// races with `appendBuffer()` at a segment boundary.  The remove fires
+/// DURING the pump's 200 ms idle sleep (buffer-ahead gate), giving the
+/// browser enough time to complete it before the next `appendBuffer`.
+///
+/// With the old embedded approach, every iteration was:
+///   fire_remove → cache_hit(instant) → wait_for_remove → appendBuffer
+/// Because the cache hit is instant the pump immediately hit `wait_for_sb`
+/// which blocked on the remove — serialising remove + append back-to-back
+/// at EVERY segment boundary.
+///
+/// With this independent loop the remove fires during idle time and is
+/// almost always complete by the time the pump's `appendBuffer` call arrives,
+/// eliminating the block entirely (matching dash.js behaviour).
+///
+/// The loop exits when the pump generation changes (seek or restart).
+async fn eviction_loop(
+    state: Rc<RefCell<Option<MseState>>>,
+    video: HtmlVideoElement,
+    pump_id: u32,
+) {
+    loop {
+        // 10 s prune interval — dash.js default `bufferPruningInterval`.
+        TimeoutFuture::new(10_000).await;
+
+        if !is_pump_current(&state, pump_id) {
+            return;
+        }
+
+        // Grab the SourceBuffer from state.
+        let sb = {
+            let borrow = state.borrow();
+            match borrow.as_ref() {
+                Some(s) if s.pump_gen == pump_id => s.source_buffer.clone(),
+                _ => return,
+            }
+        };
+
+        // If the SB is busy right now (append or previous remove in progress),
+        // skip this iteration — the prune will run again in 10 s.
+        // This avoids serialising the remove with an in-progress append,
+        // which would block the pump's next `appendBuffer`.
+        if sb.updating() {
+            continue;
+        }
+
+        // Fire sb.remove() for the data behind the back-buffer window.
+        // evict_back_buffer is a plain fn: it fires remove() if the
+        // batch-minimum is met, then returns immediately.
+        evict_back_buffer(&sb, &video);
+
+        // If a remove was started, wait for it to complete so the next
+        // iteration starts from a known-idle state.  The pump loop's
+        // pre-append wait_for_sb independently handles any SB contention.
+        if sb.updating() {
+            let _ = wait_for_sb(&sb, &state, pump_id).await;
+        }
+    }
+}
+
 /// Start (or restart) the async segment-pump loop.
 ///
 /// Bumps `pump_gen` so any previously-running `pump_loop` detects the
@@ -1708,13 +1765,22 @@ fn start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElement) {
     };
     let state_c = state.clone();
     let video_c = video.clone();
-    spawn_local(async move {
-        pump_loop(state_c.clone(), video_c, pump_id).await;
-        if let Some(s) = state_c.borrow_mut().as_mut() {
-            if s.pump_gen == pump_id {
-                s.pump_running = false;
+    // Spawn the segment-loading pump.
+    spawn_local({
+        let state_c = state_c.clone();
+        let video_c = video_c.clone();
+        async move {
+            pump_loop(state_c.clone(), video_c, pump_id).await;
+            if let Some(s) = state_c.borrow_mut().as_mut() {
+                if s.pump_gen == pump_id {
+                    s.pump_running = false;
+                }
             }
         }
+    });
+    // Spawn the independent eviction loop (dash.js bufferPruningInterval pattern).
+    spawn_local(async move {
+        eviction_loop(state_c, video_c, pump_id).await;
     });
 }
 
@@ -1737,13 +1803,22 @@ fn force_start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElem
     };
     let state_c = state.clone();
     let video_c = video.clone();
-    spawn_local(async move {
-        pump_loop(state_c.clone(), video_c, pump_id).await;
-        if let Some(s) = state_c.borrow_mut().as_mut() {
-            if s.pump_gen == pump_id {
-                s.pump_running = false;
+    // Spawn the segment-loading pump.
+    spawn_local({
+        let state_c = state_c.clone();
+        let video_c = video_c.clone();
+        async move {
+            pump_loop(state_c.clone(), video_c, pump_id).await;
+            if let Some(s) = state_c.borrow_mut().as_mut() {
+                if s.pump_gen == pump_id {
+                    s.pump_running = false;
+                }
             }
         }
+    });
+    // Spawn the independent eviction loop (dash.js bufferPruningInterval pattern).
+    spawn_local(async move {
+        eviction_loop(state_c, video_c, pump_id).await;
     });
 }
 
@@ -1766,14 +1841,19 @@ fn force_start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElem
 /// muxing which can take hundreds of milliseconds).
 ///
 /// Steps per iteration (per DASH-IF IOP v4.3 §3.2):
-///   1. Kick off background prefetch tasks for the lookahead window.
+///   1. Generation check — exit if a newer pump has started.
 ///   2. Determine the next segment needed.
-///   3. Enforce a forward buffer limit — sleep when enough data is buffered.
-///   4. Evict old played data behind the playhead to bound memory.
+///   3. Kick off background prefetch tasks for the lookahead window.
+///   4. Enforce a forward buffer limit — sleep when enough data is buffered.
 ///   5. Pull the segment from the prefetch cache (or fetch inline as fallback).
-///   6. Strip redundant init boxes (ftyp/moov) from the fMP4 data.
-///   7. Wait for the SourceBuffer to be idle, then `appendBuffer`.
-///   8. Wait for `updateend`, advance to the next segment, repeat.
+///   6. Strip redundant init boxes (ftyp/moov) from the fMP4 data, then append.
+///   7. Wait for `updateend`.
+///   8. Advance to the next segment and repeat.
+///
+/// Back-buffer eviction runs in a SEPARATE `eviction_loop` task on a 10 s
+/// timer (matching dash.js `bufferPruningInterval`), never inside this loop.
+/// This ensures `sb.remove()` never races with `appendBuffer` at a segment
+/// boundary — see `eviction_loop` for the full rationale.
 ///
 /// The loop exits when all segments are appended, the generation counter
 /// no longer matches (a seek started a newer pump), or the MseState has
@@ -1879,20 +1959,7 @@ async fn pump_loop(
             }
         }
 
-        // ── 5. Evict old data behind the playhead ────────────────────
-        // Proactively evict BEFORE appending to prevent the browser from
-        // hitting its SourceBuffer quota.  Browser emergency eviction
-        // removes data unpredictably (sometimes near the playhead),
-        // causing audio dropout at segment transitions.
-        //
-        // Ref: dash.js BufferController.pruneBuffer() — runs before
-        //      each append, not after.
-        evict_back_buffer(&sb, &video);
-        if !is_pump_current(&state, pump_id) {
-            return;
-        }
-
-        // ── 6. Pull segment from prefetch cache (or fetch inline) ────
+        // ── 5. Pull segment from prefetch cache (or fetch inline) ────
         // Fast path: segment is already in the cache (common case for
         // steady-state playback where the lookahead pipeline is full).
         //
@@ -2026,7 +2093,7 @@ async fn pump_loop(
             }
         }
 
-        // ── 7. Strip init boxes & append ─────────────────────────────
+        // ── 6. Strip init boxes & append ─────────────────────────────
         let media_bytes = strip_init_boxes(&bytes);
         if media_bytes.is_empty() {
             log::warn!("segment {seg_idx}: no media data after stripping init boxes (original size: {} bytes)", bytes.len());
@@ -2043,7 +2110,7 @@ async fn pump_loop(
             return;
         }
 
-        // ── 7b. Append without per-segment appendWindow ──────────────
+        // ── 6b. Append without per-segment appendWindow ─────────────
         //
         // dash.js (SourceBufferSink.js) only uses appendWindow for
         // multi-period transitions.  For single-period VOD content the
@@ -2083,7 +2150,7 @@ async fn pump_loop(
         }
         retry_count = 0; // reset on successful append
 
-        // ── 8. Wait for updateend ────────────────────────────────────
+        // ── 7. Wait for updateend ────────────────────────────────────
         // Background prefetch tasks continue running in parallel — the
         // browser handles HTTP requests on its I/O thread even while
         // we're waiting for the SourceBuffer.
@@ -2091,7 +2158,7 @@ async fn pump_loop(
             return;
         }
 
-        // ── 9. Advance to next segment ───────────────────────────────
+        // ── 8. Advance to next segment ───────────────────────────────
         {
             // Log buffered ranges after append for diagnostics.
             if let Ok(buffered) = sb.buffered() {
@@ -2866,8 +2933,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         // creating a buffer hole → decoder stall → post-seek stutter.
                         //
                         // After abort(), sb.updating is false synchronously, so remove()
-                        // starts immediately.  The new pump's first wait_for_sb() (inside
-                        // evict_back_buffer) will block until the remove() fires updateend.
+                        // starts immediately.  The new pump's first wait_for_sb() (at step 6,
+                        // pre-appendBuffer) will block until the remove() fires updateend.
                         {
                             let borrow = mse_state_for_seek.borrow();
                             if let Some(mse) = borrow.as_ref() {

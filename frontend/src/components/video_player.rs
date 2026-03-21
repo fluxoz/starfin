@@ -77,8 +77,9 @@ const CONTROLS_VICINITY_PX: f64 = 80.0;
 /// Target seconds of video to keep buffered ahead of the playback position.
 /// dash.js uses 12 s by default (`bufferTimeAtTopQuality`);
 /// Shaka Player uses 10 s; hls.js uses 30 s.
-/// We use 30 s for comfortable VOD buffering.
-const MSE_TARGET_BUFFER_S: f64 = 30.0;
+/// 30 s at HD bitrates (~5 Mbps) approaches Chrome's SourceBuffer quota
+/// (~150–200 MB), triggering QuotaExceededError.  Use 12 s to match dash.js.
+const MSE_TARGET_BUFFER_S: f64 = 12.0;
 
 /// Maximum seconds of already-played data to keep behind the playhead.
 /// Data older than this is evicted via `SourceBuffer.remove()` to bound
@@ -105,6 +106,9 @@ const PLAYHEAD_RANGE_TOLERANCE_S: f64 = 0.1;
 /// Minimum amount of data (in seconds) worth evicting.  Avoids issuing
 /// tiny SourceBuffer.remove() calls that add overhead without benefit.
 const MIN_EVICT_S: f64 = 0.5;
+
+/// Maximum retries for `appendBuffer` after a QuotaExceededError.
+const MAX_APPEND_RETRIES: u32 = 3;
 
 /// Number of segments to keep pre-fetched ahead of the current append
 /// position.  Background fetch tasks populate a shared segment cache so
@@ -1222,6 +1226,10 @@ struct MseState {
     last_appended_seg: Option<usize>,
     /// Extended DASH infrastructure (ABR, metrics, throughput, events, etc.)
     dash_ext: Option<DashExtState>,
+    /// Wall-clock timestamp (ms) of the last eviction.
+    /// Eviction only runs when `now - last_eviction_ms >= 10_000`
+    /// (matching dash.js `bufferPruningInterval = 10 s`).
+    last_eviction_ms: f64,
 }
 
 /// Parse a DASH MPD manifest and return the list of segment URLs with durations.
@@ -1728,17 +1736,37 @@ async fn pump_loop(
             }
         }
 
-        // ── 5. Evict old data behind the playhead ────────────────────
-        // Proactively evict BEFORE appending to prevent the browser from
-        // hitting its SourceBuffer quota.  Browser emergency eviction
-        // removes data unpredictably (sometimes near the playhead),
-        // causing audio dropout at segment transitions.
+        // ── 5. Time-gated eviction (every 10 s) ──────────────────────
+        // dash.js BufferController._onWallclockTimeUpdated() fires
+        // pruneBuffer() on a 10 s wallclock timer (bufferPruningInterval = 10).
+        // sb.remove() is NEVER called inside the segment-loading pipeline
+        // because it blocks the SourceBuffer (updating=true), stalling the
+        // append pipeline and causing per-segment stutter.
         //
-        // Ref: dash.js BufferController.pruneBuffer() — runs before
-        //      each append, not after.
-        evict_back_buffer(&sb, &video, &state, pump_id).await;
-        if !is_pump_current(&state, pump_id) {
-            return;
+        // We match this: only evict when at least 10 s have elapsed since
+        // the last eviction.  This decouples eviction from the segment
+        // append cadence.
+        {
+            let now_ms = js_sys::Date::now();
+            let should_evict = {
+                let borrow = state.borrow();
+                match borrow.as_ref() {
+                    Some(s) if s.pump_gen == pump_id => now_ms - s.last_eviction_ms >= 10_000.0,
+                    _ => return,
+                }
+            };
+            if should_evict {
+                evict_back_buffer(&sb, &video, &state, pump_id).await;
+                if !is_pump_current(&state, pump_id) {
+                    return;
+                }
+                // Update the timestamp only after eviction completes.
+                if let Some(s) = state.borrow_mut().as_mut() {
+                    if s.pump_gen == pump_id {
+                        s.last_eviction_ms = js_sys::Date::now();
+                    }
+                }
+            }
         }
 
         // ── 6. Pull segment from prefetch cache (or fetch inline) ────
@@ -1849,12 +1877,39 @@ async fn pump_loop(
 
         let uint8_array = js_sys::Uint8Array::from(media_bytes.as_slice());
         let array_buffer = uint8_array.buffer();
-        if sb.append_buffer_with_array_buffer(&array_buffer).is_err() {
-            log::error!("segment {seg_idx}: appendBuffer failed, evicting and retrying");
-            // Likely QuotaExceededError — evict aggressively and retry.
-            evict_back_buffer(&sb, &video, &state, pump_id).await;
-            TimeoutFuture::new(500).await;
-            continue;
+        match sb.append_buffer_with_array_buffer(&array_buffer) {
+            Ok(_) => {}
+            Err(_) => {
+                // Likely QuotaExceededError — force-evict everything behind
+                // playhead − 1 s, wait for the SB to become idle, then retry
+                // up to 3 times.
+                log::error!("segment {seg_idx}: appendBuffer failed (QuotaExceeded?), force-evicting and retrying");
+                let current = video.current_time();
+                let force_end = (current - 1.0).max(0.0);
+                if force_end > 0.5 {
+                    if !wait_for_sb(&sb, &state, pump_id).await { return; }
+                    let _ = sb.remove(0.0, force_end);
+                    if !wait_for_sb(&sb, &state, pump_id).await { return; }
+                }
+                // Retry up to MAX_APPEND_RETRIES times
+                let mut retries = 0;
+                loop {
+                    if retries >= MAX_APPEND_RETRIES {
+                        log::error!("segment {seg_idx}: appendBuffer failed after {MAX_APPEND_RETRIES} retries, skipping");
+                        if let Some(s) = state.borrow_mut().as_mut() {
+                            if s.pump_gen == pump_id { s.next_seg = seg_idx + 1; }
+                        }
+                        break;
+                    }
+                    if !wait_for_sb(&sb, &state, pump_id).await { return; }
+                    if sb.append_buffer_with_array_buffer(&array_buffer).is_ok() {
+                        break;
+                    }
+                    retries += 1;
+                    TimeoutFuture::new(200).await;
+                }
+                continue;
+            }
         }
 
         // ── 8. Wait for updateend ────────────────────────────────────
@@ -2290,6 +2345,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 error_recovery: ErrorRecovery::new(),
                                 live: live_ctrl,
                             }),
+                            // Initialize to now so the first eviction doesn't fire
+                            // until 10 s of playback have elapsed.
+                            last_eviction_ms: js_sys::Date::now(),
                         });
 
                         status.set(String::new());
@@ -2300,6 +2358,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         // Start the sequential async pump loop (per DASH-IF
                         // IOP v4.3 §3.2: fetch → append → wait → repeat).
                         start_pump(&mse_state, &video);
+
+                        // Autoplay: begin playback immediately when user
+                        // presses "Watch".  dash.js does the same after the
+                        // first fragment is loaded (StreamProcessor).
+                        let _ = video.play();
                     });
                 }) as Box<dyn FnOnce()>);
 
@@ -2637,15 +2700,20 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             if let Some(mse) = borrow.as_ref() {
                                 let sb = &mse.source_buffer;
                                 // Remove everything from the end of the seek-target segment
-                                // to infinity, clearing all stale ranges ahead.
+                                // to duration, clearing all stale ranges ahead.
+                                // Use media_source.duration() instead of f64::INFINITY —
+                                // Firefox and Safari reject Infinity.
                                 let flush_start = (target_seg as f64 + 1.0) * SEGMENT_DURATION_F;
-                                if !sb.updating() {
-                                    match sb.remove(flush_start, f64::INFINITY) {
+                                let flush_end = mse.media_source.duration();
+                                if flush_end.is_finite() && flush_start < flush_end && !sb.updating() {
+                                    // Cancel any in-progress SB operation first (dash.js pattern).
+                                    let _ = sb.abort();
+                                    match sb.remove(flush_start, flush_end) {
                                         Ok(_) => log::info!(
-                                            "seek: flushing stale SB data [{flush_start:.1}s, ∞) ahead of seek to {seek_time:.1}s"
+                                            "seek: flushing stale SB data [{flush_start:.1}s, {flush_end:.1}s) ahead of seek to {seek_time:.1}s"
                                         ),
                                         Err(e) => log::warn!(
-                                            "seek: sb.remove({flush_start:.1}, ∞) failed: {e:?}"
+                                            "seek: sb.remove({flush_start:.1}, {flush_end:.1}) failed: {e:?}"
                                         ),
                                     }
                                 }

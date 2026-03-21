@@ -196,41 +196,37 @@ fn is_time_buffered(video: &HtmlVideoElement, time: f64) -> bool {
     false
 }
 
-/// Gap-jumping helper modelled after dash.js `GapController._jumpGap()`.
+/// Gap-jumping helper — faithful 1:1 port of dash.js `GapController`.
 ///
-/// When the playhead is stalled just before a small gap between buffered
-/// ranges, this function nudges `currentTime` past the gap so playback
-/// resumes without a visible stutter.
+/// dash.js `GapController._shouldCheckForGaps()` (line-by-line):
+///   return !trackSwitchInProgress             // N/A (single-track VOD)
+///       && settings.jumpGaps                   // always true for us
+///       && activeStreamProcessors.length > 0   // N/A
+///       && !playbackController.isSeeking()     // → video.seeking()
+///       && !playbackController.isPaused()       // → video.paused()
+///       && !isStreamSwitchInProgress           // N/A
+///       && !hasMediaOrInitialisationError;     // N/A
 ///
 /// dash.js `GapController._jumpGap()`:
-///   1. Finds the first buffered range whose start is ahead of `currentTime`.
-///   2. If the gap (range.start − currentTime) is ≤ `smallGapLimit`, seeks
-///      past it.
-///   3. If `jumpLargeGaps` is enabled and no small gap was found, jump to
-///      the start of the next buffered range regardless of gap size.
+///   1. `_getNextRangeIndex()` finds the next buffered range after `currentTime`.
+///   2. If gap ≤ `smallGapLimit` (0.8 s) || `jumpLargeGaps`:  seekToPosition = start.
+///   3. Uses `lastGapJumpPosition` to prevent jumping to the same position twice.
+///   4. Uses `jumpTimeoutHandler` (setTimeout) — for VOD `timeToWait=0` so the
+///      jump fires immediately but still defers to the event loop.
+///   5. Applies `seekOffset` (default 0.1 s) past the gap.
 ///
-/// We enable the large-gap behaviour unconditionally because remuxed fMP4
-/// segments can have gaps larger than 0.8 s when keyframes don't align with
-/// segment boundaries (e.g. keyframes every 8 s but segments every 6 s).
-/// Ref: dash.js `settings.streaming.gaps.jumpLargeGaps`
+/// dash.js `_onPlaybackSeeking()`:
+///   Clears any pending `jumpTimeoutHandler` — prevents stale jumps after seek.
+///   Our `video.seeking()` guard achieves the same result without a timer.
 ///
-/// dash.js `GapController._shouldCheckForGaps()` guards with
-/// `!playbackController.isSeeking()` — gap jumping is completely disabled
-/// while the video element is in the seeking state.  Without this guard,
-/// backward seeks to unbuffered positions are defeated: the pump has not
-/// yet fetched data for the seek target, and the gap controller sees the
-/// gap between the playhead and the nearest buffered range ahead, jumping
-/// the playhead forward before the pump can deliver data.
-///
-/// dash.js also clears any pending `jumpTimeoutHandler` in
-/// `_onPlaybackSeeking()`, preventing stale jumps from firing after a
-/// seek starts.
+/// We enable `jumpLargeGaps` unconditionally because remuxed fMP4 segments can
+/// have gaps larger than 0.8 s when keyframes don't align with segment boundaries.
 ///
 /// Returns `true` if a gap was jumped, `false` otherwise.
-fn try_jump_gap(video: &HtmlVideoElement) -> bool {
-    // dash.js GapController._shouldCheckForGaps():
-    //   return ... && !playbackController.isSeeking() && ...
-    if video.seeking() {
+fn try_jump_gap(video: &HtmlVideoElement, last_gap_jump_position: &mut f64) -> bool {
+    // dash.js _shouldCheckForGaps():
+    //   !playbackController.isSeeking() && !playbackController.isPaused()
+    if video.seeking() || video.paused() {
         return false;
     }
 
@@ -240,40 +236,50 @@ fn try_jump_gap(video: &HtmlVideoElement) -> bool {
     let mut nearest_ahead: Option<f64> = None;
     for i in 0..len {
         if let (Ok(start), Ok(_end)) = (buffered.start(i), buffered.end(i)) {
-            // Ignore ranges that start before/at the current position and
-            // gaps smaller than 1 ms (floating-point rounding noise).
             let gap = start - current;
             if gap > 0.001 {
                 if gap <= SMALL_GAP_LIMIT_S {
-                    // Small gap — jump immediately (dash.js default).
-                    let target = start + 0.001;
-                    log::info!(
-                        "GapController: jumping {gap:.3}s gap at {current:.3}s → {target:.3}s"
-                    );
-                    video.set_current_time(target);
-                    return true;
+                    nearest_ahead = Some(start);
+                    break;
                 }
-                // Track the closest buffered-range start ahead of the
-                // current position (minimum of all candidates) so the
-                // large-gap path below can jump to it.
+                // Track closest range ahead for large-gap jump.
                 if nearest_ahead.map_or(true, |n| start < n) {
                     nearest_ahead = Some(start);
                 }
             }
         }
     }
-    // Large-gap jump (dash.js `jumpLargeGaps`): when the playhead is stalled
-    // between buffered ranges and no small gap was found, jump to the start
-    // of the nearest buffered range ahead.
+
     if let Some(start) = nearest_ahead {
-        let target = start + 0.001;
-        log::info!(
-            "GapController: large gap jump at {current:.3}s → {target:.3}s (gap {:.3}s)",
-            start - current
-        );
+        // dash.js seekOffset default = 0.1; applies past the gap start.
+        let seek_offset = 0.1;
+        let target = start + seek_offset;
+
+        // dash.js `lastGapJumpPosition` dedup — don't jump to the same
+        // position twice.  Prevents repeated gap jumps when the browser
+        // hasn't processed the first jump yet.
+        if *last_gap_jump_position == target {
+            return false;
+        }
+
+        let gap = start - current;
+        if gap <= SMALL_GAP_LIMIT_S {
+            log::info!(
+                "GapController: small gap {gap:.3}s at {current:.3}s → {target:.3}s"
+            );
+        } else {
+            log::info!(
+                "GapController: large gap {gap:.3}s at {current:.3}s → {target:.3}s"
+            );
+        }
+        *last_gap_jump_position = target;
         video.set_current_time(target);
         return true;
     }
+
+    // Reset dedup when no gap — matches dash.js which resets
+    // lastGapJumpPosition when playback time advances.
+    *last_gap_jump_position = f64::NAN;
     false
 }
 
@@ -1522,6 +1528,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // Update time/duration periodically.  Also acts as a safety-net to
     // restart the pump loop if it exited unexpectedly (e.g. a transient
     // network error exhausted its retries).
+    //
+    // dash.js GapController `lastGapJumpPosition` — shared mutable state
+    // used to deduplicate gap jumps (prevent jumping to the same position
+    // twice before the browser processes the first jump).
+    let last_gap_jump_pos: Rc<Cell<f64>> = Rc::new(Cell::new(f64::NAN));
+
     {
         let video_ref = video_ref.clone();
         let current_time = current_time.clone();
@@ -1531,6 +1543,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let is_dragging = is_dragging.clone();
         let video_ended = video_ended.clone();
         let mse_state = mse_state.clone();
+        let last_gap_jump_pos = last_gap_jump_pos.clone();
 
         use_effect_with(video_ref.clone(), move |video_ref| {
             let video_ref = video_ref.clone();
@@ -1550,10 +1563,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     video_ended.set(video.ended());
 
                     // Periodic gap-jump safety net (dash.js GapController
-                    // runs on a similar periodic interval).  Catches gaps
-                    // that don't always trigger the `waiting` event.
-                    if !video.paused() && !video.ended() && video.ready_state() <= 2 {
-                        try_jump_gap(&video);
+                    // runs on a similar periodic interval via setInterval
+                    // at `settings.streaming.gaps.checkInterval`).
+                    // Guards already inside try_jump_gap: !seeking, !paused.
+                    if !video.ended() && video.ready_state() <= 2 {
+                        let mut pos = last_gap_jump_pos.get();
+                        try_jump_gap(&video, &mut pos);
+                        last_gap_jump_pos.set(pos);
                     }
 
                     // Safety-net: restart the pump when it has exited
@@ -1614,6 +1630,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     {
         let video_ref = video_ref.clone();
         let is_buffering = is_buffering.clone();
+        let last_gap_jump_pos = last_gap_jump_pos.clone();
 
         use_effect_with(video_ref.clone(), move |video_ref| {
             let video_opt = video_ref.cast::<HtmlVideoElement>();
@@ -1621,13 +1638,16 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let waiting_cb = video_opt.as_ref().map(|video| {
                 let is_buffering = is_buffering.clone();
                 let video_for_gap = video.clone();
+                let last_gap_jump_pos = last_gap_jump_pos.clone();
                 let cb = Closure::<dyn Fn()>::new(move || {
                     // Try to jump over a small gap first (dash.js
                     // GapController pattern).  Only show buffering spinner
                     // if there's no jumpable gap.
-                    if !try_jump_gap(&video_for_gap) {
+                    let mut pos = last_gap_jump_pos.get();
+                    if !try_jump_gap(&video_for_gap, &mut pos) {
                         is_buffering.set(true);
                     }
+                    last_gap_jump_pos.set(pos);
                 });
                 video
                     .add_event_listener_with_callback("waiting", cb.as_ref().unchecked_ref())

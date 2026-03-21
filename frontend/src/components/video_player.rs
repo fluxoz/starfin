@@ -1343,9 +1343,11 @@ fn is_pump_current(state: &Rc<RefCell<Option<MseState>>>, pump_id: u32) -> bool 
 /// 4–15 ms).  Eliminating that per-segment overhead removes the
 /// inter-segment micro-freezes that were visible at segment boundaries.
 ///
-/// Thread safety: the `updateend` DOM event and the MSE API are always
-/// dispatched on the owning thread.  The Promise/JsFuture bridge is safe
-/// for use from WASM worker threads because `JsFuture` is `Send`.
+/// Note: the Promise creation, event listener registration, and `JsFuture`
+/// await must all occur on the thread that owns the SourceBuffer (the MSE
+/// thread — typically the main browser thread).  `JsFuture` is not `Send`
+/// in the general case; this function is only called from the pump task
+/// which runs on that same thread.
 async fn wait_for_sb(
     sb: &web_sys::SourceBuffer,
     state: &Rc<RefCell<Option<MseState>>>,
@@ -1359,23 +1361,49 @@ async fn wait_for_sb(
     // `once: true` tells the browser to remove the listener automatically
     // after the first fire, so there is no memory leak and no risk of the
     // Closure being invoked a second time (which would panic for FnOnce).
+    //
+    // If attaching the listener fails (e.g. the SourceBuffer is in an
+    // error state), we call `reject` so the JsFuture resolves immediately
+    // rather than hanging indefinitely.  The caller checks `is_pump_current`
+    // on return and will exit cleanly in that case.
     let sb_ref = sb.clone();
-    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+    let listener_ok = Rc::new(Cell::new(false));
+    let listener_ok_clone = listener_ok.clone();
+    let promise = js_sys::Promise::new(&mut |resolve, reject| {
         let mut opts = web_sys::AddEventListenerOptions::new();
-        opts.once(true);
+        opts.set_once(true);
         let cb = Closure::once(Box::new(move || {
             let _ = resolve.call0(&JsValue::UNDEFINED);
         }) as Box<dyn FnOnce()>);
-        let _ = sb_ref.add_event_listener_with_callback_and_add_event_listener_options(
+        match sb_ref.add_event_listener_with_callback_and_add_event_listener_options(
             "updateend",
             cb.as_ref().unchecked_ref(),
             &opts,
-        );
-        // `forget()` hands ownership of the closure to the JS side.
-        // The browser releases it after `updateend` fires (once:true).
-        cb.forget();
+        ) {
+            Ok(_) => {
+                listener_ok_clone.set(true);
+                // `forget()` hands ownership of the closure to the JS side.
+                // The browser releases it after `updateend` fires (once:true).
+                cb.forget();
+            }
+            Err(e) => {
+                // Listener attachment failed — reject the Promise so the
+                // JsFuture resolves immediately instead of hanging.
+                log::warn!("wait_for_sb: addEventListener failed: {e:?}");
+                let _ = reject.call1(&JsValue::UNDEFINED, &e);
+            }
+        }
     });
 
+    if !listener_ok.get() {
+        // Listener was not attached; fall back to a single-tick yield so the
+        // caller can re-check pump generation and decide what to do.
+        TimeoutFuture::new(0).await;
+        return is_pump_current(state, pump_id);
+    }
+
+    // Ignore Ok/Err — we only care that the Promise settled (listener fired
+    // or was rejected due to attachment failure handled above).
     let _ = JsFuture::from(promise).await;
     is_pump_current(state, pump_id)
 }
@@ -1619,11 +1647,27 @@ fn kick_prefetch(
                                 }
                             }
                             log::info!("prefetch[{pump_id}]: cached segment {idx}");
+                        } else {
+                            // Stale generation — wake any waiters so they can
+                            // detect the generation change and exit promptly.
+                            // Dropping the senders causes the receivers to
+                            // resolve with Err(Canceled), which the select!
+                            // in pump_loop treats as a notification (the pump
+                            // then checks is_pump_current and exits).
+                            drop(notifiers.lock().unwrap().remove(&idx));
                         }
                     }
-                    Err(e) => log::warn!("prefetch seg {idx}: body error: {e:?}"),
+                    Err(e) => {
+                        log::warn!("prefetch seg {idx}: body error: {e:?}");
+                        // Wake any waiting pump so it can fall back to inline
+                        // fetch rather than hanging until the 3 s timeout.
+                        drop(notifiers.lock().unwrap().remove(&idx));
+                    }
                 },
-                Err(e) => log::warn!("prefetch seg {idx}: fetch error: {e:?}"),
+                Err(e) => {
+                    log::warn!("prefetch seg {idx}: fetch error: {e:?}");
+                    drop(notifiers.lock().unwrap().remove(&idx));
+                }
             }
             in_flight.lock().unwrap().remove(&idx);
         });
@@ -2826,9 +2870,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             if let Some(mse) = borrow.as_ref() {
                                 let sb = &mse.source_buffer;
                                 // abort() cancels any in-progress appendBuffer/remove and
-                                // makes the SB immediately idle.  Errors are ignored — if
-                                // the MediaSource is not open, abort() is a no-op for us.
-                                let _ = sb.abort();
+                                // makes the SB immediately idle.  Log but don't fail on
+                                // error — if the MediaSource is not open, we proceed and
+                                // the subsequent remove() will also fail (harmlessly).
+                                if let Err(e) = sb.abort() {
+                                    log::warn!("seek: sb.abort() failed (non-fatal): {e:?}");
+                                }
                                 // Remove everything from the exact seek position to
                                 // media_source.duration().  Using seek_time (not the next
                                 // segment boundary) matches dash.js exactly:

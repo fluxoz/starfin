@@ -12,3 +12,6 @@ Use Dash.js (https://github.com/Dash-Industry-Forum/dash.js) as implementation i
 
 Read DASH engineering specs here: https://dashif.org/docs/DASH-IF-IOP-v4.3.pdf
 
+Reference dash.js source code in the dash.js/ directory
+
+Look at the Dash.js reference player: https://reference.dashif.org/dash.js/latest/samples/dash-if-reference-player/index.html, Click "Load" to start playback.

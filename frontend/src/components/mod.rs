@@ -5,5 +5,4 @@ pub mod multi_select;
 pub mod password_modal;
 pub mod processing_status;
 pub mod video_card_thumb;
-#[allow(unused_variables)]
 pub mod video_player;

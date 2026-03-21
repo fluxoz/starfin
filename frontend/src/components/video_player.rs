@@ -93,6 +93,15 @@ const MSE_BACK_BUFFER_S: f64 = 20.0;
 /// Ref: dash.js/src/streaming/controllers/GapController.js `_jumpGap()`
 const SMALL_GAP_LIMIT_S: f64 = 0.8;
 
+/// Tolerance (in seconds) for matching the playhead to a buffered range.
+/// A small tolerance prevents false negatives when the playhead sits at
+/// the exact edge of a buffered range due to floating-point imprecision.
+const PLAYHEAD_RANGE_TOLERANCE_S: f64 = 0.1;
+
+/// Minimum amount of data (in seconds) worth evicting.  Avoids issuing
+/// tiny SourceBuffer.remove() calls that add overhead without benefit.
+const MIN_EVICT_S: f64 = 0.5;
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn format_time(seconds: f64) -> String {
@@ -523,7 +532,7 @@ async fn evict_back_buffer(
         current - MSE_BACK_BUFFER_S
     };
 
-    if evict_before <= buf_start + 0.5 {
+    if evict_before <= buf_start + MIN_EVICT_S {
         return; // nothing worth evicting
     }
 
@@ -704,7 +713,7 @@ async fn pump_loop(
                 let mut ahead = 0.0_f64;
                 for i in 0..ranges.length() {
                     if let (Ok(s), Ok(e)) = (ranges.start(i), ranges.end(i)) {
-                        if current >= s - 0.1 && current <= e + 0.1 {
+                        if current >= s - PLAYHEAD_RANGE_TOLERANCE_S && current <= e + PLAYHEAD_RANGE_TOLERANCE_S {
                             ahead = (e - current).max(0.0);
                             break;
                         }
@@ -1450,7 +1459,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                     let mut ahead = 0.0_f64;
                                     for i in 0..ranges.length() {
                                         if let (Ok(rs), Ok(re)) = (ranges.start(i), ranges.end(i)) {
-                                            if current >= rs - 0.1 && current <= re + 0.1 {
+                                            if current >= rs - PLAYHEAD_RANGE_TOLERANCE_S && current <= re + PLAYHEAD_RANGE_TOLERANCE_S {
                                                 ahead = (re - current).max(0.0);
                                                 break;
                                             }

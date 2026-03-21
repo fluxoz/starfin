@@ -147,6 +147,42 @@ fn buffered_end_at(video: &HtmlVideoElement, time: f64) -> f64 {
     0.0
 }
 
+/// Return the end of the continuous buffered range starting at `time`.
+///
+/// Mirrors dash.js `BufferController.getContinuousBufferTimeForTargetTime()`:
+/// walks buffered ranges from `time` forward, coalescing ranges separated
+/// by gaps ≤ `SMALL_GAP_LIMIT_S`, and returns the end of the last
+/// contiguous range.  If `time` is not inside any range, returns `NaN`.
+///
+/// Used by the seek handler to determine where the pump should resume
+/// fetching after a seek into a buffered region.
+fn continuous_buffer_time(video: &HtmlVideoElement, time: f64) -> f64 {
+    let buffered = video.buffered();
+    let len = buffered.length();
+    let mut end = f64::NAN;
+
+    // Find the range containing `time`.
+    for i in 0..len {
+        if let (Ok(s), Ok(e)) = (buffered.start(i), buffered.end(i)) {
+            if time >= s - PLAYHEAD_RANGE_TOLERANCE_S && time <= e + PLAYHEAD_RANGE_TOLERANCE_S {
+                end = e;
+                // Coalesce subsequent ranges separated by small gaps.
+                for j in (i + 1)..len {
+                    if let (Ok(ns), Ok(ne)) = (buffered.start(j), buffered.end(j)) {
+                        if ns - end <= SMALL_GAP_LIMIT_S {
+                            end = ne;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+    end
+}
+
 /// Check whether `time` falls inside any buffered range of the video element.
 fn is_time_buffered(video: &HtmlVideoElement, time: f64) -> bool {
     let buffered = video.buffered();
@@ -178,8 +214,26 @@ fn is_time_buffered(video: &HtmlVideoElement, time: f64) -> bool {
 /// segment boundaries (e.g. keyframes every 8 s but segments every 6 s).
 /// Ref: dash.js `settings.streaming.gaps.jumpLargeGaps`
 ///
+/// dash.js `GapController._shouldCheckForGaps()` guards with
+/// `!playbackController.isSeeking()` — gap jumping is completely disabled
+/// while the video element is in the seeking state.  Without this guard,
+/// backward seeks to unbuffered positions are defeated: the pump has not
+/// yet fetched data for the seek target, and the gap controller sees the
+/// gap between the playhead and the nearest buffered range ahead, jumping
+/// the playhead forward before the pump can deliver data.
+///
+/// dash.js also clears any pending `jumpTimeoutHandler` in
+/// `_onPlaybackSeeking()`, preventing stale jumps from firing after a
+/// seek starts.
+///
 /// Returns `true` if a gap was jumped, `false` otherwise.
 fn try_jump_gap(video: &HtmlVideoElement) -> bool {
+    // dash.js GapController._shouldCheckForGaps():
+    //   return ... && !playbackController.isSeeking() && ...
+    if video.seeking() {
+        return false;
+    }
+
     let current = video.current_time();
     let buffered = video.buffered();
     let len = buffered.length();
@@ -1616,30 +1670,37 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         });
     }
 
-    // Handle seeks — modelled after how major DASH clients react to seeks:
+    // Handle seeks — faithful implementation of dash.js seek handling.
     //
-    //  • dash.js: PlaybackController listens for the `seeking` event, aborts
-    //    any in-flight segment requests, resets BufferController, and
-    //    reschedules downloads from the new position.
-    //    Source: dash.js/src/streaming/controllers/PlaybackController.js
+    // dash.js seek flow (StreamProcessor.prepareInnerPeriodPlaybackSeeking):
     //
-    //  • Shaka Player: `Player.onSeeking_()` cancels outstanding segment
-    //    requests and calls `StreamingEngine.seeked()` which clears its
-    //    internal state and restarts the update cycle from the new position.
-    //    Source: shaka-player/lib/player.js
+    //  1. If seek target IS buffered:
+    //     a. Call bufferController.pruneBuffer() (regular back-buffer trim).
+    //     b. Calculate continuousBufferTime from the seek position.
+    //     c. If the continuous range covers the entire period, mark
+    //        buffering complete; otherwise set the explicit buffering time
+    //        to the end of the continuous range and restart scheduling.
+    //     Ref: dash.js StreamProcessor.prepareInnerPeriodPlaybackSeeking()
+    //          — "hasBufferAtTargetTime" branch.
     //
-    //  • DASH-IF IOP v4.3 §3.2.4 — the client should react on the `seeking`
-    //    event (not `seeked` — reacting earlier avoids fetching intermediate
-    //    segments).  If the target is already buffered, continue; otherwise
-    //    cancel the current download and start from the target segment.
+    //  2. If seek target is NOT buffered:
+    //     a. clearScheduleTimer() — stop fetching.
+    //     b. fragmentModel.abortRequests() — abort in-flight HTTP requests.
+    //     c. bufferController.prepareForPlaybackSeek()
+    //        → sourceBufferSink.abort() — cancel pending appendBuffer.
+    //        → setIsBufferingCompleted(false) — reset EOS flag.
+    //     d. bufferController.clearBuffers(getAllRangesWithSafetyFactor)
+    //        — prune buffer keeping only data near seek target.
+    //     e. setExplicitBufferingTime(targetTime).
+    //     f. scheduleController.startScheduleTimer() — restart scheduling.
+    //     Ref: dash.js StreamProcessor.prepareInnerPeriodPlaybackSeeking()
+    //          — "!hasBufferAtTargetTime" branch.
     //
-    // In Segments mode, the browser uses baseMediaDecodeTime from each
-    // segment's moof/tfdt to place fragments on the timeline.  No
-    // timestampOffset adjustment or buffer flush is needed — just cancel
-    // the pump and restart from the target segment.
+    // DASH-IF IOP v4.3 §3.2.4 — react on `seeking` (not `seeked`).
     //
     // Firefox fires `seeking` up to 7 times for a single user seek, so
-    // we only bump the pump generation when `next_seg` actually changes.
+    // we debounce by only restarting when `next_seg` actually changes or
+    // the pump is stopped.
     {
         let video_ref = video_ref.clone();
         let mse_state = mse_state.clone();
@@ -1656,45 +1717,137 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     let target_seg = segment_for_time(seek_time);
 
                     if is_time_buffered(&video_for_seek, seek_time) {
-                        // Seek target is already in a buffered range —
-                        // the browser handles this natively.  Just ensure
-                        // the pump will keep filling ahead.
-                        let need_pump = {
+                        // ── Buffered seek ────────────────────────────
+                        // dash.js StreamProcessor.prepareInnerPeriodPlaybackSeeking():
+                        //   "If we seek to a buffered area we can keep
+                        //    requesting where we left before the seek."
+                        //
+                        // Calculate the continuous buffer end from the
+                        // seek position to decide where the pump should
+                        // resume fetching.  This handles the key case
+                        // where the pump reached EOS (all segments
+                        // appended) and next_seg points past the end:
+                        // a backward seek within the buffer needs to
+                        // reset next_seg so the pump doesn't immediately
+                        // exit.
+                        let cont_end = continuous_buffer_time(
+                            &video_for_seek,
+                            seek_time,
+                        );
+                        let desired_next = if cont_end.is_finite() && cont_end > 0.0 {
+                            segment_for_time(cont_end)
+                        } else {
+                            target_seg
+                        };
+
+                        let should_act = {
                             let borrow = mse_state_for_seek.borrow();
                             if let Some(mse) = borrow.as_ref() {
+                                // Need to act if:
+                                // - pump is stopped (e.g. after EOS)
+                                // - next_seg needs updating to fill
+                                //   from buffer end
                                 !mse.pump_running
+                                    || (mse.next_seg != desired_next
+                                        && mse.next_seg >= mse.segments.len())
                             } else {
                                 false
                             }
                         };
-                        if need_pump {
-                            start_pump(&mse_state_for_seek, &video_for_seek);
+
+                        if should_act {
+                            log::info!(
+                                "seek: {seek_time:.1}s buffered, \
+                                 cont_end={cont_end:.1}s, \
+                                 repointing pump → next_seg={desired_next}"
+                            );
+                            {
+                                let mut borrow =
+                                    mse_state_for_seek.borrow_mut();
+                                if let Some(mse) = borrow.as_mut() {
+                                    mse.next_seg = desired_next;
+                                    if desired_next > 0 {
+                                        mse.last_appended_seg =
+                                            Some(desired_next - 1);
+                                    }
+                                }
+                            }
+                            // Use force_start_pump to cancel any stale
+                            // pump and spawn a fresh one.
+                            force_start_pump(
+                                &mse_state_for_seek,
+                                &video_for_seek,
+                            );
                         }
                     } else {
-                        // Seek target is NOT buffered.  In Segments mode the
-                        // browser places fragments via baseMediaDecodeTime, so
-                        // we just cancel the pump and restart from the target
-                        // segment — no buffer flush or timestampOffset needed.
-                        //
-                        // Modelled after dash.js PlaybackController.onPlaybackSeeking():
-                        //   → clearScheduleTimer() + fragmentModel.abortRequests()
-                        //   → setExplicitBufferingTime(targetTime)
-                        //   → scheduleController.startScheduleTimer()
-                        log::info!("seek: target {seek_time:.1}s not buffered, restarting from segment {target_seg}");
+                        // ── Unbuffered seek ──────────────────────────
+                        // dash.js StreamProcessor.prepareInnerPeriodPlaybackSeeking():
+                        //   clearScheduleTimer()
+                        //   fragmentModel.abortRequests()
+                        //   bufferController.prepareForPlaybackSeek()
+                        //     → sourceBufferSink.abort()
+                        //     → setIsBufferingCompleted(false)
+                        //   bufferController.clearBuffers(...)
+                        //   setExplicitBufferingTime(targetTime)
+                        //   scheduleController.startScheduleTimer()
 
+                        // Step 1: Abort pending SourceBuffer operations.
+                        // dash.js SourceBufferSink.abort():
+                        //   appendQueue = [];
+                        //   if (mediaSource.readyState === 'open')
+                        //     _waitForUpdateEnd(() => buffer.abort());
+                        //
+                        // abort() is a no-op when updating=false (MSE
+                        // spec §3.1).  Throws InvalidStateError if
+                        // readyState != "open" (e.g. after endOfStream),
+                        // which we silently ignore — same as dash.js.
                         {
-                            let mut borrow = mse_state_for_seek.borrow_mut();
-                            if let Some(mse) = borrow.as_mut() {
-                                mse.pump_gen = mse.pump_gen.wrapping_add(1);
-                                mse.pump_running = false;
-                                mse.next_seg = target_seg;
-                                mse.last_appended_seg = None;
-                            } else {
-                                return;
+                            let borrow = mse_state_for_seek.borrow();
+                            if let Some(mse) = borrow.as_ref() {
+                                let _ = mse.source_buffer.abort();
                             }
                         }
 
-                        force_start_pump(&mse_state_for_seek, &video_for_seek);
+                        // Step 2: Update pump state and restart.
+                        // Debounce: only restart when next_seg actually
+                        // changes (Firefox fires seeking up to 7 times).
+                        let should_restart = {
+                            let borrow = mse_state_for_seek.borrow();
+                            match borrow.as_ref() {
+                                Some(mse) => {
+                                    mse.next_seg != target_seg
+                                        || !mse.pump_running
+                                }
+                                None => false,
+                            }
+                        };
+
+                        if should_restart {
+                            log::info!(
+                                "seek: {seek_time:.1}s unbuffered, \
+                                 restarting pump from seg {target_seg}"
+                            );
+                            {
+                                let mut borrow =
+                                    mse_state_for_seek.borrow_mut();
+                                if let Some(mse) = borrow.as_mut() {
+                                    // Bump generation to cancel old pump
+                                    // (dash.js clearScheduleTimer +
+                                    // fragmentModel.abortRequests).
+                                    mse.pump_gen =
+                                        mse.pump_gen.wrapping_add(1);
+                                    mse.pump_running = false;
+                                    mse.next_seg = target_seg;
+                                    mse.last_appended_seg = None;
+                                } else {
+                                    return;
+                                }
+                            }
+                            force_start_pump(
+                                &mse_state_for_seek,
+                                &video_for_seek,
+                            );
+                        }
                     }
                 });
 

@@ -1076,7 +1076,7 @@ fn remux_segment(
         }
 
         // Track earliest PTS for tfdt patching.
-        if earliest_pts_secs.is_none() || pts_secs < earliest_pts_secs.unwrap() {
+        if earliest_pts_secs.map_or(true, |e| pts_secs < e) {
             earliest_pts_secs = Some(pts_secs);
         }
 
@@ -1329,7 +1329,7 @@ fn hybrid_segment(
             }
 
             // Track earliest PTS.
-            if earliest_pts_secs.is_none() || pts_secs < earliest_pts_secs.unwrap() {
+            if earliest_pts_secs.map_or(true, |e| pts_secs < e) {
                 earliest_pts_secs = Some(pts_secs);
             }
 
@@ -1374,7 +1374,7 @@ fn hybrid_segment(
                             continue;
                         }
                         // Track earliest PTS for tfdt patching.
-                        if earliest_pts_secs.is_none() || apts_secs < earliest_pts_secs.unwrap() {
+                        if earliest_pts_secs.map_or(true, |e| apts_secs < e) {
                             earliest_pts_secs = Some(apts_secs);
                         }
                     }

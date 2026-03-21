@@ -997,20 +997,6 @@ fn remux_segment(
     // to set baseMediaDecodeTime correctly.
     let mut earliest_pts_secs: Option<f64> = None;
 
-    // Audio pre-roll buffer: holds recent audio packets seen while scanning
-    // for the video keyframe.  When the keyframe is found, these packets
-    // are flushed to the output, providing decoder priming samples that
-    // overlap with the previous segment's audio.  The browser's MSE coded
-    // frame replacement handles the overlap.
-    //
-    // Real DASH packagers (MP4Box, Bento4, Shaka Packager) include audio
-    // pre-roll in each segment for the same reason.  dash.js expects this
-    // and handles the overlap via MSE Segments mode coded frame processing.
-    //
-    // We keep the last 10 audio frames (~230 ms at 44.1 kHz), which is
-    // more than enough for AAC decoder priming (1–2 frames = 23–46 ms).
-    let mut audio_preroll: Vec<(ffmpeg_next::Packet, ffmpeg_next::Rational, f64)> = Vec::new();
-
     for (stream, mut packet) in ictx.packets() {
         if let Some(k) = kill {
             if k.load(Ordering::Relaxed) {
@@ -1054,44 +1040,37 @@ fn remux_segment(
                 }
                 // Skip keyframes before the nominal segment start.
                 if pts_secs < start_time {
-                    audio_preroll.clear();
                     continue;
                 }
                 got_video_keyframe = true;
                 keyframe_pts_secs = pts_secs;
-
-                // Flush audio pre-roll: write buffered audio packets so the
-                // decoder has priming data.  These packets have PTS slightly
-                // before the keyframe, creating a small overlap with the
-                // previous segment that MSE handles via frame replacement.
-                if let Some(out_ai) = out_audio_idx_val {
-                    for (mut apkt, a_in_tb, a_pts_secs) in audio_preroll.drain(..) {
-                        if earliest_pts_secs.is_none() || a_pts_secs < earliest_pts_secs.unwrap() {
-                            earliest_pts_secs = Some(a_pts_secs);
-                        }
-                        apkt.set_stream(out_ai);
-                        apkt.rescale_ts(a_in_tb, out_audio_tb);
-                        let _ = apkt.write_interleaved(&mut octx);
-                    }
-                }
             } else if packet.is_key() && pts_secs >= end_time {
                 // This keyframe starts the NEXT segment — stop here.
                 break;
             }
         } else {
-            // Buffer audio packets while scanning for the video keyframe.
-            // Once the keyframe is found, these are flushed as pre-roll.
-            // After the keyframe, audio packets flow through normally.
-            if !got_video_keyframe {
-                // Only keep audio packets from start_time onward — earlier
-                // packets are too far back and would create excessive overlap.
-                if pts_secs >= start_time {
-                    audio_preroll.push((packet.clone(), in_audio_tb.unwrap_or(in_video_tb), pts_secs));
-                    // Keep only the last 10 frames to limit pre-roll size.
-                    while audio_preroll.len() > 10 {
-                        audio_preroll.remove(0);
-                    }
-                }
+            // ── Audio pre-roll for seamless segment transitions ──────────
+            //
+            // Include audio from start_time onward, even before the video
+            // keyframe is found.  This ensures each segment has audio
+            // starting at the nominal boundary, providing:
+            //
+            //  1. Decoder priming — AAC decoders need 1–2 frames (~23–46 ms)
+            //     of pre-roll to produce clean output.  Without pre-roll,
+            //     the first decoded frame contains silence/artifacts.
+            //
+            //  2. Continuous audio timeline — the previous segment's audio
+            //     extends to ~end_time, and this segment's audio starts at
+            //     ~start_time, creating a small overlap.  The browser's MSE
+            //     coded frame replacement handles this overlap correctly.
+            //
+            // Real DASH packagers (MP4Box, Bento4, Shaka Packager) include
+            // audio pre-roll in every segment.  dash.js and Shaka Player
+            // expect this and handle the overlap via MSE Segments mode.
+            //
+            // FFmpeg's write_interleaved buffers and correctly interleaves
+            // these early audio packets with later video packets.
+            if pts_secs < start_time {
                 continue;
             }
         }

@@ -133,6 +133,16 @@ fn format_time(seconds: f64) -> String {
     }
 }
 
+/// Return the nominal time range `[start, end)` for a segment index.
+///
+/// Segments are assigned fixed-duration slots on the MPD timeline.  The
+/// actual data boundaries may differ slightly due to SAP alignment, but the
+/// nominal range is used for buffer-overlap checks and prefetch decisions.
+fn segment_time_range(seg_idx: usize) -> (f64, f64) {
+    let start = seg_idx as f64 * SEGMENT_DURATION_F;
+    (start, start + SEGMENT_DURATION_F)
+}
+
 /// Return the end of the buffered range that contains `time`.
 /// If `time` is not inside any buffered range, returns 0.0.
 fn buffered_end_at(video: &HtmlVideoElement, time: f64) -> f64 {
@@ -829,8 +839,7 @@ async fn pump_loop(
         //      whether a fragment is already buffered before scheduling
         //      a download.
         {
-            let seg_start = seg_idx as f64 * SEGMENT_DURATION_F;
-            let seg_end = seg_start + SEGMENT_DURATION_F;
+            let (seg_start, seg_end) = segment_time_range(seg_idx);
             let mut already_buffered = false;
             if let Ok(ranges) = sb.buffered() {
                 for i in 0..ranges.length() {
@@ -1750,6 +1759,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             let next = if buf_end > 0.0 {
                                 segment_for_time(buf_end)
                             } else {
+                                // buf_end == 0.0 should not happen here
+                                // (is_time_buffered passed), but can occur
+                                // if the buffered range ends exactly at 0
+                                // or a browser quirk returns empty ranges.
+                                // Fall back to the target segment so the
+                                // pump at least starts near the seek point.
                                 target_seg
                             };
                             (

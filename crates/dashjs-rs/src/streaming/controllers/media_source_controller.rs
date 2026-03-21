@@ -3,11 +3,11 @@
 //! Placeholder structure — full logic to be wired in future integration.
 
 #[derive(Clone, Debug, Default)]
-pub struct Mod {
+pub struct MediaSourceController {
     _initialized: bool,
 }
 
-impl Mod {
+impl MediaSourceController {
     pub fn new() -> Self { Self::default() }
     pub fn reset(&mut self) { self._initialized = false; }
 }

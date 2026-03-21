@@ -3,11 +3,11 @@
 //! Placeholder structure — full logic to be wired in future integration.
 
 #[derive(Clone, Debug, Default)]
-pub struct Mod {
+pub struct TimeSyncController {
     _initialized: bool,
 }
 
-impl Mod {
+impl TimeSyncController {
     pub fn new() -> Self { Self::default() }
     pub fn reset(&mut self) { self._initialized = false; }
 }

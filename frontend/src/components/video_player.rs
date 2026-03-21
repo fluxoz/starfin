@@ -2619,6 +2619,39 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
                         }
 
+                        // Flush stale buffered data ahead of the seek target.
+                        //
+                        // Without this, old SourceBuffer ranges ahead of the new seek
+                        // position survive as disjoint ranges (e.g. [60–66] + [114–120]).
+                        // Once seeking completes (video.seeking() == false), the 150ms
+                        // gap-controller timer sees the [66s–114s] gap and jumps the
+                        // playhead to 114s — defeating the backward seek.
+                        //
+                        // This mirrors dash.js BufferController.onPlaybackSeeking():
+                        //   this.sourceBuffer.remove(seekTime, this.mediaSource.duration)
+                        //
+                        // The pump's wait_for_sb() at the top of pump_loop handles
+                        // the SB being busy after a remove() — safe to fire-and-forget.
+                        {
+                            let borrow = mse_state_for_seek.borrow();
+                            if let Some(mse) = borrow.as_ref() {
+                                let sb = &mse.source_buffer;
+                                // Remove everything from the end of the seek-target segment
+                                // to infinity, clearing all stale ranges ahead.
+                                let flush_start = (target_seg as f64 + 1.0) * SEGMENT_DURATION_F;
+                                if !sb.updating() {
+                                    match sb.remove(flush_start, f64::INFINITY) {
+                                        Ok(_) => log::info!(
+                                            "seek: flushing stale SB data [{flush_start:.1}s, ∞) ahead of seek to {seek_time:.1}s"
+                                        ),
+                                        Err(e) => log::warn!(
+                                            "seek: sb.remove({flush_start:.1}, ∞) failed: {e:?}"
+                                        ),
+                                    }
+                                }
+                            }
+                        }
+
                         force_start_pump(&mse_state_for_seek, &video_for_seek);
                     }
                 });

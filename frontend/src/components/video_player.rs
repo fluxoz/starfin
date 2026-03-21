@@ -1898,17 +1898,17 @@ async fn pump_loop(
                     let _ = sb.remove(0.0, force_end);
                     if !wait_for_sb(&sb, &state, pump_id).await { return; }
                 }
-                let mut retried = false;
-                for retry in 0..MAX_APPEND_RETRIES {
+                let mut append_succeeded = false;
+                for attempt in 1..=MAX_APPEND_RETRIES {
                     if !wait_for_sb(&sb, &state, pump_id).await { return; }
                     if sb.append_buffer_with_array_buffer(&array_buffer).is_ok() {
-                        retried = true;
+                        append_succeeded = true;
                         break;
                     }
-                    log::warn!("segment {seg_idx}: appendBuffer retry {}/{MAX_APPEND_RETRIES}", retry + 1);
+                    log::warn!("segment {seg_idx}: appendBuffer attempt {attempt}/{MAX_APPEND_RETRIES} failed");
                     TimeoutFuture::new(200).await;
                 }
-                if !retried {
+                if !append_succeeded {
                     log::error!("segment {seg_idx}: appendBuffer failed after {MAX_APPEND_RETRIES} retries, skipping");
                     if let Some(s) = state.borrow_mut().as_mut() {
                         if s.pump_gen == pump_id { s.next_seg = seg_idx + 1; }

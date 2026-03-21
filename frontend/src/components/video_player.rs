@@ -1224,24 +1224,12 @@ struct MseState {
     last_appended_seg: Option<usize>,
     /// Extended DASH infrastructure (ABR, metrics, throughput, events, etc.)
     dash_ext: Option<DashExtState>,
-    /// Matches dash.js `BufferController.isPruningInProgress`.
-    ///
-    /// Set to `true` by the pruning timer (`_pruning_timer`) when `sb.remove()`
-    /// is called.  Cleared by the `updateend` one-shot listener when the remove
-    /// completes.  `pump_loop` checks this flag before appending and yields
-    /// while it is set — matching dash.js `StreamProcessor._onMediaFragmentNeeded`
-    /// which returns early when `bufferController.getIsPruningInProgress()`.
-    ///
-    /// `Rc<Cell<bool>>` so the timer callback (non-async Closure) and the pump
-    /// loop (async task) can share it without `RefCell` borrowing.
-    is_pruning: Rc<Cell<bool>>,
-    /// 10 s wallclock pruning timer matching dash.js
-    /// `BufferController._onWallclockTimeUpdated()` +
-    /// `settings.streaming.buffer.bufferPruningInterval = 10`.
-    ///
-    /// Stored here so it stays alive as long as the MseState exists.
-    /// Dropped automatically on cleanup / quality change.
-    _pruning_timer: Option<Interval>,
+    /// Timestamp (ms) of the last successful back-buffer eviction.
+    /// Used to implement the 10 s wallclock pruning interval matching
+    /// dash.js `bufferPruningInterval = 10`.  Eviction runs inside
+    /// `pump_loop` (not a separate timer/task) to avoid competing
+    /// `updateend` listeners on the SourceBuffer.
+    last_eviction_ms: f64,
 }
 
 /// Parse a DASH MPD manifest and return the list of segment URLs with durations.
@@ -1438,34 +1426,45 @@ async fn wait_for_sb(
 ///   • DASH-IF IOP v4.3 §3.2.8 recommends proactive buffer management.
 ///
 /// **Design: fire-and-proceed (non-blocking)**
+/// Evict played data behind the playhead to bound memory usage.
 ///
-/// `sb.remove()` sets `updating = true`.  This function fires `sb.remove()`
-/// and returns immediately without waiting for `updateend`.
+/// Matches dash.js `BufferController.pruneBuffer()` → `getClearRanges()`.
+/// Called from `pump_loop` at most once every 10 s (matching dash.js
+/// `bufferPruningInterval = 10`).
 ///
-/// **NOTE**: This function is not called directly in the current architecture.
-/// The pruning timer (`start_pruning_timer`) has inline eviction logic.
-/// Retained as documentation and for `force_evict_back_buffer`'s reference.
-///
-/// **Batch-minimum threshold**
-///
-/// We only fire `sb.remove()` when there are at least `2 × SEGMENT_DURATION_F`
-/// seconds of data to evict (≈ 12 s).
-///
-/// `force_evict_back_buffer` (called after a `QuotaExceededError`) is the
-/// emergency variant that always waits for completion and ignores this minimum.
-fn evict_back_buffer(
+/// Waits for the SourceBuffer to be idle, calls `sb.remove()`, then waits
+/// for completion.  Because this only fires every 10 s, the blocking cost
+/// is amortized and doesn't cause per-segment stutter.
+async fn evict_back_buffer(
     sb: &web_sys::SourceBuffer,
     video: &HtmlVideoElement,
+    state: &Rc<RefCell<Option<MseState>>>,
+    pump_id: u32,
 ) {
     let current = video.current_time();
 
-    // Check if there's actually buffered data.
     let ranges = match sb.buffered() {
         Ok(r) => r,
         Err(_) => return,
     };
     let len = ranges.length();
     if len == 0 {
+        return;
+    }
+
+    // Calculate total buffered as the SUM of actual range durations,
+    // matching dash.js BufferController.getBufferLength().
+    let mut total_buffered = 0.0_f64;
+    for i in 0..len {
+        if let (Ok(s), Ok(e)) = (ranges.start(i), ranges.end(i)) {
+            total_buffered += e - s;
+        }
+    }
+
+    let max_total = MSE_BACK_BUFFER_S + MSE_TARGET_BUFFER_S;
+
+    // Only evict when total buffer exceeds the cap.
+    if total_buffered <= max_total {
         return;
     }
 
@@ -1488,29 +1487,27 @@ fn evict_back_buffer(
         }
     }
 
+    if evict_start >= evict_end {
+        return;
+    }
+
     let evict_amount = evict_end - evict_start;
+    if evict_amount < SEGMENT_DURATION_F {
+        return; // too small to bother
+    }
 
-    // Batch-minimum guard: only evict when there's at least 2 × SEGMENT_DURATION_F
-    // worth of data to remove (~12 s).  This fires eviction every ~2 segments
-    // rather than every segment, cutting remove() frequency in half and
-    // eliminating the per-segment decoder stall that caused visible stuttering.
-    if evict_start >= evict_end || evict_amount < SEGMENT_DURATION_F * 2.0 {
+    // Wait for SB to be idle before removing.
+    if !wait_for_sb(sb, state, pump_id).await {
         return;
     }
 
-    // If the SB is already busy (previous iteration's remove or append is
-    // still in progress), skip eviction this iteration.  The pre-append
-    // wait_for_sb will handle the current operation, and eviction will
-    // fire on the next iteration once data accumulates again.
-    if sb.updating() {
-        return;
-    }
-
-    // Fire remove() and return immediately.
     log::info!(
-        "evict: removing [{evict_start:.3}–{evict_end:.3}] ({evict_amount:.1}s, current={current:.3})"
+        "evict: removing [{evict_start:.3}–{evict_end:.3}] ({evict_amount:.1}s, total={total_buffered:.1}s, current={current:.3})"
     );
     let _ = sb.remove(evict_start, evict_end);
+
+    // Wait for the remove operation to complete.
+    let _ = wait_for_sb(sb, state, pump_id).await;
 }
 
 /// Unconditional back-buffer eviction used as a recovery step after a
@@ -1679,133 +1676,6 @@ fn kick_prefetch(
 
 /// Start the 10 s wallclock pruning timer.
 ///
-/// Matches dash.js `BufferController._onWallclockTimeUpdated()`:
-///   - `wallclockTimeUpdateInterval = 100 ms` (timer fires every 100 ms)
-///   - `bufferPruningInterval = 10 s` (prune only after 10 s have elapsed)
-///   - `pruneBuffer()` → `clearBuffers(getClearRanges())`
-///
-/// Uses a `gloo_timers::callback::Interval` (10 s) which fires a non-async
-/// callback.  The callback:
-///   1. Skips if the SourceBuffer is busy (`sb.updating()` — matches dash.js
-///      `_waitForUpdateEnd` which queues operations)
-///   2. Calculates clear ranges (matching `getClearRanges()`)
-///   3. Calls `sb.remove()`, sets `is_pruning = true`
-///   4. Attaches a one-shot `updateend` listener that clears `is_pruning`
-///
-/// `pump_loop` checks `is_pruning` before `appendBuffer` and yields while
-/// set — matching dash.js `StreamProcessor._onMediaFragmentNeeded()` line 438:
-///   `if (bufferController.getIsPruningInProgress()) { _noValidRequest(); return; }`
-///
-/// The `Interval` is stored in `MseState._pruning_timer` so it stays alive
-/// for the lifetime of the MseState and is dropped on cleanup.
-fn start_pruning_timer(
-    state: &Rc<RefCell<Option<MseState>>>,
-    video: &HtmlVideoElement,
-) {
-    let state_c = state.clone();
-    let video_c = video.clone();
-
-    let timer = Interval::new(10_000, move || {
-        // Grab SB + is_pruning from state.
-        let (sb, is_pruning_flag) = {
-            let borrow = state_c.borrow();
-            match borrow.as_ref() {
-                Some(s) => (s.source_buffer.clone(), s.is_pruning.clone()),
-                None => return,
-            }
-        };
-
-        // If already pruning or SB is busy, skip — matches dash.js which
-        // queues the operation via _waitForUpdateEnd (we skip instead since
-        // we don't have a callback queue, and the next timer fire will retry).
-        if is_pruning_flag.get() || sb.updating() {
-            return;
-        }
-
-        // Calculate clear ranges — matching dash.js getClearRanges().
-        let current = video_c.current_time();
-        let keep_start = (current - MSE_BACK_BUFFER_S).max(0.0);
-
-        let ranges = match sb.buffered() {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        let len = ranges.length();
-        if len == 0 {
-            return;
-        }
-
-        // Find data strictly behind keep_start.
-        let mut evict_start = f64::MAX;
-        let mut evict_end = 0.0_f64;
-        for i in 0..len {
-            if let (Ok(s), Ok(e)) = (ranges.start(i), ranges.end(i)) {
-                if s < keep_start {
-                    if s < evict_start {
-                        evict_start = s;
-                    }
-                    evict_end = evict_end.max(e.min(keep_start));
-                }
-            }
-        }
-
-        if evict_start >= evict_end {
-            return;
-        }
-
-        let evict_amount = evict_end - evict_start;
-
-        // Batch-minimum: only prune when there's at least one segment
-        // worth of data to remove.  dash.js getClearRanges() has no
-        // minimum, but our timer fires every 10 s so we avoid trivially
-        // small removes (< 6 s).
-        if evict_amount < SEGMENT_DURATION_F {
-            return;
-        }
-
-        // Set isPruningInProgress = true BEFORE calling sb.remove().
-        // Matches dash.js BufferController line 1034.
-        is_pruning_flag.set(true);
-
-        log::info!(
-            "prune: removing [{evict_start:.3}–{evict_end:.3}] ({evict_amount:.1}s, current={current:.3})"
-        );
-        if sb.remove(evict_start, evict_end).is_err() {
-            // Remove failed — clear the flag so the pump isn't blocked.
-            is_pruning_flag.set(false);
-            return;
-        }
-
-        // Attach one-shot updateend listener that clears is_pruning.
-        // Matches dash.js _onRemoved callback flow.
-        let flag = is_pruning_flag.clone();
-        let cb = Closure::once(Box::new(move || {
-            flag.set(false);
-            log::info!("prune: remove completed");
-        }) as Box<dyn FnOnce()>);
-        let mut opts = web_sys::AddEventListenerOptions::new();
-        opts.set_once(true);
-        if sb
-            .add_event_listener_with_callback_and_add_event_listener_options(
-                "updateend",
-                cb.as_ref().unchecked_ref(),
-                &opts,
-            )
-            .is_ok()
-        {
-            cb.forget(); // Browser owns it; released after fire (once:true).
-        } else {
-            // Listener attachment failed — clear flag so pump isn't stuck.
-            is_pruning_flag.set(false);
-        }
-    });
-
-    // Store the timer in MseState so it stays alive.
-    if let Some(s) = state.borrow_mut().as_mut() {
-        s._pruning_timer = Some(timer);
-    }
-}
-
 /// Start (or restart) the async segment-pump loop.
 ///
 /// Bumps `pump_gen` so any previously-running `pump_loop` detects the
@@ -1899,17 +1769,13 @@ fn force_start_pump(state: &Rc<RefCell<Option<MseState>>>, video: &HtmlVideoElem
 ///   3. Kick off background prefetch tasks for the lookahead window.
 ///   4. Enforce a forward buffer limit — sleep when enough data is buffered.
 ///   5. Pull the segment from the prefetch cache (or fetch inline as fallback).
-///   6. Wait for pruning to complete (if in progress) — matches dash.js
-///      `StreamProcessor._onMediaFragmentNeeded()` line 438 which returns
-///      early when `bufferController.getIsPruningInProgress()`.
-///   7. Strip redundant init boxes (ftyp/moov) from the fMP4 data, then append.
-///   8. Wait for `updateend`.
-///   9. Advance to the next segment and repeat.
-///
-/// Back-buffer eviction runs on a 10 s `Interval` timer
-/// (`start_pruning_timer`), matching dash.js `bufferPruningInterval`.
-/// Pruning sets `is_pruning = true` and the pump yields at step 6
-/// until the remove completes — no competing `addEventListener` calls.
+///   6. Strip redundant init boxes (ftyp/moov) from the fMP4 data.
+///   7. Evict back-buffer if ≥ 10 s since last eviction (matching dash.js
+///      `bufferPruningInterval = 10 s`).  Eviction runs inline (not in a
+///      separate timer/task) to avoid competing `updateend` listeners.
+///   8. Wait for SB idle, then `appendBuffer`.
+///   9. Wait for `updateend`.
+///  10. Advance to the next segment and repeat.
 ///
 /// The loop exits when all segments are appended, the generation counter
 /// no longer matches (a seek started a newer pump), or the MseState has
@@ -2162,31 +2028,34 @@ async fn pump_loop(
             continue;
         }
 
-        // ── 7. Wait for pruning to complete ──────────────────────────
-        // Matches dash.js StreamProcessor._onMediaFragmentNeeded() line 438:
-        //   if (bufferController.getIsPruningInProgress()) {
-        //       _noValidRequest(); return;
-        //   }
-        // The pruning timer (start_pruning_timer) sets is_pruning=true
-        // when sb.remove() starts, and a one-shot updateend listener
-        // clears it when the remove completes.  We yield here until
-        // pruning is done — the SourceBuffer is exclusively owned by
-        // the remove operation during this time.
+        // ── 7. Time-based back-buffer eviction ─────────────────────────
+        // Matches dash.js `BufferController._onWallclockTimeUpdated()` +
+        // `bufferPruningInterval = 10 s`: eviction runs at most once every
+        // 10 s of wall-clock time, never on every segment boundary.
+        //
+        // The eviction call is `await`ed (blocking) because the SourceBuffer
+        // can only have one operation at a time.  However, because it only
+        // fires once every 10 s, the impact is negligible — at worst one
+        // stall per 10 s, not per segment.
         {
-            let is_pruning = {
+            let now_ms = js_sys::Date::now();
+            let last_evict = {
                 let borrow = state.borrow();
                 match borrow.as_ref() {
-                    Some(s) if s.pump_gen == pump_id => s.is_pruning.clone(),
+                    Some(s) if s.pump_gen == pump_id => s.last_eviction_ms,
                     _ => return,
                 }
             };
-            // Yield while pruning — check every 5 ms (macrotask).
-            // In practice the remove finishes in < 1 ms, so this
-            // almost never loops more than once.
-            while is_pruning.get() {
-                TimeoutFuture::new(5).await;
+            if now_ms - last_evict >= 10_000.0 {
+                evict_back_buffer(&sb, &video, &state, pump_id).await;
                 if !is_pump_current(&state, pump_id) {
                     return;
+                }
+                // Update the last eviction timestamp.
+                if let Some(s) = state.borrow_mut().as_mut() {
+                    if s.pump_gen == pump_id {
+                        s.last_eviction_ms = js_sys::Date::now();
+                    }
                 }
             }
         }
@@ -2651,7 +2520,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         } else {
                             None
                         };
-                        let is_pruning = Rc::new(Cell::new(false));
                         *mse_state.borrow_mut() = Some(MseState {
                             media_source,
                             source_buffer: source_buffer.clone(),
@@ -2670,12 +2538,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 error_recovery: ErrorRecovery::new(),
                                 live: live_ctrl,
                             }),
-                            is_pruning: is_pruning.clone(),
-                            _pruning_timer: None,
+                            last_eviction_ms: 0.0,
                         });
-
-                        // Start the 10 s pruning timer (dash.js bufferPruningInterval).
-                        start_pruning_timer(&mse_state, &video);
 
 
                         status.set(String::new());
@@ -3039,9 +2903,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 if let Err(e) = sb.abort() {
                                     log::warn!("seek: sb.abort() failed (non-fatal): {e:?}");
                                 }
-                                // If pruning was in progress, abort() cancelled it.
-                                // Clear the flag so the new pump doesn't yield needlessly.
-                                mse.is_pruning.set(false);
                                 // Remove everything from the exact seek position to
                                 // media_source.duration().  Using seek_time (not the next
                                 // segment boundary) matches dash.js exactly:

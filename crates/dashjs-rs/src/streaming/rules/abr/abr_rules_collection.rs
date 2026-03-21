@@ -13,7 +13,7 @@ impl AbrRulesCollection {
             abandon_requests_rule::AbandonRequestsRule};
         Self {
             quality_rules: vec![
-                Box::new(ThroughputRule::default()), Box::new(BolaRule::default()),
+                Box::new(ThroughputRule::default()), Box::new(BolaRule::new(12.0)),
                 Box::new(InsufficientBufferRule), Box::new(DroppedFramesRule),
             ],
             abandon_rules: vec![Box::new(AbandonRequestsRule)],
@@ -59,12 +59,13 @@ mod tests {
             media_type: MediaType::Video,
             current_representation: None,
             available_representations: vec![
-                RepresentationInfo { quality_index: 0, bandwidth: 500_000, media_type: "video".into() },
-                RepresentationInfo { quality_index: 1, bandwidth: 1_000_000, media_type: "video".into() },
+                RepresentationInfo { quality_index: 0, bandwidth: 500_000, bitrate_in_kbit: 500.0, media_type: "video".into(), id: Some("0".into()), absolute_index: 0 },
+                RepresentationInfo { quality_index: 1, bandwidth: 1_000_000, bitrate_in_kbit: 1000.0, media_type: "video".into(), id: Some("1".into()), absolute_index: 1 },
             ],
             buffer_level: 15.0, throughput: 1_500_000.0, latency: 0.05,
             is_dynamic: false, dropped_frames_total: 0, total_frames: 1000,
             schedule_controller_state: BufferState::Loaded,
+            ..Default::default()
         };
         let req = col.get_max_quality(&ctx);
         assert!(req.representation.is_some());

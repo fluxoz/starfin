@@ -3,7 +3,7 @@
 //! BOLA (Buffer Occupancy based Lyapunov Algorithm) for adaptive bitrate selection.
 //! See <http://arxiv.org/abs/1601.06748> for the algorithm description.
 
-use crate::streaming::rules::rules_context::{BufferState, MediaType, RulesContext};
+use crate::streaming::rules::rules_context::{BufferState, RulesContext};
 use crate::streaming::rules::switch_request::{
     Priority, RepresentationInfo, SwitchReason, SwitchRequest,
 };
@@ -242,7 +242,7 @@ impl AbrRule for BolaRule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::streaming::rules::rules_context::BufferState;
+    use crate::streaming::rules::rules_context::{BufferState, MediaType};
 
     fn make_reps() -> Vec<RepresentationInfo> {
         vec![

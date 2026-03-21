@@ -11,7 +11,8 @@ impl AbrRule for InsufficientBufferRule {
         if let Some(first) = context.available_representations.first() {
             SwitchRequest { representation: Some(first.clone()), priority: Priority::Strong,
                 reason: Some(SwitchReason { throughput: None, latency: None, buffer_level: Some(context.buffer_level),
-                    message: format!("InsufficientBufferRule: buffer {:.2}s", context.buffer_level) }),
+                    message: format!("InsufficientBufferRule: buffer {:.2}s", context.buffer_level),
+                    ..Default::default() }),
                 rule: Some("InsufficientBufferRule".into()) }
         } else { SwitchRequest::no_change() }
     }

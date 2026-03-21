@@ -13,7 +13,8 @@ impl AbrRule for DroppedFramesRule {
         if let Some(first) = context.available_representations.first() {
             SwitchRequest { representation: Some(first.clone()), priority: Priority::Weak,
                 reason: Some(SwitchReason { throughput: None, latency: None, buffer_level: None,
-                    message: format!("DroppedFramesRule: {:.1}% dropped", ratio * 100.0) }),
+                    message: format!("DroppedFramesRule: {:.1}% dropped", ratio * 100.0),
+                    ..Default::default() }),
                 rule: Some("DroppedFramesRule".into()) }
         } else { SwitchRequest::no_change() }
     }

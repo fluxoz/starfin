@@ -9,3 +9,5 @@ pub mod text;
 pub mod thumbnail;
 pub mod utils;
 pub mod vo;
+pub mod media_player_events;
+pub mod media_player;

@@ -70,6 +70,7 @@ impl AbrRule for ThroughputRule {
                     "ThroughputRule: safe_throughput={:.0} chose bitrate={}",
                     safe_throughput, chosen.bandwidth
                 ),
+                ..Default::default()
             }),
             rule: Some("ThroughputRule".into()),
         }
@@ -88,17 +89,17 @@ mod tests {
 
     fn make_reps() -> Vec<RepresentationInfo> {
         vec![
-            RepresentationInfo { quality_index: 0, bandwidth: 500_000, media_type: "video".into() },
-            RepresentationInfo { quality_index: 1, bandwidth: 1_000_000, media_type: "video".into() },
-            RepresentationInfo { quality_index: 2, bandwidth: 2_000_000, media_type: "video".into() },
-            RepresentationInfo { quality_index: 3, bandwidth: 4_000_000, media_type: "video".into() },
+            RepresentationInfo { quality_index: 0, bandwidth: 500_000, bitrate_in_kbit: 500.0, media_type: "video".into(), id: Some("0".into()), absolute_index: 0 },
+            RepresentationInfo { quality_index: 1, bandwidth: 1_000_000, bitrate_in_kbit: 1000.0, media_type: "video".into(), id: Some("1".into()), absolute_index: 1 },
+            RepresentationInfo { quality_index: 2, bandwidth: 2_000_000, bitrate_in_kbit: 2000.0, media_type: "video".into(), id: Some("2".into()), absolute_index: 2 },
+            RepresentationInfo { quality_index: 3, bandwidth: 4_000_000, bitrate_in_kbit: 4000.0, media_type: "video".into(), id: Some("3".into()), absolute_index: 3 },
         ]
     }
 
     fn ctx(throughput: f64, state: BufferState) -> RulesContext {
         RulesContext {
             media_type: MediaType::Video,
-            current_representation: Some(RepresentationInfo { quality_index: 0, bandwidth: 500_000, media_type: "video".into() }),
+            current_representation: Some(RepresentationInfo { quality_index: 0, bandwidth: 500_000, bitrate_in_kbit: 500.0, media_type: "video".into(), id: Some("0".into()), absolute_index: 0 }),
             available_representations: make_reps(),
             buffer_level: 15.0,
             throughput,
@@ -107,6 +108,7 @@ mod tests {
             dropped_frames_total: 0,
             total_frames: 1000,
             schedule_controller_state: state,
+            ..Default::default()
         }
     }
 

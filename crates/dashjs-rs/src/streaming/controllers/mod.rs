@@ -1,13 +1,24 @@
-//! Port of the corresponding dash.js streaming controller.
-//!
-//! Placeholder structure — full logic to be wired in future integration.
+//! Port of `dash.js/src/streaming/controllers/`.
+pub mod abr_controller;
+pub mod buffer_controller;
+pub mod playback_controller;
+pub mod schedule_controller;
+pub mod stream_controller;
+pub mod gap_controller;
+pub mod throughput_controller;
+pub mod media_source_controller;
+pub mod catchup_controller;
+pub mod base_url_controller;
+pub mod fragment_controller;
+pub mod media_controller;
+pub mod event_controller;
+pub mod time_sync_controller;
 
-#[derive(Clone, Debug, Default)]
-pub struct Mod {
-    _initialized: bool,
-}
-
-impl Mod {
-    pub fn new() -> Self { Self::default() }
-    pub fn reset(&mut self) { self._initialized = false; }
-}
+pub use abr_controller::AbrController;
+pub use buffer_controller::BufferController;
+pub use playback_controller::PlaybackController;
+pub use schedule_controller::ScheduleController;
+pub use stream_controller::StreamController;
+pub use gap_controller::GapController;
+pub use throughput_controller::ThroughputController;
+pub use media_source_controller::MediaSourceController;

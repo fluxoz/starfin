@@ -75,7 +75,7 @@ pub fn probe_codecs(path: &Path) -> CodecInfo {
 
 /// Build an RFC 6381 video codec string from `AVCodecParameters`.
 fn video_codec_string(params: &ffmpeg_next::codec::Parameters) -> String {
-    let ptr = params.as_ptr();
+    let ptr = unsafe { params.as_ptr() };
     // Safety: `ptr` is valid as long as `params` is alive.
     let (codec_id, profile, level) = unsafe {
         ((*ptr).codec_id, (*ptr).profile, (*ptr).level)
@@ -101,7 +101,7 @@ fn video_codec_string(params: &ffmpeg_next::codec::Parameters) -> String {
             // constraint_set_flags — ffmpeg doesn't expose them directly;
             // use a reasonable default per profile.
             let constraint: u8 = match profile_idc {
-                0x42 => 0xC0, // Baseline: constraint_set0_flag + constraint_set1_flag
+                0x42 => 0xC0, // Baseline: constraint_set0_flag | constraint_set1_flag
                 0x4D => 0x40, // Main: constraint_set1_flag
                 _    => 0x00, // High and above
             };
@@ -120,7 +120,7 @@ fn video_codec_string(params: &ffmpeg_next::codec::Parameters) -> String {
 
 /// Build an RFC 6381 audio codec string from `AVCodecParameters`.
 fn audio_codec_string(params: &ffmpeg_next::codec::Parameters) -> String {
-    let ptr = params.as_ptr();
+    let ptr = unsafe { params.as_ptr() };
     let codec_id = unsafe { (*ptr).codec_id };
     let id = ffmpeg_next::codec::Id::from(codec_id);
 

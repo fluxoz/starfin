@@ -1064,12 +1064,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             // 1:1 match of dash.js SourceBufferSink._getCodecStringForRepresentation():
                             //   `representation.mimeType + ';codecs="' + representation.codecs + '"'`
                             // Falls back to probing only when the MPD has no codecs attribute.
-                            let mime: String = if let Some(ref mc) = mpd_result.mime_codec {
+                            let mime: String = if let Some(ref codec_from_mpd) = mpd_result.mime_codec {
                                 // Codec from MPD — verify the browser supports it
-                                if web_sys::MediaSource::is_type_supported(mc) {
-                                    mc.clone()
+                                if web_sys::MediaSource::is_type_supported(codec_from_mpd) {
+                                    codec_from_mpd.clone()
                                 } else {
-                                    log::warn!("MSE: MPD codec {mc} not supported, falling back to probe");
+                                    log::warn!("MSE: MPD codec {codec_from_mpd} not supported, falling back to probe");
                                     probe_mime_type()
                                 }
                             } else {

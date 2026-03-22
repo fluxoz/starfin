@@ -570,7 +570,15 @@ pub fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
     while pos + 8 <= data.len() {
         let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
             as usize;
-        if size < 8 || pos + size > data.len() {
+        // size == 0 means "box extends to EOF" per ISO BMFF; consume the rest.
+        if size == 0 {
+            let box_type = &data[pos + 4..pos + 8];
+            if box_type != b"ftyp" && box_type != b"moov" {
+                result.extend_from_slice(&data[pos..]);
+            }
+            break;
+        }
+        if size < 8 || size > data.len() - pos {
             break;
         }
         let box_type = &data[pos + 4..pos + 8];

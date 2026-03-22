@@ -1434,7 +1434,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             if let Some(dp) = borrow.as_ref() {
                                 if !dp.source_buffer.updating() {
                                     let dur = video_for_seek.duration();
-                                    let end = if dur.is_finite() && dur > 0.0 { dur } else { f64::MAX };
+                                    let end = if dur.is_finite() && dur > 0.0 { dur } else { f64::INFINITY };
                                     let _ = dp.source_buffer.remove(0.0, end);
                                 }
                             }

@@ -56,6 +56,10 @@ const BACK_BUFFER_S: f64 = 20.0;
 const LOOKAHEAD_SEGMENTS: usize = 3;
 // Wall-clock interval (ms) between back-buffer eviction attempts.
 const EVICTION_INTERVAL_MS: f64 = 10_000.0;
+// Max consecutive fetch failures before skipping a segment.
+const MAX_FETCH_FAILURES: u32 = 3;
+// Max consecutive append failures before the pump exits entirely.
+const MAX_APPEND_FAILURES: u32 = 5;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // DASH ENGINE — powered by dashjs-rs
@@ -412,7 +416,9 @@ async fn force_evict_back_buffer(
     };
 
     if sb.updating() {
-        let _ = sb.abort();
+        if let Err(e) = sb.abort() {
+            log::warn!("force_evict: sb.abort() failed: {e:?}");
+        }
         TimeoutFuture::new(50).await;
     }
 
@@ -546,7 +552,7 @@ async fn pump_loop(
                     if !resp.ok() {
                         log::error!("pump[{pump_id}]: segment {seg_idx} HTTP {}", resp.status());
                         consecutive_failures += 1;
-                        if consecutive_failures > 3 {
+                        if consecutive_failures > MAX_FETCH_FAILURES {
                             // Skip this segment after too many failures
                             if let Some(dp) = state.borrow_mut().as_mut() {
                                 if dp.pump_gen == pump_id { dp.next_seg = seg_idx + 1; }
@@ -630,7 +636,7 @@ async fn pump_loop(
                 } else {
                     log::error!("pump[{pump_id}]: append failed for segment {seg_idx}: {:?}", e);
                     consecutive_failures += 1;
-                    if consecutive_failures > 5 {
+                    if consecutive_failures > MAX_APPEND_FAILURES {
                         log::error!("pump[{pump_id}]: too many consecutive failures, exiting");
                         return;
                     }

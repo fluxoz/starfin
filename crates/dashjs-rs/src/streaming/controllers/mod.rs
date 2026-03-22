@@ -22,3 +22,5 @@ pub use stream_controller::StreamController;
 pub use gap_controller::GapController;
 pub use throughput_controller::ThroughputController;
 pub use media_source_controller::MediaSourceController;
+pub use catchup_controller::{CatchupController, CatchupMode};
+pub use gap_controller::GapInfo;

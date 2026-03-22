@@ -68,6 +68,20 @@ const MAX_APPEND_FAILURES: u32 = 5;
 // Max QuotaExceeded retries for a single segment before skipping it.
 const MAX_QUOTA_RETRIES: u32 = 3;
 
+// ── Lookahead prefetch (mirrors dash.js StreamProcessor._onMediaFragmentNeeded) ──
+/// How many segments ahead of next_seg to prefetch into the SegmentCache.
+/// dash.js uses a full bufferTarget/segmentDuration window; we use 3 here.
+const LOOKAHEAD_WINDOW: usize = 3;
+
+/// Shared cache of already-fetched segment bytes, keyed by segment index.
+/// Populated by background `spawn_local` prefetch tasks.
+/// Accessed by both the main pump loop (read/evict) and background tasks (write).
+type SegmentCache = Rc<RefCell<std::collections::HashMap<usize, Vec<u8>>>>;
+
+/// Set of segment indices currently being fetched in background prefetch tasks.
+/// Prevents duplicate in-flight fetches for the same segment.
+type InFlightSet = Rc<RefCell<std::collections::HashSet<usize>>>;
+
 // ══════════════════════════════════════════════════════════════════════════════
 // DASH ENGINE — powered by dashjs-rs
 // ══════════════════════════════════════════════════════════════════════════════
@@ -152,6 +166,11 @@ struct DashPlayer {
     /// races between sb.remove() and sb.appendBuffer().
     /// Matches dash.js _onWallclockTimeUpdated / bufferPruningInterval=10s.
     last_eviction_ms: f64,
+    /// Pre-fetched segment bytes (keyed by segment index).
+    /// Background tasks write here; pump_loop reads and evicts.
+    seg_cache: SegmentCache,
+    /// Set of segment indices currently being fetched in background tasks.
+    in_flight: InFlightSet,
 }
 
 // ── MPD Parsing (via dashjs-rs) ──────────────────────────────────────────────
@@ -565,6 +584,73 @@ async fn force_evict_for_quota(
     true
 }
 
+/// Spawn background prefetch tasks for segments [next_seg+1, next_seg+LOOKAHEAD_WINDOW).
+///
+/// Mirrors dash.js `StreamProcessor._onMediaFragmentNeeded` + `FragmentController`
+/// background loading pattern: start fetching the next N segments in the background
+/// so they are already cached when the main pump loop needs them.
+///
+/// - Skips segments already in the cache (already fetched)
+/// - Skips segments already in-flight (fetch in progress)
+/// - Stores result bytes in `seg_cache` on completion
+/// - Removes from `in_flight` when done (success or failure)
+fn kick_prefetch(
+    state: &Rc<RefCell<Option<DashPlayer>>>,
+    pump_id: u32,
+) {
+    let (seg_cache, in_flight, urls): (SegmentCache, InFlightSet, Vec<(usize, String)>) = {
+        let borrow = state.borrow();
+        let dp = match borrow.as_ref() {
+            Some(dp) if dp.pump_gen == pump_id => dp,
+            _ => return,
+        };
+        let next = dp.next_seg;
+        let total = dp.segments.len();
+        let cache = dp.seg_cache.clone();
+        let inflight = dp.in_flight.clone();
+
+        // Collect URLs for segments we need to prefetch
+        let cache_borrow = cache.borrow();
+        let inflight_borrow = inflight.borrow();
+        let lookahead_end = total.min(next.saturating_add(LOOKAHEAD_WINDOW + 1));
+        let to_fetch: Vec<(usize, String)> = (next.saturating_add(1)..lookahead_end)
+            .filter(|&i| !cache_borrow.contains_key(&i) && !inflight_borrow.contains(&i))
+            .map(|i| (i, dp.segments[i].url.clone()))
+            .collect();
+        drop(cache_borrow);
+        drop(inflight_borrow);
+
+        (cache, inflight, to_fetch)
+    };
+
+    for (seg_idx, url) in urls {
+        // Mark as in-flight before spawning
+        in_flight.borrow_mut().insert(seg_idx);
+
+        let cache_clone = seg_cache.clone();
+        let inflight_clone = in_flight.clone();
+
+        spawn_local(async move {
+            let result = Request::get(&url).send().await;
+            let bytes = match result {
+                Ok(resp) if resp.ok() => resp.binary().await.ok(),
+                _ => None,
+            };
+
+            // Store in cache if successful, always remove from in-flight
+            if let Some(b) = bytes {
+                if !b.is_empty() {
+                    cache_clone.borrow_mut().insert(seg_idx, b);
+                    log::debug!("prefetch: cached segment {seg_idx}");
+                }
+            } else {
+                log::debug!("prefetch: failed to fetch segment {seg_idx}, will retry inline");
+            }
+            inflight_clone.borrow_mut().remove(&seg_idx);
+        });
+    }
+}
+
 /// Main pump loop — drives the segment fetch/append pipeline.
 ///
 /// Mirrors dash.js StreamProcessor._onMediaFragmentNeeded:
@@ -663,52 +749,84 @@ async fn pump_loop(
             }
         }
 
-        // ── 6. Fetch segment from network ──
-        let fetch_start_ms = js_sys::Date::now();
-        let bytes = match Request::get(&seg_url).send().await {
-            Ok(resp) => {
-                if !resp.ok() {
-                    log::error!("pump[{pump_id}]: segment {seg_idx} HTTP {}", resp.status());
-                    consecutive_failures += 1;
-                    if consecutive_failures > MAX_FETCH_FAILURES {
-                        if let Some(dp) = state.borrow_mut().as_mut() {
-                            if dp.pump_gen == pump_id { dp.next_seg = seg_idx + 1; }
-                        }
-                        consecutive_failures = 0;
+        // ── 6. Kick background prefetch for upcoming segments ──
+        // Mirrors dash.js StreamProcessor._onMediaFragmentNeeded: always keep
+        // LOOKAHEAD_WINDOW segments in-flight or cached ahead of the playhead.
+        kick_prefetch(&state, pump_id);
+
+        // ── 7. Obtain segment bytes — from cache or inline fetch ──
+        // Check the SegmentCache first: if a background prefetch already
+        // has the bytes, use them immediately (no network wait).
+        // This is the core fix for segment-transition stutter.
+        let bytes: Vec<u8> = {
+            // Try cache first
+            let cached = {
+                let borrow = state.borrow();
+                borrow.as_ref().and_then(|dp| {
+                    if dp.pump_gen == pump_id {
+                        dp.seg_cache.borrow_mut().remove(&seg_idx)
+                    } else {
+                        None
                     }
-                    TimeoutFuture::new(1000).await;
-                    continue;
-                }
-                match resp.binary().await {
-                    Ok(b) => b,
+                })
+            };
+
+            if let Some(b) = cached {
+                log::debug!("pump[{pump_id}]: segment {seg_idx} served from prefetch cache");
+                b
+            } else {
+                // Cache miss — fetch inline. fetch_start_ms is measured here so
+                // only actual network fetches contribute to throughput estimation.
+                let fetch_start_ms = js_sys::Date::now();
+                let result = match Request::get(&seg_url).send().await {
+                    Ok(resp) => {
+                        if !resp.ok() {
+                            log::error!("pump[{pump_id}]: segment {seg_idx} HTTP {}", resp.status());
+                            consecutive_failures += 1;
+                            if consecutive_failures > MAX_FETCH_FAILURES {
+                                if let Some(dp) = state.borrow_mut().as_mut() {
+                                    if dp.pump_gen == pump_id { dp.next_seg = seg_idx + 1; }
+                                }
+                                consecutive_failures = 0;
+                            }
+                            TimeoutFuture::new(1000).await;
+                            continue;
+                        }
+                        match resp.binary().await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                log::error!("pump[{pump_id}]: segment {seg_idx} read error: {e:?}");
+                                TimeoutFuture::new(1000).await;
+                                continue;
+                            }
+                        }
+                    },
                     Err(e) => {
-                        log::error!("pump[{pump_id}]: segment {seg_idx} read error: {e:?}");
+                        log::error!("pump[{pump_id}]: segment {seg_idx} fetch error: {e:?}");
                         TimeoutFuture::new(1000).await;
                         continue;
                     }
+                };
+
+                // Record throughput for inline fetches only (cache hits don't reflect network speed)
+                let elapsed_ms = (js_sys::Date::now() - fetch_start_ms).max(1.0);
+                let throughput_bps = (result.len() as f64 * 8.0) / (elapsed_ms / 1000.0);
+                {
+                    let mut borrow = state.borrow_mut();
+                    if let Some(dp) = borrow.as_mut() {
+                        dp.engine.throughput_controller_mut().add_sample(throughput_bps);
+                    }
                 }
-            },
-            Err(e) => {
-                log::error!("pump[{pump_id}]: segment {seg_idx} fetch error: {e:?}");
-                TimeoutFuture::new(1000).await;
-                continue;
+                result
             }
         };
 
         if !is_pump_current(&state, pump_id) { return; }
 
-        // ── 7. Record throughput via dashjs-rs ThroughputController ──
-        {
-            let fetch_end_ms = js_sys::Date::now();
-            let elapsed_ms = (fetch_end_ms - fetch_start_ms).max(1.0);
-            let throughput_bps = (bytes.len() as f64 * 8.0) / (elapsed_ms / 1000.0);
-            let mut borrow = state.borrow_mut();
-            if let Some(dp) = borrow.as_mut() {
-                dp.engine.throughput_controller_mut().add_sample(throughput_bps);
-            }
-        }
+        // ── 8. Record throughput via dashjs-rs ThroughputController ──
+        // (Already recorded above for inline fetches; skipped for cache hits)
 
-        // ── 8. Append segment data ──
+        // ── 9. Append segment data ──
         if bytes.is_empty() {
             log::warn!("pump[{pump_id}]: segment {seg_idx} empty, skipping");
             if let Some(dp) = state.borrow_mut().as_mut() {
@@ -785,7 +903,7 @@ async fn pump_loop(
         // Wait for append to complete
         if !wait_for_sb(&sb, &state, pump_id).await { return; }
 
-        // ── 9. Update dashjs-rs state ──
+        // ── 10. Update dashjs-rs state ──
         {
             let mut borrow = state.borrow_mut();
             if let Some(dp) = borrow.as_mut() {
@@ -837,6 +955,12 @@ fn force_start_pump(state: &Rc<RefCell<Option<DashPlayer>>>, video: &HtmlVideoEl
         if let Some(dp) = borrow.as_mut() {
             dp.pump_gen = dp.pump_gen.wrapping_add(1);
             dp.pump_running = false;
+            // Replace prefetch state with fresh instances on seek.
+            // Background tasks hold Rc clones of the old instances; by
+            // replacing them here, any in-flight prefetch writes go to the
+            // old (now unreferenced) cache and are silently discarded.
+            dp.seg_cache = Rc::new(RefCell::new(std::collections::HashMap::new()));
+            dp.in_flight = Rc::new(RefCell::new(std::collections::HashSet::new()));
         }
     }
     start_pump(state, video);
@@ -1174,6 +1298,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 pump_running: false,
                                 last_appended_seg: None,
                                 last_eviction_ms: js_sys::Date::now(),
+                                seg_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
+                                in_flight: Rc::new(RefCell::new(std::collections::HashSet::new())),
                             });
 
                             status.set(String::new());

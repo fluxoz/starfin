@@ -11,3 +11,6 @@ pub mod utils;
 pub mod vo;
 pub mod media_player_events;
 pub mod media_player;
+pub mod xlink_loader;
+pub mod manifest_updater;
+pub mod pre_buffer_sink;

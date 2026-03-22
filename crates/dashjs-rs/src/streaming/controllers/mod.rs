@@ -13,6 +13,11 @@ pub mod fragment_controller;
 pub mod media_controller;
 pub mod event_controller;
 pub mod time_sync_controller;
+pub mod blacklist_controller;
+pub mod client_data_reporting_controller;
+pub mod common_access_token_controller;
+pub mod ext_url_query_info_controller;
+pub mod xlink_controller;
 
 pub use abr_controller::AbrController;
 pub use buffer_controller::BufferController;
@@ -29,3 +34,8 @@ pub use fragment_controller::{FragmentController, FragmentRequest, FragmentState
 pub use media_controller::{MediaController, TrackInfo};
 pub use event_controller::{EventController, DashEvent};
 pub use time_sync_controller::TimeSyncController;
+pub use blacklist_controller::BlacklistController;
+pub use client_data_reporting_controller::{ClientDataReportingController, ClientDataReportingSettings};
+pub use common_access_token_controller::{CommonAccessTokenController, HttpResponse, COMMON_ACCESS_TOKEN_HEADER};
+pub use ext_url_query_info_controller::{ExtUrlQueryInfoController, QueryInfoDescriptor, QueryInfoKind, PeriodInput, AdaptationInput, RepresentationInput, MpdQueryInfo};
+pub use xlink_controller::{XlinkController, XlinkElement, RESOLVE_TYPE_ONLOAD, RESOLVE_TYPE_ONACTUATE, RESOLVE_TO_ZERO};

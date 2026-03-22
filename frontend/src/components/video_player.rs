@@ -78,6 +78,22 @@ struct SegmentInfo {
     duration: f64,
 }
 
+/// Probe browser MIME type support — fallback when MPD has no `codecs` attribute.
+/// Tries common H.264+AAC codec strings and falls back to plain `video/mp4`.
+fn probe_mime_type() -> String {
+    let candidates = [
+        "video/mp4; codecs=\"avc1.640029,mp4a.40.2\"",
+        "video/mp4; codecs=\"avc1.64001F,mp4a.40.2\"",
+        "video/mp4; codecs=\"avc1.4D4028,mp4a.40.2\"",
+        "video/mp4; codecs=\"avc1.42E01E,mp4a.40.2\"",
+        "video/mp4",
+    ];
+    candidates.iter()
+        .find(|m| web_sys::MediaSource::is_type_supported(m))
+        .unwrap_or(candidates.last().unwrap())
+        .to_string()
+}
+
 /// Server commands for future WebSocket/SSE integration with main.rs.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -140,25 +156,55 @@ struct DashPlayer {
 
 // ── MPD Parsing (via dashjs-rs) ──────────────────────────────────────────────
 
+/// Parsed MPD result: init URL, total duration, segment list, and
+/// MIME+codecs string for `MediaSource.addSourceBuffer()`.
+///
+/// The codec string is built exactly like dash.js
+/// `SourceBufferSink._getCodecStringForRepresentation()`:
+///   `representation.mimeType + ';codecs="' + representation.codecs + '"'`
+struct MpdParseResult {
+    init_url: String,
+    total_duration: f64,
+    segments: Vec<SegmentInfo>,
+    /// Full MIME type with codecs for `addSourceBuffer()`, e.g.
+    /// `video/mp4;codecs="avc1.640029,mp4a.40.2"`.
+    /// `None` if the MPD has no codec info.
+    mime_codec: Option<String>,
+}
+
 /// Parse MPD using dashjs-rs parser, extract segment list.
-fn parse_mpd(text: &str) -> (String, f64, Vec<SegmentInfo>) {
+fn parse_mpd(text: &str) -> MpdParseResult {
     match dash_parser::parse(text) {
         Ok(mpd) => extract_segments(&mpd, text),
         Err(e) => {
             log::error!("dashjs-rs MPD parse error: {:?} {}", e.code, e.message);
-            (String::new(), 0.0, Vec::new())
+            MpdParseResult {
+                init_url: String::new(),
+                total_duration: 0.0,
+                segments: Vec::new(),
+                mime_codec: None,
+            }
         }
     }
 }
 
 /// Extract segments from dashjs-rs Mpd using template expansion.
+///
+/// Also extracts the codec string from the MPD `<Representation>` element,
+/// matching dash.js `SourceBufferSink._getCodecStringForRepresentation()`.
 fn extract_segments(
     mpd: &dashjs_rs::dash::vo::Mpd,
     raw_xml: &str,
-) -> (String, f64, Vec<SegmentInfo>) {
-    if mpd.periods.is_empty() { return (String::new(), 0.0, Vec::new()); }
+) -> MpdParseResult {
+    let empty = MpdParseResult {
+        init_url: String::new(),
+        total_duration: 0.0,
+        segments: Vec::new(),
+        mime_codec: None,
+    };
+    if mpd.periods.is_empty() { return empty; }
     let period = &mpd.periods[0];
-    if period.adaptation_sets.is_empty() { return (String::new(), 0.0, Vec::new()); }
+    if period.adaptation_sets.is_empty() { return empty; }
 
     let aset_idx = period.adaptation_sets.iter()
         .position(|a| {
@@ -168,12 +214,22 @@ fn extract_segments(
         })
         .unwrap_or(0);
     let aset = &period.adaptation_sets[aset_idx];
-    if aset.representations.is_empty() { return (String::new(), 0.0, Vec::new()); }
+    if aset.representations.is_empty() { return empty; }
 
     let rep = &aset.representations[0];
     let total_duration = mpd.media_presentation_duration.unwrap_or(0.0);
     let rep_id = rep.id.as_deref().unwrap_or("");
     let bw = rep.bandwidth.unwrap_or(0);
+
+    // ── Codec string — 1:1 match of dash.js SourceBufferSink ──
+    // dash.js: `representation.mimeType + ';codecs="' + representation.codecs + '"'`
+    // mimeType inherits from AdaptationSet if not on Representation.
+    let mime_type = rep.mime_type.as_deref()
+        .or(aset.mime_type.as_deref())
+        .unwrap_or("video/mp4");
+    let codecs = rep.codecs.as_deref()
+        .or(aset.codecs.as_deref());
+    let mime_codec = codecs.map(|c| format!("{mime_type};codecs=\"{c}\""));
 
     // Build init URL via dashjs-rs template expansion
     let init_url = rep.initialization.as_deref()
@@ -182,7 +238,7 @@ fn extract_segments(
 
     let media_tmpl = rep.media.as_deref().unwrap_or("");
     if media_tmpl.is_empty() {
-        return (init_url, total_duration, Vec::new());
+        return MpdParseResult { init_url, total_duration, segments: Vec::new(), mime_codec };
     }
 
     let mut segs = Vec::new();
@@ -231,7 +287,7 @@ fn extract_segments(
         }
     }
 
-    (init_url, total_duration, segs)
+    MpdParseResult { init_url, total_duration, segments: segs, mime_codec }
 }
 
 struct TimelineEntry { t: Option<u64>, d: u64, r: Option<i64> }
@@ -991,31 +1047,37 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             };
 
                             // Parse via dashjs-rs
-                            let (init_url, total_duration, segments) = parse_mpd(&text);
-                            if segments.is_empty() {
+                            let mpd_result = parse_mpd(&text);
+                            if mpd_result.segments.is_empty() {
                                 error.set(Some("Manifest contains no segments.".into()));
                                 return;
                             }
-                            if init_url.is_empty() {
+                            if mpd_result.init_url.is_empty() {
                                 error.set(Some("Manifest missing init segment URL.".into()));
                                 return;
                             }
+                            let init_url = mpd_result.init_url;
+                            let total_duration = mpd_result.total_duration;
+                            let segments = mpd_result.segments;
 
-                            // Probe MIME type
-                            let mime_candidates = [
-                                "video/mp4; codecs=\"avc1.640029,mp4a.40.2\"",
-                                "video/mp4; codecs=\"avc1.64001F,mp4a.40.2\"",
-                                "video/mp4; codecs=\"avc1.4D4028,mp4a.40.2\"",
-                                "video/mp4; codecs=\"avc1.42E01E,mp4a.40.2\"",
-                                "video/mp4",
-                            ];
-                            let mime = mime_candidates.iter()
-                                .find(|m| web_sys::MediaSource::is_type_supported(m))
-                                .or(mime_candidates.last())
-                                .unwrap();
+                            // ── Determine MIME+codecs for addSourceBuffer() ──
+                            // 1:1 match of dash.js SourceBufferSink._getCodecStringForRepresentation():
+                            //   `representation.mimeType + ';codecs="' + representation.codecs + '"'`
+                            // Falls back to probing only when the MPD has no codecs attribute.
+                            let mime: String = if let Some(ref mc) = mpd_result.mime_codec {
+                                // Codec from MPD — verify the browser supports it
+                                if web_sys::MediaSource::is_type_supported(mc) {
+                                    mc.clone()
+                                } else {
+                                    log::warn!("MSE: MPD codec {mc} not supported, falling back to probe");
+                                    probe_mime_type()
+                                }
+                            } else {
+                                probe_mime_type()
+                            };
                             log::info!("MSE: using MIME type: {mime}");
 
-                            let source_buffer = match media_source.add_source_buffer(mime) {
+                            let source_buffer = match media_source.add_source_buffer(&mime) {
                                 Ok(sb) => sb,
                                 Err(e) => {
                                     error.set(Some(format!("Unsupported format ({e:?})")));
@@ -1027,13 +1089,48 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 media_source.set_duration(total_duration);
                             }
 
-                            // Fetch & append init segment
-                            let init_bytes = match Request::get(&init_url).send().await {
-                                Ok(r) => match r.binary().await {
-                                    Ok(b) => b,
-                                    Err(e) => { error.set(Some(format!("Init segment read error: {e:?}"))); return; }
-                                },
-                                Err(e) => { error.set(Some(format!("Init segment fetch error: {e:?}"))); return; }
+                            // ── Fetch & append init segment ──
+                            // Matches dash.js HTTPLoader: check status 200-299, retry on failure.
+                            let mut init_bytes: Option<Vec<u8>> = None;
+                            for attempt in 0..MAX_FETCH_FAILURES {
+                                let resp = match Request::get(&init_url).send().await {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        log::warn!("Init segment fetch error (attempt {}/{}): {e:?}",
+                                            attempt + 1, MAX_FETCH_FAILURES);
+                                        TimeoutFuture::new(1000).await;
+                                        continue;
+                                    }
+                                };
+                                if !resp.ok() {
+                                    log::warn!("Init segment HTTP {} (attempt {}/{})",
+                                        resp.status(), attempt + 1, MAX_FETCH_FAILURES);
+                                    TimeoutFuture::new(1000).await;
+                                    continue;
+                                }
+                                match resp.binary().await {
+                                    Ok(b) if !b.is_empty() => {
+                                        init_bytes = Some(b);
+                                        break;
+                                    }
+                                    Ok(_) => {
+                                        log::warn!("Init segment empty (attempt {}/{})",
+                                            attempt + 1, MAX_FETCH_FAILURES);
+                                        TimeoutFuture::new(1000).await;
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Init segment read error (attempt {}/{}): {e:?}",
+                                            attempt + 1, MAX_FETCH_FAILURES);
+                                        TimeoutFuture::new(1000).await;
+                                    }
+                                }
+                            }
+                            let init_bytes = match init_bytes {
+                                Some(b) => b,
+                                None => {
+                                    error.set(Some("Failed to fetch init segment after retries.".into()));
+                                    return;
+                                }
                             };
 
                             let uint8 = js_sys::Uint8Array::from(init_bytes.as_slice());

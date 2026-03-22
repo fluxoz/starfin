@@ -14,6 +14,128 @@ pub struct ProbeMeta {
     pub director: Option<String>,
 }
 
+/// Codec information extracted from the first video and audio streams.
+///
+/// Used to populate the `codecs` attribute in DASH MPD manifests, matching
+/// dash.js `SourceBufferSink._getCodecStringForRepresentation()` which
+/// constructs `mimeType + ';codecs="' + codecs + '"'` from the MPD.
+#[derive(Debug, Default, Clone)]
+pub struct CodecInfo {
+    /// RFC 6381 video codec string, e.g. `"avc1.640029"` for H.264 High L4.1.
+    pub video_codec: Option<String>,
+    /// RFC 6381 audio codec string, e.g. `"mp4a.40.2"` for AAC-LC.
+    pub audio_codec: Option<String>,
+}
+
+impl CodecInfo {
+    /// Build a combined codecs string for DASH MPD `@codecs` attribute.
+    /// Returns e.g. `"avc1.640029,mp4a.40.2"` or just `"avc1.640029"` if
+    /// there is no audio.
+    pub fn codecs_string(&self) -> Option<String> {
+        match (&self.video_codec, &self.audio_codec) {
+            (Some(v), Some(a)) => Some(format!("{v},{a}")),
+            (Some(v), None) => Some(v.clone()),
+            (None, Some(a)) => Some(a.clone()),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Detect codec information from a media file.
+///
+/// Reads the first video and first audio stream and builds RFC 6381 codec
+/// strings.  For H.264 this inspects the profile/level stored in
+/// `AVCodecParameters` to produce the `avc1.PPCCLL` form that browsers
+/// require in `MediaSource.addSourceBuffer()`.
+pub fn probe_codecs(path: &Path) -> CodecInfo {
+    super::ensure_init();
+
+    let input = match ffmpeg_next::format::input(path) {
+        Ok(ctx) => ctx,
+        Err(_) => return CodecInfo::default(),
+    };
+
+    let mut info = CodecInfo::default();
+
+    for stream in input.streams() {
+        let params = stream.parameters();
+        match params.medium() {
+            ffmpeg_next::media::Type::Video if info.video_codec.is_none() => {
+                info.video_codec = Some(video_codec_string(&params));
+            }
+            ffmpeg_next::media::Type::Audio if info.audio_codec.is_none() => {
+                info.audio_codec = Some(audio_codec_string(&params));
+            }
+            _ => {}
+        }
+    }
+
+    info
+}
+
+/// Build an RFC 6381 video codec string from `AVCodecParameters`.
+fn video_codec_string(params: &ffmpeg_next::codec::Parameters) -> String {
+    let ptr = params.as_ptr();
+    // Safety: `ptr` is valid as long as `params` is alive.
+    let (codec_id, profile, level) = unsafe {
+        ((*ptr).codec_id, (*ptr).profile, (*ptr).level)
+    };
+    let id = ffmpeg_next::codec::Id::from(codec_id);
+
+    match id {
+        ffmpeg_next::codec::Id::H264 => {
+            // H.264 / AVC: avc1.PPCCLL
+            //   PP = profile_idc (hex, 2 digits)
+            //   CC = constraint_set_flags (hex, 2 digits) — use 0x00 as default
+            //   LL = level_idc (hex, 2 digits)
+            let profile_idc: u8 = match profile {
+                66  => 0x42, // Baseline
+                77  => 0x4D, // Main
+                88  => 0x58, // Extended
+                100 => 0x64, // High
+                110 => 0x6E, // High 10
+                122 => 0x7A, // High 4:2:2
+                244 => 0xF4, // High 4:4:4 Predictive
+                _   => if profile >= 0 { profile as u8 } else { 0x64 },
+            };
+            // constraint_set_flags — ffmpeg doesn't expose them directly;
+            // use a reasonable default per profile.
+            let constraint: u8 = match profile_idc {
+                0x42 => 0xC0, // Baseline: constraint_set0_flag + constraint_set1_flag
+                0x4D => 0x40, // Main: constraint_set1_flag
+                _    => 0x00, // High and above
+            };
+            let level_idc: u8 = if level > 0 { level as u8 } else { 0x29 }; // default L4.1
+            format!("avc1.{profile_idc:02X}{constraint:02X}{level_idc:02X}")
+        }
+        ffmpeg_next::codec::Id::HEVC => {
+            // H.265 / HEVC — simplified form
+            format!("hev1.1.6.L{}.B0", if level > 0 { level } else { 120 })
+        }
+        ffmpeg_next::codec::Id::VP9 => "vp09.00.10.08".to_string(),
+        ffmpeg_next::codec::Id::AV1 => "av01.0.01M.08".to_string(),
+        _ => "avc1.640029".to_string(), // fallback to H.264 High L4.1
+    }
+}
+
+/// Build an RFC 6381 audio codec string from `AVCodecParameters`.
+fn audio_codec_string(params: &ffmpeg_next::codec::Parameters) -> String {
+    let ptr = params.as_ptr();
+    let codec_id = unsafe { (*ptr).codec_id };
+    let id = ffmpeg_next::codec::Id::from(codec_id);
+
+    match id {
+        ffmpeg_next::codec::Id::AAC => "mp4a.40.2".to_string(),    // AAC-LC
+        ffmpeg_next::codec::Id::EAC3 => "ec-3".to_string(),        // E-AC3
+        ffmpeg_next::codec::Id::AC3 => "ac-3".to_string(),
+        ffmpeg_next::codec::Id::OPUS => "opus".to_string(),
+        ffmpeg_next::codec::Id::VORBIS => "vorbis".to_string(),
+        ffmpeg_next::codec::Id::FLAC => "fLaC".to_string(),
+        ffmpeg_next::codec::Id::MP3 => "mp4a.40.34".to_string(),
+        _ => "mp4a.40.2".to_string(), // fallback to AAC-LC
+    }
+}
+
 /// Probe a media file and return `(duration_secs, metadata)`.
 ///
 /// Returns `(0.0, ProbeMeta::default())` on any error (file not found, corrupt

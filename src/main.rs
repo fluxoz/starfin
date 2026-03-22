@@ -2094,6 +2094,20 @@ async fn get_manifest(
             .body("Could not determine video duration. Ensure ffprobe is installed and the video file is valid.");
     }
 
+    // Detect codecs from the source file so the MPD includes a `codecs`
+    // attribute — matching dash.js SourceBufferSink._getCodecStringForRepresentation()
+    // which builds `mimeType + ';codecs="' + codecs + '"'` from the MPD.
+    let abs_for_codec = abs_path.clone();
+    let codec_info = tokio::task::spawn_blocking(move || {
+        media::probe::probe_codecs(&abs_for_codec)
+    })
+    .await
+    .unwrap_or_default();
+    let codecs_attr = codec_info
+        .codecs_string()
+        .map(|c| format!(" codecs=\"{c}\""))
+        .unwrap_or_default();
+
     // Segments are stored in a quality-specific subdirectory.
     let seg_dir = state.cache_dir.join(id.as_str()).join(quality.as_str());
     if let Err(e) = tokio::fs::create_dir_all(&seg_dir).await {
@@ -2130,8 +2144,9 @@ async fn get_manifest(
          subsegmentStartsWithSAP=\"1\">\n"
     ));
     mpd.push_str(&format!(
-        "      <Representation id=\"{quality}\" bandwidth=\"2000000\">\n",
-        quality = quality.as_str()
+        "      <Representation id=\"{quality}\" bandwidth=\"2000000\"{codecs}>\n",
+        quality = quality.as_str(),
+        codecs = codecs_attr,
     ));
 
     // SegmentTemplate with explicit SegmentTimeline for precise duration control.

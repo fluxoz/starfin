@@ -55,6 +55,10 @@ const BUFFER_TARGET_S: f64 = 30.0;
 // dash.js streaming.buffer.bufferToKeep (default 20s) — data behind playhead
 // to keep. Anything older is pruned every PRUNING_INTERVAL_MS.
 const BACK_BUFFER_S: f64 = 20.0;
+// On QuotaExceededError, keep only 5s behind playhead (more aggressive).
+const QUOTA_KEEP_BEHIND_S: f64 = 5.0;
+// Minimum remove range to bother with (avoids no-op removes).
+const MIN_REMOVE_THRESHOLD_S: f64 = 0.5;
 // dash.js streaming.buffer.bufferPruningInterval (default 10s).
 const PRUNING_INTERVAL_MS: f64 = 10_000.0;
 // Max consecutive fetch failures before skipping a segment.
@@ -381,7 +385,7 @@ async fn evict_back_buffer(
 ) -> bool {
     let current = video.current_time();
     let remove_end = current - BACK_BUFFER_S;
-    if remove_end <= 0.5 { return false; }
+    if remove_end <= MIN_REMOVE_THRESHOLD_S { return false; }
 
     let ranges = get_buffered_ranges(video);
     if ranges.is_empty() { return false; }
@@ -420,8 +424,8 @@ async fn evict_back_buffer(
 ///   2. clearBuffers removes data behind currentTime - bufferToKeep
 ///      where bufferToKeep = max(0.2 * criticalBufferLevel, 1)
 ///
-/// We remove everything from buffer start to (currentTime - 5s) which is
-/// more aggressive than normal pruning (BACK_BUFFER_S=20s).
+/// We remove everything from buffer start to (currentTime - QUOTA_KEEP_BEHIND_S)
+/// which is more aggressive than normal pruning (BACK_BUFFER_S=20s).
 async fn force_evict_for_quota(
     sb: &web_sys::SourceBuffer,
     video: &HtmlVideoElement,
@@ -429,9 +433,8 @@ async fn force_evict_for_quota(
     pump_id: u32,
 ) -> bool {
     let current = video.current_time();
-    // Keep at most 5s behind playhead on quota pressure
-    let remove_end = (current - 5.0).max(0.1);
-    if remove_end <= 0.5 { return false; }
+    let remove_end = (current - QUOTA_KEEP_BEHIND_S).max(0.1);
+    if remove_end <= MIN_REMOVE_THRESHOLD_S { return false; }
 
     let ranges = get_buffered_ranges(video);
     if ranges.is_empty() { return false; }

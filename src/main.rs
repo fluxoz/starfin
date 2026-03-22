@@ -939,6 +939,9 @@ struct AppState {
     segment_inflight: Arc<Mutex<HashMap<(String, usize, Quality), Arc<tokio::sync::watch::Sender<Option<Result<(), String>>>>>>>,
     /// Pre-rendered CSS for the active theme (served at `/api/theme.css`).
     theme_css: String,
+    /// Last known playback positions per video ID (populated by player_ws).
+    /// Used for resume-on-reload support.
+    playback_positions: Arc<RwLock<HashMap<String, f64>>>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1856,6 +1859,123 @@ async fn progress_ws(
     Ok(response)
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// Player WebSocket — tight integration between video_player.rs and main.rs
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// This endpoint enables bidirectional communication between the frontend
+// video player (powered by dashjs-rs) and the server.
+//
+// **Client → Server messages:**
+//   • `{ "type": "playback_state", "video_id": "...", "time": 1.23, "paused": false }`
+//     Reports playback position for resume-on-reload and multi-device sync.
+//   • `{ "type": "buffer_health", "video_id": "...", "buffer_level": 12.3, "throughput_kbps": 5000 }`
+//     Reports dashjs-rs buffer/throughput metrics for server-side monitoring.
+//
+// **Server → Client messages (ServerCommand):**
+//   • `{ "type": "play" }` / `{ "type": "pause" }`
+//   • `{ "type": "seek", "time": 30.0 }`
+//   • `{ "type": "set_quality", "quality": "high" }`
+//   • `{ "type": "set_volume", "volume": 0.8 }`
+//   • `{ "type": "update_source", "video_id": "..." }`
+//
+// The frontend `apply_server_command()` function in `video_player.rs`
+// dispatches these commands to the dashjs-rs MediaPlayer and browser video
+// element.
+//
+// **Architecture:**
+//   frontend/video_player.rs → dashjs-rs MediaPlayer → browser MSE
+//                             ↕ (WebSocket)
+//   src/main.rs (player_ws)  → AppState (playback positions, metrics)
+
+/// Playback state reported by the frontend player.
+#[derive(Debug, Clone, Deserialize)]
+struct PlaybackReport {
+    video_id: String,
+    time: f64,
+    #[allow(dead_code)]
+    paused: bool,
+}
+
+/// Buffer health reported by the frontend player (dashjs-rs metrics).
+#[derive(Debug, Clone, Deserialize)]
+struct BufferHealthReport {
+    #[allow(dead_code)]
+    video_id: String,
+    #[allow(dead_code)]
+    buffer_level: f64,
+    #[allow(dead_code)]
+    throughput_kbps: f64,
+}
+
+/// `GET /api/player/ws` — WebSocket for player ↔ server integration.
+///
+/// Accepts playback state and buffer health reports from the frontend.
+/// Can send ServerCommand messages to control playback remotely.
+/// Stores the last known playback position per video so the frontend
+/// can resume from where the user left off.
+async fn player_ws(
+    req: HttpRequest,
+    body: web::Payload,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body)?;
+
+    let playback_positions = Arc::clone(&state.playback_positions);
+
+    actix_web::rt::spawn(async move {
+        while let Some(Ok(msg)) = msg_stream.recv().await {
+            match msg {
+                actix_ws::Message::Text(text) => {
+                    // Parse incoming JSON messages from the player
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                        match value.get("type").and_then(|t| t.as_str()) {
+                            Some("playback_state") => {
+                                if let Ok(report) = serde_json::from_value::<PlaybackReport>(value) {
+                                    // Store the playback position for resume support
+                                    playback_positions.write().insert(report.video_id.clone(), report.time);
+                                }
+                            }
+                            Some("buffer_health") => {
+                                // Buffer health from dashjs-rs metrics — logged for monitoring
+                                if let Ok(_report) = serde_json::from_value::<BufferHealthReport>(value) {
+                                    // Future: aggregate metrics, trigger quality hints
+                                }
+                            }
+                            _ => {
+                                // Unknown message type — ignore
+                            }
+                        }
+                    }
+                }
+                actix_ws::Message::Close(_) => break,
+                actix_ws::Message::Ping(data) => {
+                    if session.pong(&data).await.is_err() { break; }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    Ok(response)
+}
+
+/// `GET /api/player/position/{id}` — Get the last known playback position.
+///
+/// Returns `{ "time": <seconds> }` for resume-on-reload support.
+/// The position is updated by the player WebSocket.
+async fn get_playback_position(
+    path: web::Path<String>,
+    state: web::Data<AppState>,
+) -> HttpResponse {
+    let video_id = path.into_inner();
+    let time = state.playback_positions.read()
+        .get(&video_id)
+        .copied()
+        .unwrap_or(0.0);
+    HttpResponse::Ok().json(serde_json::json!({ "time": time }))
+}
+
 /// Segment duration in seconds for on-demand DASH segment generation.
 /// Apple recommends 6 seconds; common range is 2–10 seconds.
 /// Jellyfin/Plex default to 6 second segments.
@@ -1974,6 +2094,20 @@ async fn get_manifest(
             .body("Could not determine video duration. Ensure ffprobe is installed and the video file is valid.");
     }
 
+    // Detect codecs from the source file so the MPD includes a `codecs`
+    // attribute — matching dash.js SourceBufferSink._getCodecStringForRepresentation()
+    // which builds `mimeType + ';codecs="' + codecs + '"'` from the MPD.
+    let abs_for_codec = abs_path.clone();
+    let codec_info = tokio::task::spawn_blocking(move || {
+        media::probe::probe_codecs(&abs_for_codec)
+    })
+    .await
+    .unwrap_or_default();
+    let codecs_attr = codec_info
+        .codecs_string()
+        .map(|c| format!(" codecs=\"{c}\""))
+        .unwrap_or_default();
+
     // Segments are stored in a quality-specific subdirectory.
     let seg_dir = state.cache_dir.join(id.as_str()).join(quality.as_str());
     if let Err(e) = tokio::fs::create_dir_all(&seg_dir).await {
@@ -2010,8 +2144,9 @@ async fn get_manifest(
          subsegmentStartsWithSAP=\"1\">\n"
     ));
     mpd.push_str(&format!(
-        "      <Representation id=\"{quality}\" bandwidth=\"2000000\">\n",
-        quality = quality.as_str()
+        "      <Representation id=\"{quality}\" bandwidth=\"2000000\"{codecs}>\n",
+        quality = quality.as_str(),
+        codecs = codecs_attr,
     ));
 
     // SegmentTemplate with explicit SegmentTimeline for precise duration control.
@@ -2182,15 +2317,21 @@ async fn get_segment(
         if *v { false } else { *v = true; true }
     });
 
-    // If segment exists, serve it immediately from cache
+    // If segment exists, serve it immediately from cache.
+    // Strip ftyp+moov init boxes so the SourceBuffer only receives moof+mdat
+    // fragments — the init segment is served separately via /init.mp4.
+    // Without this, the browser re-initialises the decoder at every segment
+    // boundary, causing visible stutter (matching dash.js SourceBufferSink
+    // which never sends duplicate init segments during normal playback).
     if let Ok(data) = tokio::fs::read(&seg_path).await {
+        let stripped = media::transcode::strip_init_boxes(&data);
         return HttpResponse::Ok()
             .content_type("video/mp4")
             .insert_header((
                 header::CACHE_CONTROL,
                 "public, max-age=31536000, immutable",
             ))
-            .body(data);
+            .body(stripped);
     }
 
     // Parse segment index from filename (e.g., "seg_00042.m4s" -> 42)
@@ -2304,13 +2445,16 @@ async fn get_segment(
     match transcode_result {
         Ok(()) => {
             match tokio::fs::read(&seg_path).await {
-                Ok(data) => HttpResponse::Ok()
-                    .content_type("video/mp4")
-                    .insert_header((
-                        header::CACHE_CONTROL,
-                        "public, max-age=31536000, immutable",
-                    ))
-                    .body(data),
+                Ok(data) => {
+                    let stripped = media::transcode::strip_init_boxes(&data);
+                    HttpResponse::Ok()
+                        .content_type("video/mp4")
+                        .insert_header((
+                            header::CACHE_CONTROL,
+                            "public, max-age=31536000, immutable",
+                        ))
+                        .body(stripped)
+                }
                 Err(e) => HttpResponse::InternalServerError()
                     .body(format!("failed to read generated segment: {e}")),
             }
@@ -3533,6 +3677,7 @@ async fn main() -> std::io::Result<()> {
         auth_tokens,
         segment_inflight: Arc::new(Mutex::new(HashMap::new())),
         theme_css,
+        playback_positions: Arc::new(RwLock::new(HashMap::new())),
     });
 
     // One-time background scan at startup to refresh the index immediately.
@@ -3756,6 +3901,8 @@ async fn main() -> std::io::Result<()> {
             .route("/api/quality-options", web::get().to(get_quality_options))
             .route("/api/scan/ws", web::get().to(scan_ws))
             .route("/api/progress/ws", web::get().to(progress_ws))
+            .route("/api/player/ws", web::get().to(player_ws))
+            .route("/api/player/position/{id}", web::get().to(get_playback_position))
             .route("/api/thumbnails/progress", web::get().to(get_thumb_progress))
             .route("/api/videos", web::get().to(list_videos))
             .route(

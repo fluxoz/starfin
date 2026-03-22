@@ -12,8 +12,8 @@ pub const BUFFER_END_THRESHOLD: f64 = 0.5;
 pub const BUFFER_RANGE_CALCULATION_THRESHOLD: f64 = 0.01;
 
 /// Default value for `buffer_time_at_top_quality` (seconds), mirroring the
-/// dash.js `Settings.streaming.buffer.bufferTimeAtTopQuality`.
-const DEFAULT_BUFFER_TIME_AT_TOP_QUALITY: f64 = 12.0;
+/// dash.js `Settings.streaming.buffer.bufferTimeAtTopQuality` (default 30).
+const DEFAULT_BUFFER_TIME_AT_TOP_QUALITY: f64 = 30.0;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -273,6 +273,6 @@ mod tests {
     #[test]
     fn top_quality_buffer_time_returns_default() {
         let ctrl = BufferController::new();
-        assert_eq!(ctrl.get_top_quality_buffer_time(), 12.0);
+        assert_eq!(ctrl.get_top_quality_buffer_time(), 30.0);
     }
 }

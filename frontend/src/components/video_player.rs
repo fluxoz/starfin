@@ -1085,6 +1085,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
 
                             start_pump(&dash_state, &video);
+
+                            // Auto-play when the user opens the player
+                            let _ = video.play();
                         });
                     }) as Box<dyn FnOnce()>);
 
@@ -1332,6 +1335,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         }
 
                         force_start_pump(&dash_state, &video_for_seek);
+                    }
+
+                    // Auto-play after seek (matches dash.js PlaybackController
+                    // which resumes playback on seek, including after ended state)
+                    if video_for_seek.paused() {
+                        let _ = video_for_seek.play();
                     }
                 });
 

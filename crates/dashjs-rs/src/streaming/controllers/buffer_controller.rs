@@ -116,6 +116,16 @@ impl BufferController {
         self.buffer_time_at_top_quality
     }
 
+    // -- seek target --------------------------------------------------------
+
+    pub fn get_seek_target(&self) -> Option<f64> {
+        self.seek_target
+    }
+
+    pub fn set_seek_target(&mut self, target: Option<f64>) {
+        self.seek_target = target;
+    }
+
     // -- buffer length from ranges ------------------------------------------
 
     /// Returns the continuous buffer length (seconds) starting from `time`.

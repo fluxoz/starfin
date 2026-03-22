@@ -1310,6 +1310,12 @@ fn hybrid_segment(
                                 aac_enc.set_bit_rate(AAC_ENCODE_BITRATE);
                                 aac_enc.set_time_base(ffmpeg_next::Rational::new(1, dec.rate() as i32));
 
+                                // fMP4 requires global header (extradata) for AAC too.
+                                unsafe {
+                                    let ctx_ptr = aac_enc.as_mut_ptr();
+                                    (*ctx_ptr).flags |= ffmpeg_next::ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+                                }
+
                                 match aac_enc.open_as(aac) {
                                     Ok(opened) => {
                                         let mut out_aud_stream = octx.add_stream(aac)
@@ -1718,6 +1724,23 @@ fn transcode_segment_body(
         enc.set_gop(250);
         enc.set_max_b_frames(0);
 
+        // ── AV_CODEC_FLAG_GLOBAL_HEADER ──────────────────────────────────
+        // For fMP4/CMAF output the encoder MUST store SPS/PPS in extradata
+        // (the moov/avcC box) rather than repeating them inline in each
+        // access unit.  Without this flag, every independently-encoded
+        // segment can produce slightly different SPS/PPS parameters, and
+        // Firefox's H264ChangeMonitor rejects any segment whose SPS/PPS
+        // differ from the init segment's avcC → NS_ERROR_DOM_MEDIA_FATAL_ERR.
+        //
+        // This matches what `ffmpeg` CLI does: it checks
+        // `oformat->flags & AVFMT_GLOBALHEADER` and sets the codec flag
+        // automatically.  Since we always output fMP4, we set it
+        // unconditionally.
+        unsafe {
+            let ctx_ptr = enc.as_mut_ptr();
+            (*ctx_ptr).flags |= ffmpeg_next::ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+        }
+
         if use_hw && !hw_frames_ctx.is_null() {
             enc.set_format(ffmpeg_next::format::Pixel::NV12);
             unsafe {
@@ -1811,6 +1834,12 @@ fn transcode_segment_body(
                                     aac_enc.set_format(enc_format);
                                     aac_enc.set_bit_rate(AAC_ENCODE_BITRATE);
                                     aac_enc.set_time_base(ffmpeg_next::Rational::new(1, dec.rate() as i32));
+
+                                    // fMP4 requires global header (extradata) for AAC too.
+                                    unsafe {
+                                        let ctx_ptr = aac_enc.as_mut_ptr();
+                                        (*ctx_ptr).flags |= ffmpeg_next::ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+                                    }
 
                                     match aac_enc.open_as(aac) {
                                         Ok(opened) => {

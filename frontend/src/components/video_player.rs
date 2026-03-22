@@ -264,9 +264,15 @@ fn mpd_resolve_base(base: &str, rel: &str) -> String {
 /// Extract segment URLs from a dashjs-rs `Mpd`, returning
 /// `(init_url, total_duration, segments)` — backward-compatible output for
 /// the existing MSE pump loop.
+///
+/// The dashjs-rs parser stores template attributes (initialization, media,
+/// timescale, start_number) directly on `Representation` but does not expose
+/// SegmentTimeline S elements in a form usable for segment list building.
+/// We supplement the parsed MPD with direct XML extraction of timeline entries.
 fn extract_segments_from_mpd(
     mpd: &dashjs_rs::dash::vo::Mpd,
     base: &str,
+    raw_xml: &str,
 ) -> (String, f64, Vec<SegmentInfo>) {
     if mpd.periods.is_empty() {
         return (String::new(), 0.0, Vec::new());
@@ -316,8 +322,7 @@ fn extract_segments_from_mpd(
     let rep_id = rep.id.as_deref().unwrap_or("");
     let bw = rep.bandwidth.unwrap_or(0);
 
-    // Try SegmentTemplate with timeline (segment_info_type == "SegmentTimeline") or
-    // SegmentTemplate with duration.
+    // Try SegmentTemplate with timeline or fixed duration.
     if rep.media.is_some() || rep.initialization.is_some() {
         let init_tmpl = rep.initialization.as_deref().unwrap_or("");
         let init_url = if !init_tmpl.is_empty() {
@@ -337,8 +342,10 @@ fn extract_segments_from_mpd(
         let media_tmpl = rep.media.as_deref().unwrap_or("");
         let mut segs = Vec::new();
 
-        // Check for AdaptationSet-level SegmentTimeline stored in segment_template JSON.
-        let timeline = parse_timeline_from_aset(aset);
+        // Extract SegmentTimeline S entries directly from raw XML.
+        // The dashjs-rs parser inherits template attributes onto the Representation
+        // but does not expose the raw S elements for segment list building.
+        let timeline = extract_timeline_from_xml(raw_xml);
 
         if !timeline.is_empty() {
             let timescale = rep.timescale.max(1);
@@ -386,6 +393,26 @@ fn extract_segments_from_mpd(
                     duration: sd,
                 });
             }
+        } else if total_duration > 0.0 {
+            // Fallback: SegmentTimeline indicated but timeline entries not
+            // extractable.  Use the known segment duration constant to
+            // compute the segment count from total duration.
+            let sd = SEGMENT_DURATION_F;
+            let n = (total_duration / sd).ceil() as usize;
+            for i in 0..n {
+                let url = dash_parser::process_uri_template(
+                    media_tmpl,
+                    Some(rep_id),
+                    Some(rep.start_number + i as u64),
+                    None,
+                    Some(bw),
+                    None,
+                );
+                segs.push(SegmentInfo {
+                    url: mpd_resolve_base(&resolved_base, &url),
+                    duration: sd,
+                });
+            }
         }
 
         return (init_url, total_duration, segs);
@@ -395,7 +422,7 @@ fn extract_segments_from_mpd(
     (String::new(), total_duration, Vec::new())
 }
 
-/// Minimal timeline entry extracted from AdaptationSet-level SegmentTemplate JSON.
+/// Minimal timeline entry extracted from SegmentTimeline S elements.
 /// Field names match the MPEG-DASH specification SegmentTimeline S element attributes.
 struct TimelineEntry {
     /// Start time (S@t).
@@ -406,29 +433,35 @@ struct TimelineEntry {
     r: Option<i64>,
 }
 
-/// Parse SegmentTimeline S elements from the AdaptationSet's `segment_template`
-/// JSON blob produced by the dashjs-rs parser.
-fn parse_timeline_from_aset(
-    aset: &dashjs_rs::dash::vo::AdaptationSet,
-) -> Vec<TimelineEntry> {
+/// Extract SegmentTimeline S elements directly from MPD XML.
+///
+/// The dashjs-rs parser inherits SegmentTemplate attributes onto
+/// Representation fields (initialization, media, timescale, etc.) but
+/// does not expose the raw S elements.  This function supplements the
+/// dashjs-rs parsing by extracting timeline entries from the XML.
+fn extract_timeline_from_xml(xml: &str) -> Vec<TimelineEntry> {
+    fn tag_attr(tag: &str, attr: &str) -> Option<String> {
+        let s = format!("{attr}=\"");
+        let p = tag.find(&s)?;
+        let r = &tag[p + s.len()..];
+        Some(r[..r.find('"')?].to_string())
+    }
+
     let mut result = Vec::new();
-    let tmpl = match &aset.segment_template {
-        Some(v) => v,
-        None => return result,
-    };
-    let tl = match tmpl.get("SegmentTimeline") {
-        Some(v) => v,
-        None => return result,
-    };
-    let s_arr = match tl.get("S") {
-        Some(serde_json::Value::Array(a)) => a,
-        _ => return result,
-    };
-    for s in s_arr {
-        let d = s.get("d").and_then(|v| v.as_u64()).unwrap_or(0);
-        let t = s.get("t").and_then(|v| v.as_u64());
-        let r = s.get("r").and_then(|v| v.as_i64());
-        result.push(TimelineEntry { t, d, r });
+    let mut s = 0;
+    while let Some(i) = xml[s..].find("<S ") {
+        let a = s + i;
+        if let Some(e) = xml[a..].find("/>") {
+            let t = &xml[a..a + e + 2];
+            result.push(TimelineEntry {
+                t: tag_attr(t, "t").and_then(|s| s.parse().ok()),
+                d: tag_attr(t, "d").and_then(|s| s.parse().ok()).unwrap_or(0),
+                r: tag_attr(t, "r").and_then(|s| s.parse().ok()),
+            });
+            s = a + e + 2;
+        } else {
+            break;
+        }
     }
     result
 }
@@ -604,12 +637,15 @@ struct MseState {
 
 /// Parse a DASH MPD manifest and return the list of segment URLs with durations.
 ///
-/// Uses the dashjs-rs parser (proper XML parsing via quick-xml).
+/// Uses the dashjs-rs parser (proper XML parsing via quick-xml) for the MPD
+/// structure, with supplementary XML extraction for SegmentTimeline entries
+/// (the dashjs-rs parser stores template attributes on Representation but
+/// does not expose the raw S elements for external segment list building).
 ///
 /// Returns `(init_url, total_duration_secs, segments)`.
 fn parse_mpd(text: &str) -> (String, f64, Vec<SegmentInfo>) {
     match dash_parser::parse(text) {
-        Ok(mpd) => extract_segments_from_mpd(&mpd, ""),
+        Ok(mpd) => extract_segments_from_mpd(&mpd, "", text),
         Err(e) => {
             log::error!("dashjs-rs MPD parse error (code {:?}): {}", e.code, e.message);
             (String::new(), 0.0, Vec::new())

@@ -49,9 +49,13 @@ const CONTROL_HIDE_TIMEOUT_MS: f64 = 5000.0;
 const CONTROLS_VICINITY_PX: f64 = 80.0;
 
 // ── Buffer targets (driven by dashjs-rs ScheduleController) ──────────────────
-const BUFFER_TARGET_S: f64 = 30.0;
+// 12s matches dash.js bufferTimeAtTopQuality. 30s was too high — at HD
+// bitrates it approaches Chrome's SourceBuffer quota (~150-200 MB).
+const BUFFER_TARGET_S: f64 = 12.0;
 const BACK_BUFFER_S: f64 = 20.0;
-const LOOKAHEAD_SEGMENTS: usize = 5;
+const LOOKAHEAD_SEGMENTS: usize = 3;
+// Wall-clock interval (ms) between back-buffer eviction attempts.
+const EVICTION_INTERVAL_MS: f64 = 10_000.0;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // DASH ENGINE — powered by dashjs-rs
@@ -244,27 +248,6 @@ fn extract_timeline_from_xml(xml: &str) -> Vec<TimelineEntry> {
     result
 }
 
-// ── fMP4 box stripping ───────────────────────────────────────────────────────
-
-/// Strip ftyp and moov boxes from fMP4, keeping only moof+mdat.
-fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
-    let mut result = Vec::new();
-    let mut pos = 0usize;
-    while pos + 8 <= data.len() {
-        let size = u32::from_be_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
-        if size < 8 || pos + size > data.len() {
-            result.extend_from_slice(&data[pos..]);
-            break;
-        }
-        let box_type = &data[pos + 4..pos + 8];
-        if box_type != b"ftyp" && box_type != b"moov" {
-            result.extend_from_slice(&data[pos..pos + size]);
-        }
-        pos += size;
-    }
-    if result.is_empty() && pos == 0 { data.to_vec() } else { result }
-}
-
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn format_time(seconds: f64) -> String {
@@ -352,38 +335,93 @@ fn is_pump_current(state: &Rc<RefCell<Option<DashPlayer>>>, pump_id: u32) -> boo
 }
 
 /// Wait for SourceBuffer to finish updating.
+/// Uses a small delay between checks to let the browser process events.
 async fn wait_for_sb(
     sb: &web_sys::SourceBuffer,
     state: &Rc<RefCell<Option<DashPlayer>>>,
     pump_id: u32,
 ) -> bool {
-    for _ in 0..2000 {
+    // Up to ~10 seconds (200 × 50ms)
+    for _ in 0..200 {
         if !sb.updating() { return true; }
         if !is_pump_current(state, pump_id) { return false; }
-        TimeoutFuture::new(0).await;
+        TimeoutFuture::new(50).await;
     }
+    log::warn!("wait_for_sb: timed out after 10s");
     false
 }
 
 /// Evict back buffer behind playhead using dashjs-rs BufferController logic.
-fn evict_back_buffer(
-    dp: &mut DashPlayer,
+/// Returns true if eviction was performed and completed.
+async fn evict_back_buffer(
+    state: &Rc<RefCell<Option<DashPlayer>>>,
     video: &HtmlVideoElement,
-) {
+    pump_id: u32,
+) -> bool {
     let current = video.current_time();
     let remove_end = current - BACK_BUFFER_S;
-    if remove_end <= 0.5 { return; }
+    if remove_end <= 0.5 { return false; }
 
     let ranges = get_buffered_ranges(video);
+    // Sum actual buffered data (not just buf_end - buf_start which over-counts
+    // disjoint ranges). Matches dash.js BufferController.getClearRanges().
     let total_buffered: f64 = ranges.iter().map(|r| r.end - r.start).sum();
-    if total_buffered < BACK_BUFFER_S + SEGMENT_DURATION_F { return; }
+    if total_buffered < BACK_BUFFER_S + SEGMENT_DURATION_F * 2.0 { return false; }
 
-    // Use dashjs-rs buffer controller to track the removal
-    dp.engine.buffer_controller_mut().remove_data(0.0, remove_end);
+    let sb = {
+        let mut borrow = state.borrow_mut();
+        let dp = match borrow.as_mut() {
+            Some(dp) if dp.pump_gen == pump_id => dp,
+            _ => return false,
+        };
+        // Track in dashjs-rs
+        dp.engine.buffer_controller_mut().remove_data(0.0, remove_end);
+        dp.source_buffer.clone()
+    };
 
-    if !dp.source_buffer.updating() {
-        let _ = dp.source_buffer.remove(0.0, remove_end);
+    if sb.updating() {
+        if !wait_for_sb(&sb, state, pump_id).await { return false; }
     }
+
+    if sb.remove(0.0, remove_end).is_err() {
+        log::warn!("evict_back_buffer: remove(0, {remove_end:.1}) failed");
+        return false;
+    }
+
+    // Wait for remove to complete
+    wait_for_sb(&sb, state, pump_id).await
+}
+
+/// Force evict back buffer — called on QuotaExceededError.
+/// Aggressively removes everything behind (currentTime - 5s).
+async fn force_evict_back_buffer(
+    state: &Rc<RefCell<Option<DashPlayer>>>,
+    video: &HtmlVideoElement,
+    pump_id: u32,
+) -> bool {
+    let current = video.current_time();
+    let remove_end = (current - 5.0).max(0.1);
+    if remove_end <= 0.5 { return false; }
+
+    let sb = {
+        let borrow = state.borrow();
+        match borrow.as_ref() {
+            Some(dp) if dp.pump_gen == pump_id => dp.source_buffer.clone(),
+            _ => return false,
+        }
+    };
+
+    if sb.updating() {
+        let _ = sb.abort();
+        TimeoutFuture::new(50).await;
+    }
+
+    if sb.remove(0.0, remove_end).is_err() {
+        log::warn!("force_evict: remove(0, {remove_end:.1}) failed");
+        return false;
+    }
+
+    wait_for_sb(&sb, state, pump_id).await
 }
 
 /// Kick off prefetch for upcoming segments.
@@ -433,12 +471,25 @@ async fn pump_loop(
     video: HtmlVideoElement,
     pump_id: u32,
 ) {
+    let mut consecutive_failures: u32 = 0;
+
     loop {
         // ── 1. Check pump is still current ──
         if !is_pump_current(&state, pump_id) { return; }
 
-        // ── 2. Get next segment info ──
-        let (seg_idx, seg_url, total_segs) = {
+        // ── 2. Check MediaSource is still open ──
+        {
+            let borrow = state.borrow();
+            if let Some(dp) = borrow.as_ref() {
+                if dp.media_source.ready_state() != web_sys::MediaSourceReadyState::Open {
+                    log::info!("pump[{pump_id}]: MediaSource no longer open, exiting");
+                    return;
+                }
+            } else { return; }
+        }
+
+        // ── 3. Get next segment info ──
+        let (seg_idx, seg_url, _total_segs) = {
             let borrow = state.borrow();
             let dp = match borrow.as_ref() {
                 Some(dp) if dp.pump_gen == pump_id => dp,
@@ -455,31 +506,30 @@ async fn pump_loop(
             (dp.next_seg, dp.segments[dp.next_seg].url.clone(), dp.segments.len())
         };
 
-        // ── 3. Use dashjs-rs ScheduleController to decide if we should fetch ──
+        // ── 4. Use dashjs-rs ScheduleController to decide if we should fetch ──
         {
-            let has_state = state.borrow().is_some();
-            if has_state {
-                let buf_ahead = (buffered_end_at(&video, video.current_time()) - video.current_time()).max(0.0);
+            let buf_ahead = (buffered_end_at(&video, video.current_time()) - video.current_time()).max(0.0);
 
-                let mut borrow = state.borrow_mut();
-                if let Some(dp) = borrow.as_mut() {
-                    dp.engine.buffer_controller_mut().set_buffer_level(buf_ahead);
+            let mut borrow = state.borrow_mut();
+            if let Some(dp) = borrow.as_mut() {
+                dp.engine.buffer_controller_mut().set_buffer_level(buf_ahead);
 
-                    // ScheduleController: should we schedule another fetch?
-                    if !dp.engine.schedule_controller().should_schedule(buf_ahead, SEGMENT_DURATION_F) {
-                        drop(borrow);
-                        // Buffer is full enough — wait before checking again
-                        TimeoutFuture::new(500).await;
-                        continue;
-                    }
+                // ScheduleController: should we schedule another fetch?
+                if !dp.engine.schedule_controller().should_schedule(buf_ahead, SEGMENT_DURATION_F) {
+                    drop(borrow);
+                    // Buffer is full enough — wait before checking again
+                    TimeoutFuture::new(500).await;
+                    continue;
                 }
+            } else {
+                return;
             }
         }
 
-        // ── 4. Kick prefetch for upcoming segments ──
+        // ── 5. Kick prefetch for upcoming segments ──
         kick_prefetch(&state, pump_id);
 
-        // ── 5. Fetch segment (from cache or network) ──
+        // ── 6. Fetch segment (from cache or network) ──
         let fetch_start_ms = js_sys::Date::now();
         let bytes = {
             let mut borrow = state.borrow_mut();
@@ -489,16 +539,30 @@ async fn pump_loop(
         };
 
         let bytes = if let Some(cached) = bytes {
-            log::info!("pump[{pump_id}]: using cached segment {seg_idx}");
             cached
         } else {
             match Request::get(&seg_url).send().await {
-                Ok(resp) => match resp.binary().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        log::error!("pump[{pump_id}]: segment {seg_idx} read error: {e:?}");
+                Ok(resp) => {
+                    if !resp.ok() {
+                        log::error!("pump[{pump_id}]: segment {seg_idx} HTTP {}", resp.status());
+                        consecutive_failures += 1;
+                        if consecutive_failures > 3 {
+                            // Skip this segment after too many failures
+                            if let Some(dp) = state.borrow_mut().as_mut() {
+                                if dp.pump_gen == pump_id { dp.next_seg = seg_idx + 1; }
+                            }
+                            consecutive_failures = 0;
+                        }
                         TimeoutFuture::new(1000).await;
                         continue;
+                    }
+                    match resp.binary().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            log::error!("pump[{pump_id}]: segment {seg_idx} read error: {e:?}");
+                            TimeoutFuture::new(1000).await;
+                            continue;
+                        }
                     }
                 },
                 Err(e) => {
@@ -511,7 +575,7 @@ async fn pump_loop(
 
         if !is_pump_current(&state, pump_id) { return; }
 
-        // ── 6. Record throughput via dashjs-rs ThroughputController ──
+        // ── 7. Record throughput via dashjs-rs ThroughputController ──
         {
             let fetch_end_ms = js_sys::Date::now();
             let elapsed_ms = (fetch_end_ms - fetch_start_ms).max(1.0);
@@ -522,10 +586,9 @@ async fn pump_loop(
             }
         }
 
-        // ── 7. Strip init boxes & append ──
-        let media_bytes = strip_init_boxes(&bytes);
-        if media_bytes.is_empty() {
-            log::warn!("segment {seg_idx}: no media data after stripping init boxes");
+        // ── 8. Append segment data ──
+        if bytes.is_empty() {
+            log::warn!("pump[{pump_id}]: segment {seg_idx} empty, skipping");
             if let Some(dp) = state.borrow_mut().as_mut() {
                 if dp.pump_gen == pump_id { dp.next_seg = seg_idx + 1; }
             }
@@ -536,25 +599,56 @@ async fn pump_loop(
         let sb = {
             let borrow = state.borrow();
             match borrow.as_ref() {
-                Some(dp) => dp.source_buffer.clone(),
-                None => return,
+                Some(dp) if dp.pump_gen == pump_id => dp.source_buffer.clone(),
+                _ => return,
             }
         };
 
         if !wait_for_sb(&sb, &state, pump_id).await { return; }
 
-        let uint8 = js_sys::Uint8Array::from(media_bytes.as_slice());
+        let uint8 = js_sys::Uint8Array::from(bytes.as_slice());
         let ab = uint8.buffer();
-        if sb.append_buffer_with_array_buffer(&ab).is_err() {
-            log::error!("pump[{pump_id}]: append failed for segment {seg_idx}");
-            TimeoutFuture::new(500).await;
-            continue;
+        match sb.append_buffer_with_array_buffer(&ab) {
+            Ok(()) => {
+                consecutive_failures = 0;
+            }
+            Err(e) => {
+                // Check if this is a QuotaExceededError
+                let is_quota = e.dyn_ref::<web_sys::DomException>()
+                    .map_or(false, |ex| ex.name() == "QuotaExceededError");
+
+                if is_quota {
+                    log::warn!("pump[{pump_id}]: QuotaExceededError on segment {seg_idx}, forcing eviction");
+                    // Force-evict aggressively and retry
+                    if force_evict_back_buffer(&state, &video, pump_id).await {
+                        // Retry this segment after eviction
+                        TimeoutFuture::new(100).await;
+                        continue;
+                    } else {
+                        log::error!("pump[{pump_id}]: force eviction failed, skipping segment {seg_idx}");
+                    }
+                } else {
+                    log::error!("pump[{pump_id}]: append failed for segment {seg_idx}: {:?}", e);
+                    consecutive_failures += 1;
+                    if consecutive_failures > 5 {
+                        log::error!("pump[{pump_id}]: too many consecutive failures, exiting");
+                        return;
+                    }
+                    TimeoutFuture::new(500).await;
+                }
+
+                // Skip this segment on non-quota errors after retries
+                if let Some(dp) = state.borrow_mut().as_mut() {
+                    if dp.pump_gen == pump_id { dp.next_seg = seg_idx + 1; }
+                }
+                continue;
+            }
         }
 
         // Wait for append to complete
         if !wait_for_sb(&sb, &state, pump_id).await { return; }
 
-        // ── 8. Update dashjs-rs state ──
+        // ── 9. Update dashjs-rs state ──
         {
             let mut borrow = state.borrow_mut();
             if let Some(dp) = borrow.as_mut() {
@@ -568,29 +662,26 @@ async fn pump_loop(
                 // Update buffer level
                 let buf_level = buffered_end_at(&video, video.current_time()) - video.current_time();
                 dp.engine.buffer_controller_mut().set_buffer_level(buf_level.max(0.0));
-
-                log::info!("pump[{pump_id}]: appended segment {seg_idx}, next_seg={}", dp.next_seg);
             }
         }
 
-        // ── 9. Evict old data behind playhead ──
+        // ── 10. Evict old data behind playhead (time-gated, every 10s) ──
         {
             let now = js_sys::Date::now();
             let should_evict = {
                 let borrow = state.borrow();
-                borrow.as_ref().map_or(false, |dp| now - dp.last_eviction_ms >= 10_000.0)
+                borrow.as_ref().map_or(false, |dp| now - dp.last_eviction_ms >= EVICTION_INTERVAL_MS)
             };
             if should_evict {
-                let mut borrow = state.borrow_mut();
-                if let Some(dp) = borrow.as_mut() {
+                if let Some(dp) = state.borrow_mut().as_mut() {
                     dp.last_eviction_ms = now;
-                    evict_back_buffer(dp, &video);
                 }
+                evict_back_buffer(&state, &video, pump_id).await;
             }
         }
 
         // Small yield to let browser process
-        TimeoutFuture::new(0).await;
+        TimeoutFuture::new(10).await;
     }
 }
 
@@ -932,8 +1023,18 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         });
                     }) as Box<dyn FnOnce()>);
 
+                    // MUST use {once: true} to auto-remove after first fire.
+                    // Without this, Closure::once panics with 'FnOnce called
+                    // more than once' when MediaSource transitions ended→open
+                    // on replay/seek after endOfStream().
+                    let mut opts = web_sys::AddEventListenerOptions::new();
+                    opts.set_once(true);
                     media_source
-                        .add_event_listener_with_callback("sourceopen", sourceopen_cb.as_ref().unchecked_ref())
+                        .add_event_listener_with_callback_and_add_event_listener_options(
+                            "sourceopen",
+                            sourceopen_cb.as_ref().unchecked_ref(),
+                            &opts,
+                        )
                         .ok();
                     sourceopen_cb.forget();
                 });
@@ -1145,6 +1246,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 dp.pump_running = false;
                                 dp.next_seg = target_seg;
                                 dp.last_appended_seg = None;
+                                dp.segment_cache.clear();
+                                // Abort ongoing SourceBuffer operations before
+                                // flushing, matching dash.js seek behaviour.
+                                if dp.source_buffer.updating() {
+                                    let _ = dp.source_buffer.abort();
+                                }
                             }
                         }
 

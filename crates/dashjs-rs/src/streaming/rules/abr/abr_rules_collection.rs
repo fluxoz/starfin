@@ -10,11 +10,12 @@ impl AbrRulesCollection {
     pub fn new_default() -> Self {
         use super::{bola_rule::BolaRule, throughput_rule::ThroughputRule,
             insufficient_buffer_rule::InsufficientBufferRule, dropped_frames_rule::DroppedFramesRule,
-            abandon_requests_rule::AbandonRequestsRule};
+            abandon_requests_rule::AbandonRequestsRule, lolp::LolpRule};
         Self {
             quality_rules: vec![
                 Box::new(ThroughputRule::default()), Box::new(BolaRule::new(12.0)),
                 Box::new(InsufficientBufferRule), Box::new(DroppedFramesRule),
+                Box::new(LolpRule::new()),
             ],
             abandon_rules: vec![Box::new(AbandonRequestsRule::new())],
         }

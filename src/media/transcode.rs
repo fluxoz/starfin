@@ -503,7 +503,9 @@ fn write_fmp4_trailer(octx: &mut ffmpeg_next::format::context::Output) -> Result
 
 // ── Init segment extraction ──────────────────────────────────────────────────
 
-/// Extract the fMP4 init segment (ftyp + moov atoms) from a source video.
+/// Extract the fMP4 init segment (ftyp + moov atoms) from a source video,
+/// creating segment 0 in the given `seg_cache_dir` so that the very same
+/// file is later served by `get_segment`.
 ///
 /// The init segment contains the codec configuration (SPS/PPS for H.264,
 /// channel layout for AAC) that the browser's MSE SourceBuffer needs before
@@ -517,37 +519,39 @@ fn write_fmp4_trailer(octx: &mut ffmpeg_next::format::context::Output) -> Result
 /// misinterpret baseMediaDecodeTime / sample durations and play at the wrong
 /// speed.  Extracting from a real segment is the approach used by dash.js's
 /// test content generator and by Shaka Packager.
-pub fn create_init_segment(abs_path: &str, quality: Quality, hwaccel: &HwAccel) -> Result<Vec<u8>, String> {
+///
+/// **Critical for Firefox compatibility**: the init segment's `moov` (and
+/// its embedded `avcC` with SPS/PPS) MUST come from the same FFmpeg run
+/// that produced the media segment data.  If the init and media segments
+/// come from *different* FFmpeg runs the SPS/PPS can differ slightly
+/// (e.g. different VUI parameters, different pic_order_cnt_type).  Chrome
+/// tolerates this; Firefox's `H264ChangeMonitor::CheckForChange` does not
+/// and raises `NS_ERROR_DOM_MEDIA_FATAL_ERR: Invalid H264 content`.
+///
+/// By creating segment 0 directly in `seg_cache_dir` (the same directory
+/// from which `get_segment` later serves it), we guarantee byte-level
+/// identity between init and media segment 0.
+pub fn create_init_segment(abs_path: &str, quality: Quality, hwaccel: &HwAccel, seg_cache_dir: &Path) -> Result<Vec<u8>, String> {
     super::ensure_init();
 
-    // Generate segment 0 and extract ftyp+moov from it.
-    // This ensures the init segment's codec params AND timescale match
-    // the media segments exactly — critical for correct MSE playback
-    // timing in both Segments and Sequence SourceBuffer modes.
-    //
-    // Use a unique temp directory per call (thread ID + timestamp) to
-    // avoid races when concurrent requests create the init for the same
-    // video simultaneously.
-    let unique = format!(
-        "starfin_init_{}_{:?}",
-        std::process::id(),
-        std::thread::current().id(),
-    );
-    let tmp_dir = std::env::temp_dir().join(unique);
-    let _ = std::fs::create_dir_all(&tmp_dir);
+    let seg0_path = seg_cache_dir.join("seg_00000.m4s");
 
-    let result = (|| -> Result<Vec<u8>, String> {
-        create_segment(abs_path, &tmp_dir, 0, hwaccel, quality, None)?;
-        let seg0_path = tmp_dir.join("seg_00000.m4s");
+    // If segment 0 already exists in the cache (e.g. from a pre-cache run),
+    // extract ftyp+moov directly from it — no new FFmpeg run needed, and
+    // the init is guaranteed to match the cached segment exactly.
+    if seg0_path.exists() {
         let data = std::fs::read(&seg0_path)
-            .map_err(|e| format!("failed to read segment 0: {e}"))?;
-        extract_ftyp_moov(&data)
-    })();
+            .map_err(|e| format!("failed to read cached segment 0 from {}: {e}", seg0_path.display()))?;
+        return extract_ftyp_moov(&data);
+    }
 
-    // Cleanup regardless of success or failure.
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-
-    result
+    // Generate segment 0 in the cache directory itself.  This file stays
+    // on disk so that `get_segment` serves the exact same bytes the init
+    // segment's moov was derived from.
+    create_segment(abs_path, seg_cache_dir, 0, hwaccel, quality, None)?;
+    let data = std::fs::read(&seg0_path)
+        .map_err(|e| format!("failed to read segment 0 from {}: {e}", seg0_path.display()))?;
+    extract_ftyp_moov(&data)
 }
 
 /// Strip `ftyp` and `moov` boxes from an fMP4 media segment, keeping only

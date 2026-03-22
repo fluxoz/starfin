@@ -2248,8 +2248,9 @@ async fn get_init_segment(
     }
 
     let hwaccel = state.hwaccel.clone();
+    let seg_dir_clone = seg_dir.clone();
     let init_data = match tokio::task::spawn_blocking(move || {
-        media::transcode::create_init_segment(&abs_str, quality, &hwaccel)
+        media::transcode::create_init_segment(&abs_str, quality, &hwaccel, &seg_dir_clone)
     }).await {
         Ok(Ok(data)) => data,
         Ok(Err(e)) => {

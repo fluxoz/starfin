@@ -912,6 +912,20 @@ async fn pump_loop(
                             break;
                         }
                     } else {
+                        // Check for InvalidStateError specifically — this means the
+                        // SourceBuffer is no longer usable (e.g. Firefox MEDIA_FATAL_ERR
+                        // caused by H264 decode failure has detached the SourceBuffer
+                        // from the MediaSource).  Unlike QuotaExceeded, this is NOT
+                        // retriable — the entire MediaSource pipeline is dead.
+                        let is_invalid_state = e.dyn_ref::<web_sys::DomException>()
+                            .map_or(false, |ex| ex.name() == "InvalidStateError");
+
+                        if is_invalid_state {
+                            log::error!("pump[{pump_id}]: InvalidStateError on segment {seg_idx} — \
+                                SourceBuffer detached (likely decode error), exiting");
+                            return;
+                        }
+
                         log::error!("pump[{pump_id}]: append failed for segment {seg_idx}: {:?}", e);
                         consecutive_failures += 1;
                         if consecutive_failures > MAX_APPEND_FAILURES {

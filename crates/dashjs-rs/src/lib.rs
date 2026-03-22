@@ -14,3 +14,4 @@ pub use crate::core::event_bus::EventBus;
 pub use crate::core::events::Event;
 pub use crate::core::logger::LogLevel;
 pub use crate::core::settings::Settings;
+pub use crate::streaming::media_player::MediaPlayer;

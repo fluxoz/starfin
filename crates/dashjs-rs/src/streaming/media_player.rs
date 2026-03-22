@@ -447,11 +447,10 @@ impl MediaPlayer {
 
     /// Returns the current live latency in seconds.
     ///
-    /// Requires `wall_clock_time` (milliseconds since epoch) — in a
-    /// browser this would be `Date.now()`.
+    /// Returns `0.0` when no wall-clock source is available. Use
+    /// [`get_current_live_latency_with_clock`](Self::get_current_live_latency_with_clock)
+    /// for accurate calculations with an explicit timestamp.
     pub fn get_current_live_latency(&self) -> f64 {
-        // Without a real clock source we return 0.0; callers can use
-        // `get_current_live_latency_with_clock` for a proper calculation.
         0.0
     }
 
@@ -469,8 +468,8 @@ impl MediaPlayer {
 
     /// Returns the average measured throughput for the given media type.
     ///
-    /// Currently returns the global throughput estimate; per-type tracking
-    /// is planned.
+    /// Currently returns the global throughput estimate.
+    // TODO: implement per-media-type throughput tracking
     pub fn get_average_throughput(&self, _media_type: &str) -> f64 {
         self.throughput_controller.get_average_throughput()
     }

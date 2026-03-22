@@ -272,24 +272,67 @@ fn format_time(seconds: f64) -> String {
     else { format!("{mins}:{secs:02}") }
 }
 
-fn buffered_end_at(video: &HtmlVideoElement, time: f64) -> f64 {
+/// Get the continuous buffered range at `time`, merging adjacent ranges whose
+/// gap is ≤ `tolerance`.  This is a 1:1 port of dash.js
+/// `BufferController.getRangeAt(time, tolerance)` which merges through small
+/// gaps (default `smallGapLimit = 0.15s`).
+///
+/// Returns `(range_start, range_end)` or `None`.
+fn get_range_at(video: &HtmlVideoElement, time: f64, tolerance: f64) -> Option<(f64, f64)> {
     let buffered = video.buffered();
+    let mut first_start: Option<f64> = None;
+    let mut last_end: f64 = 0.0;
+
     for i in 0..buffered.length() {
         if let (Ok(start), Ok(end)) = (buffered.start(i), buffered.end(i)) {
-            if time >= start && time <= end { return end; }
+            if first_start.is_none() {
+                let gap = (start - time).abs();
+                if time >= start && time < end {
+                    // time is inside this range
+                    first_start = Some(start);
+                    last_end = end;
+                } else if gap <= tolerance {
+                    // time is within tolerance of range start
+                    first_start = Some(start);
+                    last_end = end;
+                }
+            } else {
+                let gap = start - last_end;
+                if gap <= tolerance {
+                    // merge adjacent ranges with small gap
+                    last_end = end;
+                } else {
+                    break;
+                }
+            }
         }
     }
-    0.0
+
+    first_start.map(|_| (first_start.unwrap(), last_end))
+}
+
+/// dash.js `_getBufferLength(time, tolerance)`: returns the number of seconds
+/// buffered ahead of `time`, using `getRangeAt` with gap tolerance.
+/// This is the buffer level used by `ScheduleController._shouldBuffer()`.
+const BUFFER_RANGE_TOLERANCE: f64 = 0.15; // dash.js streaming.gaps.smallGapLimit
+
+fn get_buffer_level(video: &HtmlVideoElement, time: f64) -> f64 {
+    match get_range_at(video, time, BUFFER_RANGE_TOLERANCE) {
+        Some((_start, end)) => (end - time).max(0.0),
+        None => 0.0,
+    }
+}
+
+/// Legacy helper — returns the end of the buffered range containing `time`.
+fn buffered_end_at(video: &HtmlVideoElement, time: f64) -> f64 {
+    match get_range_at(video, time, BUFFER_RANGE_TOLERANCE) {
+        Some((_start, end)) => end,
+        None => 0.0,
+    }
 }
 
 fn is_time_buffered(video: &HtmlVideoElement, time: f64) -> bool {
-    let buffered = video.buffered();
-    for i in 0..buffered.length() {
-        if let (Ok(s), Ok(e)) = (buffered.start(i), buffered.end(i)) {
-            if time >= s && time <= e { return true; }
-        }
-    }
-    false
+    get_range_at(video, time, BUFFER_RANGE_TOLERANCE).is_some()
 }
 
 /// Get buffered ranges as dashjs-rs BufferedRange vec for GapController.
@@ -480,7 +523,6 @@ async fn pump_loop(
     pump_id: u32,
 ) {
     let mut consecutive_failures: u32 = 0;
-    let mut quota_retries: u32 = 0;
 
     loop {
         // ── 1. Check pump is still current ──
@@ -544,8 +586,11 @@ async fn pump_loop(
         // ── 5. Use dashjs-rs ScheduleController to decide if we should fetch ──
         // Mirrors dash.js ScheduleController._shouldBuffer():
         //   bufferLevel + segmentDuration < bufferTarget
+        // Uses get_buffer_level() which matches dash.js _getBufferLength() with
+        // 0.15s tolerance through getRangeAt().
         {
-            let buf_ahead = (buffered_end_at(&video, video.current_time()) - video.current_time()).max(0.0);
+            let current_time = video.current_time();
+            let buf_ahead = get_buffer_level(&video, current_time);
 
             let mut borrow = state.borrow_mut();
             if let Some(dp) = borrow.as_mut() {
@@ -627,47 +672,58 @@ async fn pump_loop(
 
         if !wait_for_sb(&sb, &state, pump_id).await { return; }
 
+        // Retry loop for append — does NOT re-fetch the segment data.
+        // On QuotaExceeded, evicts behind playhead and retries the same bytes
+        // (matching dash.js SourceBufferSink → BufferController._handleQuotaExceededError).
         let uint8 = js_sys::Uint8Array::from(bytes.as_slice());
         let ab = uint8.buffer();
-        match sb.append_buffer_with_array_buffer(&ab) {
-            Ok(()) => {
-                consecutive_failures = 0;
-                quota_retries = 0;
-            }
-            Err(e) => {
-                // Check if this is a QuotaExceededError
-                let is_quota = e.dyn_ref::<web_sys::DomException>()
-                    .map_or(false, |ex| ex.name() == "QuotaExceededError");
+        let mut append_ok = false;
+        let mut quota_retries: u32 = 0;
+        loop {
+            if !wait_for_sb(&sb, &state, pump_id).await { return; }
+            match sb.append_buffer_with_array_buffer(&ab) {
+                Ok(()) => {
+                    consecutive_failures = 0;
+                    append_ok = true;
+                    break;
+                }
+                Err(e) => {
+                    let is_quota = e.dyn_ref::<web_sys::DomException>()
+                        .map_or(false, |ex| ex.name() == "QuotaExceededError");
 
-                if is_quota {
-                    quota_retries += 1;
-                    if quota_retries <= MAX_QUOTA_RETRIES {
-                        log::warn!("pump[{pump_id}]: QuotaExceededError on segment {seg_idx} (attempt {quota_retries}/{MAX_QUOTA_RETRIES}), forcing aggressive eviction");
-                        // Aggressive eviction — matching dash.js
-                        // BufferController._handleQuotaExceededError + clearBuffers
-                        force_evict_for_quota(&sb, &video, &state, pump_id).await;
-                        TimeoutFuture::new(200).await;
-                        continue;
+                    if is_quota {
+                        quota_retries += 1;
+                        if quota_retries <= MAX_QUOTA_RETRIES {
+                            log::warn!("pump[{pump_id}]: QuotaExceededError on segment {seg_idx} \
+                                (attempt {quota_retries}/{MAX_QUOTA_RETRIES}), evicting");
+                            force_evict_for_quota(&sb, &video, &state, pump_id).await;
+                            TimeoutFuture::new(200).await;
+                            // Retry the append with the SAME bytes (no re-fetch)
+                        } else {
+                            log::error!("pump[{pump_id}]: QuotaExceeded persists after \
+                                {MAX_QUOTA_RETRIES} evictions, skipping segment {seg_idx}");
+                            break;
+                        }
                     } else {
-                        log::error!("pump[{pump_id}]: QuotaExceeded persists after {MAX_QUOTA_RETRIES} evictions, skipping segment {seg_idx}");
-                        quota_retries = 0;
+                        log::error!("pump[{pump_id}]: append failed for segment {seg_idx}: {:?}", e);
+                        consecutive_failures += 1;
+                        if consecutive_failures > MAX_APPEND_FAILURES {
+                            log::error!("pump[{pump_id}]: too many consecutive failures, exiting");
+                            return;
+                        }
+                        TimeoutFuture::new(500).await;
+                        break;
                     }
-                } else {
-                    log::error!("pump[{pump_id}]: append failed for segment {seg_idx}: {:?}", e);
-                    consecutive_failures += 1;
-                    if consecutive_failures > MAX_APPEND_FAILURES {
-                        log::error!("pump[{pump_id}]: too many consecutive failures, exiting");
-                        return;
-                    }
-                    TimeoutFuture::new(500).await;
                 }
-
-                // Skip this segment
-                if let Some(dp) = state.borrow_mut().as_mut() {
-                    if dp.pump_gen == pump_id { dp.next_seg = seg_idx + 1; }
-                }
-                continue;
             }
+        }
+
+        if !append_ok {
+            // Skip this segment and move on
+            if let Some(dp) = state.borrow_mut().as_mut() {
+                if dp.pump_gen == pump_id { dp.next_seg = seg_idx + 1; }
+            }
+            continue;
         }
 
         // Wait for append to complete
@@ -685,8 +741,8 @@ async fn pump_loop(
                 dp.engine.buffer_controller_mut().append_data(seg_idx as i64);
 
                 // Update buffer level
-                let buf_level = buffered_end_at(&video, video.current_time()) - video.current_time();
-                dp.engine.buffer_controller_mut().set_buffer_level(buf_level.max(0.0));
+                let buf_level = get_buffer_level(&video, video.current_time());
+                dp.engine.buffer_controller_mut().set_buffer_level(buf_level);
             }
         }
 

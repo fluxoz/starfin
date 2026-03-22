@@ -4,6 +4,10 @@
 
 use serde::{Deserialize, Serialize};
 
+// ---------------------------------------------------------------------------
+// Metric value objects
+// ---------------------------------------------------------------------------
+
 /// Scheduling info metric.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SchedulingInfo {
@@ -18,6 +22,32 @@ pub struct SchedulingInfo {
 pub struct BufferLevel {
     pub t: f64,
     pub level: f64,
+}
+
+/// HTTP request metric.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HttpRequestMetric {
+    pub url: String,
+    pub actual_url: Option<String>,
+    pub media_type: String,
+    pub response_code: u16,
+    pub t_request: f64,
+    pub t_response: f64,
+    pub bytes_loaded: u64,
+    pub interval: f64,
+}
+
+/// Representation switch event.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RepresentationSwitch {
+    /// Wall-clock time of the switch.
+    pub t: f64,
+    /// Media time at switch.
+    pub mt: f64,
+    /// New representation id.
+    pub to: String,
+    /// Previous representation id.
+    pub lto: String,
 }
 
 /// Playback rate metric for DVB reporting.
@@ -39,6 +69,68 @@ pub struct PlayListTrace {
     pub stopreason: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// MetricsCollector
+// ---------------------------------------------------------------------------
+
+/// Collects all metric types for a single media type.
+#[derive(Clone, Debug, Default)]
+pub struct MetricsCollector {
+    pub scheduling_info: Vec<SchedulingInfo>,
+    pub buffer_levels: Vec<BufferLevel>,
+    pub http_list: Vec<HttpRequestMetric>,
+    pub play_lists: Vec<PlayList>,
+    pub dropped_frames: u64,
+    pub representation_switches: Vec<RepresentationSwitch>,
+}
+
+impl MetricsCollector {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn add_scheduling_info(&mut self, info: SchedulingInfo) {
+        self.scheduling_info.push(info);
+    }
+
+    pub fn add_buffer_level(&mut self, level: BufferLevel) {
+        self.buffer_levels.push(level);
+    }
+
+    pub fn add_http_request(&mut self, req: HttpRequestMetric) {
+        self.http_list.push(req);
+    }
+
+    pub fn add_representation_switch(&mut self, sw: RepresentationSwitch) {
+        self.representation_switches.push(sw);
+    }
+
+    pub fn add_play_list(&mut self, pl: PlayList) {
+        self.play_lists.push(pl);
+    }
+
+    /// Returns the most recent buffer level, if any.
+    pub fn get_current_buffer_level(&self) -> Option<&BufferLevel> {
+        self.buffer_levels.last()
+    }
+
+    /// Returns all recorded HTTP requests.
+    pub fn get_http_requests(&self) -> &[HttpRequestMetric] {
+        &self.http_list
+    }
+
+    pub fn reset(&mut self) {
+        self.scheduling_info.clear();
+        self.buffer_levels.clear();
+        self.http_list.clear();
+        self.play_lists.clear();
+        self.dropped_frames = 0;
+        self.representation_switches.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MetricsReporting (kept from original)
+// ---------------------------------------------------------------------------
+
 /// Metrics reporting events stub.
 pub struct MetricsReporting;
 impl MetricsReporting {
@@ -48,6 +140,8 @@ impl MetricsReporting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- original tests ---
 
     #[test]
     fn scheduling_info_defaults() {
@@ -113,6 +207,93 @@ mod tests {
     #[test]
     fn metrics_reporting_new() {
         let _mr = MetricsReporting::new();
-        // should not panic
+    }
+
+    // --- MetricsCollector tests ---
+
+    #[test]
+    fn collector_add_scheduling_info() {
+        let mut mc = MetricsCollector::new();
+        mc.add_scheduling_info(SchedulingInfo { media_type: "video".into(), t: 1.0, quality: 2, state: "executing".into() });
+        assert_eq!(mc.scheduling_info.len(), 1);
+    }
+
+    #[test]
+    fn collector_add_buffer_level() {
+        let mut mc = MetricsCollector::new();
+        mc.add_buffer_level(BufferLevel { t: 1.0, level: 10.0 });
+        mc.add_buffer_level(BufferLevel { t: 2.0, level: 15.0 });
+        assert_eq!(mc.get_current_buffer_level().unwrap().level, 15.0);
+    }
+
+    #[test]
+    fn collector_get_current_buffer_level_empty() {
+        let mc = MetricsCollector::new();
+        assert!(mc.get_current_buffer_level().is_none());
+    }
+
+    #[test]
+    fn collector_add_http_request() {
+        let mut mc = MetricsCollector::new();
+        mc.add_http_request(HttpRequestMetric { url: "http://a.com/seg.m4s".into(), response_code: 200, ..Default::default() });
+        assert_eq!(mc.get_http_requests().len(), 1);
+        assert_eq!(mc.get_http_requests()[0].response_code, 200);
+    }
+
+    #[test]
+    fn collector_add_representation_switch() {
+        let mut mc = MetricsCollector::new();
+        mc.add_representation_switch(RepresentationSwitch { t: 10.0, mt: 10.0, to: "v2".into(), lto: "v1".into() });
+        assert_eq!(mc.representation_switches.len(), 1);
+        assert_eq!(mc.representation_switches[0].to, "v2");
+    }
+
+    #[test]
+    fn collector_add_play_list() {
+        let mut mc = MetricsCollector::new();
+        mc.add_play_list(PlayList { start_type: "seek".into(), ..Default::default() });
+        assert_eq!(mc.play_lists.len(), 1);
+    }
+
+    #[test]
+    fn collector_dropped_frames() {
+        let mut mc = MetricsCollector::new();
+        mc.dropped_frames = 42;
+        assert_eq!(mc.dropped_frames, 42);
+    }
+
+    #[test]
+    fn collector_reset() {
+        let mut mc = MetricsCollector::new();
+        mc.add_scheduling_info(SchedulingInfo::default());
+        mc.add_buffer_level(BufferLevel::default());
+        mc.add_http_request(HttpRequestMetric::default());
+        mc.add_play_list(PlayList::default());
+        mc.add_representation_switch(RepresentationSwitch::default());
+        mc.dropped_frames = 10;
+        mc.reset();
+        assert!(mc.scheduling_info.is_empty());
+        assert!(mc.buffer_levels.is_empty());
+        assert!(mc.http_list.is_empty());
+        assert!(mc.play_lists.is_empty());
+        assert!(mc.representation_switches.is_empty());
+        assert_eq!(mc.dropped_frames, 0);
+    }
+
+    // --- RepresentationSwitch tests ---
+    #[test]
+    fn representation_switch_defaults() {
+        let rs = RepresentationSwitch::default();
+        assert_eq!(rs.t, 0.0);
+        assert!(rs.to.is_empty());
+    }
+
+    // --- HttpRequestMetric tests ---
+    #[test]
+    fn http_request_metric_defaults() {
+        let h = HttpRequestMetric::default();
+        assert!(h.url.is_empty());
+        assert_eq!(h.response_code, 0);
+        assert_eq!(h.bytes_loaded, 0);
     }
 }

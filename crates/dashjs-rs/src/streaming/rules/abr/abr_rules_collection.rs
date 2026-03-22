@@ -16,7 +16,7 @@ impl AbrRulesCollection {
                 Box::new(ThroughputRule::default()), Box::new(BolaRule::new(12.0)),
                 Box::new(InsufficientBufferRule), Box::new(DroppedFramesRule),
             ],
-            abandon_rules: vec![Box::new(AbandonRequestsRule)],
+            abandon_rules: vec![Box::new(AbandonRequestsRule::new())],
         }
     }
     pub fn get_max_quality(&self, context: &RulesContext) -> SwitchRequest {

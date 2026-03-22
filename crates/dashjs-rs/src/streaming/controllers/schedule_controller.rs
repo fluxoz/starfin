@@ -4,8 +4,8 @@
 //! buffer level, scheduling state, and quality-switch bookkeeping.
 
 /// Default buffer target (seconds), matching
-/// `Settings.streaming.buffer.bufferTimeAtTopQuality` in dash.js.
-const DEFAULT_BUFFER_TARGET: f64 = 12.0;
+/// `Settings.streaming.buffer.bufferTimeAtTopQuality` in dash.js (default 30).
+const DEFAULT_BUFFER_TARGET: f64 = 30.0;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -205,8 +205,8 @@ mod tests {
         ctrl.start_scheduling();
         // Buffer has room (0.0 + 4.0 < 12.0).
         assert!(ctrl.should_schedule(0.0, 4.0));
-        // Buffer full (10.0 + 4.0 >= 12.0).
-        assert!(!ctrl.should_schedule(10.0, 4.0));
+        // Buffer full (28.0 + 4.0 >= 30.0).
+        assert!(!ctrl.should_schedule(28.0, 4.0));
     }
 
     #[test]

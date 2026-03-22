@@ -588,6 +588,26 @@ impl MediaPlayer {
         &mut self.throughput_controller
     }
 
+    /// Returns a reference to the internal `GapController`.
+    pub fn gap_controller(&self) -> &GapController {
+        &self.gap_controller
+    }
+
+    /// Returns a mutable reference to the internal `GapController`.
+    pub fn gap_controller_mut(&mut self) -> &mut GapController {
+        &mut self.gap_controller
+    }
+
+    /// Returns a reference to the internal `ScheduleController`.
+    pub fn schedule_controller(&self) -> &ScheduleController {
+        &self.schedule_controller
+    }
+
+    /// Returns a mutable reference to the internal `ScheduleController`.
+    pub fn schedule_controller_mut(&mut self) -> &mut ScheduleController {
+        &mut self.schedule_controller
+    }
+
     /// Returns a reference to the internal `EventBus`.
     pub fn event_bus(&self) -> &EventBus {
         &self.event_bus

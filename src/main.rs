@@ -2317,15 +2317,21 @@ async fn get_segment(
         if *v { false } else { *v = true; true }
     });
 
-    // If segment exists, serve it immediately from cache
+    // If segment exists, serve it immediately from cache.
+    // Strip ftyp+moov init boxes so the SourceBuffer only receives moof+mdat
+    // fragments — the init segment is served separately via /init.mp4.
+    // Without this, the browser re-initialises the decoder at every segment
+    // boundary, causing visible stutter (matching dash.js SourceBufferSink
+    // which never sends duplicate init segments during normal playback).
     if let Ok(data) = tokio::fs::read(&seg_path).await {
+        let stripped = media::transcode::strip_init_boxes(&data);
         return HttpResponse::Ok()
             .content_type("video/mp4")
             .insert_header((
                 header::CACHE_CONTROL,
                 "public, max-age=31536000, immutable",
             ))
-            .body(data);
+            .body(stripped);
     }
 
     // Parse segment index from filename (e.g., "seg_00042.m4s" -> 42)
@@ -2439,13 +2445,16 @@ async fn get_segment(
     match transcode_result {
         Ok(()) => {
             match tokio::fs::read(&seg_path).await {
-                Ok(data) => HttpResponse::Ok()
-                    .content_type("video/mp4")
-                    .insert_header((
-                        header::CACHE_CONTROL,
-                        "public, max-age=31536000, immutable",
-                    ))
-                    .body(data),
+                Ok(data) => {
+                    let stripped = media::transcode::strip_init_boxes(&data);
+                    HttpResponse::Ok()
+                        .content_type("video/mp4")
+                        .insert_header((
+                            header::CACHE_CONTROL,
+                            "public, max-age=31536000, immutable",
+                        ))
+                        .body(stripped)
+                }
                 Err(e) => HttpResponse::InternalServerError()
                     .body(format!("failed to read generated segment: {e}")),
             }

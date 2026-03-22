@@ -550,6 +550,46 @@ pub fn create_init_segment(abs_path: &str, quality: Quality, hwaccel: &HwAccel) 
     result
 }
 
+/// Strip `ftyp` and `moov` boxes from an fMP4 media segment, keeping only
+/// the media fragment boxes (`moof`, `mdat`, `sidx`, `styp`, etc.).
+///
+/// FFmpeg's fMP4 muxer with `empty_moov` writes `ftyp+moov+moof+mdat` into
+/// every segment file.  When appending these to an MSE SourceBuffer the
+/// redundant moov causes the browser to re-initialise the decoder at every
+/// segment boundary, producing visible stutter.
+///
+/// The init segment (`ftyp+moov`) is served separately via the
+/// `/api/videos/{id}/init.mp4` endpoint; media segments must contain only
+/// fragment data.  This matches how dash.js expects media segments: the
+/// SourceBufferSink receives the init segment once, then a stream of
+/// `moof+mdat` fragments.
+pub fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut pos = 0usize;
+
+    while pos + 8 <= data.len() {
+        let size = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+            as usize;
+        if size < 8 || pos + size > data.len() {
+            break;
+        }
+        let box_type = &data[pos + 4..pos + 8];
+        // Keep everything except the init-segment boxes.
+        if box_type != b"ftyp" && box_type != b"moov" {
+            result.extend_from_slice(&data[pos..pos + size]);
+        }
+        pos += size;
+    }
+
+    // If stripping would produce empty output (unexpected), return the
+    // original data unmodified to avoid serving a broken response.
+    if result.is_empty() {
+        data.to_vec()
+    } else {
+        result
+    }
+}
+
 /// Extract ftyp and moov boxes from an fMP4 byte buffer.
 ///
 /// Parses MP4 box headers (4-byte size + 4-byte type) and copies only the

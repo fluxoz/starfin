@@ -1412,21 +1412,30 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 dp.next_seg = target_seg;
                                 dp.last_appended_seg = None;
                                 dp.last_eviction_ms = js_sys::Date::now();
-                                // Abort ongoing SourceBuffer operations before
-                                // flushing, matching dash.js seek behaviour.
-                                if dp.source_buffer.updating() {
-                                    let _ = dp.source_buffer.abort();
-                                }
+                                // Abort any in-progress SourceBuffer operations.
+                                // Matches dash.js SourceBufferSink.abortBeforeAppend()
+                                // which is called during seek to cancel pending appends.
+                                let _ = dp.source_buffer.abort();
                             }
                         }
 
-                        // Flush stale data ahead
+                        // Flush the entire SourceBuffer so the pump rebuilds
+                        // from the target segment cleanly.  dash.js
+                        // BufferController._onSeekTarget() clears the buffer
+                        // around the seek position to prevent stale data from
+                        // causing decoder artifacts.
+                        //
+                        // We remove everything: old data behind the seek
+                        // target would be pruned anyway, and data ahead may
+                        // belong to a different GOP structure that causes chop.
+                        // The pump will re-fetch segments from target_seg.
                         {
                             let borrow = dash_state.borrow();
                             if let Some(dp) = borrow.as_ref() {
-                                let flush_start = (target_seg as f64 + 1.0) * SEGMENT_DURATION_F;
                                 if !dp.source_buffer.updating() {
-                                    let _ = dp.source_buffer.remove(flush_start, f64::INFINITY);
+                                    let dur = video_for_seek.duration();
+                                    let end = if dur.is_finite() && dur > 0.0 { dur } else { f64::MAX };
+                                    let _ = dp.source_buffer.remove(0.0, end);
                                 }
                             }
                         }

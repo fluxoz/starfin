@@ -50,3 +50,75 @@ pub enum ProtectionEvent {
     NeedKey,
     ServerCertificateUpdated,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_system_variants() {
+        let ks = KeySystem::Widevine;
+        assert_eq!(ks, KeySystem::Widevine);
+        assert_ne!(ks, KeySystem::PlayReady);
+        let other = KeySystem::Other("custom.drm".into());
+        assert_eq!(other, KeySystem::Other("custom.drm".into()));
+    }
+
+    #[test]
+    fn key_system_clone() {
+        let ks = KeySystem::ClearKey;
+        let ks2 = ks.clone();
+        assert_eq!(ks, ks2);
+    }
+
+    #[test]
+    fn protection_config_defaults() {
+        let cfg = ProtectionConfig::default();
+        assert!(cfg.key_system.is_none());
+        assert!(cfg.server_url.is_none());
+        assert!(cfg.server_certificate.is_none());
+        assert!(cfg.clear_keys.is_none());
+        assert!(cfg.robustness.is_none());
+    }
+
+    #[test]
+    fn protection_controller_lifecycle() {
+        let mut ctrl = ProtectionController::new();
+        assert!(!ctrl.is_initialized());
+        ctrl.initialize();
+        assert!(ctrl.is_initialized());
+        ctrl.reset();
+        assert!(!ctrl.is_initialized());
+    }
+
+    #[test]
+    fn protection_controller_double_initialize() {
+        let mut ctrl = ProtectionController::new();
+        ctrl.initialize();
+        ctrl.initialize();
+        assert!(ctrl.is_initialized());
+    }
+
+    #[test]
+    fn protection_event_variants_equality() {
+        assert_eq!(ProtectionEvent::NeedKey, ProtectionEvent::NeedKey);
+        assert_ne!(ProtectionEvent::NeedKey, ProtectionEvent::KeySessionCreated);
+        assert_eq!(ProtectionEvent::LicenseRequestComplete, ProtectionEvent::LicenseRequestComplete);
+    }
+
+    #[test]
+    fn protection_event_clone() {
+        let evt = ProtectionEvent::KeySystemSelected;
+        let evt2 = evt.clone();
+        assert_eq!(evt, evt2);
+    }
+
+    #[test]
+    fn protection_config_with_clear_keys() {
+        let mut keys = std::collections::HashMap::new();
+        keys.insert("kid1".into(), "key1".into());
+        let cfg = ProtectionConfig { clear_keys: Some(keys), ..Default::default() };
+        assert!(cfg.clear_keys.is_some());
+        assert_eq!(cfg.clear_keys.unwrap().len(), 1);
+    }
+}

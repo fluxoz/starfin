@@ -34,28 +34,35 @@
     # evaluation time (always the host platform).  Setting CARGO_BUILD_TARGET
     # as an env var does NOT override that substitution, so we must supply our
     # own buildPhase to pass --target wasm32-unknown-unknown explicitly.
+    #
+    # src = self (the whole repository) so that the path dependency
+    # dashjs-rs = { path = "../crates/dashjs-rs" } declared in
+    # frontend/Cargo.toml is reachable at build time.  With src = ./frontend
+    # the ../crates/dashjs-rs path would be outside the Nix sandbox.
     starfinFrontendWasm = rustPlatform.buildRustPackage {
       pname = "starfin-frontend-wasm";
       inherit version;
-      src = ./frontend;
+      src = self;
       cargoLock.lockFile = ./frontend/Cargo.lock;
 
-      # Override buildPhase to target wasm32-unknown-unknown explicitly.
+      # Build only the frontend crate using its manifest explicitly so that
+      # cargo does not pick up the root starfin backend Cargo.toml.
       buildPhase = ''
         runHook preBuild
-        cargo build --release --target wasm32-unknown-unknown --offline
+        cargo build --release --target wasm32-unknown-unknown --offline \
+          --manifest-path frontend/Cargo.toml
         runHook postBuild
       '';
 
       # No runnable tests for a WASM crate.
       doCheck = false;
 
-      # The frontend crate is a binary (src/main.rs), so cargo preserves
-      # hyphens in the output filename: starfin-frontend.wasm (not underscores).
+      # With --manifest-path frontend/Cargo.toml cargo uses frontend/ as the
+      # workspace root, so the target directory is frontend/target/.
       installPhase = ''
         runHook preInstall
         mkdir -p $out
-        cp target/wasm32-unknown-unknown/release/starfin-frontend.wasm $out/
+        cp frontend/target/wasm32-unknown-unknown/release/starfin-frontend.wasm $out/
         runHook postInstall
       '';
     };

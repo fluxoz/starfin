@@ -725,7 +725,18 @@ async fn pump_loop(
             (dp.next_seg, dp.segments[dp.next_seg].url.clone())
         };
 
-        // ── 5. Use dashjs-rs ScheduleController to decide if we should fetch ──
+        // ── 5. Kick background prefetch for upcoming segments ──
+        // Mirrors dash.js StreamProcessor._onMediaFragmentNeeded + FragmentController:
+        // always keep LOOKAHEAD_WINDOW segments in-flight or cached, REGARDLESS of
+        // whether should_schedule currently gates the main append.  Moving this
+        // before the schedule gate is critical for post-seek recovery: after a seek
+        // the seek-flush remove() is async, so get_buffer_level may still see old
+        // data and should_schedule may return false for a few 500ms wait cycles.
+        // Without prefetch running during those waits, every post-seek segment is
+        // a cold inline fetch.
+        kick_prefetch(&state, pump_id);
+
+        // ── 6. Use dashjs-rs ScheduleController to decide if we should append ──
         // Mirrors dash.js ScheduleController._shouldBuffer():
         //   bufferLevel + segmentDuration < bufferTarget
         // Uses get_buffer_level() which matches dash.js _getBufferLength() with
@@ -748,11 +759,6 @@ async fn pump_loop(
                 return;
             }
         }
-
-        // ── 6. Kick background prefetch for upcoming segments ──
-        // Mirrors dash.js StreamProcessor._onMediaFragmentNeeded: always keep
-        // LOOKAHEAD_WINDOW segments in-flight or cached ahead of the playhead.
-        kick_prefetch(&state, pump_id);
 
         // ── 7. Obtain segment bytes — from cache or inline fetch ──
         // Check the SegmentCache first: if a background prefetch already
@@ -849,12 +855,39 @@ async fn pump_loop(
         // Retry loop for append — does NOT re-fetch the segment data.
         // On QuotaExceeded, evicts behind playhead and retries the same bytes
         // (matching dash.js SourceBufferSink → BufferController._handleQuotaExceededError).
-        let uint8 = js_sys::Uint8Array::from(bytes.as_slice());
-        let ab = uint8.buffer();
+        //
+        // Firefox robustness notes:
+        //   1. The ArrayBuffer is recreated on every attempt.  Firefox (and the MSE spec)
+        //      may transfer/detach the ArrayBuffer on a failed appendBuffer() call, so
+        //      reusing the same `ab` across retries causes InvalidStateError on the second
+        //      attempt.  Re-creating it from the original `bytes` slice is safe and cheap
+        //      because retries are rare.
+        //   2. The MediaSource readyState is checked immediately before each appendBuffer()
+        //      call.  Firefox transitions the MediaSource to "ended"/"closed" more eagerly
+        //      than Chrome; catching this here prevents the "object is no longer usable"
+        //      InvalidStateError that would otherwise appear in the error log.
         let mut append_ok = false;
         let mut quota_retries: u32 = 0;
         loop {
             if !wait_for_sb(&sb, &state, pump_id).await { return; }
+
+            // Guard: MediaSource must be Open before appendBuffer (Firefox strict check)
+            {
+                let borrow = state.borrow();
+                match borrow.as_ref() {
+                    Some(dp) if dp.pump_gen == pump_id => {
+                        if dp.media_source.ready_state() != web_sys::MediaSourceReadyState::Open {
+                            log::info!("pump[{pump_id}]: MediaSource closed, exiting");
+                            return;
+                        }
+                    }
+                    _ => return,
+                }
+            }
+
+            // Rebuild ArrayBuffer on every attempt to avoid Firefox detachment issues
+            let uint8 = js_sys::Uint8Array::from(bytes.as_slice());
+            let ab = uint8.buffer();
             match sb.append_buffer_with_array_buffer(&ab) {
                 Ok(()) => {
                     consecutive_failures = 0;

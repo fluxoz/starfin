@@ -609,11 +609,12 @@ pub fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
         // that starts with `styp`.
         //
         // Prepend a minimal `styp` box: brand = `msdh`, minor version = 0,
-        // compatible brands = `msdh`, `msix`, `isom`.  This matches what
-        // Bento4 and Shaka Packager emit for CMAF.
-        let mut with_styp = Vec::with_capacity(result.len() + 24);
-        // styp box: size=24, type='styp', brand='msdh', version=0, compat=['msdh','msix']
-        with_styp.extend_from_slice(&24u32.to_be_bytes());  // size
+        // compatible brands = `msdh`, `msix`.  This matches what Bento4 and
+        // Shaka Packager emit for CMAF.
+        // Layout: 4 (size) + 4 (type) + 4 (brand) + 4 (version) + 4+4 (compat) = 24 bytes
+        const STYP_BOX_SIZE: usize = 24;
+        let mut with_styp = Vec::with_capacity(result.len() + STYP_BOX_SIZE);
+        with_styp.extend_from_slice(&(STYP_BOX_SIZE as u32).to_be_bytes());  // size
         with_styp.extend_from_slice(b"styp");               // type
         with_styp.extend_from_slice(b"msdh");               // major brand
         with_styp.extend_from_slice(&0u32.to_be_bytes());   // minor version

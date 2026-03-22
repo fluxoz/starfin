@@ -171,6 +171,83 @@ impl DashEngine {
     }
 }
 
+// ── Server integration ───────────────────────────────────────────────────────
+//
+// Commands that can be sent from the server to control playback.
+// This provides the integration points between `video_player.rs` and
+// `main.rs` as required by the architecture.
+//
+// **Current integration:**
+//   • The player fetches manifests and segments via HTTP from main.rs
+//     endpoints (`/api/videos/{id}/manifest.mpd`, `/api/videos/{id}/segments/…`).
+//   • Quality selection is communicated via the `?quality=` query parameter.
+//   • Cache management uses `DELETE /api/videos/{id}/cache`.
+//
+// **Extensibility:**
+//   • `ServerCommand` defines the full set of operations the server can
+//     trigger on the player (play, pause, seek, quality change, source
+//     update, volume).
+//   • A WebSocket or Server-Sent Events transport can be added by
+//     connecting to `/api/player/ws` (future endpoint) and dispatching
+//     incoming `ServerCommand` messages to the `apply_server_command()`
+//     helper.
+//   • The command handler is designed to work with both SSE (`EventSource`)
+//     and WebSocket (`actix-ws`) transports without changing the player code.
+
+/// Commands that can be sent from the server to control playback.
+/// Designed for use over WebSocket or Server-Sent Events.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerCommand {
+    /// Start or resume playback.
+    Play,
+    /// Pause playback.
+    Pause,
+    /// Seek to the specified time (seconds).
+    Seek { time: f64 },
+    /// Change the stream quality (e.g. "original", "high", "medium", "low").
+    SetQuality { quality: String },
+    /// Update the video source (triggers full re-initialisation).
+    UpdateSource { video_id: String },
+    /// Set the playback volume (0.0–1.0).
+    SetVolume { volume: f64 },
+}
+
+/// Apply a server command to the video element.
+/// Returns `true` if the command was handled successfully.
+fn apply_server_command(
+    video: &HtmlVideoElement,
+    cmd: &ServerCommand,
+) -> bool {
+    match cmd {
+        ServerCommand::Play => {
+            let _ = video.play();
+            true
+        }
+        ServerCommand::Pause => {
+            let _ = video.pause();
+            true
+        }
+        ServerCommand::Seek { time } => {
+            let dur = video.duration();
+            if dur.is_finite() && *time >= 0.0 {
+                video.set_current_time(time.min(dur));
+                true
+            } else {
+                false
+            }
+        }
+        ServerCommand::SetVolume { volume } => {
+            video.set_volume(volume.clamp(0.0, 1.0));
+            true
+        }
+        // SetQuality and UpdateSource are handled by the component
+        // (they require re-initialising the MSE pipeline) — the caller
+        // should update the corresponding Yew state handles.
+        ServerCommand::SetQuality { .. } | ServerCommand::UpdateSource { .. } => false,
+    }
+}
+
 /// Resolve a potentially-relative URL against a base URL.
 fn mpd_resolve_base(base: &str, rel: &str) -> String {
     if rel.starts_with("http://") || rel.starts_with("https://") || rel.starts_with("//") {

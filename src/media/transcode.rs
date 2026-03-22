@@ -569,6 +569,7 @@ pub fn create_init_segment(abs_path: &str, quality: Quality, hwaccel: &HwAccel, 
 /// `moof+mdat` fragments.
 pub fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
     let mut result = Vec::new();
+    let mut has_styp = false;
     let mut pos = 0usize;
 
     while pos + 8 <= data.len() {
@@ -577,6 +578,7 @@ pub fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
         // size == 0 means "box extends to EOF" per ISO BMFF; consume the rest.
         if size == 0 {
             let box_type = &data[pos + 4..pos + 8];
+            if box_type == b"styp" { has_styp = true; }
             if box_type != b"ftyp" && box_type != b"moov" {
                 result.extend_from_slice(&data[pos..]);
             }
@@ -586,6 +588,7 @@ pub fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
             break;
         }
         let box_type = &data[pos + 4..pos + 8];
+        if box_type == b"styp" { has_styp = true; }
         // Keep everything except the init-segment boxes.
         if box_type != b"ftyp" && box_type != b"moov" {
             result.extend_from_slice(&data[pos..pos + size]);
@@ -597,6 +600,27 @@ pub fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
     // original data unmodified to avoid serving a broken response.
     if result.is_empty() {
         data.to_vec()
+    } else if !has_styp {
+        // CMAF media segments should start with a `styp` (segment type) box.
+        // FFmpeg's fMP4 muxer with `empty_moov` does not emit `styp`; it
+        // writes `ftyp+moov+moof+mdat`.  After stripping `ftyp+moov`, the
+        // segment starts with bare `moof` — some browsers (particularly
+        // Firefox) may handle this less reliably than a proper CMAF segment
+        // that starts with `styp`.
+        //
+        // Prepend a minimal `styp` box: brand = `msdh`, minor version = 0,
+        // compatible brands = `msdh`, `msix`, `isom`.  This matches what
+        // Bento4 and Shaka Packager emit for CMAF.
+        let mut with_styp = Vec::with_capacity(result.len() + 24);
+        // styp box: size=24, type='styp', brand='msdh', version=0, compat=['msdh','msix']
+        with_styp.extend_from_slice(&24u32.to_be_bytes());  // size
+        with_styp.extend_from_slice(b"styp");               // type
+        with_styp.extend_from_slice(b"msdh");               // major brand
+        with_styp.extend_from_slice(&0u32.to_be_bytes());   // minor version
+        with_styp.extend_from_slice(b"msdh");               // compatible brand 1
+        with_styp.extend_from_slice(b"msix");               // compatible brand 2
+        with_styp.extend_from_slice(&result);
+        with_styp
     } else {
         result
     }

@@ -1,4 +1,5 @@
-// DASH video player — uses dashjs-rs for MPD parsing, ABR, and metrics.
+// New DASH infrastructure types are additive — suppress warnings for code
+// that will be consumed as the player evolves.
 
 use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
@@ -119,354 +120,942 @@ const MIN_EVICT_S: f64 = 0.5;
 const LOOKAHEAD_SEGMENTS: usize = 5;
 
 // ══════════════════════════════════════════════════════════════════════════════
-// DASH INFRASTRUCTURE — powered by dashjs-rs (Rust port of dash.js).
-// The dashjs-rs crate handles: MPD parsing, ABR decisions, throughput
-// estimation, metrics collection, and event system.
-// The existing playback pipeline (MseState, pump_loop, seeking, gap-jumping)
-// is preserved — only the DASH engine is swapped.
+// NEW DASH INFRASTRUCTURE — dash.js parity additions.
+// These types and functions are purely additive — the existing playback
+// pipeline (MseState, pump_loop, seeking, gap-jumping) is UNCHANGED.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// ── dashjs-rs integration ────────────────────────────────────────────────────
-// Using the in-project dashjs-rs crate (Rust port of dash.js) for:
-// - MPD parsing (dashjs_rs::dash::parser::parse)
-// - ABR quality decisions (dashjs_rs::streaming::controllers::AbrController)
-// - Event system (dashjs_rs::EventBus / dashjs_rs::Event)
-// - Throughput/buffer metrics tracking (dashjs_rs::DashMetrics)
-// - Live stream support (dashjs_rs::streaming::controllers::CatchupController)
+// ── ABR / schedule / live constants ──────────────────────────────────────────
+const ABR_BANDWIDTH_SAFETY_FACTOR: f64 = 0.9;
+const EWMA_HALF_LIFE_FAST: f64 = 3.0;
+const EWMA_HALF_LIFE_SLOW: f64 = 8.0;
+const ABR_MIN_SAMPLES: usize = 2;
+const DROPPED_FRAMES_MIN_SAMPLE: u32 = 300;
+const DROPPED_FRAMES_THRESHOLD: f64 = 0.15;
+const SWITCH_HISTORY_SAMPLE_SIZE: usize = 8;
+const SWITCH_HISTORY_THRESHOLD: f64 = 0.075;
+const ABANDON_DURATION_MULTIPLIER: f64 = 1.8;
+const BOLA_MINIMUM_BUFFER_S: f64 = 10.0;
+const BOLA_MINIMUM_BUFFER_PER_LEVEL_S: f64 = 2.0;
+const BOLA_PLACEHOLDER_DECAY: f64 = 0.99;
+const STABLE_BUFFER_TIME_S: f64 = 12.0;
+const BUFFER_TIME_DEFAULT_S: f64 = 12.0;
+const QUOTA_EXCEEDED_ERR_CODE: u16 = 22;
+const LIVE_DEFAULT_PRESENTATION_DELAY_S: f64 = 4.0;
+const LIVE_CATCHUP_RATE_MAX: f64 = 0.5;
+const LIVE_CATCHUP_RATE_MIN: f64 = -0.5;
+const LIVE_MPD_REFRESH_INTERVAL_MS: u32 = 5000;
+const FAST_SWITCH_ENABLED: bool = true;
 
-use dashjs_rs::MediaPlayer as DashMediaPlayer;
-use dashjs_rs::dash::parser as dash_parser;
-use dashjs_rs::dash::vo::mpd::PresentationType;
+// ── §1 Event System — mirrors MediaPlayerEvents.js ───────────────────────────
 
-/// Bridge between dashjs-rs pure-Rust engine and browser MSE APIs.
-/// dashjs-rs handles: MPD parsing, ABR decisions, metrics, events.
-/// Browser MSE code handles: MediaSource, SourceBuffer, actual fetching.
-struct DashEngine {
-    player: DashMediaPlayer,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlayerEvent {
+    ManifestLoadingStarted, ManifestLoadingFinished, ManifestLoaded,
+    ManifestValidityChanged,
+    StreamInitializing, StreamInitialized, StreamUpdated,
+    StreamActivated, StreamDeactivated, StreamTeardownComplete,
+    PeriodSwitchStarted, PeriodSwitchCompleted,
+    QualityChangeRequested, QualityChangeRendered,
+    RepresentationSwitch, AdaptationSetRemovedNoCapabilities,
+    BufferEmpty, BufferLoaded, BufferLevelStateChanged, BufferLevelUpdated,
+    FragmentLoadingStarted, FragmentLoadingCompleted,
+    FragmentLoadingProgress, FragmentLoadingAbandoned,
+    PlaybackPlaying, PlaybackPaused, PlaybackSeeking, PlaybackSeeked,
+    PlaybackStarted, PlaybackTimeUpdated, PlaybackProgress,
+    PlaybackRateChanged, PlaybackEnded, PlaybackWaiting, PlaybackStalled,
+    PlaybackNotAllowed, PlaybackError,
+    PlaybackMetadataLoaded, PlaybackLoadedData,
+    PlaybackInitialized, PlaybackVolumeChanged,
+    MetricsChanged, MetricChanged, MetricAdded, MetricUpdated,
+    ThroughputMeasurementStored,
+    NewTrackSelected, TrackChangeRendered,
+    TextTracksAdded, TextTrackAdded, CueEnter, CueExit, CaptionRendered,
+    CanPlay, CanPlayThrough, Error, Log,
+    DynamicToStatic, AstInFuture, BaseUrlsUpdated, InbandPrft,
+    ManagedMediaSourceStartStreaming, ManagedMediaSourceEndStreaming,
 }
 
-impl DashEngine {
-    fn new() -> Self {
-        Self { player: DashMediaPlayer::create() }
-    }
-
-    fn initialize(&mut self, mpd_url: &str) {
-        self.player.initialize(Some(mpd_url), false);
-    }
-
-    /// Record a throughput sample (kbps) into the dashjs-rs throughput controller.
-    fn add_throughput_sample(&mut self, throughput_kbps: f64) {
-        // Convert kbps → bps for the dashjs-rs controller.
-        self.player.throughput_controller_mut().add_sample(throughput_kbps * 1000.0);
-    }
-
-    /// Get the conservative throughput estimate (kbps).
-    fn get_safe_throughput_kbps(&self) -> f64 {
-        self.player.throughput_controller().get_safe_throughput() / 1000.0
-    }
-
-    /// Check if the parsed MPD is dynamic (live).
-    fn is_dynamic(mpd: &dashjs_rs::dash::vo::Mpd) -> bool {
-        mpd.type_ == PresentationType::Dynamic
-    }
-}
-
-// ── Server integration ───────────────────────────────────────────────────────
-//
-// Commands that can be sent from the server to control playback.
-// This provides the integration points between `video_player.rs` and
-// `main.rs` as required by the architecture.
-//
-// **Current integration:**
-//   • The player fetches manifests and segments via HTTP from main.rs
-//     endpoints (`/api/videos/{id}/manifest.mpd`, `/api/videos/{id}/segments/…`).
-//   • Quality selection is communicated via the `?quality=` query parameter.
-//   • Cache management uses `DELETE /api/videos/{id}/cache`.
-//
-// **Extensibility:**
-//   • `ServerCommand` defines the full set of operations the server can
-//     trigger on the player (play, pause, seek, quality change, source
-//     update, volume).
-//   • A WebSocket or Server-Sent Events transport can be added by
-//     connecting to `/api/player/ws` (future endpoint) and dispatching
-//     incoming `ServerCommand` messages to the `apply_server_command()`
-//     helper.
-//   • The command handler is designed to work with both SSE (`EventSource`)
-//     and WebSocket (`actix-ws`) transports without changing the player code.
-
-/// Commands that can be sent from the server to control playback.
-/// Designed for use over WebSocket or Server-Sent Events.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerCommand {
-    /// Start or resume playback.
-    Play,
-    /// Pause playback.
-    Pause,
-    /// Seek to the specified time (seconds).
-    Seek { time: f64 },
-    /// Change the stream quality (e.g. "original", "high", "medium", "low").
-    SetQuality { quality: String },
-    /// Update the video source (triggers full re-initialisation).
-    UpdateSource { video_id: String },
-    /// Set the playback volume (0.0–1.0).
-    SetVolume { volume: f64 },
-}
-
-/// Apply a server command to the video element.
-/// Returns `true` if the command was handled successfully.
-fn apply_server_command(
-    video: &HtmlVideoElement,
-    cmd: &ServerCommand,
-) -> bool {
-    match cmd {
-        ServerCommand::Play => {
-            let _ = video.play();
-            true
+impl PlayerEvent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ManifestLoadingStarted => "manifestLoadingStarted",
+            Self::ManifestLoadingFinished => "manifestLoadingFinished",
+            Self::ManifestLoaded => "manifestLoaded",
+            Self::ManifestValidityChanged => "manifestValidityChanged",
+            Self::StreamInitializing => "streamInitializing",
+            Self::StreamInitialized => "streamInitialized",
+            Self::StreamUpdated => "streamUpdated",
+            Self::StreamActivated => "streamActivated",
+            Self::StreamDeactivated => "streamDeactivated",
+            Self::StreamTeardownComplete => "streamTeardownComplete",
+            Self::PeriodSwitchStarted => "periodSwitchStarted",
+            Self::PeriodSwitchCompleted => "periodSwitchCompleted",
+            Self::QualityChangeRequested => "qualityChangeRequested",
+            Self::QualityChangeRendered => "qualityChangeRendered",
+            Self::RepresentationSwitch => "representationSwitch",
+            Self::AdaptationSetRemovedNoCapabilities => "adaptationSetRemovedNoCapabilities",
+            Self::BufferEmpty => "bufferStalled",
+            Self::BufferLoaded => "bufferLoaded",
+            Self::BufferLevelStateChanged => "bufferStateChanged",
+            Self::BufferLevelUpdated => "bufferLevelUpdated",
+            Self::FragmentLoadingStarted => "fragmentLoadingStarted",
+            Self::FragmentLoadingCompleted => "fragmentLoadingCompleted",
+            Self::FragmentLoadingProgress => "fragmentLoadingProgress",
+            Self::FragmentLoadingAbandoned => "fragmentLoadingAbandoned",
+            Self::PlaybackPlaying => "playbackPlaying",
+            Self::PlaybackPaused => "playbackPaused",
+            Self::PlaybackSeeking => "playbackSeeking",
+            Self::PlaybackSeeked => "playbackSeeked",
+            Self::PlaybackStarted => "playbackStarted",
+            Self::PlaybackTimeUpdated => "playbackTimeUpdated",
+            Self::PlaybackProgress => "playbackProgress",
+            Self::PlaybackRateChanged => "playbackRateChanged",
+            Self::PlaybackEnded => "playbackEnded",
+            Self::PlaybackWaiting => "playbackWaiting",
+            Self::PlaybackStalled => "playbackStalled",
+            Self::PlaybackNotAllowed => "playbackNotAllowed",
+            Self::PlaybackError => "playbackError",
+            Self::PlaybackMetadataLoaded => "playbackMetaDataLoaded",
+            Self::PlaybackLoadedData => "playbackLoadedData",
+            Self::PlaybackInitialized => "playbackInitialized",
+            Self::PlaybackVolumeChanged => "playbackVolumeChanged",
+            Self::MetricsChanged => "metricsChanged",
+            Self::MetricChanged => "metricChanged",
+            Self::MetricAdded => "metricAdded",
+            Self::MetricUpdated => "metricUpdated",
+            Self::ThroughputMeasurementStored => "throughputMeasurementStored",
+            Self::NewTrackSelected => "newTrackSelected",
+            Self::TrackChangeRendered => "trackChangeRendered",
+            Self::TextTracksAdded => "allTextTracksAdded",
+            Self::TextTrackAdded => "textTrackAdded",
+            Self::CueEnter => "cueEnter",
+            Self::CueExit => "cueExit",
+            Self::CaptionRendered => "captionRendered",
+            Self::CanPlay => "canPlay",
+            Self::CanPlayThrough => "canPlayThrough",
+            Self::Error => "error",
+            Self::Log => "log",
+            Self::DynamicToStatic => "dynamicToStatic",
+            Self::AstInFuture => "astInFuture",
+            Self::BaseUrlsUpdated => "baseUrlsUpdated",
+            Self::InbandPrft => "inbandPrft",
+            Self::ManagedMediaSourceStartStreaming => "managedMediaSourceStartStreaming",
+            Self::ManagedMediaSourceEndStreaming => "managedMediaSourceEndStreaming",
         }
-        ServerCommand::Pause => {
-            let _ = video.pause();
-            true
-        }
-        ServerCommand::Seek { time } => {
-            let dur = video.duration();
-            if dur.is_finite() && *time >= 0.0 {
-                video.set_current_time(time.min(dur));
-                true
-            } else {
-                false
-            }
-        }
-        ServerCommand::SetVolume { volume } => {
-            video.set_volume(volume.clamp(0.0, 1.0));
-            true
-        }
-        // SetQuality and UpdateSource are handled by the component
-        // (they require re-initialising the MSE pipeline) — the caller
-        // should update the corresponding Yew state handles.
-        ServerCommand::SetQuality { .. } | ServerCommand::UpdateSource { .. } => false,
     }
 }
 
-/// Resolve a potentially-relative URL against a base URL.
-fn mpd_resolve_base(base: &str, rel: &str) -> String {
-    if rel.starts_with("http://") || rel.starts_with("https://") || rel.starts_with("//") {
-        return rel.into();
+#[derive(Debug, Clone)]
+pub struct EventPayload { pub data: serde_json::Value }
+impl Default for EventPayload { fn default() -> Self { Self { data: serde_json::Value::Null } } }
+
+type EventCallback = Rc<dyn Fn(&EventPayload)>;
+
+#[derive(Clone)]
+pub struct EventBus {
+    listeners: Rc<RefCell<HashMap<PlayerEvent, Vec<EventCallback>>>>,
+}
+impl EventBus {
+    pub fn new() -> Self { Self { listeners: Rc::new(RefCell::new(HashMap::new())) } }
+    pub fn on(&self, event: PlayerEvent, cb: EventCallback) {
+        self.listeners.borrow_mut().entry(event).or_default().push(cb);
     }
-    if base.is_empty() { return rel.into(); }
-    if let Some(ls) = base.rfind('/') {
-        format!("{}/{rel}", &base[..ls])
-    } else {
-        rel.into()
+    pub fn off(&self, event: PlayerEvent) { self.listeners.borrow_mut().remove(&event); }
+    pub fn emit(&self, event: PlayerEvent, payload: &EventPayload) {
+        let listeners = self.listeners.borrow();
+        if let Some(cbs) = listeners.get(&event) { for cb in cbs { cb(payload); } }
+    }
+    pub fn emit_simple(&self, event: PlayerEvent) { self.emit(event, &EventPayload::default()); }
+}
+
+// ── §2 Metrics — DashMetrics.js ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MediaType { Video, Audio }
+
+#[derive(Debug, Clone)]
+pub struct ThroughputSample {
+    pub timestamp_ms: f64, pub throughput_kbps: f64, pub latency_ms: f64,
+    pub bytes: usize, pub duration_ms: f64, pub media_type: MediaType,
+}
+
+#[derive(Debug, Clone)]
+pub struct BufferLevelEntry { pub timestamp_ms: f64, pub level_s: f64, pub media_type: MediaType }
+#[derive(Debug, Clone, Default)]
+pub struct DroppedFrameEntry { pub total_frames: u32, pub dropped_frames: u32, pub timestamp_ms: f64 }
+#[derive(Debug, Clone, Default)]
+pub struct SwitchHistoryEntry { pub drops: usize, pub no_drops: usize }
+#[derive(Debug, Clone)]
+pub struct LatencyEntry { pub timestamp_ms: f64, pub latency_s: f64 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferState { Loaded, Empty }
+
+#[derive(Debug, Clone)]
+pub struct DashMetrics {
+    pub throughput_history: Vec<ThroughputSample>,
+    pub buffer_levels: Vec<BufferLevelEntry>,
+    pub dropped_frames: DroppedFrameEntry,
+    pub switch_history: HashMap<usize, SwitchHistoryEntry>,
+    pub latency_history: Vec<LatencyEntry>,
+    pub current_buffer_state: HashMap<MediaType, BufferState>,
+}
+impl DashMetrics {
+    pub fn new() -> Self {
+        let mut cbs = HashMap::new();
+        cbs.insert(MediaType::Video, BufferState::Empty);
+        cbs.insert(MediaType::Audio, BufferState::Empty);
+        Self { throughput_history: Vec::new(), buffer_levels: Vec::new(),
+            dropped_frames: DroppedFrameEntry::default(), switch_history: HashMap::new(),
+            latency_history: Vec::new(), current_buffer_state: cbs }
+    }
+    pub fn add_throughput_sample(&mut self, s: ThroughputSample) {
+        self.throughput_history.push(s);
+        if self.throughput_history.len() > 100 { self.throughput_history.drain(..self.throughput_history.len() - 100); }
+    }
+    pub fn add_buffer_level(&mut self, e: BufferLevelEntry) {
+        self.buffer_levels.push(e);
+        if self.buffer_levels.len() > 200 { self.buffer_levels.drain(..self.buffer_levels.len() - 200); }
+    }
+    pub fn update_dropped_frames(&mut self, total: u32, dropped: u32) {
+        self.dropped_frames = DroppedFrameEntry { total_frames: total, dropped_frames: dropped, timestamp_ms: js_sys::Date::now() };
+    }
+    pub fn set_buffer_state(&mut self, mt: MediaType, st: BufferState) { self.current_buffer_state.insert(mt, st); }
+    pub fn get_buffer_state(&self, mt: MediaType) -> BufferState { self.current_buffer_state.get(&mt).copied().unwrap_or(BufferState::Empty) }
+    pub fn record_switch(&mut self, idx: usize, was_drop: bool) {
+        let e = self.switch_history.entry(idx).or_default();
+        if was_drop { e.drops += 1; } else { e.no_drops += 1; }
+    }
+    pub fn add_latency(&mut self, e: LatencyEntry) {
+        self.latency_history.push(e);
+        if self.latency_history.len() > 100 { self.latency_history.drain(..self.latency_history.len() - 100); }
+    }
+    pub fn current_buffer_level(&self, mt: MediaType) -> f64 {
+        self.buffer_levels.iter().rev().find(|e| e.media_type == mt).map(|e| e.level_s).unwrap_or(0.0)
+    }
+    pub fn get_average_throughput(&self, mt: MediaType) -> f64 {
+        let s: Vec<_> = self.throughput_history.iter().filter(|s| s.media_type == mt).collect();
+        if s.is_empty() { 0.0 } else { s.iter().map(|s| s.throughput_kbps).sum::<f64>() / s.len() as f64 }
     }
 }
 
-/// Extract segment URLs from a dashjs-rs `Mpd`, returning
-/// `(init_url, total_duration, segments)` — backward-compatible output for
-/// the existing MSE pump loop.
-///
-/// The dashjs-rs parser stores template attributes (initialization, media,
-/// timescale, start_number) directly on `Representation` but does not expose
-/// SegmentTimeline S elements in a form usable for segment list building.
-/// We supplement the parsed MPD with direct XML extraction of timeline entries.
-fn extract_segments_from_mpd(
-    mpd: &dashjs_rs::dash::vo::Mpd,
-    base: &str,
-    raw_xml: &str,
-) -> (String, f64, Vec<SegmentInfo>) {
-    if mpd.periods.is_empty() {
-        return (String::new(), 0.0, Vec::new());
+// ── §3 Throughput Controller — ThroughputController.js ───────────────────────
+
+#[derive(Debug, Clone)]
+struct EwmaState { total_weight: f64, fast_estimate: f64, slow_estimate: f64 }
+impl EwmaState {
+    fn new() -> Self { Self { total_weight: 0.0, fast_estimate: 0.0, slow_estimate: 0.0 } }
+    fn add_sample(&mut self, value: f64) {
+        let w = 1.0;
+        let af = 1.0 - 0.5_f64.powf(w / EWMA_HALF_LIFE_FAST);
+        let as_ = 1.0 - 0.5_f64.powf(w / EWMA_HALF_LIFE_SLOW);
+        self.fast_estimate = af * value + (1.0 - af) * self.fast_estimate;
+        self.slow_estimate = as_ * value + (1.0 - as_) * self.slow_estimate;
+        self.total_weight += w;
     }
-    let period = &mpd.periods[0];
-    if period.adaptation_sets.is_empty() {
-        return (String::new(), 0.0, Vec::new());
+    fn get_estimate(&self, use_min: bool) -> f64 {
+        if self.total_weight <= 0.0 { return f64::NAN; }
+        let cf = 1.0 - 0.5_f64.powf(self.total_weight / EWMA_HALF_LIFE_FAST);
+        let cs = 1.0 - 0.5_f64.powf(self.total_weight / EWMA_HALF_LIFE_SLOW);
+        let fast = self.fast_estimate / cf;
+        let slow = self.slow_estimate / cs;
+        if use_min { fast.min(slow) } else { fast.max(slow) }
     }
+}
 
-    // Find the video (or muxed) adaptation set.
-    let aset_idx = period
-        .adaptation_sets
-        .iter()
-        .position(|a| {
-            a.content_type.as_deref() == Some("video")
-                || a.mime_type.as_deref().is_some_and(|m| m.starts_with("video"))
-                || a.content_type.is_none()
-        })
-        .unwrap_or(0);
-    let aset = &period.adaptation_sets[aset_idx];
-    if aset.representations.is_empty() {
-        return (String::new(), 0.0, Vec::new());
-    }
-
-    let rep = &aset.representations[0];
-    let total_duration = mpd.media_presentation_duration.unwrap_or(0.0);
-
-    // Resolve base URL chain: representation → adaptation set → period → mpd → caller-supplied.
-    let resolved_base = if !rep.base_urls.is_empty() {
-        rep.base_urls[0].url.clone()
-    } else if !aset.base_urls.is_empty() {
-        aset.base_urls[0].url.clone()
-    } else if !period.base_urls.is_empty() {
-        period.base_urls[0].url.clone()
-    } else if !mpd.base_urls.is_empty() {
-        mpd.base_urls[0].url.clone()
-    } else if let Some(sl) = base.rfind('/') {
-        base[..sl + 1].into()
-    } else {
-        String::new()
-    };
-
-    // Build segments from Representation-level segment info.
-    // The dashjs-rs parser stores template information directly on Representation
-    // (initialization, media, timescale, start_number, segment_duration) as well
-    // as segment_info_type to indicate addressing mode.
-    let rep_id = rep.id.as_deref().unwrap_or("");
-    let bw = rep.bandwidth.unwrap_or(0);
-
-    // Try SegmentTemplate with timeline or fixed duration.
-    if rep.media.is_some() || rep.initialization.is_some() {
-        let init_tmpl = rep.initialization.as_deref().unwrap_or("");
-        let init_url = if !init_tmpl.is_empty() {
-            let expanded = dash_parser::process_uri_template(
-                init_tmpl,
-                Some(rep_id),
-                None,
-                None,
-                Some(bw),
-                None,
-            );
-            mpd_resolve_base(&resolved_base, &expanded)
-        } else {
-            String::new()
-        };
-
-        let media_tmpl = rep.media.as_deref().unwrap_or("");
-        let mut segs = Vec::new();
-
-        // Extract SegmentTimeline S entries directly from raw XML.
-        // The dashjs-rs parser inherits template attributes onto the Representation
-        // but does not expose the raw S elements for segment list building.
-        let timeline = extract_timeline_from_xml(raw_xml);
-
-        if !timeline.is_empty() {
-            let timescale = rep.timescale.max(1);
-            let mut num = rep.start_number;
-            let mut ct: u64 = 0;
-            for entry in &timeline {
-                if let Some(tv) = entry.t { ct = tv; }
-                let rc = entry.r.unwrap_or(0).max(0) as usize;
-                for _ in 0..=rc {
-                    let url = dash_parser::process_uri_template(
-                        media_tmpl,
-                        Some(rep_id),
-                        Some(num),
-                        None,
-                        Some(bw),
-                        Some(ct),
-                    );
-                    segs.push(SegmentInfo {
-                        url: mpd_resolve_base(&resolved_base, &url),
-                        duration: entry.d as f64 / timescale as f64,
-                    });
-                    ct += entry.d;
-                    num += 1;
-                }
-            }
-        } else if let Some(seg_dur) = rep.segment_duration {
-            // SegmentTemplate with fixed duration.
-            let sd = seg_dur;
-            let n = if sd > 0.0 {
-                (total_duration / sd).ceil() as usize
-            } else {
-                0
-            };
-            for i in 0..n {
-                let url = dash_parser::process_uri_template(
-                    media_tmpl,
-                    Some(rep_id),
-                    Some(rep.start_number + i as u64),
-                    None,
-                    Some(bw),
-                    None,
-                );
-                segs.push(SegmentInfo {
-                    url: mpd_resolve_base(&resolved_base, &url),
-                    duration: sd,
-                });
-            }
-        } else if total_duration > 0.0 {
-            // Fallback: SegmentTimeline indicated but timeline entries not
-            // extractable.  Use the known segment duration constant to
-            // compute the segment count from total duration.
-            let sd = SEGMENT_DURATION_F;
-            let n = (total_duration / sd).ceil() as usize;
-            for i in 0..n {
-                let url = dash_parser::process_uri_template(
-                    media_tmpl,
-                    Some(rep_id),
-                    Some(rep.start_number + i as u64),
-                    None,
-                    Some(bw),
-                    None,
-                );
-                segs.push(SegmentInfo {
-                    url: mpd_resolve_base(&resolved_base, &url),
-                    duration: sd,
-                });
-            }
+#[derive(Debug, Clone)]
+pub struct ThroughputController {
+    throughput_ewma: HashMap<MediaType, EwmaState>,
+    latency_ewma: HashMap<MediaType, EwmaState>,
+    sample_count: HashMap<MediaType, usize>,
+}
+impl ThroughputController {
+    pub fn new() -> Self {
+        let mut te = HashMap::new(); let mut le = HashMap::new(); let mut sc = HashMap::new();
+        for mt in [MediaType::Video, MediaType::Audio] {
+            te.insert(mt, EwmaState::new()); le.insert(mt, EwmaState::new()); sc.insert(mt, 0);
         }
-
-        return (init_url, total_duration, segs);
+        Self { throughput_ewma: te, latency_ewma: le, sample_count: sc }
     }
-
-    // Fallback: no template-based segments found.
-    (String::new(), total_duration, Vec::new())
+    pub fn add_measurement(&mut self, mt: MediaType, throughput_kbps: f64, latency_ms: f64) {
+        if let Some(e) = self.throughput_ewma.get_mut(&mt) { e.add_sample(throughput_kbps); }
+        if let Some(e) = self.latency_ewma.get_mut(&mt) { e.add_sample(latency_ms); }
+        *self.sample_count.entry(mt).or_insert(0) += 1;
+    }
+    pub fn get_safe_average_throughput(&self, mt: MediaType) -> f64 {
+        let avg = self.throughput_ewma.get(&mt).map(|e| e.get_estimate(true)).unwrap_or(f64::NAN);
+        if avg.is_nan() { f64::NAN } else { avg * ABR_BANDWIDTH_SAFETY_FACTOR }
+    }
+    pub fn get_average_throughput(&self, mt: MediaType) -> f64 {
+        self.throughput_ewma.get(&mt).map(|e| e.get_estimate(true)).unwrap_or(f64::NAN)
+    }
+    pub fn get_average_latency(&self, mt: MediaType) -> f64 {
+        self.latency_ewma.get(&mt).map(|e| e.get_estimate(false)).unwrap_or(f64::NAN)
+    }
+    pub fn get_sample_count(&self, mt: MediaType) -> usize { self.sample_count.get(&mt).copied().unwrap_or(0) }
+    pub fn reset(&mut self) {
+        for mt in [MediaType::Video, MediaType::Audio] {
+            self.throughput_ewma.insert(mt, EwmaState::new());
+            self.latency_ewma.insert(mt, EwmaState::new());
+            self.sample_count.insert(mt, 0);
+        }
+    }
 }
 
-/// Minimal timeline entry extracted from SegmentTimeline S elements.
-/// Field names match the MPEG-DASH specification SegmentTimeline S element attributes.
-struct TimelineEntry {
-    /// Start time (S@t).
-    t: Option<u64>,
-    /// Duration (S@d).
-    d: u64,
-    /// Repeat count (S@r): the segment repeats r additional times.
-    r: Option<i64>,
+// ── §4 Full MPD Parser — DashParser.js + DashAdapter.js ──────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Mpd {
+    pub mpd_type: MpdType, pub media_presentation_duration: f64,
+    pub min_buffer_time: f64, pub availability_start_time: Option<String>,
+    pub time_shift_buffer_depth: Option<f64>, pub minimum_update_period: Option<f64>,
+    pub suggested_presentation_delay: Option<f64>, pub publish_time: Option<String>,
+    pub base_urls: Vec<String>, pub utc_timing: Vec<UtcTiming>, pub periods: Vec<MpdPeriod>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MpdType { Static, Dynamic }
+#[derive(Debug, Clone)]
+pub struct UtcTiming { pub scheme_id_uri: String, pub value: String }
+#[derive(Debug, Clone)]
+pub struct MpdPeriod {
+    pub id: Option<String>, pub start: Option<f64>, pub duration: Option<f64>,
+    pub base_urls: Vec<String>, pub adaptation_sets: Vec<MpdAdaptationSet>,
+    pub xlink_href: Option<String>,
+}
+#[derive(Debug, Clone)]
+pub struct MpdAdaptationSet {
+    pub id: Option<String>, pub content_type: Option<String>,
+    pub mime_type: Option<String>, pub codecs: Option<String>,
+    pub lang: Option<String>, pub segment_alignment: bool,
+    pub subsegment_alignment: bool, pub bitstream_switching: bool,
+    pub roles: Vec<MpdDescriptor>, pub accessibility: Vec<MpdDescriptor>,
+    pub labels: Vec<String>, pub content_protection: Vec<MpdContentProtection>,
+    pub supplemental_properties: Vec<MpdDescriptor>,
+    pub essential_properties: Vec<MpdDescriptor>,
+    pub segment_template: Option<MpdSegmentTemplate>,
+    pub segment_base: Option<MpdSegmentBase>, pub segment_list: Option<MpdSegmentList>,
+    pub base_urls: Vec<String>, pub representations: Vec<MpdRepresentation>,
+}
+#[derive(Debug, Clone)]
+pub struct MpdRepresentation {
+    pub id: Option<String>, pub bandwidth: u64,
+    pub width: Option<u32>, pub height: Option<u32>,
+    pub codecs: Option<String>, pub mime_type: Option<String>,
+    pub frame_rate: Option<String>, pub sar: Option<String>,
+    pub audio_sampling_rate: Option<u32>,
+    pub segment_template: Option<MpdSegmentTemplate>,
+    pub segment_base: Option<MpdSegmentBase>, pub segment_list: Option<MpdSegmentList>,
+    pub base_urls: Vec<String>, pub content_protection: Vec<MpdContentProtection>,
+    pub absolute_index: usize,
+}
+impl MpdRepresentation {
+    pub fn bitrate_kbps(&self) -> f64 { self.bandwidth as f64 / 1000.0 }
+}
+#[derive(Debug, Clone)]
+pub struct MpdSegmentTemplate {
+    pub initialization: Option<String>, pub media: Option<String>,
+    pub start_number: usize, pub timescale: f64, pub duration: Option<f64>,
+    pub presentation_time_offset: Option<f64>, pub timeline: Vec<MpdTimelineEntry>,
+}
+#[derive(Debug, Clone)]
+pub struct MpdSegmentBase {
+    pub index_range: Option<String>, pub initialization_range: Option<String>,
+    pub timescale: f64, pub presentation_time_offset: Option<f64>,
+}
+#[derive(Debug, Clone)]
+pub struct MpdSegmentList {
+    pub initialization: Option<String>, pub timescale: f64,
+    pub duration: Option<f64>, pub start_number: usize,
+    pub segment_urls: Vec<MpdSegmentUrl>,
+}
+#[derive(Debug, Clone)]
+pub struct MpdSegmentUrl { pub media: String, pub media_range: Option<String> }
+#[derive(Debug, Clone)]
+pub struct MpdTimelineEntry { pub t: Option<u64>, pub d: u64, pub r: i64 }
+#[derive(Debug, Clone)]
+pub struct MpdDescriptor { pub scheme_id_uri: String, pub value: Option<String> }
+#[derive(Debug, Clone)]
+pub struct MpdContentProtection {
+    pub scheme_id_uri: String, pub value: Option<String>,
+    pub default_kid: Option<String>, pub cenc_pssh: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioTrackInfo {
+    pub adaptation_set_idx: usize, pub lang: Option<String>,
+    pub label: Option<String>, pub codecs: Option<String>, pub roles: Vec<String>,
 }
 
-/// Extract SegmentTimeline S elements directly from MPD XML.
-///
-/// The dashjs-rs parser inherits SegmentTemplate attributes onto
-/// Representation fields (initialization, media, timescale, etc.) but
-/// does not expose the raw S elements.  This function supplements the
-/// dashjs-rs parsing by extracting timeline entries from the XML.
-fn extract_timeline_from_xml(xml: &str) -> Vec<TimelineEntry> {
-    fn tag_attr(tag: &str, attr: &str) -> Option<String> {
-        let s = format!("{attr}=\"");
-        let p = tag.find(&s)?;
-        let r = &tag[p + s.len()..];
-        Some(r[..r.find('"')?].to_string())
+/// Full MPD parser — supports multiple Periods, AdaptationSets, all segment
+/// addressing schemes, live attributes, etc.
+pub fn parse_mpd_full(text: &str) -> Mpd {
+    let mpd_type = if mpd_attr(text, "MPD", "type").as_deref() == Some("dynamic") { MpdType::Dynamic } else { MpdType::Static };
+    let duration = mpd_attr(text, "MPD", "mediaPresentationDuration").map(|s| parse_iso8601_duration(&s)).unwrap_or(0.0);
+    let min_buf = mpd_attr(text, "MPD", "minBufferTime").map(|s| parse_iso8601_duration(&s)).unwrap_or(1.5);
+    Mpd {
+        mpd_type, media_presentation_duration: duration, min_buffer_time: min_buf,
+        availability_start_time: mpd_attr(text, "MPD", "availabilityStartTime"),
+        time_shift_buffer_depth: mpd_attr(text, "MPD", "timeShiftBufferDepth").map(|s| parse_iso8601_duration(&s)),
+        minimum_update_period: mpd_attr(text, "MPD", "minimumUpdatePeriod").map(|s| parse_iso8601_duration(&s)),
+        suggested_presentation_delay: mpd_attr(text, "MPD", "suggestedPresentationDelay").map(|s| parse_iso8601_duration(&s)),
+        publish_time: mpd_attr(text, "MPD", "publishTime"),
+        base_urls: mpd_base_urls(text), utc_timing: mpd_utc(text),
+        periods: mpd_periods(text),
     }
+}
 
-    let mut result = Vec::new();
-    let mut s = 0;
+fn mpd_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
+    let ts = xml.find(&format!("<{tag}"))?;
+    let te = xml[ts..].find('>')?;
+    let c = &xml[ts..ts + te]; let s = format!("{attr}=\"");
+    let p = c.find(&s)?; let r = &c[p + s.len()..]; Some(r[..r.find('"')?].to_string())
+}
+fn mpd_tag_attr(tag: &str, attr: &str) -> Option<String> {
+    let s = format!("{attr}=\""); let p = tag.find(&s)?;
+    let r = &tag[p + s.len()..]; Some(r[..r.find('"')?].to_string())
+}
+fn mpd_base_urls(xml: &str) -> Vec<String> {
+    let mut v = Vec::new(); let mut s = 0;
+    while let Some(i) = xml[s..].find("<BaseURL>") {
+        let a = s + i + 9;
+        if let Some(e) = xml[a..].find("</BaseURL>") { v.push(xml[a..a + e].trim().into()); s = a + e; } else { break; }
+    }
+    v
+}
+fn mpd_utc(xml: &str) -> Vec<UtcTiming> {
+    let mut v = Vec::new(); let mut s = 0;
+    while let Some(i) = xml[s..].find("<UTCTiming") {
+        let a = s + i;
+        if let Some(e) = xml[a..].find("/>").or_else(|| xml[a..].find('>')) {
+            let t = &xml[a..a + e + 2];
+            v.push(UtcTiming { scheme_id_uri: mpd_tag_attr(t, "schemeIdUri").unwrap_or_default(), value: mpd_tag_attr(t, "value").unwrap_or_default() });
+            s = a + e + 2;
+        } else { break; }
+    }
+    v
+}
+fn mpd_close(xml: &str, tag: &str) -> Option<usize> { xml.find(&format!("</{tag}>")).map(|p| p + tag.len() + 3) }
+
+fn mpd_periods(xml: &str) -> Vec<MpdPeriod> {
+    let mut v = Vec::new(); let mut s = 0;
+    while let Some(i) = xml[s..].find("<Period") {
+        let a = s + i;
+        let e = mpd_close(&xml[a..], "Period").map(|x| a + x).unwrap_or(xml.len());
+        let px = &xml[a..e];
+        v.push(MpdPeriod {
+            id: mpd_tag_attr(px, "id"), start: mpd_tag_attr(px, "start").map(|v| parse_iso8601_duration(&v)),
+            duration: mpd_tag_attr(px, "duration").map(|v| parse_iso8601_duration(&v)),
+            base_urls: mpd_base_urls(px), adaptation_sets: mpd_asets(px),
+            xlink_href: mpd_tag_attr(px, "xlink:href"),
+        });
+        s = e;
+    }
+    v
+}
+
+fn mpd_asets(px: &str) -> Vec<MpdAdaptationSet> {
+    let mut v = Vec::new(); let mut s = 0;
+    while let Some(i) = px[s..].find("<AdaptationSet") {
+        let a = s + i;
+        let e = mpd_close(&px[a..], "AdaptationSet").map(|x| a + x).unwrap_or(px.len());
+        let ax = &px[a..e];
+        let ct = mpd_tag_attr(ax, "contentType");
+        let mt = mpd_tag_attr(ax, "mimeType");
+        let codecs = mpd_tag_attr(ax, "codecs");
+        let st = mpd_seg_template(ax); let sb = mpd_seg_base(ax); let sl = mpd_seg_list(ax);
+        let mut reps = mpd_reps(ax);
+        reps.sort_by_key(|r| r.bandwidth);
+        for (i, r) in reps.iter_mut().enumerate() {
+            r.absolute_index = i;
+            if r.codecs.is_none() { r.codecs = codecs.clone(); }
+            if r.mime_type.is_none() { r.mime_type = mt.clone(); }
+            if r.segment_template.is_none() { r.segment_template = st.clone(); }
+            if r.segment_base.is_none() { r.segment_base = sb.clone(); }
+            if r.segment_list.is_none() { r.segment_list = sl.clone(); }
+        }
+        let ect = ct.clone().or_else(|| mt.as_deref().map(|m| {
+            if m.starts_with("video") { "video".into() }
+            else if m.starts_with("audio") { "audio".into() }
+            else if m.starts_with("text") { "text".into() }
+            else { m.to_string() }
+        }));
+        v.push(MpdAdaptationSet {
+            id: mpd_tag_attr(ax, "id"), content_type: ect, mime_type: mt, codecs,
+            lang: mpd_tag_attr(ax, "lang"),
+            segment_alignment: mpd_tag_attr(ax, "segmentAlignment").as_deref() == Some("true"),
+            subsegment_alignment: mpd_tag_attr(ax, "subsegmentAlignment").as_deref() == Some("true"),
+            bitstream_switching: mpd_tag_attr(ax, "bitstreamSwitching").as_deref() == Some("true"),
+            roles: mpd_descriptors(ax, "Role"), accessibility: mpd_descriptors(ax, "Accessibility"),
+            labels: mpd_labels(ax), content_protection: mpd_cp(ax),
+            supplemental_properties: mpd_descriptors(ax, "SupplementalProperty"),
+            essential_properties: mpd_descriptors(ax, "EssentialProperty"),
+            segment_template: st, segment_base: sb, segment_list: sl,
+            base_urls: mpd_base_urls(ax), representations: reps,
+        });
+        s = e;
+    }
+    v
+}
+
+fn mpd_reps(ax: &str) -> Vec<MpdRepresentation> {
+    let mut v = Vec::new(); let mut s = 0;
+    while let Some(i) = ax[s..].find("<Representation") {
+        let a = s + i;
+        let e = mpd_close(&ax[a..], "Representation")
+            .map(|x| a + x).unwrap_or_else(|| ax[a..].find("/>").map(|x| a + x + 2).unwrap_or(ax.len()));
+        let rx = &ax[a..e];
+        v.push(MpdRepresentation {
+            id: mpd_tag_attr(rx, "id"),
+            bandwidth: mpd_tag_attr(rx, "bandwidth").and_then(|s| s.parse().ok()).unwrap_or(0),
+            width: mpd_tag_attr(rx, "width").and_then(|s| s.parse().ok()),
+            height: mpd_tag_attr(rx, "height").and_then(|s| s.parse().ok()),
+            codecs: mpd_tag_attr(rx, "codecs"), mime_type: mpd_tag_attr(rx, "mimeType"),
+            frame_rate: mpd_tag_attr(rx, "frameRate"), sar: mpd_tag_attr(rx, "sar"),
+            audio_sampling_rate: mpd_tag_attr(rx, "audioSamplingRate").and_then(|s| s.parse().ok()),
+            segment_template: mpd_seg_template(rx), segment_base: mpd_seg_base(rx),
+            segment_list: mpd_seg_list(rx), base_urls: mpd_base_urls(rx),
+            content_protection: mpd_cp(rx), absolute_index: 0,
+        });
+        s = e;
+    }
+    v
+}
+
+fn mpd_seg_template(xml: &str) -> Option<MpdSegmentTemplate> {
+    let i = xml.find("<SegmentTemplate")?;
+    let ce = xml[i..].find('>')?;
+    let e = mpd_close(&xml[i..], "SegmentTemplate").map(|x| i + x).unwrap_or(i + ce + 1);
+    let inner = &xml[i..e];
+    Some(MpdSegmentTemplate {
+        initialization: mpd_tag_attr(inner, "initialization"), media: mpd_tag_attr(inner, "media"),
+        start_number: mpd_tag_attr(inner, "startNumber").and_then(|s| s.parse().ok()).unwrap_or(0),
+        timescale: mpd_tag_attr(inner, "timescale").and_then(|s| s.parse().ok()).unwrap_or(1000.0),
+        duration: mpd_tag_attr(inner, "duration").and_then(|s| s.parse().ok()),
+        presentation_time_offset: mpd_tag_attr(inner, "presentationTimeOffset").and_then(|s| s.parse().ok()),
+        timeline: mpd_timeline(inner),
+    })
+}
+fn mpd_timeline(xml: &str) -> Vec<MpdTimelineEntry> {
+    let mut v = Vec::new(); let mut s = 0;
     while let Some(i) = xml[s..].find("<S ") {
         let a = s + i;
         if let Some(e) = xml[a..].find("/>") {
             let t = &xml[a..a + e + 2];
-            result.push(TimelineEntry {
-                t: tag_attr(t, "t").and_then(|s| s.parse().ok()),
-                d: tag_attr(t, "d").and_then(|s| s.parse().ok()).unwrap_or(0),
-                r: tag_attr(t, "r").and_then(|s| s.parse().ok()),
+            v.push(MpdTimelineEntry {
+                t: mpd_tag_attr(t, "t").and_then(|s| s.parse().ok()),
+                d: mpd_tag_attr(t, "d").and_then(|s| s.parse().ok()).unwrap_or(0),
+                r: mpd_tag_attr(t, "r").and_then(|s| s.parse().ok()).unwrap_or(0),
             });
             s = a + e + 2;
-        } else {
-            break;
-        }
+        } else { break; }
     }
-    result
+    v
+}
+fn mpd_seg_base(xml: &str) -> Option<MpdSegmentBase> {
+    let i = xml.find("<SegmentBase")?;
+    let e = xml[i..].find("/>").or_else(|| xml[i..].find('>'))?;
+    let t = &xml[i..i + e + 2];
+    Some(MpdSegmentBase {
+        index_range: mpd_tag_attr(t, "indexRange"),
+        initialization_range: mpd_tag_attr(t, "Initialization")
+            .or_else(|| xml[i..].find("<Initialization").and_then(|x| mpd_tag_attr(&xml[i + x..], "range"))),
+        timescale: mpd_tag_attr(t, "timescale").and_then(|s| s.parse().ok()).unwrap_or(1000.0),
+        presentation_time_offset: mpd_tag_attr(t, "presentationTimeOffset").and_then(|s| s.parse().ok()),
+    })
+}
+fn mpd_seg_list(xml: &str) -> Option<MpdSegmentList> {
+    let i = xml.find("<SegmentList")?;
+    let e = mpd_close(&xml[i..], "SegmentList").map(|x| i + x).unwrap_or(xml.len());
+    let inner = &xml[i..e];
+    let init = inner.find("<Initialization").and_then(|x| mpd_tag_attr(&inner[x..], "sourceURL"));
+    let mut urls = Vec::new(); let mut s2 = 0;
+    while let Some(su) = inner[s2..].find("<SegmentURL") {
+        let a2 = s2 + su;
+        if let Some(e2) = inner[a2..].find("/>") {
+            let t = &inner[a2..a2 + e2 + 2];
+            urls.push(MpdSegmentUrl { media: mpd_tag_attr(t, "media").unwrap_or_default(), media_range: mpd_tag_attr(t, "mediaRange") });
+            s2 = a2 + e2 + 2;
+        } else { break; }
+    }
+    Some(MpdSegmentList {
+        initialization: init, timescale: mpd_tag_attr(inner, "timescale").and_then(|s| s.parse().ok()).unwrap_or(1000.0),
+        duration: mpd_tag_attr(inner, "duration").and_then(|s| s.parse().ok()),
+        start_number: mpd_tag_attr(inner, "startNumber").and_then(|s| s.parse().ok()).unwrap_or(0),
+        segment_urls: urls,
+    })
+}
+fn mpd_descriptors(xml: &str, tag: &str) -> Vec<MpdDescriptor> {
+    let mut v = Vec::new(); let st = format!("<{tag}"); let mut s = 0;
+    while let Some(i) = xml[s..].find(&st) {
+        let a = s + i;
+        if let Some(e) = xml[a..].find("/>").or_else(|| xml[a..].find('>')) {
+            let t = &xml[a..a + e + 2];
+            v.push(MpdDescriptor { scheme_id_uri: mpd_tag_attr(t, "schemeIdUri").unwrap_or_default(), value: mpd_tag_attr(t, "value") });
+            s = a + e + 2;
+        } else { break; }
+    }
+    v
+}
+fn mpd_labels(xml: &str) -> Vec<String> {
+    let mut v = Vec::new(); let mut s = 0;
+    while let Some(i) = xml[s..].find("<Label>") {
+        let a = s + i + 7;
+        if let Some(e) = xml[a..].find("</Label>") { v.push(xml[a..a + e].trim().into()); s = a + e; } else { break; }
+    }
+    v
+}
+fn mpd_cp(xml: &str) -> Vec<MpdContentProtection> {
+    let mut v = Vec::new(); let mut s = 0;
+    while let Some(i) = xml[s..].find("<ContentProtection") {
+        let a = s + i;
+        let e = mpd_close(&xml[a..], "ContentProtection").unwrap_or_else(|| xml[a..].find("/>").map(|x| x + 2).unwrap_or(xml.len() - a));
+        let t = &xml[a..a + e];
+        let pssh = t.find("<cenc:pssh>").and_then(|p| { let r = &t[p + 11..]; r.find("</cenc:pssh>").map(|e| r[..e].trim().into()) });
+        v.push(MpdContentProtection {
+            scheme_id_uri: mpd_tag_attr(t, "schemeIdUri").unwrap_or_default(), value: mpd_tag_attr(t, "value"),
+            default_kid: mpd_tag_attr(t, "cenc:default_KID").or_else(|| mpd_tag_attr(t, "default_KID")), cenc_pssh: pssh,
+        });
+        s = a + e;
+    }
+    v
 }
 
-// ── End of dashjs-rs integration ─────────────────────────────────────────────
+fn mpd_resolve_tmpl(tmpl: &str, num: Option<usize>, rep_id: Option<&str>, time: Option<u64>, bw: Option<u64>) -> String {
+    let mut r = tmpl.to_string();
+    if let Some(n) = num {
+        if r.contains("$Number%") {
+            if let Some(s) = r.find("$Number%") {
+                if let Some(e) = r[s + 8..].find('$') {
+                    let fmt = &r[s + 8..s + 8 + e];
+                    let pw: usize = fmt.trim_end_matches('d').parse().unwrap_or(1);
+                    let f = format!("{:0>pw$}", n, pw = pw);
+                    r = r.replace(&format!("$Number%{fmt}$"), &f);
+                }
+            }
+        }
+        r = r.replace("$Number$", &n.to_string());
+    }
+    if let Some(id) = rep_id { r = r.replace("$RepresentationID$", id); }
+    if let Some(t) = time { r = r.replace("$Time$", &t.to_string()); }
+    if let Some(b) = bw { r = r.replace("$Bandwidth$", &b.to_string()); }
+    r
+}
+fn mpd_resolve_base(base: &str, rel: &str) -> String {
+    if rel.starts_with("http://") || rel.starts_with("https://") || rel.starts_with("//") { return rel.into(); }
+    if base.is_empty() { return rel.into(); }
+    if let Some(ls) = base.rfind('/') { format!("{}/{rel}", &base[..ls]) } else { rel.into() }
+}
+
+/// Build segment list from parsed MPD for backward-compatible integration.
+fn mpd_build_segments(mpd: &Mpd, pi: usize, ai: usize, ri: usize, base: &str) -> (String, f64, Vec<SegmentInfo>) {
+    let p = &mpd.periods[pi]; let a = &p.adaptation_sets[ai]; let rep = &a.representations[ri];
+    let b = if !rep.base_urls.is_empty() { rep.base_urls[0].clone() }
+        else if !a.base_urls.is_empty() { a.base_urls[0].clone() }
+        else if !p.base_urls.is_empty() { p.base_urls[0].clone() }
+        else if !mpd.base_urls.is_empty() { mpd.base_urls[0].clone() }
+        else if let Some(sl) = base.rfind('/') { base[..sl + 1].into() }
+        else { String::new() };
+    if let Some(t) = rep.segment_template.as_ref().or(a.segment_template.as_ref()) {
+        return mpd_build_tmpl(mpd, t, rep, &b);
+    }
+    if let Some(l) = rep.segment_list.as_ref().or(a.segment_list.as_ref()) {
+        return mpd_build_list(l, &b);
+    }
+    if let Some(sb) = rep.segment_base.as_ref().or(a.segment_base.as_ref()) {
+        return mpd_build_base(sb, rep, &b);
+    }
+    (String::new(), mpd.media_presentation_duration, Vec::new())
+}
+
+fn mpd_build_tmpl(mpd: &Mpd, t: &MpdSegmentTemplate, rep: &MpdRepresentation, base: &str) -> (String, f64, Vec<SegmentInfo>) {
+    let rid = rep.id.as_deref().unwrap_or("");
+    let init = t.initialization.as_ref().map(|i| mpd_resolve_base(base, &mpd_resolve_tmpl(i, None, Some(rid), None, Some(rep.bandwidth)))).unwrap_or_default();
+    let media = t.media.as_deref().unwrap_or("");
+    let mut segs = Vec::new();
+    if !t.timeline.is_empty() {
+        let mut num = t.start_number; let mut ct: u64 = 0;
+        for entry in &t.timeline {
+            if let Some(tv) = entry.t { ct = tv; }
+            let rc = if entry.r >= 0 { entry.r as usize } else { 0 };
+            for _ in 0..=rc {
+                let url = mpd_resolve_tmpl(media, Some(num), Some(rid), Some(ct), Some(rep.bandwidth));
+                segs.push(SegmentInfo { url: mpd_resolve_base(base, &url), duration: entry.d as f64 / t.timescale });
+                ct += entry.d; num += 1;
+            }
+        }
+    } else if let Some(dur) = t.duration {
+        let sd = dur / t.timescale;
+        let n = if sd > 0.0 { (mpd.media_presentation_duration / sd).ceil() as usize } else { 0 };
+        for i in 0..n {
+            let url = mpd_resolve_tmpl(media, Some(t.start_number + i), Some(rid), None, Some(rep.bandwidth));
+            segs.push(SegmentInfo { url: mpd_resolve_base(base, &url), duration: sd });
+        }
+    }
+    (init, mpd.media_presentation_duration, segs)
+}
+fn mpd_build_list(l: &MpdSegmentList, base: &str) -> (String, f64, Vec<SegmentInfo>) {
+    let init = l.initialization.as_ref().map(|u| mpd_resolve_base(base, u)).unwrap_or_default();
+    let sd = l.duration.map(|d| d / l.timescale).unwrap_or_else(|| { log::warn!("SegmentList missing duration, using default"); SEGMENT_DURATION_F });
+    let segs: Vec<_> = l.segment_urls.iter().map(|su| SegmentInfo { url: mpd_resolve_base(base, &su.media), duration: sd }).collect();
+    (init, sd * segs.len() as f64, segs)
+}
+fn mpd_build_base(_sb: &MpdSegmentBase, rep: &MpdRepresentation, base: &str) -> (String, f64, Vec<SegmentInfo>) {
+    let url = if !rep.base_urls.is_empty() { mpd_resolve_base(base, &rep.base_urls[0]) } else { base.into() };
+    (url.clone(), 0.0, vec![SegmentInfo { url, duration: 0.0 }])
+}
+
+// ── §5 ABR Controller — AbrController.js ─────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SwitchPriority { Weak = 0, Default = 1, Strong = 2 }
+
+#[derive(Debug, Clone)]
+pub struct SwitchRequest {
+    pub representation_index: Option<usize>, pub priority: SwitchPriority,
+    pub reason: String, pub rule: String,
+}
+impl SwitchRequest {
+    fn no_change(rule: &str) -> Self { Self { representation_index: None, priority: SwitchPriority::Default, reason: "no change".into(), rule: rule.into() } }
+    fn with_index(idx: usize, p: SwitchPriority, reason: String, rule: &str) -> Self { Self { representation_index: Some(idx), priority: p, reason, rule: rule.into() } }
+}
+
+#[derive(Debug, Clone)]
+struct BolaState { state: BolaPhase, utilities: Vec<f64>, vp: f64, gp: f64, placeholder_buffer: f64, last_quality: usize }
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BolaPhase { OneBitrate, Startup, Steady }
+
+pub struct AbrController {
+    pub auto_switch_bitrate: bool,
+    pub use_bola: HashMap<MediaType, bool>,
+    bola_states: HashMap<MediaType, Option<BolaState>>,
+    manual_quality: HashMap<MediaType, Option<usize>>,
+}
+impl AbrController {
+    pub fn new() -> Self {
+        let mut ub = HashMap::new(); ub.insert(MediaType::Video, false); ub.insert(MediaType::Audio, false);
+        Self { auto_switch_bitrate: true, use_bola: ub, bola_states: HashMap::new(), manual_quality: HashMap::new() }
+    }
+    pub fn set_manual_quality(&mut self, mt: MediaType, idx: Option<usize>) { self.manual_quality.insert(mt, idx); }
+    pub fn get_optimal_rep(reps: &[MpdRepresentation], kbps: f64) -> usize {
+        let mut best = 0;
+        for (i, r) in reps.iter().enumerate() { if r.bitrate_kbps() <= kbps { best = i; } }
+        best
+    }
+    pub fn get_quality(&mut self, mt: MediaType, reps: &[MpdRepresentation], tc: &ThroughputController, metrics: &DashMetrics, buf: f64, is_dyn: bool) -> usize {
+        if !self.auto_switch_bitrate { if let Some(Some(m)) = self.manual_quality.get(&mt) { return (*m).min(reps.len().saturating_sub(1)); } }
+        if reps.len() <= 1 { return 0; }
+        let mut reqs = vec![
+            Self::throughput_rule(mt, reps, tc, metrics, is_dyn),
+            Self::insufficient_buffer_rule(mt, reps, tc, buf),
+            Self::switch_history_rule(reps, metrics),
+            Self::dropped_frames_rule(reps, metrics),
+        ];
+        if *self.use_bola.get(&mt).unwrap_or(&false) { reqs.push(self.bola_rule(mt, reps, tc, buf)); }
+        Self::arbitrate(&reqs, reps)
+    }
+    pub fn should_abandon(_mt: MediaType, reps: &[MpdRepresentation], cur: usize, loaded: usize, total: usize, elapsed_ms: f64, seg_dur: f64, buf: f64) -> Option<SwitchRequest> {
+        if reps.len() <= 1 || cur == 0 || buf >= STABLE_BUFFER_TIME_S || elapsed_ms < 500.0 || loaded < 1000 || loaded >= total { return None; }
+        let tp = (loaded as f64 * 8.0) / elapsed_ms;
+        let est = (total as f64 * 8.0) / tp / 1000.0;
+        if est < seg_dur * ABANDON_DURATION_MULTIPLIER { return None; }
+        let opt = Self::get_optimal_rep(reps, tp);
+        if opt >= cur { return None; }
+        Some(SwitchRequest::with_index(opt, SwitchPriority::Strong, format!("abandon: est {est:.1}s"), "AbandonRequestsRule"))
+    }
+    fn throughput_rule(mt: MediaType, reps: &[MpdRepresentation], tc: &ThroughputController, metrics: &DashMetrics, is_dyn: bool) -> SwitchRequest {
+        if metrics.get_buffer_state(mt) != BufferState::Loaded && !is_dyn { return SwitchRequest::no_change("ThroughputRule"); }
+        if tc.get_sample_count(mt) < ABR_MIN_SAMPLES { return SwitchRequest::no_change("ThroughputRule"); }
+        let safe = tc.get_safe_average_throughput(mt);
+        if safe.is_nan() || safe <= 0.0 { return SwitchRequest::no_change("ThroughputRule"); }
+        SwitchRequest::with_index(Self::get_optimal_rep(reps, safe), SwitchPriority::Default, format!("tp {safe:.0}kbps"), "ThroughputRule")
+    }
+    fn bola_rule(&mut self, mt: MediaType, reps: &[MpdRepresentation], tc: &ThroughputController, buf: f64) -> SwitchRequest {
+        let bola = self.bola_states.entry(mt).or_insert_with(|| Self::init_bola(reps));
+        let b = match bola { Some(b) => b, None => return SwitchRequest::no_change("BolaRule") };
+        match b.state {
+            BolaPhase::OneBitrate => SwitchRequest::no_change("BolaRule"),
+            BolaPhase::Startup => {
+                let safe = tc.get_safe_average_throughput(mt);
+                let idx = if safe.is_nan() || safe <= 0.0 { 0 } else { Self::get_optimal_rep(reps, safe) };
+                b.last_quality = idx; if buf >= SEGMENT_DURATION_F { b.state = BolaPhase::Steady; }
+                SwitchRequest::with_index(idx, SwitchPriority::Default, "BOLA startup".into(), "BolaRule")
+            }
+            BolaPhase::Steady => {
+                b.placeholder_buffer *= BOLA_PLACEHOLDER_DECAY;
+                let eb = buf + b.placeholder_buffer;
+                let mut bi = 0; let mut bs = f64::NEG_INFINITY;
+                for (i, rep) in reps.iter().enumerate() {
+                    if i < b.utilities.len() {
+                        let sc = (b.vp * (b.utilities[i] - 1.0 + b.gp) - eb) / rep.bandwidth as f64;
+                        if sc > bs { bs = sc; bi = i; }
+                    }
+                }
+                let safe = tc.get_safe_average_throughput(mt);
+                if !safe.is_nan() && safe > 0.0 {
+                    let ti = Self::get_optimal_rep(reps, safe);
+                    if bi > ti && bi > b.last_quality { bi = b.last_quality.max(ti); }
+                }
+                b.last_quality = bi;
+                SwitchRequest::with_index(bi, SwitchPriority::Default, format!("BOLA buf={eb:.1}s"), "BolaRule")
+            }
+        }
+    }
+    fn init_bola(reps: &[MpdRepresentation]) -> Option<BolaState> {
+        if reps.len() <= 1 { return Some(BolaState { state: BolaPhase::OneBitrate, utilities: vec![1.0], vp: 0.0, gp: 0.0, placeholder_buffer: 0.0, last_quality: 0 }); }
+        let brs: Vec<f64> = reps.iter().map(|r| r.bandwidth as f64).collect();
+        let mut utils: Vec<f64> = brs.iter().map(|b| b.ln()).collect();
+        let u0 = utils[0]; for u in utils.iter_mut() { *u -= u0 - 1.0; }
+        let hi = utils.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)).map(|(i, _)| i).unwrap_or(0);
+        if hi == 0 { return None; }
+        let bt = BUFFER_TIME_DEFAULT_S.max(BOLA_MINIMUM_BUFFER_S + BOLA_MINIMUM_BUFFER_PER_LEVEL_S * reps.len() as f64);
+        let gp = (utils[hi] - 1.0) / (bt / BOLA_MINIMUM_BUFFER_S - 1.0);
+        let vp = BOLA_MINIMUM_BUFFER_S / gp;
+        Some(BolaState { state: BolaPhase::Startup, utilities: utils, vp, gp, placeholder_buffer: 0.0, last_quality: 0 })
+    }
+    fn insufficient_buffer_rule(mt: MediaType, reps: &[MpdRepresentation], tc: &ThroughputController, buf: f64) -> SwitchRequest {
+        if buf >= STABLE_BUFFER_TIME_S { return SwitchRequest::no_change("InsufficientBufferRule"); }
+        let tp = tc.get_average_throughput(mt);
+        if tp.is_nan() || tp <= 0.0 { return SwitchRequest::no_change("InsufficientBufferRule"); }
+        let avail = tp * ABR_BANDWIDTH_SAFETY_FACTOR * buf / SEGMENT_DURATION_F;
+        SwitchRequest::with_index(Self::get_optimal_rep(reps, avail), SwitchPriority::Default, format!("low buf {buf:.1}s"), "InsufficientBufferRule")
+    }
+    fn switch_history_rule(reps: &[MpdRepresentation], metrics: &DashMetrics) -> SwitchRequest {
+        for (i, _) in reps.iter().enumerate().rev() {
+            if let Some(e) = metrics.switch_history.get(&i) {
+                let total = e.drops + e.no_drops;
+                if total >= SWITCH_HISTORY_SAMPLE_SIZE && e.no_drops > 0 && (e.drops as f64 / e.no_drops as f64) > SWITCH_HISTORY_THRESHOLD {
+                    return SwitchRequest::with_index(i.saturating_sub(1), SwitchPriority::Default, "history".into(), "SwitchHistoryRule");
+                }
+            }
+        }
+        SwitchRequest::no_change("SwitchHistoryRule")
+    }
+    fn dropped_frames_rule(reps: &[MpdRepresentation], metrics: &DashMetrics) -> SwitchRequest {
+        let df = &metrics.dropped_frames;
+        if df.total_frames < DROPPED_FRAMES_MIN_SAMPLE { return SwitchRequest::no_change("DroppedFramesRule"); }
+        if df.dropped_frames as f64 / df.total_frames as f64 > DROPPED_FRAMES_THRESHOLD && reps.len() > 1 {
+            return SwitchRequest::with_index(reps.len().saturating_sub(2), SwitchPriority::Default, "drops".into(), "DroppedFramesRule");
+        }
+        SwitchRequest::no_change("DroppedFramesRule")
+    }
+    fn arbitrate(reqs: &[SwitchRequest], reps: &[MpdRepresentation]) -> usize {
+        let (mut strong, mut default, mut weak): (Option<usize>, Option<usize>, Option<usize>) = (None, None, None);
+        for req in reqs {
+            if let Some(idx) = req.representation_index {
+                let slot = match req.priority { SwitchPriority::Strong => &mut strong, SwitchPriority::Default => &mut default, SwitchPriority::Weak => &mut weak };
+                let cur_bw = slot.and_then(|i| reps.get(i).map(|r| r.bandwidth));
+                let new_bw = reps.get(idx).map(|r| r.bandwidth).unwrap_or(u64::MAX);
+                if cur_bw.is_none() || new_bw < cur_bw.unwrap() { *slot = Some(idx); }
+            }
+        }
+        strong.or(default).or(weak).unwrap_or(0)
+    }
+}
+
+// ── §6 Schedule Controller ───────────────────────────────────────────────────
+
+pub struct ScheduleController;
+impl ScheduleController {
+    pub fn should_schedule(buf: f64, seg_dur: f64, is_startup: bool) -> bool {
+        let target = if is_startup { BUFFER_TIME_DEFAULT_S } else { STABLE_BUFFER_TIME_S };
+        buf + seg_dur < target.max(MSE_TARGET_BUFFER_S)
+    }
+}
+
+// ── §7 Live Stream Support ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct LiveStreamController {
+    pub clock_offset_s: f64, pub target_delay_s: f64,
+    pub availability_start_time_epoch: Option<f64>,
+    pub time_shift_buffer_depth: Option<f64>, pub minimum_update_period: Option<f64>,
+    pub catchup_active: bool,
+}
+impl LiveStreamController {
+    pub fn new() -> Self {
+        Self { clock_offset_s: 0.0, target_delay_s: LIVE_DEFAULT_PRESENTATION_DELAY_S,
+            availability_start_time_epoch: None, time_shift_buffer_depth: None,
+            minimum_update_period: None, catchup_active: false }
+    }
+    pub fn configure_from_mpd(&mut self, mpd: &Mpd) {
+        self.target_delay_s = mpd.suggested_presentation_delay.unwrap_or(LIVE_DEFAULT_PRESENTATION_DELAY_S);
+        self.time_shift_buffer_depth = mpd.time_shift_buffer_depth;
+        self.minimum_update_period = mpd.minimum_update_period;
+        if let Some(ast) = &mpd.availability_start_time {
+            let d = js_sys::Date::new(&JsValue::from_str(ast));
+            let ms = d.get_time();
+            if !ms.is_nan() { self.availability_start_time_epoch = Some(ms / 1000.0); }
+        }
+    }
+    pub fn get_live_edge_time(&self) -> f64 {
+        let now = js_sys::Date::now() / 1000.0;
+        (now + self.clock_offset_s) - self.availability_start_time_epoch.unwrap_or(now)
+    }
+    pub fn get_live_start_position(&self) -> f64 { (self.get_live_edge_time() - self.target_delay_s).max(0.0) }
+    pub fn is_segment_available(&self, time: f64) -> bool {
+        let le = self.get_live_edge_time();
+        let ws = self.time_shift_buffer_depth.map(|d| (le - d).max(0.0)).unwrap_or(0.0);
+        time >= ws && time <= le
+    }
+    pub fn dvr_window_start(&self) -> f64 {
+        self.time_shift_buffer_depth.map(|d| (self.get_live_edge_time() - d).max(0.0)).unwrap_or(0.0)
+    }
+    pub fn dvr_window_end(&self) -> f64 { self.get_live_edge_time() }
+    pub fn get_refresh_interval_ms(&self) -> u32 {
+        self.minimum_update_period.map(|p| (p * 1000.0) as u32).unwrap_or(LIVE_MPD_REFRESH_INTERVAL_MS)
+    }
+    pub fn calculate_catchup_rate(&self, latency: f64, buf: f64) -> f64 {
+        let delta = latency - self.target_delay_s;
+        let cpr = if delta < 0.0 { LIVE_CATCHUP_RATE_MIN.abs() } else { LIVE_CATCHUP_RATE_MAX };
+        let sigmoid = (cpr * 2.0) / (1.0 + (-delta * 5.0).exp());
+        let mut rate = (1.0 - cpr) + sigmoid;
+        if buf <= self.target_delay_s / 2.0 && delta > 0.0 { rate = 1.0; }
+        rate.clamp(1.0 + LIVE_CATCHUP_RATE_MIN, 1.0 + LIVE_CATCHUP_RATE_MAX)
+    }
+    pub fn sync_clock_from_response(&mut self, server_time_ms: f64) {
+        self.clock_offset_s = (server_time_ms - js_sys::Date::now()) / 1000.0;
+    }
+}
+
+// ── §8 Error Recovery ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ErrorRecovery {
+    pub consecutive_errors: u32, pub max_retries: u32, pub fatal_error: bool,
+}
+impl ErrorRecovery {
+    pub fn new() -> Self { Self { consecutive_errors: 0, max_retries: 3, fatal_error: false } }
+    pub fn on_success(&mut self) { self.consecutive_errors = 0; }
+    pub fn on_error(&mut self) -> bool { self.consecutive_errors += 1; self.consecutive_errors < self.max_retries }
+    pub fn is_quota_exceeded(err: &JsValue) -> bool {
+        if let Some(de) = err.dyn_ref::<web_sys::DomException>() { return de.code() == QUOTA_EXCEEDED_ERR_CODE; }
+        err.as_string().is_some_and(|s| s.contains("QuotaExceeded"))
+    }
+    pub fn signal_eos_error(ms: &web_sys::MediaSource, err_type: &str) {
+        match err_type {
+            "decode" | "network" => {
+                let v: &JsValue = ms.as_ref();
+                if let Ok(f) = js_sys::Reflect::get(v, &JsValue::from_str("endOfStream")).and_then(|m| m.dyn_into::<js_sys::Function>()) {
+                    let _ = f.call1(v, &JsValue::from_str(err_type));
+                }
+            }
+            _ => { let _ = ms.end_of_stream(); }
+        }
+    }
+    pub fn reset(&mut self) { self.consecutive_errors = 0; self.fatal_error = false; }
+}
+
+/// Extended DASH state attached alongside MseState.
+struct DashExtState {
+    mpd: Mpd,
+    abr: AbrController,
+    throughput: ThroughputController,
+    metrics: DashMetrics,
+    event_bus: EventBus,
+    error_recovery: ErrorRecovery,
+    live: Option<LiveStreamController>,
+}
+
+// ── End of new DASH infrastructure ───────────────────────────────────────────
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -631,26 +1220,58 @@ struct MseState {
     /// whether enough data has been buffered ahead of the playhead.
     /// Set to `None` until the first media segment is appended.
     last_appended_seg: Option<usize>,
-    /// dashjs-rs engine — MPD parsing, ABR decisions, throughput, metrics.
-    dash_ext: Option<DashEngine>,
+    /// Extended DASH infrastructure (ABR, metrics, throughput, events, etc.)
+    dash_ext: Option<DashExtState>,
 }
 
 /// Parse a DASH MPD manifest and return the list of segment URLs with durations.
 ///
-/// Uses the dashjs-rs parser (proper XML parsing via quick-xml) for the MPD
-/// structure, with supplementary XML extraction for SegmentTimeline entries
-/// (the dashjs-rs parser stores template attributes on Representation but
-/// does not expose the raw S elements for external segment list building).
+/// This is a minimal parser that handles the specific MPD format our server
+/// emits: a single Period with a single AdaptationSet containing a
+/// SegmentTemplate with a SegmentTimeline.
 ///
 /// Returns `(init_url, total_duration_secs, segments)`.
 fn parse_mpd(text: &str) -> (String, f64, Vec<SegmentInfo>) {
-    match dash_parser::parse(text) {
-        Ok(mpd) => extract_segments_from_mpd(&mpd, "", text),
-        Err(e) => {
-            log::error!("dashjs-rs MPD parse error (code {:?}): {}", e.code, e.message);
-            (String::new(), 0.0, Vec::new())
+    // Use the full MPD parser and extract backward-compatible output.
+    let mpd = parse_mpd_full(text);
+    if mpd.periods.is_empty() { return (String::new(), 0.0, Vec::new()); }
+    let period = &mpd.periods[0];
+    if period.adaptation_sets.is_empty() { return (String::new(), 0.0, Vec::new()); }
+    // Find the video (or muxed) adaptation set.
+    let aset_idx = period.adaptation_sets.iter().position(|a| {
+        a.content_type.as_deref() == Some("video")
+            || a.mime_type.as_deref().is_some_and(|m| m.starts_with("video"))
+            || a.content_type.is_none()
+    }).unwrap_or(0);
+    let aset = &period.adaptation_sets[aset_idx];
+    if aset.representations.is_empty() { return (String::new(), 0.0, Vec::new()); }
+    // Use first representation (lowest bandwidth after sorting).
+    mpd_build_segments(&mpd, 0, aset_idx, 0, "")
+}
+
+/// Parse an ISO 8601 duration like "PT1H23M45S" or "PT0H0M30S" into seconds.
+fn parse_iso8601_duration(s: &str) -> f64 {
+    let s = s.strip_prefix("PT").unwrap_or(s);
+    let mut total = 0.0_f64;
+    let mut num_buf = String::new();
+    for ch in s.chars() {
+        match ch {
+            'H' | 'h' => {
+                total += num_buf.parse::<f64>().unwrap_or(0.0) * 3600.0;
+                num_buf.clear();
+            }
+            'M' | 'm' => {
+                total += num_buf.parse::<f64>().unwrap_or(0.0) * 60.0;
+                num_buf.clear();
+            }
+            'S' | 's' => {
+                total += num_buf.parse::<f64>().unwrap_or(0.0);
+                num_buf.clear();
+            }
+            _ => num_buf.push(ch),
         }
     }
+    total
 }
 
 /// Strip ftyp and moov boxes from an fMP4 segment, keeping only moof+mdat.
@@ -1174,15 +1795,24 @@ async fn pump_loop(
             return;
         }
 
-        // Record throughput measurement via dashjs-rs engine.
+        // Record throughput measurement for ABR.
         {
             let fetch_end_ms = js_sys::Date::now();
             let elapsed_ms = (fetch_end_ms - fetch_start_ms).max(1.0);
             let throughput_kbps = (bytes.len() as f64 * 8.0) / elapsed_ms;
             let mut borrow = state.borrow_mut();
             if let Some(mse) = borrow.as_mut() {
-                if let Some(engine) = mse.dash_ext.as_mut() {
-                    engine.add_throughput_sample(throughput_kbps);
+                if let Some(ext) = mse.dash_ext.as_mut() {
+                    ext.throughput.add_measurement(MediaType::Video, throughput_kbps, elapsed_ms);
+                    ext.metrics.add_throughput_sample(ThroughputSample {
+                        timestamp_ms: fetch_end_ms,
+                        throughput_kbps,
+                        latency_ms: elapsed_ms,
+                        bytes: bytes.len(),
+                        duration_ms: elapsed_ms,
+                        media_type: MediaType::Video,
+                    });
+                    ext.event_bus.emit_simple(PlayerEvent::FragmentLoadingCompleted);
                 }
             }
         }
@@ -1633,9 +2263,15 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             0
                         };
 
-                        // Store MSE state with dashjs-rs engine.
-                        let mut engine = DashEngine::new();
-                        engine.initialize(&manifest_url);
+                        // Store MSE state.
+                        let full_mpd = parse_mpd_full(&text);
+                        let live_ctrl = if full_mpd.mpd_type == MpdType::Dynamic {
+                            let mut lc = LiveStreamController::new();
+                            lc.configure_from_mpd(&full_mpd);
+                            Some(lc)
+                        } else {
+                            None
+                        };
                         *mse_state.borrow_mut() = Some(MseState {
                             media_source,
                             source_buffer: source_buffer.clone(),
@@ -1645,7 +2281,15 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             pump_gen: 0,
                             pump_running: false,
                             last_appended_seg: None,
-                            dash_ext: Some(engine),
+                            dash_ext: Some(DashExtState {
+                                mpd: full_mpd,
+                                abr: AbrController::new(),
+                                throughput: ThroughputController::new(),
+                                metrics: DashMetrics::new(),
+                                event_bus: EventBus::new(),
+                                error_recovery: ErrorRecovery::new(),
+                                live: live_ctrl,
+                            }),
                         });
 
                         status.set(String::new());

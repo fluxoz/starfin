@@ -602,6 +602,12 @@ pub fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Public wrapper for [`extract_ftyp_moov`] — called by `get_init_segment`
+/// in `main.rs` to re-derive the init segment from a cached segment 0 file.
+pub fn extract_ftyp_moov_pub(data: &[u8]) -> Result<Vec<u8>, String> {
+    extract_ftyp_moov(data)
+}
+
 /// Extract ftyp and moov boxes from an fMP4 byte buffer.
 ///
 /// Parses MP4 box headers (4-byte size + 4-byte type) and copies only the

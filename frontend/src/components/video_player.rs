@@ -171,6 +171,11 @@ struct DashPlayer {
     seg_cache: SegmentCache,
     /// Set of segment indices currently being fetched in background tasks.
     in_flight: InFlightSet,
+    /// Fatal error flag — when set, the pump should NOT be restarted.
+    /// Set on unrecoverable errors like Firefox H264 decode failures that
+    /// detach the SourceBuffer.  Prevents the periodic timer from restarting
+    /// the pump in an infinite loop of identical errors.
+    fatal_error: bool,
 }
 
 // ── MPD Parsing (via dashjs-rs) ──────────────────────────────────────────────
@@ -923,6 +928,10 @@ async fn pump_loop(
                         if is_invalid_state {
                             log::error!("pump[{pump_id}]: InvalidStateError on segment {seg_idx} — \
                                 SourceBuffer detached (likely decode error), exiting");
+                            // Mark as fatal so the periodic timer doesn't restart us
+                            if let Some(dp) = state.borrow_mut().as_mut() {
+                                dp.fatal_error = true;
+                            }
                             return;
                         }
 
@@ -930,6 +939,10 @@ async fn pump_loop(
                         consecutive_failures += 1;
                         if consecutive_failures > MAX_APPEND_FAILURES {
                             log::error!("pump[{pump_id}]: too many consecutive failures, exiting");
+                            // Mark as fatal after too many failures
+                            if let Some(dp) = state.borrow_mut().as_mut() {
+                                dp.fatal_error = true;
+                            }
                             return;
                         }
                         TimeoutFuture::new(500).await;
@@ -980,7 +993,11 @@ fn start_pump(state: &Rc<RefCell<Option<DashPlayer>>>, video: &HtmlVideoElement)
             Some(dp) => dp,
             None => return,
         };
-        if dp.pump_running { return; }
+        if dp.pump_running || dp.fatal_error { return; }
+        // Don't start if MediaSource is no longer open
+        if dp.media_source.ready_state() != web_sys::MediaSourceReadyState::Open {
+            return;
+        }
         dp.pump_running = true;
         dp.pump_gen
     };
@@ -1311,10 +1328,25 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 return;
                             }
 
-                            // Wait for init append
+                            // Wait for init append to complete.
+                            // Also check readyState — Firefox may close the MediaSource
+                            // if the init segment contains invalid codec data (e.g.
+                            // malformed avcC → NS_ERROR_DOM_MEDIA_FATAL_ERR).
                             for _ in 0..200 {
                                 if !source_buffer.updating() { break; }
                                 TimeoutFuture::new(5).await;
+                            }
+
+                            // Verify MediaSource is still open after init append.
+                            // If Firefox rejected the init segment (bad H264 parameters),
+                            // the MediaSource transitions to "closed"/"ended" and all
+                            // subsequent operations will fail with InvalidStateError.
+                            if media_source.ready_state() != web_sys::MediaSourceReadyState::Open {
+                                error.set(Some(
+                                    "Init segment rejected by browser (codec/format mismatch). \
+                                     Try clearing server cache or switching quality.".into()
+                                ));
+                                return;
                             }
 
                             let start_seg = if start_pos > 0.0 { segment_for_time(start_pos) } else { 0 };
@@ -1347,6 +1379,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 last_eviction_ms: js_sys::Date::now(),
                                 seg_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
                                 in_flight: Rc::new(RefCell::new(std::collections::HashSet::new())),
+                                fatal_error: false,
                             });
 
                             status.set(String::new());
@@ -1470,7 +1503,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     let needs_restart = {
                         let borrow = dash_state.borrow();
                         if let Some(dp) = borrow.as_ref() {
-                            if dp.pump_running || dp.next_seg >= dp.segments.len() {
+                            // Never restart after a fatal error (e.g. H264
+                            // decode failure that detached the SourceBuffer).
+                            if dp.fatal_error || dp.pump_running || dp.next_seg >= dp.segments.len() {
                                 false
                             } else {
                                 let buf_ahead = buffered_end_at(&video, video.current_time()) - video.current_time();
@@ -1572,7 +1607,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     if is_time_buffered(&video_for_seek, seek_time) {
                         let need_pump = {
                             let borrow = dash_state.borrow();
-                            borrow.as_ref().map_or(false, |dp| !dp.pump_running)
+                            borrow.as_ref().map_or(false, |dp| !dp.pump_running && !dp.fatal_error)
                         };
                         if need_pump { start_pump(&dash_state, &video_for_seek); }
                     } else {
@@ -1585,33 +1620,28 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 dp.next_seg = target_seg;
                                 dp.last_appended_seg = None;
                                 dp.last_eviction_ms = js_sys::Date::now();
+                                // Clear fatal_error on seek — user is retrying.
+                                dp.fatal_error = false;
                                 // Abort any in-progress SourceBuffer operations.
-                                // Matches dash.js SourceBufferSink.abortBeforeAppend()
-                                // which is called during seek to cancel pending appends.
+                                // Matches dash.js BufferController.prepareForPlaybackSeek()
+                                // which calls sourceBufferSink.abort() to cancel pending
+                                // appends.  dash.js does NOT flush the entire buffer on
+                                // seek — it relies on MSE's coded-frame-removal algorithm
+                                // to handle overlapping data when new segments are appended.
                                 let _ = dp.source_buffer.abort();
                             }
                         }
 
-                        // Flush the entire SourceBuffer so the pump rebuilds
-                        // from the target segment cleanly.  dash.js
-                        // BufferController._onSeekTarget() clears the buffer
-                        // around the seek position to prevent stale data from
-                        // causing decoder artifacts.
+                        // ── Do NOT flush the entire SourceBuffer ──
+                        // dash.js keeps existing buffered data and just starts
+                        // fetching from the seek target.  Flushing removes all
+                        // buffered data, creating a visible blank/freeze until
+                        // the first new segment is fetched and appended.
                         //
-                        // We remove everything: old data behind the seek
-                        // target would be pruned anyway, and data ahead may
-                        // belong to a different GOP structure that causes chop.
-                        // The pump will re-fetch segments from target_seg.
-                        {
-                            let borrow = dash_state.borrow();
-                            if let Some(dp) = borrow.as_ref() {
-                                if !dp.source_buffer.updating() {
-                                    let dur = video_for_seek.duration();
-                                    let end = if dur.is_finite() && dur > 0.0 { dur } else { f64::INFINITY };
-                                    let _ = dp.source_buffer.remove(0.0, end);
-                                }
-                            }
-                        }
+                        // The browser's MSE implementation handles the overlap:
+                        // new segments will replace any stale data at the same
+                        // presentation time via the coded-frame-removal algorithm
+                        // (MSE spec §3.5.1 Coded Frame Processing).
 
                         force_start_pump(&dash_state, &video_for_seek);
                     }

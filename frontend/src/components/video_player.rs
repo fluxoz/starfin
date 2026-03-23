@@ -471,16 +471,19 @@ fn is_pump_current(state: &Rc<RefCell<Option<DashPlayer>>>, pump_id: u32) -> boo
 
 /// Wait for SourceBuffer to finish updating.
 /// Uses a small delay between checks to let the browser process events.
+/// dash.js SourceBufferSink uses event-driven callbacks (updateend DOM event) which fire
+/// immediately on completion — zero latency.  WASM can't subscribe to those events directly,
+/// so we poll, but at 5 ms to match the typical <5 ms SourceBuffer operation time.
 async fn wait_for_sb(
     sb: &web_sys::SourceBuffer,
     state: &Rc<RefCell<Option<DashPlayer>>>,
     pump_id: u32,
 ) -> bool {
-    // Up to ~10 seconds (200 × 50ms)
-    for _ in 0..200 {
+    // Up to ~10 seconds (2000 × 5ms)
+    for _ in 0..2000 {
         if !sb.updating() { return true; }
         if !is_pump_current(state, pump_id) { return false; }
-        TimeoutFuture::new(50).await;
+        TimeoutFuture::new(5).await;
     }
     log::warn!("wait_for_sb: timed out after 10s");
     false
@@ -1016,7 +1019,7 @@ fn start_pump(state: &Rc<RefCell<Option<DashPlayer>>>, video: &HtmlVideoElement)
 
 /// Force-start pump (cancels existing, increments gen).
 fn force_start_pump(state: &Rc<RefCell<Option<DashPlayer>>>, video: &HtmlVideoElement) {
-    {
+    let new_gen = {
         let mut borrow = state.borrow_mut();
         if let Some(dp) = borrow.as_mut() {
             dp.pump_gen = dp.pump_gen.wrapping_add(1);
@@ -1027,9 +1030,16 @@ fn force_start_pump(state: &Rc<RefCell<Option<DashPlayer>>>, video: &HtmlVideoEl
             // old (now unreferenced) cache and are silently discarded.
             dp.seg_cache = Rc::new(RefCell::new(std::collections::HashMap::new()));
             dp.in_flight = Rc::new(RefCell::new(std::collections::HashSet::new()));
+            dp.pump_gen
+        } else {
+            return;
         }
-    }
+    };
     start_pump(state, video);
+    // Seed the prefetch cache immediately for the new seek position, matching
+    // dash.js's eager prefetch after seek (StreamProcessor._onMediaFragmentNeeded).
+    // Without this, the first segment at the seek target is always a cold inline fetch.
+    kick_prefetch(state, new_gen);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

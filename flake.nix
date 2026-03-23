@@ -45,6 +45,16 @@
       src = self;
       cargoLock.lockFile = ./frontend/Cargo.lock;
 
+      # cargoSetupHook (configure phase) checks that $sourceRoot/Cargo.lock
+      # matches the vendored lock file (built from frontend/Cargo.lock above).
+      # src = self puts the backend root Cargo.lock at $sourceRoot/Cargo.lock,
+      # which has extra packages (zune-core, zune-jpeg, …) absent from the
+      # frontend lock, causing the hash check to fail.  Replace it in postPatch
+      # (which runs before configure) with the frontend lock so the check passes.
+      postPatch = ''
+        cp frontend/Cargo.lock Cargo.lock
+      '';
+
       # Build only the frontend crate using its manifest explicitly so that
       # cargo does not pick up the root starfin backend Cargo.toml.
       buildPhase = ''

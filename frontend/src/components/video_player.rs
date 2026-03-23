@@ -387,17 +387,15 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     // Create dash.js player
                     let player = DashPlayer::create();
 
-                    // Configure dash.js settings to match our server
+                    // Configure dash.js v5 settings to match our server
                     let settings = js_sys::eval(&format!(
                         r#"({{
                             streaming: {{
                                 buffer: {{
+                                    bufferTimeDefault: {buf_target},
                                     bufferTimeAtTopQuality: {buf_target},
                                     bufferTimeAtTopQualityLongForm: {buf_target},
-                                    bufferToKeep: {back_buf},
-                                    bufferPruningInterval: 10,
-                                    stableBufferTime: {buf_target},
-                                    fastSwitchEnabled: false
+                                    bufferToKeep: {back_buf}
                                 }},
                                 gaps: {{
                                     jumpGaps: true,

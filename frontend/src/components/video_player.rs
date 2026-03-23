@@ -70,8 +70,8 @@ const MAX_QUOTA_RETRIES: u32 = 3;
 
 // ── Lookahead prefetch (mirrors dash.js StreamProcessor._onMediaFragmentNeeded) ──
 /// How many segments ahead of next_seg to prefetch into the SegmentCache.
-/// dash.js uses a full bufferTarget/segmentDuration window; we use 3 here.
-const LOOKAHEAD_WINDOW: usize = 3;
+/// dash.js uses bufferTarget/segmentDuration = 30s/6s = 5 segments.
+const LOOKAHEAD_WINDOW: usize = 5;
 
 /// Shared cache of already-fetched segment bytes, keyed by segment index.
 /// Populated by background `spawn_local` prefetch tasks.
@@ -589,12 +589,14 @@ async fn force_evict_for_quota(
     true
 }
 
-/// Spawn background prefetch tasks for segments [next_seg+1, next_seg+LOOKAHEAD_WINDOW).
+/// Spawn background prefetch tasks for segments [next_seg, next_seg+LOOKAHEAD_WINDOW).
 ///
 /// Mirrors dash.js `StreamProcessor._onMediaFragmentNeeded` + `FragmentController`
 /// background loading pattern: start fetching the next N segments in the background
 /// so they are already cached when the main pump loop needs them.
 ///
+/// - Includes the current segment (`next_seg`) so the pump loop can serve it from
+///   cache on the next iteration, matching dash.js's eager prefetch behaviour.
 /// - Skips segments already in the cache (already fetched)
 /// - Skips segments already in-flight (fetch in progress)
 /// - Stores result bytes in `seg_cache` on completion
@@ -617,8 +619,8 @@ fn kick_prefetch(
         // Collect URLs for segments we need to prefetch
         let cache_borrow = cache.borrow();
         let inflight_borrow = inflight.borrow();
-        let lookahead_end = total.min(next.saturating_add(LOOKAHEAD_WINDOW + 1));
-        let to_fetch: Vec<(usize, String)> = (next.saturating_add(1)..lookahead_end)
+        let lookahead_end = total.min(next.saturating_add(LOOKAHEAD_WINDOW));
+        let to_fetch: Vec<(usize, String)> = (next..lookahead_end)
             .filter(|&i| !cache_borrow.contains_key(&i) && !inflight_borrow.contains(&i))
             .map(|i| (i, dp.segments[i].url.clone()))
             .collect();
@@ -1388,6 +1390,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
 
                             start_pump(&dash_state, &video);
+                            // Seed the lookahead cache immediately so the first segments
+                            // are already being fetched before the pump loop begins,
+                            // matching dash.js's eager prefetch on initialization.
+                            kick_prefetch(&dash_state, 0);
 
                             // Auto-play when the user opens the player
                             let _ = video.play();

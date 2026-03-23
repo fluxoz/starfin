@@ -39,6 +39,11 @@ const CONTROLS_VICINITY_PX: f64 = 80.0;
 // ── Buffer target for dash.js configuration ──────────────────────────────────
 const BUFFER_TARGET_S: f64 = 30.0;
 const BACK_BUFFER_S: f64 = 20.0;
+const BUFFER_PRUNING_INTERVAL_S: f64 = 30.0;
+
+// ── Gap handling — dash.js will seek past gaps smaller than this ──────────────
+const GAP_SMALL_LIMIT_S: f64 = 0.8;
+const GAP_STALL_THRESHOLD_S: f64 = 0.5;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // dash.js JavaScript interop via wasm-bindgen
@@ -396,13 +401,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                     bufferTimeAtTopQuality: {buf_target},
                                     bufferTimeAtTopQualityLongForm: {buf_target},
                                     bufferToKeep: {back_buf},
-                                    bufferPruningInterval: 30
+                                    bufferPruningInterval: {prune_interval}
                                 }},
                                 gaps: {{
                                     jumpGaps: true,
                                     jumpLargeGaps: true,
-                                    smallGapLimit: 0.8,
-                                    threshold: 0.5
+                                    smallGapLimit: {gap_small},
+                                    threshold: {gap_threshold}
                                 }},
                                 abr: {{
                                     autoSwitchBitrate: {{ video: false, audio: false }}
@@ -422,6 +427,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         }})"#,
                         buf_target = BUFFER_TARGET_S,
                         back_buf = BACK_BUFFER_S,
+                        prune_interval = BUFFER_PRUNING_INTERVAL_S,
+                        gap_small = GAP_SMALL_LIMIT_S,
+                        gap_threshold = GAP_STALL_THRESHOLD_S,
                     )).unwrap();
 
                     player.update_settings(&settings);

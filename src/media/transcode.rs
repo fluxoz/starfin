@@ -29,6 +29,13 @@ use super::hwaccel::HwAccel;
 /// Duration of each DASH segment in seconds.
 pub const SEGMENT_DURATION: f64 = 6.0;
 
+/// Maximum allowed difference (in seconds) between a segment's actual keyframe
+/// time and its nominal start time before we fall back to the actual time for
+/// the tfdt patch.  Within this tolerance we use the nominal time so that
+/// segments create a small overlap (handled seamlessly by MSE coded-frame-
+/// removal) rather than a small gap that causes dash.js gap-jump stutter.
+const SEGMENT_BOUNDARY_TOLERANCE_S: f64 = 0.5;
+
 /// Error message returned when a background operation is cancelled by a kill
 /// flag (e.g. playback started while a background worker was running).
 pub const CANCELLED: &str = "cancelled";
@@ -975,7 +982,7 @@ fn create_segment(
     //
     // For large differences (source keyframes far from segment boundaries),
     // use the actual keyframe time to preserve A/V sync.
-    let tfdt_time = if (actual_start - start_time).abs() < 0.5 {
+    let tfdt_time = if (actual_start - start_time).abs() < SEGMENT_BOUNDARY_TOLERANCE_S {
         start_time
     } else {
         actual_start

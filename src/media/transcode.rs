@@ -965,10 +965,25 @@ fn create_segment(
     // correct absolute time on the presentation timeline.  FFmpeg's fMP4
     // muxer always normalizes DTS to 0, so without this patch all segments
     // would overlap at time 0 and MSE Segments mode would show only ~6 s.
+    //
+    // When the actual keyframe is close to the nominal segment boundary
+    // (< 500 ms), use the NOMINAL start time.  This creates a tiny overlap
+    // with the previous segment instead of a tiny gap.  MSE handles overlap
+    // via coded-frame-removal (seamless), whereas gaps cause the video
+    // element to stall briefly — then dash.js gap-jumps forward, producing
+    // visible stutter on every segment transition.
+    //
+    // For large differences (source keyframes far from segment boundaries),
+    // use the actual keyframe time to preserve A/V sync.
+    let tfdt_time = if (actual_start - start_time).abs() < 0.5 {
+        start_time
+    } else {
+        actual_start
+    };
     eprintln!(
-        "[segment] seg {seg_index}: nominal_start={start_time:.3}s, actual_keyframe={actual_start:.3}s",
+        "[segment] seg {seg_index}: nominal_start={start_time:.3}s, actual_keyframe={actual_start:.3}s, tfdt={tfdt_time:.3}s",
     );
-    patch_segment_tfdt(&tmp_path, actual_start)?;
+    patch_segment_tfdt(&tmp_path, tfdt_time)?;
 
     // Atomic rename.
     std::fs::rename(&tmp_path, &seg_path)

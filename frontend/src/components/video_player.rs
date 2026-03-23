@@ -395,13 +395,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                     bufferTimeDefault: {buf_target},
                                     bufferTimeAtTopQuality: {buf_target},
                                     bufferTimeAtTopQualityLongForm: {buf_target},
-                                    bufferToKeep: {back_buf}
+                                    bufferToKeep: {back_buf},
+                                    bufferPruningInterval: 30
                                 }},
                                 gaps: {{
                                     jumpGaps: true,
                                     jumpLargeGaps: true,
-                                    smallGapLimit: 0.15,
-                                    threshold: 0.3
+                                    smallGapLimit: 0.8,
+                                    threshold: 0.5
                                 }},
                                 abr: {{
                                     autoSwitchBitrate: {{ video: false, audio: false }}
@@ -415,7 +416,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                     MPD: 1000,
                                     MediaSegment: 1000,
                                     InitializationSegment: 1000
-                                }}
+                                }},
+                                cacheInitSegments: true
                             }}
                         }})"#,
                         buf_target = BUFFER_TARGET_S,

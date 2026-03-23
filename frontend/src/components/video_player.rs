@@ -1670,7 +1670,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     } else {
                         log::info!("seek: target {seek_time:.1}s not buffered, restarting from segment {target_seg}");
 
-                        // Synchronously: bump gen, update state, abort.
+                        // Synchronously: bump gen, update state, abort, reset cache.
                         // Matches dash.js BufferController.prepareForPlaybackSeek()
                         // which calls sourceBufferSink.abort() to cancel pending appends.
                         let (sb, abort_gen) = {
@@ -1683,6 +1683,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 dp.last_eviction_ms = js_sys::Date::now();
                                 // Clear fatal_error on seek — user is retrying.
                                 dp.fatal_error = false;
+                                // Replace prefetch state (same as force_start_pump would do).
+                                dp.seg_cache = Rc::new(RefCell::new(std::collections::HashMap::new()));
+                                dp.in_flight = Rc::new(RefCell::new(std::collections::HashSet::new()));
                                 // Abort any in-progress SourceBuffer operations.
                                 let _ = dp.source_buffer.abort();
                                 (dp.source_buffer.clone(), dp.pump_gen)
@@ -1691,39 +1694,42 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             }
                         };
 
-                        // Async: prune buffer behind the seek target, then start pump.
+                        // Start the pump immediately so the network fetch begins without
+                        // delay.  Chromium needs this — any latency before the first fetch
+                        // is visible as stutter.
+                        start_pump(&dash_state, &video_for_seek);
+
+                        // Async: prune stale data behind the seek target concurrently with
+                        // the network fetch.
                         //
                         // Matches dash.js StreamProcessor.prepareInnerPeriodPlaybackSeeking()
-                        // which calls bufferController.clearBuffers(getAllRangesWithSafetyFactor(seekTime))
-                        // after prepareForPlaybackSeek().  Firefox specifically requires this:
-                        // without the prune, Firefox's decoder gets confused about which frame
-                        // to decode next at the new seek position, causing visible stutter.
+                        // which calls clearBuffers(getAllRangesWithSafetyFactor(seekTime))
+                        // after prepareForPlaybackSeek().  Firefox requires this prune:
+                        // without it, its decoder gets confused about which frame to decode
+                        // next at the new seek position, causing visible stutter.
+                        //
+                        // Concurrency is safe: the prune completes in <5 ms (no network),
+                        // while the pump's first appendBuffer arrives after >100 ms of
+                        // network fetch time.  The pump_loop's wait_for_sb before each
+                        // appendBuffer acts as the synchronisation point for the rare case
+                        // where they would otherwise overlap.
                         let dash_state_seek = dash_state.clone();
-                        let video_seek = video_for_seek.clone();
                         spawn_local(async move {
-                            // 1. Wait for abort to settle.
+                            // Wait for abort to settle (usually returns immediately since
+                            // abort() clears the updating flag synchronously).
                             if !wait_for_sb(&sb, &dash_state_seek, abort_gen).await { return; }
 
                             // Bail if a newer seek has already superseded us.
                             if !is_pump_current(&dash_state_seek, abort_gen) { return; }
 
-                            // 2. Prune everything behind the seek target.
-                            //    SEEK_SAFETY_MARGIN_S matches dash.js getAllRangesWithSafetyFactor.
+                            // Prune everything behind the seek target.
+                            // SEEK_SAFETY_MARGIN_S matches dash.js getAllRangesWithSafetyFactor.
                             let prune_end = (seek_time - SEEK_SAFETY_MARGIN_S).max(0.0);
                             if prune_end > 0.0 {
-                                if sb.remove(0.0, prune_end).is_ok() {
-                                    // 3. Wait for remove to complete.
-                                    if !wait_for_sb(&sb, &dash_state_seek, abort_gen).await {
-                                        return;
-                                    }
-                                }
+                                let _ = sb.remove(0.0, prune_end);
+                                // No need to await the remove: pump_loop's wait_for_sb before
+                                // appendBuffer is the natural sync point.
                             }
-
-                            // Bail again in case a newer seek arrived during the remove.
-                            if !is_pump_current(&dash_state_seek, abort_gen) { return; }
-
-                            // 4. Start the pump from the new position.
-                            force_start_pump(&dash_state_seek, &video_seek);
                         });
                     }
 

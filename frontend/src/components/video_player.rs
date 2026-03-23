@@ -1,13 +1,10 @@
-// DASH video player — powered by dashjs-rs (Rust port of dash.js).
+// DASH video player — powered by dash.js (JavaScript library via wasm-bindgen).
 //
 // Architecture:
-//   dashjs-rs MediaPlayer    → state machine for playback (play/pause/seek/volume)
-//   dashjs-rs GapController  → detects & jumps gaps between buffered ranges
-//   dashjs-rs BufferController → tracks buffer level, decides when to fetch
-//   dashjs-rs ScheduleController → scheduling decisions (should_schedule)
-//   dashjs-rs ThroughputController → dual-EWMA bandwidth estimation
-//   dashjs-rs parser         → MPD parsing + URI template expansion
-//   Browser MSE              → MediaSource + SourceBuffer for actual media pipeline
+//   dash.js MediaPlayer      → handles MSE, MPD parsing, segment fetching, ABR,
+//                               buffer management, gap detection, throughput estimation
+//   Yew UI component         → custom controls, keyboard shortcuts, quality selection,
+//                               subtitles, thumbnails, WebSocket reporting
 //
 // The UI/controls/styling are preserved from the original component.
 
@@ -15,7 +12,7 @@ use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
 use gloo_timers::future::TimeoutFuture;
 use serde::Deserialize;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -23,16 +20,8 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{window, HtmlVideoElement, KeyboardEvent, MouseEvent};
 use yew::prelude::*;
 
-// dashjs-rs imports
-use dashjs_rs::MediaPlayer as DashMediaPlayer;
-use dashjs_rs::dash::parser as dash_parser;
-use dashjs_rs::streaming::controllers::buffer_controller::BufferedRange;
-
 // ── Playback speed options ───────────────────────────────────────────────────
 const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
-
-// ── Segment duration — must stay in sync with SEGMENT_DURATION in main.rs ───
-const SEGMENT_DURATION_F: f64 = 6.0;
 
 // ── Stream quality options ────────────────────────────────────────────────────
 const QUALITY_OPTIONS: [(&str, &str); 4] = [
@@ -47,68 +36,114 @@ const QUALITY_STORAGE_KEY: &str = "starfin_quality";
 const CONTROL_HIDE_TIMEOUT_MS: f64 = 5000.0;
 const CONTROLS_VICINITY_PX: f64 = 80.0;
 
-// ── Buffer targets (driven by dashjs-rs ScheduleController) ──────────────────
-// Matches dash.js streaming.buffer.bufferTimeAtTopQuality (default 30s).
-// Chrome SourceBuffer quota is ~150-200 MB.  At 5 Mbps → 30s ≈ 19 MB which
-// is safe.  We use 30s ahead like dash.js.
+// ── Buffer target for dash.js configuration ──────────────────────────────────
 const BUFFER_TARGET_S: f64 = 30.0;
-// dash.js streaming.buffer.bufferToKeep (default 20s) — data behind playhead
-// to keep. Anything older is pruned every PRUNING_INTERVAL_MS.
 const BACK_BUFFER_S: f64 = 20.0;
-// On QuotaExceededError, keep only 5s behind playhead (more aggressive).
-const QUOTA_KEEP_BEHIND_S: f64 = 5.0;
-// Minimum remove range to bother with (avoids no-op removes).
-const MIN_REMOVE_THRESHOLD_S: f64 = 0.5;
-// dash.js streaming.buffer.bufferPruningInterval (default 10s).
-const PRUNING_INTERVAL_MS: f64 = 10_000.0;
-// Max consecutive fetch failures before skipping a segment.
-const MAX_FETCH_FAILURES: u32 = 3;
-// Max consecutive append failures (non-quota) before the pump exits.
-const MAX_APPEND_FAILURES: u32 = 5;
-// Max QuotaExceeded retries for a single segment before skipping it.
-const MAX_QUOTA_RETRIES: u32 = 3;
-
-// ── Lookahead prefetch (mirrors dash.js StreamProcessor._onMediaFragmentNeeded) ──
-/// How many segments ahead of next_seg to prefetch into the SegmentCache.
-/// dash.js uses a full bufferTarget/segmentDuration window; we use 3 here.
-const LOOKAHEAD_WINDOW: usize = 3;
-
-/// Shared cache of already-fetched segment bytes, keyed by segment index.
-/// Populated by background `spawn_local` prefetch tasks.
-/// Accessed by both the main pump loop (read/evict) and background tasks (write).
-type SegmentCache = Rc<RefCell<std::collections::HashMap<usize, Vec<u8>>>>;
-
-/// Set of segment indices currently being fetched in background prefetch tasks.
-/// Prevents duplicate in-flight fetches for the same segment.
-type InFlightSet = Rc<RefCell<std::collections::HashSet<usize>>>;
 
 // ══════════════════════════════════════════════════════════════════════════════
-// DASH ENGINE — powered by dashjs-rs
+// dash.js JavaScript interop via wasm-bindgen
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Segment info extracted from the parsed MPD.
-struct SegmentInfo {
-    url: String,
-    duration: f64,
+#[wasm_bindgen]
+extern "C" {
+    // Access the global `dashjs` object
+    #[wasm_bindgen(js_namespace = dashjs)]
+    type MediaPlayer;
+
+    // dashjs.MediaPlayer().create() — factory
+    #[wasm_bindgen(js_namespace = dashjs, js_name = "MediaPlayer")]
+    fn media_player_factory() -> JsValue;
 }
 
-/// Probe browser MIME type support — fallback when MPD has no `codecs` attribute.
-/// Tries common H.264+AAC codec strings and falls back to plain `video/mp4`.
-fn probe_mime_type() -> String {
-    let candidates = [
-        "video/mp4; codecs=\"avc1.640029,mp4a.40.2\"",
-        "video/mp4; codecs=\"avc1.64001F,mp4a.40.2\"",
-        "video/mp4; codecs=\"avc1.4D4028,mp4a.40.2\"",
-        "video/mp4; codecs=\"avc1.42E01E,mp4a.40.2\"",
-        "video/mp4",
-    ];
-    candidates.iter()
-        .find(|m| web_sys::MediaSource::is_type_supported(m))
-        .unwrap_or(candidates.last().unwrap())
-        .to_string()
+/// Wrapper around a dash.js MediaPlayer instance.
+struct DashPlayer {
+    /// The JS MediaPlayer object
+    player: JsValue,
 }
 
-/// Server commands for future WebSocket/SSE integration with main.rs.
+impl DashPlayer {
+    /// Create a new dash.js MediaPlayer instance.
+    fn create() -> Self {
+        let factory = media_player_factory();
+        let player = js_sys::Reflect::apply(
+            &js_sys::Reflect::get(&factory, &"create".into()).unwrap().dyn_into::<js_sys::Function>().unwrap(),
+            &factory,
+            &js_sys::Array::new(),
+        ).unwrap();
+        Self { player }
+    }
+
+    /// Initialize the player with a video element and manifest URL.
+    fn initialize(&self, video: &HtmlVideoElement, url: &str, auto_play: bool) {
+        let init_fn = js_sys::Reflect::get(&self.player, &"initialize".into())
+            .unwrap()
+            .dyn_into::<js_sys::Function>()
+            .unwrap();
+        let _ = init_fn.call3(
+            &self.player,
+            video,
+            &JsValue::from_str(url),
+            &JsValue::from_bool(auto_play),
+        );
+    }
+
+    /// Update dash.js settings.
+    fn update_settings(&self, settings: &JsValue) {
+        let update_fn = js_sys::Reflect::get(&self.player, &"updateSettings".into())
+            .unwrap()
+            .dyn_into::<js_sys::Function>()
+            .unwrap();
+        let _ = update_fn.call1(&self.player, settings);
+    }
+
+    /// Register an event listener on the dash.js player.
+    fn on(&self, event: &str, callback: &JsValue) {
+        let on_fn = js_sys::Reflect::get(&self.player, &"on".into())
+            .unwrap()
+            .dyn_into::<js_sys::Function>()
+            .unwrap();
+        let _ = on_fn.call2(&self.player, &JsValue::from_str(event), callback);
+    }
+
+    /// Unregister an event listener.
+    fn off(&self, event: &str, callback: &JsValue) {
+        let off_fn = js_sys::Reflect::get(&self.player, &"off".into())
+            .unwrap()
+            .dyn_into::<js_sys::Function>()
+            .unwrap();
+        let _ = off_fn.call2(&self.player, &JsValue::from_str(event), callback);
+    }
+
+    /// Get buffer length for a media type ("video" or "audio").
+    fn get_buffer_length(&self) -> f64 {
+        let get_fn = js_sys::Reflect::get(&self.player, &"getBufferLength".into());
+        if let Ok(func) = get_fn {
+            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                if let Ok(val) = func.call0(&self.player) {
+                    return val.as_f64().unwrap_or(0.0);
+                }
+            }
+        }
+        0.0
+    }
+
+    /// Destroy/reset the player.
+    fn destroy(&self) {
+        if let Ok(func) = js_sys::Reflect::get(&self.player, &"destroy".into()) {
+            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                let _ = func.call0(&self.player);
+            }
+        }
+    }
+
+    /// Get the underlying JsValue.
+    fn as_js(&self) -> &JsValue {
+        &self.player
+    }
+}
+
+// ── Server commands ──────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerCommand {
@@ -120,7 +155,6 @@ pub enum ServerCommand {
     SetVolume { volume: f64 },
 }
 
-/// Apply a server command to the video element.
 fn apply_server_command(video: &HtmlVideoElement, cmd: &ServerCommand) -> bool {
     match cmd {
         ServerCommand::Play => { let _ = video.play(); true }
@@ -140,206 +174,6 @@ fn apply_server_command(video: &HtmlVideoElement, cmd: &ServerCommand) -> bool {
     }
 }
 
-/// The DashPlayer wraps dashjs-rs MediaPlayer + browser MSE state.
-/// All playback pipeline decisions flow through dashjs-rs controllers.
-struct DashPlayer {
-    /// dashjs-rs engine — MPD parsing, ABR, throughput, buffer, schedule, gap
-    engine: DashMediaPlayer,
-    /// Browser MediaSource
-    media_source: web_sys::MediaSource,
-    /// Browser SourceBuffer
-    source_buffer: web_sys::SourceBuffer,
-    /// Blob URL (revoked on cleanup)
-    object_url: String,
-    /// Segment list from parsed MPD
-    segments: Vec<SegmentInfo>,
-    /// Next segment index to fetch
-    next_seg: usize,
-    /// Generation counter for pump cancellation on seek
-    pump_gen: u32,
-    /// Whether pump loop is running
-    pump_running: bool,
-    /// Last segment index appended
-    last_appended_seg: Option<usize>,
-    /// Wall-clock timestamp of last eviction attempt (ms).
-    /// Eviction runs INLINE in pump_loop — no separate timer — to avoid
-    /// races between sb.remove() and sb.appendBuffer().
-    /// Matches dash.js _onWallclockTimeUpdated / bufferPruningInterval=10s.
-    last_eviction_ms: f64,
-    /// Pre-fetched segment bytes (keyed by segment index).
-    /// Background tasks write here; pump_loop reads and evicts.
-    seg_cache: SegmentCache,
-    /// Set of segment indices currently being fetched in background tasks.
-    in_flight: InFlightSet,
-    /// Fatal error flag — when set, the pump should NOT be restarted.
-    /// Set on unrecoverable errors like Firefox H264 decode failures that
-    /// detach the SourceBuffer.  Prevents the periodic timer from restarting
-    /// the pump in an infinite loop of identical errors.
-    fatal_error: bool,
-}
-
-// ── MPD Parsing (via dashjs-rs) ──────────────────────────────────────────────
-
-/// Parsed MPD result: init URL, total duration, segment list, and
-/// MIME+codecs string for `MediaSource.addSourceBuffer()`.
-///
-/// The codec string is built exactly like dash.js
-/// `SourceBufferSink._getCodecStringForRepresentation()`:
-///   `representation.mimeType + ';codecs="' + representation.codecs + '"'`
-struct MpdParseResult {
-    init_url: String,
-    total_duration: f64,
-    segments: Vec<SegmentInfo>,
-    /// Full MIME type with codecs for `addSourceBuffer()`, e.g.
-    /// `video/mp4;codecs="avc1.640029,mp4a.40.2"`.
-    /// `None` if the MPD has no codec info.
-    mime_codec: Option<String>,
-}
-
-/// Parse MPD using dashjs-rs parser, extract segment list.
-fn parse_mpd(text: &str) -> MpdParseResult {
-    match dash_parser::parse(text) {
-        Ok(mpd) => extract_segments(&mpd, text),
-        Err(e) => {
-            log::error!("dashjs-rs MPD parse error: {:?} {}", e.code, e.message);
-            MpdParseResult {
-                init_url: String::new(),
-                total_duration: 0.0,
-                segments: Vec::new(),
-                mime_codec: None,
-            }
-        }
-    }
-}
-
-/// Extract segments from dashjs-rs Mpd using template expansion.
-///
-/// Also extracts the codec string from the MPD `<Representation>` element,
-/// matching dash.js `SourceBufferSink._getCodecStringForRepresentation()`.
-fn extract_segments(
-    mpd: &dashjs_rs::dash::vo::Mpd,
-    raw_xml: &str,
-) -> MpdParseResult {
-    let empty = MpdParseResult {
-        init_url: String::new(),
-        total_duration: 0.0,
-        segments: Vec::new(),
-        mime_codec: None,
-    };
-    if mpd.periods.is_empty() { return empty; }
-    let period = &mpd.periods[0];
-    if period.adaptation_sets.is_empty() { return empty; }
-
-    let aset_idx = period.adaptation_sets.iter()
-        .position(|a| {
-            a.content_type.as_deref() == Some("video")
-                || a.mime_type.as_deref().is_some_and(|m| m.starts_with("video"))
-                || a.content_type.is_none()
-        })
-        .unwrap_or(0);
-    let aset = &period.adaptation_sets[aset_idx];
-    if aset.representations.is_empty() { return empty; }
-
-    let rep = &aset.representations[0];
-    let total_duration = mpd.media_presentation_duration.unwrap_or(0.0);
-    let rep_id = rep.id.as_deref().unwrap_or("");
-    let bw = rep.bandwidth.unwrap_or(0);
-
-    // ── Codec string — 1:1 match of dash.js SourceBufferSink ──
-    // dash.js: `representation.mimeType + ';codecs="' + representation.codecs + '"'`
-    // mimeType inherits from AdaptationSet if not on Representation.
-    let mime_type = rep.mime_type.as_deref()
-        .or(aset.mime_type.as_deref())
-        .unwrap_or("video/mp4");
-    let codecs = rep.codecs.as_deref()
-        .or(aset.codecs.as_deref());
-    let mime_codec = codecs.map(|c| format!("{mime_type};codecs=\"{c}\""));
-
-    // Build init URL via dashjs-rs template expansion
-    let init_url = rep.initialization.as_deref()
-        .map(|tmpl| dash_parser::process_uri_template(tmpl, Some(rep_id), None, None, Some(bw), None))
-        .unwrap_or_default();
-
-    let media_tmpl = rep.media.as_deref().unwrap_or("");
-    if media_tmpl.is_empty() {
-        return MpdParseResult { init_url, total_duration, segments: Vec::new(), mime_codec };
-    }
-
-    let mut segs = Vec::new();
-
-    // Extract SegmentTimeline S elements from raw XML
-    let timeline = extract_timeline_from_xml(raw_xml);
-    if !timeline.is_empty() {
-        let timescale = rep.timescale.max(1);
-        let mut num = rep.start_number;
-        let mut ct: u64 = 0;
-        for entry in &timeline {
-            if let Some(tv) = entry.t { ct = tv; }
-            let rc = entry.r.unwrap_or(0).max(0) as usize;
-            for _ in 0..=rc {
-                let url = dash_parser::process_uri_template(
-                    media_tmpl, Some(rep_id), Some(num), None, Some(bw), Some(ct),
-                );
-                segs.push(SegmentInfo {
-                    url,
-                    duration: entry.d as f64 / timescale as f64,
-                });
-                ct += entry.d;
-                num += 1;
-            }
-        }
-    } else if let Some(sd) = rep.segment_duration {
-        let n = if sd > 0.0 { (total_duration / sd).ceil() as usize } else { 0 };
-        for i in 0..n {
-            segs.push(SegmentInfo {
-                url: dash_parser::process_uri_template(
-                    media_tmpl, Some(rep_id), Some(rep.start_number + i as u64), None, Some(bw), None,
-                ),
-                duration: sd,
-            });
-        }
-    } else if total_duration > 0.0 {
-        // Fallback: use known segment duration constant
-        let n = (total_duration / SEGMENT_DURATION_F).ceil() as usize;
-        for i in 0..n {
-            segs.push(SegmentInfo {
-                url: dash_parser::process_uri_template(
-                    media_tmpl, Some(rep_id), Some(rep.start_number + i as u64), None, Some(bw), None,
-                ),
-                duration: SEGMENT_DURATION_F,
-            });
-        }
-    }
-
-    MpdParseResult { init_url, total_duration, segments: segs, mime_codec }
-}
-
-struct TimelineEntry { t: Option<u64>, d: u64, r: Option<i64> }
-
-fn extract_timeline_from_xml(xml: &str) -> Vec<TimelineEntry> {
-    fn tag_attr(tag: &str, attr: &str) -> Option<String> {
-        let s = format!("{attr}=\"");
-        let p = tag.find(&s)?;
-        let r = &tag[p + s.len()..];
-        Some(r[..r.find('"')?].to_string())
-    }
-    let mut result = Vec::new();
-    let mut s = 0;
-    while let Some(i) = xml[s..].find("<S ") {
-        let a = s + i;
-        if let Some(e) = xml[a..].find("/>") {
-            let t = &xml[a..a + e + 2];
-            result.push(TimelineEntry {
-                t: tag_attr(t, "t").and_then(|s| s.parse().ok()),
-                d: tag_attr(t, "d").and_then(|s| s.parse().ok()).unwrap_or(0),
-                r: tag_attr(t, "r").and_then(|s| s.parse().ok()),
-            });
-            s = a + e + 2;
-        } else { break; }
-    }
-    result
-}
-
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn format_time(seconds: f64) -> String {
@@ -352,84 +186,17 @@ fn format_time(seconds: f64) -> String {
     else { format!("{mins}:{secs:02}") }
 }
 
-/// Get the continuous buffered range at `time`, merging adjacent ranges whose
-/// gap is ≤ `tolerance`.  This is a 1:1 port of dash.js
-/// `BufferController.getRangeAt(time, tolerance)` which merges through small
-/// gaps (default `smallGapLimit = 0.15s`).
-///
-/// Returns `(range_start, range_end)` or `None`.
-fn get_range_at(video: &HtmlVideoElement, time: f64, tolerance: f64) -> Option<(f64, f64)> {
+/// Get the end of the buffered range containing `time`.
+fn buffered_end_at(video: &HtmlVideoElement, time: f64) -> f64 {
     let buffered = video.buffered();
-    let mut first_start: Option<f64> = None;
-    let mut last_end: f64 = 0.0;
-
     for i in 0..buffered.length() {
         if let (Ok(start), Ok(end)) = (buffered.start(i), buffered.end(i)) {
-            if first_start.is_none() {
-                let gap = (start - time).abs();
-                if time >= start && time < end {
-                    // time is inside this range
-                    first_start = Some(start);
-                    last_end = end;
-                } else if gap <= tolerance {
-                    // time is within tolerance of range start
-                    first_start = Some(start);
-                    last_end = end;
-                }
-            } else {
-                let gap = start - last_end;
-                if gap <= tolerance {
-                    // merge adjacent ranges with small gap
-                    last_end = end;
-                } else {
-                    break;
-                }
+            if time >= start - 0.15 && time < end + 0.15 {
+                return end;
             }
         }
     }
-
-    first_start.map(|_| (first_start.unwrap(), last_end))
-}
-
-/// dash.js `_getBufferLength(time, tolerance)`: returns the number of seconds
-/// buffered ahead of `time`, using `getRangeAt` with gap tolerance.
-/// This is the buffer level used by `ScheduleController._shouldBuffer()`.
-const BUFFER_RANGE_TOLERANCE: f64 = 0.15; // dash.js streaming.gaps.smallGapLimit
-
-fn get_buffer_level(video: &HtmlVideoElement, time: f64) -> f64 {
-    match get_range_at(video, time, BUFFER_RANGE_TOLERANCE) {
-        Some((_start, end)) => (end - time).max(0.0),
-        None => 0.0,
-    }
-}
-
-/// Legacy helper — returns the end of the buffered range containing `time`.
-fn buffered_end_at(video: &HtmlVideoElement, time: f64) -> f64 {
-    match get_range_at(video, time, BUFFER_RANGE_TOLERANCE) {
-        Some((_start, end)) => end,
-        None => 0.0,
-    }
-}
-
-fn is_time_buffered(video: &HtmlVideoElement, time: f64) -> bool {
-    get_range_at(video, time, BUFFER_RANGE_TOLERANCE).is_some()
-}
-
-/// Get buffered ranges as dashjs-rs BufferedRange vec for GapController.
-fn get_buffered_ranges(video: &HtmlVideoElement) -> Vec<BufferedRange> {
-    let buffered = video.buffered();
-    let mut ranges = Vec::new();
-    for i in 0..buffered.length() {
-        if let (Ok(s), Ok(e)) = (buffered.start(i), buffered.end(i)) {
-            ranges.push(BufferedRange { start: s, end: e });
-        }
-    }
-    ranges
-}
-
-/// Compute the segment index for a given time position.
-fn segment_for_time(t: f64) -> usize {
-    if t <= 0.0 { 0 } else { (t / SEGMENT_DURATION_F) as usize }
+    0.0
 }
 
 // ── Thumbnail / Subtitle types ───────────────────────────────────────────────
@@ -457,577 +224,6 @@ pub struct SubtitleTrack {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct SubtitleTracksResponse {
     pub tracks: Vec<SubtitleTrack>,
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// PLAYBACK PIPELINE — driven by dashjs-rs controllers
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// Check whether pump_gen still matches (pump should exit if not).
-fn is_pump_current(state: &Rc<RefCell<Option<DashPlayer>>>, pump_id: u32) -> bool {
-    let borrow = state.borrow();
-    matches!(borrow.as_ref(), Some(s) if s.pump_gen == pump_id)
-}
-
-/// Wait for SourceBuffer to finish updating.
-/// Uses a small delay between checks to let the browser process events.
-async fn wait_for_sb(
-    sb: &web_sys::SourceBuffer,
-    state: &Rc<RefCell<Option<DashPlayer>>>,
-    pump_id: u32,
-) -> bool {
-    // Up to ~10 seconds (200 × 50ms)
-    for _ in 0..200 {
-        if !sb.updating() { return true; }
-        if !is_pump_current(state, pump_id) { return false; }
-        TimeoutFuture::new(50).await;
-    }
-    log::warn!("wait_for_sb: timed out after 10s");
-    false
-}
-
-// ── Buffer pruning (matches dash.js BufferController wall-clock pruning) ─────
-
-/// Get total buffered duration across all ranges.
-fn get_total_buffered(video: &HtmlVideoElement) -> f64 {
-    get_buffered_ranges(video).iter().map(|r| r.end - r.start).sum()
-}
-
-/// Inline eviction — called from pump_loop every PRUNING_INTERVAL_MS.
-///
-/// Matches dash.js BufferController._onWallclockTimeUpdated + pruneBuffer():
-///   - Removes data behind (currentTime - BACK_BUFFER_S) matching bufferToKeep
-///   - Only the pump_loop owns SourceBuffer mutations, avoiding races
-///
-/// Returns true if eviction was performed.
-async fn evict_back_buffer(
-    sb: &web_sys::SourceBuffer,
-    video: &HtmlVideoElement,
-    state: &Rc<RefCell<Option<DashPlayer>>>,
-    pump_id: u32,
-) -> bool {
-    let current = video.current_time();
-    let remove_end = current - BACK_BUFFER_S;
-    if remove_end <= MIN_REMOVE_THRESHOLD_S { return false; }
-
-    let ranges = get_buffered_ranges(video);
-    if ranges.is_empty() { return false; }
-    let buf_start = ranges[0].start;
-    if buf_start >= remove_end { return false; }
-
-    // Wait for any in-progress operation to finish first
-    if sb.updating() {
-        if !wait_for_sb(sb, state, pump_id).await { return false; }
-    }
-
-    if sb.remove(buf_start, remove_end).is_err() {
-        log::warn!("eviction: remove({buf_start:.1}, {remove_end:.1}) failed");
-        return false;
-    }
-
-    // Wait for remove to complete before pump continues
-    if !wait_for_sb(sb, state, pump_id).await { return false; }
-
-    // Track removal in dashjs-rs
-    {
-        let mut borrow = state.borrow_mut();
-        if let Some(dp) = borrow.as_mut() {
-            dp.engine.buffer_controller_mut().remove_data(buf_start, remove_end);
-        }
-    }
-
-    true
-}
-
-/// Aggressive eviction on QuotaExceededError.
-///
-/// Matches dash.js BufferController._handleQuotaExceededError +
-/// clearBuffers(getClearRanges()):
-///   1. _handleQuotaExceededError sets criticalBufferLevel = totalBuffered*0.8
-///   2. clearBuffers removes data behind currentTime - bufferToKeep
-///      where bufferToKeep = max(0.2 * criticalBufferLevel, 1)
-///
-/// We remove everything from buffer start to (currentTime - QUOTA_KEEP_BEHIND_S)
-/// which is more aggressive than normal pruning (BACK_BUFFER_S=20s).
-async fn force_evict_for_quota(
-    sb: &web_sys::SourceBuffer,
-    video: &HtmlVideoElement,
-    state: &Rc<RefCell<Option<DashPlayer>>>,
-    pump_id: u32,
-) -> bool {
-    let current = video.current_time();
-    let remove_end = (current - QUOTA_KEEP_BEHIND_S).max(0.1);
-    if remove_end <= MIN_REMOVE_THRESHOLD_S { return false; }
-
-    let ranges = get_buffered_ranges(video);
-    if ranges.is_empty() { return false; }
-    let buf_start = ranges[0].start;
-    if buf_start >= remove_end { return false; }
-
-    log::info!("force_evict: removing {buf_start:.1}..{remove_end:.1}s (currentTime={current:.1}s)");
-
-    // Wait for any in-progress operation to finish first
-    if sb.updating() {
-        if !wait_for_sb(sb, state, pump_id).await { return false; }
-    }
-
-    if sb.remove(buf_start, remove_end).is_err() {
-        log::warn!("force_evict: remove({buf_start:.1}, {remove_end:.1}) failed");
-        return false;
-    }
-
-    if !wait_for_sb(sb, state, pump_id).await { return false; }
-
-    // Track removal in dashjs-rs
-    {
-        let mut borrow = state.borrow_mut();
-        if let Some(dp) = borrow.as_mut() {
-            dp.engine.buffer_controller_mut().remove_data(buf_start, remove_end);
-        }
-    }
-
-    true
-}
-
-/// Spawn background prefetch tasks for segments [next_seg+1, next_seg+LOOKAHEAD_WINDOW).
-///
-/// Mirrors dash.js `StreamProcessor._onMediaFragmentNeeded` + `FragmentController`
-/// background loading pattern: start fetching the next N segments in the background
-/// so they are already cached when the main pump loop needs them.
-///
-/// - Skips segments already in the cache (already fetched)
-/// - Skips segments already in-flight (fetch in progress)
-/// - Stores result bytes in `seg_cache` on completion
-/// - Removes from `in_flight` when done (success or failure)
-fn kick_prefetch(
-    state: &Rc<RefCell<Option<DashPlayer>>>,
-    pump_id: u32,
-) {
-    let (seg_cache, in_flight, urls): (SegmentCache, InFlightSet, Vec<(usize, String)>) = {
-        let borrow = state.borrow();
-        let dp = match borrow.as_ref() {
-            Some(dp) if dp.pump_gen == pump_id => dp,
-            _ => return,
-        };
-        let next = dp.next_seg;
-        let total = dp.segments.len();
-        let cache = dp.seg_cache.clone();
-        let inflight = dp.in_flight.clone();
-
-        // Collect URLs for segments we need to prefetch
-        let cache_borrow = cache.borrow();
-        let inflight_borrow = inflight.borrow();
-        let lookahead_end = total.min(next.saturating_add(LOOKAHEAD_WINDOW + 1));
-        let to_fetch: Vec<(usize, String)> = (next.saturating_add(1)..lookahead_end)
-            .filter(|&i| !cache_borrow.contains_key(&i) && !inflight_borrow.contains(&i))
-            .map(|i| (i, dp.segments[i].url.clone()))
-            .collect();
-        drop(cache_borrow);
-        drop(inflight_borrow);
-
-        (cache, inflight, to_fetch)
-    };
-
-    for (seg_idx, url) in urls {
-        // Mark as in-flight before spawning
-        in_flight.borrow_mut().insert(seg_idx);
-
-        let cache_clone = seg_cache.clone();
-        let inflight_clone = in_flight.clone();
-
-        spawn_local(async move {
-            let result = Request::get(&url).send().await;
-            let bytes = match result {
-                Ok(resp) if resp.ok() => resp.binary().await.ok(),
-                _ => None,
-            };
-
-            // Store in cache if successful, always remove from in-flight
-            if let Some(b) = bytes {
-                if !b.is_empty() {
-                    cache_clone.borrow_mut().insert(seg_idx, b);
-                    log::debug!("prefetch: cached segment {seg_idx}");
-                }
-            } else {
-                log::debug!("prefetch: failed to fetch segment {seg_idx}, will retry inline");
-            }
-            inflight_clone.borrow_mut().remove(&seg_idx);
-        });
-    }
-}
-
-/// Main pump loop — drives the segment fetch/append pipeline.
-///
-/// Mirrors dash.js StreamProcessor._onMediaFragmentNeeded:
-///   - Uses ScheduleController._shouldBuffer() for buffer-level gating
-///   - On QuotaExceeded: evicts behind playhead + retries
-///   - Records throughput via ThroughputController
-///   - Updates BufferController after each append
-///   - Runs inline eviction every PRUNING_INTERVAL_MS (no separate timer)
-async fn pump_loop(
-    state: Rc<RefCell<Option<DashPlayer>>>,
-    video: HtmlVideoElement,
-    pump_id: u32,
-) {
-    let mut consecutive_failures: u32 = 0;
-
-    loop {
-        // ── 1. Check pump is still current ──
-        if !is_pump_current(&state, pump_id) { return; }
-
-        // ── 2. Check MediaSource is still open ──
-        {
-            let borrow = state.borrow();
-            if let Some(dp) = borrow.as_ref() {
-                if dp.media_source.ready_state() != web_sys::MediaSourceReadyState::Open {
-                    log::info!("pump[{pump_id}]: MediaSource no longer open, exiting");
-                    return;
-                }
-            } else { return; }
-        }
-
-        // ── 3. Inline eviction (matches dash.js _onWallclockTimeUpdated) ──
-        // Runs every PRUNING_INTERVAL_MS (10s), gated by wall-clock.
-        // Only pump_loop touches sb, avoiding races.
-        {
-            let should_evict = {
-                let borrow = state.borrow();
-                borrow.as_ref().map_or(false, |dp| {
-                    js_sys::Date::now() - dp.last_eviction_ms >= PRUNING_INTERVAL_MS
-                })
-            };
-            if should_evict {
-                let sb = {
-                    let borrow = state.borrow();
-                    match borrow.as_ref() {
-                        Some(dp) if dp.pump_gen == pump_id => dp.source_buffer.clone(),
-                        _ => return,
-                    }
-                };
-                evict_back_buffer(&sb, &video, &state, pump_id).await;
-                // Update timestamp whether eviction ran or not
-                if let Some(dp) = state.borrow_mut().as_mut() {
-                    dp.last_eviction_ms = js_sys::Date::now();
-                }
-            }
-        }
-
-        // ── 4. Get next segment info ──
-        let (seg_idx, seg_url) = {
-            let borrow = state.borrow();
-            let dp = match borrow.as_ref() {
-                Some(dp) if dp.pump_gen == pump_id => dp,
-                _ => return,
-            };
-            if dp.next_seg >= dp.segments.len() {
-                // All segments done — signal end of stream
-                if dp.media_source.ready_state() == web_sys::MediaSourceReadyState::Open {
-                    let _ = dp.media_source.end_of_stream();
-                    log::info!("pump[{pump_id}]: all {} segments appended, EOS", dp.segments.len());
-                }
-                return;
-            }
-            (dp.next_seg, dp.segments[dp.next_seg].url.clone())
-        };
-
-        // ── 5. Kick background prefetch for upcoming segments ──
-        // Mirrors dash.js StreamProcessor._onMediaFragmentNeeded + FragmentController:
-        // always keep LOOKAHEAD_WINDOW segments in-flight or cached, REGARDLESS of
-        // whether should_schedule currently gates the main append.  Moving this
-        // before the schedule gate is critical for post-seek recovery: after a seek
-        // the seek-flush remove() is async, so get_buffer_level may still see old
-        // data and should_schedule may return false for a few 500ms wait cycles.
-        // Without prefetch running during those waits, every post-seek segment is
-        // a cold inline fetch.
-        kick_prefetch(&state, pump_id);
-
-        // ── 6. Use dashjs-rs ScheduleController to decide if we should append ──
-        // Mirrors dash.js ScheduleController._shouldBuffer():
-        //   bufferLevel + segmentDuration < bufferTarget
-        // Uses get_buffer_level() which matches dash.js _getBufferLength() with
-        // 0.15s tolerance through getRangeAt().
-        {
-            let current_time = video.current_time();
-            let buf_ahead = get_buffer_level(&video, current_time);
-
-            let mut borrow = state.borrow_mut();
-            if let Some(dp) = borrow.as_mut() {
-                dp.engine.buffer_controller_mut().set_buffer_level(buf_ahead);
-
-                if !dp.engine.schedule_controller().should_schedule(buf_ahead, SEGMENT_DURATION_F) {
-                    drop(borrow);
-                    // Buffer is full enough — wait before checking again
-                    TimeoutFuture::new(500).await;
-                    continue;
-                }
-            } else {
-                return;
-            }
-        }
-
-        // ── 7. Obtain segment bytes — from cache or inline fetch ──
-        // Check the SegmentCache first: if a background prefetch already
-        // has the bytes, use them immediately (no network wait).
-        // This is the core fix for segment-transition stutter.
-        let bytes: Vec<u8> = {
-            // Try cache first
-            let cached = {
-                let borrow = state.borrow();
-                borrow.as_ref().and_then(|dp| {
-                    if dp.pump_gen == pump_id {
-                        dp.seg_cache.borrow_mut().remove(&seg_idx)
-                    } else {
-                        None
-                    }
-                })
-            };
-
-            if let Some(b) = cached {
-                log::debug!("pump[{pump_id}]: segment {seg_idx} served from prefetch cache");
-                b
-            } else {
-                // Cache miss — fetch inline. fetch_start_ms is measured here so
-                // only actual network fetches contribute to throughput estimation.
-                let fetch_start_ms = js_sys::Date::now();
-                let result = match Request::get(&seg_url).send().await {
-                    Ok(resp) => {
-                        if !resp.ok() {
-                            log::error!("pump[{pump_id}]: segment {seg_idx} HTTP {}", resp.status());
-                            consecutive_failures += 1;
-                            if consecutive_failures > MAX_FETCH_FAILURES {
-                                if let Some(dp) = state.borrow_mut().as_mut() {
-                                    if dp.pump_gen == pump_id { dp.next_seg = seg_idx + 1; }
-                                }
-                                consecutive_failures = 0;
-                            }
-                            TimeoutFuture::new(1000).await;
-                            continue;
-                        }
-                        match resp.binary().await {
-                            Ok(b) => b,
-                            Err(e) => {
-                                log::error!("pump[{pump_id}]: segment {seg_idx} read error: {e:?}");
-                                TimeoutFuture::new(1000).await;
-                                continue;
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        log::error!("pump[{pump_id}]: segment {seg_idx} fetch error: {e:?}");
-                        TimeoutFuture::new(1000).await;
-                        continue;
-                    }
-                };
-
-                // Record throughput for inline fetches only (cache hits don't reflect network speed)
-                let elapsed_ms = (js_sys::Date::now() - fetch_start_ms).max(1.0);
-                let throughput_bps = (result.len() as f64 * 8.0) / (elapsed_ms / 1000.0);
-                {
-                    let mut borrow = state.borrow_mut();
-                    if let Some(dp) = borrow.as_mut() {
-                        dp.engine.throughput_controller_mut().add_sample(throughput_bps);
-                    }
-                }
-                result
-            }
-        };
-
-        if !is_pump_current(&state, pump_id) { return; }
-
-        // ── 8. Record throughput via dashjs-rs ThroughputController ──
-        // (Already recorded above for inline fetches; skipped for cache hits)
-
-        // ── 9. Append segment data ──
-        if bytes.is_empty() {
-            log::warn!("pump[{pump_id}]: segment {seg_idx} empty, skipping");
-            if let Some(dp) = state.borrow_mut().as_mut() {
-                if dp.pump_gen == pump_id { dp.next_seg = seg_idx + 1; }
-            }
-            continue;
-        }
-
-        // Wait for SourceBuffer to be ready (also waits for any pruning remove)
-        let sb = {
-            let borrow = state.borrow();
-            match borrow.as_ref() {
-                Some(dp) if dp.pump_gen == pump_id => dp.source_buffer.clone(),
-                _ => return,
-            }
-        };
-
-        if !wait_for_sb(&sb, &state, pump_id).await { return; }
-
-        // Retry loop for append — does NOT re-fetch the segment data.
-        // On QuotaExceeded, evicts behind playhead and retries the same bytes
-        // (matching dash.js SourceBufferSink → BufferController._handleQuotaExceededError).
-        //
-        // Firefox robustness notes:
-        //   1. The ArrayBuffer is recreated on every attempt.  Firefox (and the MSE spec)
-        //      may transfer/detach the ArrayBuffer on a failed appendBuffer() call, so
-        //      reusing the same `ab` across retries causes InvalidStateError on the second
-        //      attempt.  Re-creating it from the original `bytes` slice is safe and cheap
-        //      because retries are rare.
-        //   2. The MediaSource readyState is checked immediately before each appendBuffer()
-        //      call.  Firefox transitions the MediaSource to "ended"/"closed" more eagerly
-        //      than Chrome; catching this here prevents the "object is no longer usable"
-        //      InvalidStateError that would otherwise appear in the error log.
-        let mut append_ok = false;
-        let mut quota_retries: u32 = 0;
-        loop {
-            if !wait_for_sb(&sb, &state, pump_id).await { return; }
-
-            // Guard: MediaSource must be Open before appendBuffer (Firefox strict check)
-            {
-                let borrow = state.borrow();
-                match borrow.as_ref() {
-                    Some(dp) if dp.pump_gen == pump_id => {
-                        if dp.media_source.ready_state() != web_sys::MediaSourceReadyState::Open {
-                            log::info!("pump[{pump_id}]: MediaSource closed, exiting");
-                            return;
-                        }
-                    }
-                    _ => return,
-                }
-            }
-
-            // Rebuild ArrayBuffer on every attempt to avoid Firefox detachment issues
-            let uint8 = js_sys::Uint8Array::from(bytes.as_slice());
-            let ab = uint8.buffer();
-            match sb.append_buffer_with_array_buffer(&ab) {
-                Ok(()) => {
-                    consecutive_failures = 0;
-                    append_ok = true;
-                    break;
-                }
-                Err(e) => {
-                    let is_quota = e.dyn_ref::<web_sys::DomException>()
-                        .map_or(false, |ex| ex.name() == "QuotaExceededError");
-
-                    if is_quota {
-                        quota_retries += 1;
-                        if quota_retries <= MAX_QUOTA_RETRIES {
-                            log::warn!("pump[{pump_id}]: QuotaExceededError on segment {seg_idx} \
-                                (attempt {quota_retries}/{MAX_QUOTA_RETRIES}), evicting");
-                            force_evict_for_quota(&sb, &video, &state, pump_id).await;
-                            TimeoutFuture::new(200).await;
-                            // Retry the append with the SAME bytes (no re-fetch)
-                        } else {
-                            log::error!("pump[{pump_id}]: QuotaExceeded persists after \
-                                {MAX_QUOTA_RETRIES} evictions, skipping segment {seg_idx}");
-                            break;
-                        }
-                    } else {
-                        // Check for InvalidStateError specifically — this means the
-                        // SourceBuffer is no longer usable (e.g. Firefox MEDIA_FATAL_ERR
-                        // caused by H264 decode failure has detached the SourceBuffer
-                        // from the MediaSource).  Unlike QuotaExceeded, this is NOT
-                        // retriable — the entire MediaSource pipeline is dead.
-                        let is_invalid_state = e.dyn_ref::<web_sys::DomException>()
-                            .map_or(false, |ex| ex.name() == "InvalidStateError");
-
-                        if is_invalid_state {
-                            log::error!("pump[{pump_id}]: InvalidStateError on segment {seg_idx} — \
-                                SourceBuffer detached (likely decode error), exiting");
-                            // Mark as fatal so the periodic timer doesn't restart us
-                            if let Some(dp) = state.borrow_mut().as_mut() {
-                                dp.fatal_error = true;
-                            }
-                            return;
-                        }
-
-                        log::error!("pump[{pump_id}]: append failed for segment {seg_idx}: {:?}", e);
-                        consecutive_failures += 1;
-                        if consecutive_failures > MAX_APPEND_FAILURES {
-                            log::error!("pump[{pump_id}]: too many consecutive failures, exiting");
-                            // Mark as fatal after too many failures
-                            if let Some(dp) = state.borrow_mut().as_mut() {
-                                dp.fatal_error = true;
-                            }
-                            return;
-                        }
-                        TimeoutFuture::new(500).await;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if !append_ok {
-            // Skip this segment and move on
-            if let Some(dp) = state.borrow_mut().as_mut() {
-                if dp.pump_gen == pump_id { dp.next_seg = seg_idx + 1; }
-            }
-            continue;
-        }
-
-        // Wait for append to complete
-        if !wait_for_sb(&sb, &state, pump_id).await { return; }
-
-        // ── 10. Update dashjs-rs state ──
-        {
-            let mut borrow = state.borrow_mut();
-            if let Some(dp) = borrow.as_mut() {
-                if dp.pump_gen != pump_id { return; }
-                dp.next_seg = seg_idx + 1;
-                dp.last_appended_seg = Some(seg_idx);
-
-                // Update dashjs-rs buffer controller with new append
-                dp.engine.buffer_controller_mut().append_data(seg_idx as i64);
-
-                // Update buffer level
-                let buf_level = get_buffer_level(&video, video.current_time());
-                dp.engine.buffer_controller_mut().set_buffer_level(buf_level);
-            }
-        }
-
-        // Small yield to let browser process
-        TimeoutFuture::new(10).await;
-    }
-}
-
-/// Start the pump loop if not already running.
-fn start_pump(state: &Rc<RefCell<Option<DashPlayer>>>, video: &HtmlVideoElement) {
-    let pump_id = {
-        let mut borrow = state.borrow_mut();
-        let dp = match borrow.as_mut() {
-            Some(dp) => dp,
-            None => return,
-        };
-        if dp.pump_running || dp.fatal_error { return; }
-        // Don't start if MediaSource is no longer open
-        if dp.media_source.ready_state() != web_sys::MediaSourceReadyState::Open {
-            return;
-        }
-        dp.pump_running = true;
-        dp.pump_gen
-    };
-
-    let state = state.clone();
-    let video = video.clone();
-    spawn_local(async move {
-        pump_loop(state.clone(), video, pump_id).await;
-        if let Some(dp) = state.borrow_mut().as_mut() {
-            if dp.pump_gen == pump_id { dp.pump_running = false; }
-        }
-    });
-}
-
-/// Force-start pump (cancels existing, increments gen).
-fn force_start_pump(state: &Rc<RefCell<Option<DashPlayer>>>, video: &HtmlVideoElement) {
-    {
-        let mut borrow = state.borrow_mut();
-        if let Some(dp) = borrow.as_mut() {
-            dp.pump_gen = dp.pump_gen.wrapping_add(1);
-            dp.pump_running = false;
-            // Replace prefetch state with fresh instances on seek.
-            // Background tasks hold Rc clones of the old instances; by
-            // replacing them here, any in-flight prefetch writes go to the
-            // old (now unreferenced) cache and are silently discarded.
-            dp.seg_cache = Rc::new(RefCell::new(std::collections::HashMap::new()));
-            dp.in_flight = Rc::new(RefCell::new(std::collections::HashSet::new()));
-        }
-    }
-    start_pump(state, video);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1115,10 +311,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let active_subtitle = use_state(|| Option::<u32>::None);
     let captions_menu_open = use_state(|| false);
 
-    // DashPlayer state (Rc<RefCell<>> for async access)
-    let dash_state = use_mut_ref(|| Option::<DashPlayer>::None);
+    // dash.js player state (Rc for async access)
+    let dash_player_ref = use_mut_ref(|| Option::<Rc<DashPlayer>>::None);
 
-    // ── Initialize dashjs-rs player ──────────────────────────────────────────
+    // ── Initialize dash.js player ────────────────────────────────────────────
     {
         let video_ref = video_ref.clone();
         let status = status.clone();
@@ -1126,9 +322,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let thumbnail_info = thumbnail_info.clone();
         let thumbnail_image = thumbnail_image.clone();
         let subtitle_tracks = subtitle_tracks.clone();
-        let dash_state = dash_state.clone();
+        let dash_player_ref = dash_player_ref.clone();
         let selected_quality = selected_quality.clone();
         let resume_position = resume_position.clone();
+        let is_buffering = is_buffering.clone();
 
         use_effect_with(
             (props.video_id.clone(), (*selected_quality).clone()),
@@ -1170,11 +367,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 let start_pos = *resume_position.borrow();
                 *resume_position.borrow_mut() = 0.0;
 
-                // Initialize dashjs-rs + MSE
+                // Initialize dash.js player
                 let video_ref_clone = video_ref.clone();
                 let status_clone = status.clone();
                 let error_clone = error.clone();
-                let dash_state_clone = dash_state.clone();
+                let dash_player_ref_clone = dash_player_ref.clone();
+                let is_buffering_clone = is_buffering.clone();
 
                 spawn_local(async move {
                     TimeoutFuture::new(50).await;
@@ -1186,240 +384,119 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
                     let manifest_url = format!("/api/videos/{}/manifest.mpd?quality={}", video_id, quality);
 
-                    // Create MediaSource
-                    let media_source = match web_sys::MediaSource::new() {
-                        Ok(ms) => ms,
-                        Err(_) => {
-                            error_clone.set(Some("MSE not supported".into()));
-                            return;
-                        }
-                    };
+                    // Create dash.js player
+                    let player = DashPlayer::create();
 
-                    let object_url = match web_sys::Url::create_object_url_with_source(&media_source) {
-                        Ok(u) => u,
-                        Err(_) => {
-                            error_clone.set(Some("Failed to create MediaSource URL".into()));
-                            return;
-                        }
-                    };
-                    video.set_src(&object_url);
-                    status_clone.set("Loading stream…".to_string());
+                    // Configure dash.js settings to match our server
+                    let settings = js_sys::eval(&format!(
+                        r#"({{
+                            streaming: {{
+                                buffer: {{
+                                    bufferTimeAtTopQuality: {buf_target},
+                                    bufferTimeAtTopQualityLongForm: {buf_target},
+                                    bufferToKeep: {back_buf},
+                                    bufferPruningInterval: 10,
+                                    stableBufferTime: {buf_target},
+                                    fastSwitchEnabled: false
+                                }},
+                                gaps: {{
+                                    jumpGaps: true,
+                                    jumpLargeGaps: true,
+                                    smallGapLimit: 0.15,
+                                    threshold: 0.3
+                                }},
+                                abr: {{
+                                    autoSwitchBitrate: {{ video: false, audio: false }}
+                                }},
+                                retryAttempts: {{
+                                    MPD: 3,
+                                    MediaSegment: 3,
+                                    InitializationSegment: 3
+                                }},
+                                retryIntervals: {{
+                                    MPD: 1000,
+                                    MediaSegment: 1000,
+                                    InitializationSegment: 1000
+                                }}
+                            }}
+                        }})"#,
+                        buf_target = BUFFER_TARGET_S,
+                        back_buf = BACK_BUFFER_S,
+                    )).unwrap();
 
-                    // sourceopen callback
-                    let manifest_url_open = manifest_url.clone();
-                    let video_open = video.clone();
-                    let status_open = status_clone.clone();
-                    let error_open = error_clone.clone();
-                    let dash_state_open = dash_state_clone.clone();
-                    let media_source_open = media_source.clone();
-                    let object_url_open = object_url.clone();
+                    player.update_settings(&settings);
 
-                    let sourceopen_cb = Closure::once(Box::new(move || {
-                        let manifest_url = manifest_url_open;
-                        let video = video_open;
-                        let status = status_open;
-                        let error = error_open;
-                        let dash_state = dash_state_open;
-                        let media_source = media_source_open;
-                        let object_url = object_url_open;
+                    // Listen for dash.js events
+                    // BUFFER_EMPTY / BUFFER_LOADED for buffering indicator
+                    let is_buffering_empty = is_buffering_clone.clone();
+                    let on_buffer_empty = Closure::<dyn Fn()>::new(move || {
+                        is_buffering_empty.set(true);
+                    });
+                    player.on("bufferStalled", on_buffer_empty.as_ref().unchecked_ref());
+                    on_buffer_empty.forget();
 
-                        spawn_local(async move {
-                            // Fetch MPD manifest
-                            let resp = match Request::get(&manifest_url).send().await {
-                                Ok(r) => r,
-                                Err(e) => { error.set(Some(format!("Manifest fetch failed: {e:?}"))); return; }
-                            };
-                            let text = match resp.text().await {
-                                Ok(t) => t,
-                                Err(e) => { error.set(Some(format!("Manifest read failed: {e:?}"))); return; }
-                            };
+                    let is_buffering_loaded = is_buffering_clone.clone();
+                    let on_buffer_loaded = Closure::<dyn Fn()>::new(move || {
+                        is_buffering_loaded.set(false);
+                    });
+                    player.on("bufferLoaded", on_buffer_loaded.as_ref().unchecked_ref());
+                    on_buffer_loaded.forget();
 
-                            // Parse via dashjs-rs
-                            let mpd_result = parse_mpd(&text);
-                            if mpd_result.segments.is_empty() {
-                                error.set(Some("Manifest contains no segments.".into()));
-                                return;
-                            }
-                            if mpd_result.init_url.is_empty() {
-                                error.set(Some("Manifest missing init segment URL.".into()));
-                                return;
-                            }
-                            let init_url = mpd_result.init_url;
-                            let total_duration = mpd_result.total_duration;
-                            let segments = mpd_result.segments;
-
-                            // ── Determine MIME+codecs for addSourceBuffer() ──
-                            // 1:1 match of dash.js SourceBufferSink._getCodecStringForRepresentation():
-                            //   `representation.mimeType + ';codecs="' + representation.codecs + '"'`
-                            // Falls back to probing only when the MPD has no codecs attribute.
-                            let mime: String = if let Some(ref codec_from_mpd) = mpd_result.mime_codec {
-                                // Codec from MPD — verify the browser supports it
-                                if web_sys::MediaSource::is_type_supported(codec_from_mpd) {
-                                    codec_from_mpd.clone()
-                                } else {
-                                    log::warn!("MSE: MPD codec {codec_from_mpd} not supported, falling back to probe");
-                                    probe_mime_type()
-                                }
+                    // Error handling
+                    let error_handler = error_clone.clone();
+                    let on_error = Closure::<dyn Fn(JsValue)>::new(move |e: JsValue| {
+                        let msg = if let Some(err_obj) = e.dyn_ref::<js_sys::Object>() {
+                            let error_val = js_sys::Reflect::get(err_obj, &"error".into()).unwrap_or(JsValue::UNDEFINED);
+                            if let Some(error_obj) = error_val.dyn_ref::<js_sys::Object>() {
+                                let msg = js_sys::Reflect::get(error_obj, &"message".into())
+                                    .unwrap_or(JsValue::UNDEFINED);
+                                msg.as_string().unwrap_or_else(|| format!("{:?}", e))
                             } else {
-                                probe_mime_type()
-                            };
-                            log::info!("MSE: using MIME type: {mime}");
-
-                            let source_buffer = match media_source.add_source_buffer(&mime) {
-                                Ok(sb) => sb,
-                                Err(e) => {
-                                    error.set(Some(format!("Unsupported format ({e:?})")));
-                                    return;
-                                }
-                            };
-
-                            if total_duration > 0.0 {
-                                media_source.set_duration(total_duration);
+                                format!("{:?}", e)
                             }
+                        } else {
+                            format!("{:?}", e)
+                        };
+                        log::error!("dash.js error: {msg}");
+                        error_handler.set(Some(msg));
+                    });
+                    player.on("error", on_error.as_ref().unchecked_ref());
+                    on_error.forget();
 
-                            // ── Fetch & append init segment ──
-                            // Matches dash.js HTTPLoader: check status 200-299, retry on failure.
-                            let mut init_bytes: Option<Vec<u8>> = None;
-                            for attempt in 0..MAX_FETCH_FAILURES {
-                                let resp = match Request::get(&init_url).send().await {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        log::warn!("Init segment fetch error (attempt {}/{}): {e:?}",
-                                            attempt + 1, MAX_FETCH_FAILURES);
-                                        TimeoutFuture::new(1000).await;
-                                        continue;
-                                    }
-                                };
-                                if !resp.ok() {
-                                    log::warn!("Init segment HTTP {} (attempt {}/{})",
-                                        resp.status(), attempt + 1, MAX_FETCH_FAILURES);
-                                    TimeoutFuture::new(1000).await;
-                                    continue;
-                                }
-                                match resp.binary().await {
-                                    Ok(b) if !b.is_empty() => {
-                                        init_bytes = Some(b);
-                                        break;
-                                    }
-                                    Ok(_) => {
-                                        log::warn!("Init segment empty (attempt {}/{})",
-                                            attempt + 1, MAX_FETCH_FAILURES);
-                                        TimeoutFuture::new(1000).await;
-                                    }
-                                    Err(e) => {
-                                        log::warn!("Init segment read error (attempt {}/{}): {e:?}",
-                                            attempt + 1, MAX_FETCH_FAILURES);
-                                        TimeoutFuture::new(1000).await;
-                                    }
-                                }
-                            }
-                            let init_bytes = match init_bytes {
-                                Some(b) => b,
-                                None => {
-                                    error.set(Some("Failed to fetch init segment after retries.".into()));
-                                    return;
-                                }
-                            };
+                    // Stream initialized event — clear status
+                    let status_for_init = status_clone.clone();
+                    let on_stream_init = Closure::<dyn Fn()>::new(move || {
+                        status_for_init.set(String::new());
+                    });
+                    player.on("streamInitialized", on_stream_init.as_ref().unchecked_ref());
+                    on_stream_init.forget();
 
-                            let uint8 = js_sys::Uint8Array::from(init_bytes.as_slice());
-                            let ab = uint8.buffer();
-                            if source_buffer.append_buffer_with_array_buffer(&ab).is_err() {
-                                error.set(Some("Failed to append init segment.".into()));
-                                return;
-                            }
+                    // Initialize the player — dash.js handles MSE, MPD, segments
+                    player.initialize(&video, &manifest_url, true);
 
-                            // Wait for init append to complete.
-                            // Also check readyState — Firefox may close the MediaSource
-                            // if the init segment contains invalid codec data (e.g.
-                            // malformed avcC → NS_ERROR_DOM_MEDIA_FATAL_ERR).
-                            for _ in 0..200 {
-                                if !source_buffer.updating() { break; }
-                                TimeoutFuture::new(5).await;
-                            }
+                    // Seek to resume position if needed
+                    if start_pos > 0.0 {
+                        // Wait a bit for dash.js to set up MSE
+                        TimeoutFuture::new(200).await;
+                        video.set_current_time(start_pos);
+                    }
 
-                            // Verify MediaSource is still open after init append.
-                            // If Firefox rejected the init segment (bad H264 parameters),
-                            // the MediaSource transitions to "closed"/"ended" and all
-                            // subsequent operations will fail with InvalidStateError.
-                            if media_source.ready_state() != web_sys::MediaSourceReadyState::Open {
-                                error.set(Some(
-                                    "Init segment rejected by browser (codec/format mismatch). \
-                                     Try clearing server cache or switching quality.".into()
-                                ));
-                                return;
-                            }
+                    status_clone.set(String::new());
 
-                            let start_seg = if start_pos > 0.0 { segment_for_time(start_pos) } else { 0 };
-
-                            // Create dashjs-rs MediaPlayer
-                            let mut engine = DashMediaPlayer::create();
-                            engine.initialize(Some(&manifest_url), false);
-
-                            // Configure dashjs-rs controllers
-                            engine.buffer_controller_mut().initialize("video", "stream0");
-                            engine.buffer_controller_mut().set_buffer_level(0.0);
-                            engine.schedule_controller_mut().initialize("video", "stream0", true);
-                            engine.schedule_controller_mut().set_buffer_target(BUFFER_TARGET_S);
-                            engine.schedule_controller_mut().start_scheduling();
-                            engine.playback_controller_mut().initialize("stream0", false);
-                            engine.playback_controller_mut().set_duration(total_duration);
-                            engine.gap_controller_mut().initialize();
-
-                            // Store DashPlayer
-                            *dash_state.borrow_mut() = Some(DashPlayer {
-                                engine,
-                                media_source,
-                                source_buffer: source_buffer.clone(),
-                                object_url,
-                                segments,
-                                next_seg: start_seg,
-                                pump_gen: 0,
-                                pump_running: false,
-                                last_appended_seg: None,
-                                last_eviction_ms: js_sys::Date::now(),
-                                seg_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
-                                in_flight: Rc::new(RefCell::new(std::collections::HashSet::new())),
-                                fatal_error: false,
-                            });
-
-                            status.set(String::new());
-                            if start_pos > 0.0 {
-                                video.set_current_time(start_pos);
-                            }
-
-                            start_pump(&dash_state, &video);
-
-                            // Auto-play when the user opens the player
-                            let _ = video.play();
-                        });
-                    }) as Box<dyn FnOnce()>);
-
-                    // MUST use {once: true} to auto-remove after first fire.
-                    // Without this, Closure::once panics with 'FnOnce called
-                    // more than once' when MediaSource transitions ended→open
-                    // on replay/seek after endOfStream().
-                    let opts = web_sys::AddEventListenerOptions::new();
-                    opts.set_once(true);
-                    media_source
-                        .add_event_listener_with_callback_and_add_event_listener_options(
-                            "sourceopen",
-                            sourceopen_cb.as_ref().unchecked_ref(),
-                            &opts,
-                        )
-                        .ok();
-                    sourceopen_cb.forget();
+                    // Store the player reference
+                    let player_rc = Rc::new(player);
+                    *dash_player_ref_clone.borrow_mut() = Some(player_rc);
                 });
 
                 // Cleanup
-                let dash_state_cleanup = dash_state.clone();
+                let dash_player_ref_cleanup = dash_player_ref.clone();
                 let video_ref_cleanup = video_ref.clone();
                 move || {
-                    if let Some(dp) = dash_state_cleanup.borrow_mut().take() {
-                        let _ = dp.media_source.end_of_stream();
-                        let _ = web_sys::Url::revoke_object_url(&dp.object_url);
-                        if let Some(video) = video_ref_cleanup.cast::<HtmlVideoElement>() {
-                            video.set_src("");
-                        }
+                    if let Some(player) = dash_player_ref_cleanup.borrow_mut().take() {
+                        player.destroy();
+                    }
+                    if let Some(video) = video_ref_cleanup.cast::<HtmlVideoElement>() {
+                        video.set_src("");
                     }
                 }
             },
@@ -1463,7 +540,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         );
     }
 
-    // ── Periodic time update + dashjs-rs gap controller + pump restart ────────
+    // ── Periodic time update ─────────────────────────────────────────────────
     {
         let video_ref = video_ref.clone();
         let current_time = current_time.clone();
@@ -1472,7 +549,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let is_playing = is_playing.clone();
         let is_dragging = is_dragging.clone();
         let video_ended = video_ended.clone();
-        let dash_state = dash_state.clone();
 
         use_effect_with(video_ref.clone(), move |video_ref| {
             let video_ref = video_ref.clone();
@@ -1484,38 +560,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     buffered_end.set(buffered_end_at(&video, video.current_time()));
                     is_playing.set(!video.paused());
                     video_ended.set(video.ended());
-
-                    // dashjs-rs GapController: detect & jump gaps
-                    if !video.paused() && !video.ended() && !video.seeking() && video.ready_state() <= 2 {
-                        let ranges = get_buffered_ranges(&video);
-                        let ct = video.current_time();
-                        let mut borrow = dash_state.borrow_mut();
-                        if let Some(dp) = borrow.as_mut() {
-                            dp.engine.playback_controller_mut().set_time(ct);
-                            if let Some(jump_to) = dp.engine.gap_controller_mut().jump_gap(&ranges, ct) {
-                                log::info!("dashjs-rs GapController: jumping to {jump_to:.3}s");
-                                video.set_current_time(jump_to + 0.001);
-                            }
-                        }
-                    }
-
-                    // Pump restart safety net
-                    let needs_restart = {
-                        let borrow = dash_state.borrow();
-                        if let Some(dp) = borrow.as_ref() {
-                            // Never restart after a fatal error (e.g. H264
-                            // decode failure that detached the SourceBuffer).
-                            if dp.fatal_error || dp.pump_running || dp.next_seg >= dp.segments.len() {
-                                false
-                            } else {
-                                let buf_ahead = buffered_end_at(&video, video.current_time()) - video.current_time();
-                                buf_ahead < BUFFER_TARGET_S
-                            }
-                        } else { false }
-                    };
-                    if needs_restart {
-                        start_pump(&dash_state, &video);
-                    }
                 }
             });
             move || drop(interval)
@@ -1526,33 +570,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     {
         let video_ref = video_ref.clone();
         let is_buffering = is_buffering.clone();
-        let dash_state = dash_state.clone();
 
         use_effect_with(video_ref.clone(), move |video_ref| {
             let video_opt = video_ref.cast::<HtmlVideoElement>();
 
             let waiting_cb = video_opt.as_ref().map(|video| {
                 let is_buffering = is_buffering.clone();
-                let video_for_gap = video.clone();
-                let dash_state = dash_state.clone();
                 let cb = Closure::<dyn Fn()>::new(move || {
-                    // Try dashjs-rs gap jump first
-                    if !video_for_gap.seeking() {
-                        let ranges = get_buffered_ranges(&video_for_gap);
-                        let ct = video_for_gap.current_time();
-                        let mut borrow = dash_state.borrow_mut();
-                        let jumped = if let Some(dp) = borrow.as_mut() {
-                            dp.engine.gap_controller_mut().jump_gap(&ranges, ct).map(|t| {
-                                video_for_gap.set_current_time(t + 0.001);
-                            }).is_some()
-                        } else { false };
-                        drop(borrow);
-                        if !jumped {
-                            is_buffering.set(true);
-                        }
-                    } else {
-                        is_buffering.set(true);
-                    }
+                    is_buffering.set(true);
                 });
                 video.add_event_listener_with_callback("waiting", cb.as_ref().unchecked_ref()).ok();
                 cb
@@ -1579,100 +604,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         });
     }
 
-    // ── Seek handling — uses dashjs-rs PlaybackController ────────────────────
-    {
-        let video_ref = video_ref.clone();
-        let dash_state = dash_state.clone();
-
-        use_effect_with(video_ref.clone(), move |video_ref| {
-            let video_opt = video_ref.cast::<HtmlVideoElement>();
-
-            let seeking_cb = video_opt.as_ref().map(|video| {
-                let dash_state = dash_state.clone();
-                let video_for_seek = video.clone();
-
-                let cb = Closure::<dyn Fn()>::new(move || {
-                    let seek_time = video_for_seek.current_time();
-                    let target_seg = segment_for_time(seek_time);
-
-                    // Update dashjs-rs playback controller
-                    {
-                        let mut borrow = dash_state.borrow_mut();
-                        if let Some(dp) = borrow.as_mut() {
-                            dp.engine.playback_controller_mut().seek(seek_time);
-                            dp.engine.buffer_controller_mut().set_seek_target(Some(seek_time));
-                        }
-                    }
-
-                    if is_time_buffered(&video_for_seek, seek_time) {
-                        let need_pump = {
-                            let borrow = dash_state.borrow();
-                            borrow.as_ref().map_or(false, |dp| !dp.pump_running && !dp.fatal_error)
-                        };
-                        if need_pump { start_pump(&dash_state, &video_for_seek); }
-                    } else {
-                        log::info!("seek: target {seek_time:.1}s not buffered, restarting from segment {target_seg}");
-                        {
-                            let mut borrow = dash_state.borrow_mut();
-                            if let Some(dp) = borrow.as_mut() {
-                                dp.pump_gen = dp.pump_gen.wrapping_add(1);
-                                dp.pump_running = false;
-                                dp.next_seg = target_seg;
-                                dp.last_appended_seg = None;
-                                dp.last_eviction_ms = js_sys::Date::now();
-                                // Clear fatal_error on seek — user is retrying.
-                                dp.fatal_error = false;
-                                // Abort any in-progress SourceBuffer operations.
-                                // Matches dash.js BufferController.prepareForPlaybackSeek()
-                                // which calls sourceBufferSink.abort() to cancel pending
-                                // appends.  dash.js does NOT flush the entire buffer on
-                                // seek — it relies on MSE's coded-frame-removal algorithm
-                                // to handle overlapping data when new segments are appended.
-                                let _ = dp.source_buffer.abort();
-                            }
-                        }
-
-                        // ── Do NOT flush the entire SourceBuffer ──
-                        // dash.js keeps existing buffered data and just starts
-                        // fetching from the seek target.  Flushing removes all
-                        // buffered data, creating a visible blank/freeze until
-                        // the first new segment is fetched and appended.
-                        //
-                        // The browser's MSE implementation handles the overlap:
-                        // new segments will replace any stale data at the same
-                        // presentation time via the coded-frame-removal algorithm
-                        // (MSE spec §3.5.1 Coded Frame Processing).
-
-                        force_start_pump(&dash_state, &video_for_seek);
-                    }
-
-                    // Auto-play after seek (matches dash.js PlaybackController
-                    // which resumes playback on seek, including after ended state)
-                    if video_for_seek.paused() {
-                        let _ = video_for_seek.play();
-                    }
-                });
-
-                video.add_event_listener_with_callback("seeking", cb.as_ref().unchecked_ref()).ok();
-                cb
-            });
-
-            move || {
-                if let (Some(cb), Some(video)) = (seeking_cb, video_opt) {
-                    video.remove_event_listener_with_callback("seeking", cb.as_ref().unchecked_ref()).ok();
-                    drop(cb);
-                }
-            }
-        });
-    }
-
     // ── Server integration: WebSocket for playback state reporting ────────────
-    // Connects to /api/player/ws and reports playback position every 2s.
-    // Also fetches initial resume position from /api/player/position/{id}.
-    // The server can send ServerCommand messages back to control playback.
     {
         let video_ref = video_ref.clone();
-        let _dash_state = dash_state.clone();
 
         use_effect_with(props.video_id.clone(), move |video_id| {
             let video_id = video_id.clone();
@@ -1688,7 +622,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         if let Ok(json) = resp.json::<serde_json::Value>().await {
                             if let Some(time) = json.get("time").and_then(|t| t.as_f64()) {
                                 if time > 1.0 {
-                                    // Wait for video element and MSE to be ready
                                     TimeoutFuture::new(500).await;
                                     if let Some(video) = video_ref_resume.cast::<HtmlVideoElement>() {
                                         let dur = video.duration();
@@ -1720,7 +653,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let video_id_report = video_id.clone();
             let interval = Interval::new(2000, move || {
                 if let Some(ref ws) = ws_clone {
-                    if ws.ready_state() == 1 { // OPEN
+                    if ws.ready_state() == 1 {
                         if let Some(video) = video_ref_report.cast::<HtmlVideoElement>() {
                             let msg = serde_json::json!({
                                 "type": "playback_state",
@@ -2157,7 +1090,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let hover_time_move = hover_time.clone();
             let hover_position_move = hover_position.clone();
 
-            let closures: Rc<RefCell<Option<(Closure<dyn Fn(MouseEvent)>, Closure<dyn Fn(MouseEvent)>)>>> = Rc::new(RefCell::new(None));
+            let closures: Rc<std::cell::RefCell<Option<(Closure<dyn Fn(MouseEvent)>, Closure<dyn Fn(MouseEvent)>)>>> = Rc::new(std::cell::RefCell::new(None));
             let closures_for_mouseup = closures.clone();
 
             let on_mousemove = Closure::<dyn Fn(MouseEvent)>::new(move |e: MouseEvent| {

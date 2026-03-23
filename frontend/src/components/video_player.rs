@@ -12,7 +12,7 @@ use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
 use gloo_timers::future::TimeoutFuture;
 use serde::Deserialize;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -1088,7 +1088,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let hover_time_move = hover_time.clone();
             let hover_position_move = hover_position.clone();
 
-            let closures: Rc<std::cell::RefCell<Option<(Closure<dyn Fn(MouseEvent)>, Closure<dyn Fn(MouseEvent)>)>>> = Rc::new(std::cell::RefCell::new(None));
+            let closures: Rc<RefCell<Option<(Closure<dyn Fn(MouseEvent)>, Closure<dyn Fn(MouseEvent)>)>>> = Rc::new(RefCell::new(None));
             let closures_for_mouseup = closures.clone();
 
             let on_mousemove = Closure::<dyn Fn(MouseEvent)>::new(move |e: MouseEvent| {

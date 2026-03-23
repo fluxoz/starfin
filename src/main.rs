@@ -616,6 +616,126 @@ async fn get_quality_options() -> impl Responder {
     ]))
 }
 
+/// `GET /api/videos/{id}/quality-info` – return quality options with estimated
+/// bitrate and resolution specific to this video.
+async fn get_video_quality_info(
+    id: web::Path<String>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let (abs, _title) = match find_video(&state, &id) {
+        Some(v) => v,
+        None => return HttpResponse::NotFound().body("video not found"),
+    };
+
+    let stream_info = tokio::task::spawn_blocking(move || {
+        media::probe::probe_stream_info(&abs)
+    })
+    .await
+    .unwrap_or_default();
+
+    let qualities = [Quality::Original, Quality::High, Quality::Medium, Quality::Low];
+    let options: Vec<serde_json::Value> = qualities
+        .iter()
+        .map(|&q| {
+            let bw = estimate_bandwidth(&stream_info, q);
+            let (w, h) = estimate_resolution(&stream_info, q);
+            let mbps = bw as f64 / 1_000_000.0;
+            let label = if mbps >= 1.0 {
+                format!("{}p · {:.1} Mbps", h, mbps)
+            } else {
+                format!("{}p · {} Kbps", h, (bw / 1000) as u32)
+            };
+            serde_json::json!({
+                "value": q.as_str(),
+                "label": label,
+                "width": w,
+                "height": h,
+                "bitrate": bw,
+            })
+        })
+        .collect();
+
+    HttpResponse::Ok().json(options)
+}
+
+/// Estimate the DASH `bandwidth` attribute (bits/sec) for a given quality.
+///
+/// For `Original` the probed container bitrate is used directly.  For
+/// transcoded qualities we scale by the pixel-count ratio (area) and an
+/// empirical CRF factor so that the MPD advertises a realistic value and
+/// the frontend can display Mbps in the quality selector.
+fn estimate_bandwidth(info: &media::probe::StreamInfo, quality: Quality) -> u64 {
+    // Fallback: if probing returned 0 use a conservative 5 Mbps default.
+    let source_bps = if info.bitrate > 0 { info.bitrate } else { 5_000_000 };
+
+    match quality {
+        Quality::Original => source_bps,
+        Quality::High => {
+            // CRF 18 at native res ≈ 80 % of original (re-encode removes B-frame waste).
+            (source_bps as f64 * 0.8) as u64
+        }
+        Quality::Medium => {
+            // ≤ 1280×720, CRF 26 — resolution ratio + CRF compression.
+            let max_w = 1280u32;
+            let sw = info.width.max(1);
+            let area_ratio = if sw > max_w {
+                let r = max_w as f64 / sw as f64;
+                r * r // both dimensions scale
+            } else {
+                1.0
+            };
+            // CRF 26 vs 18: roughly 0.35× the bitrate for the same content.
+            let crf_factor = 0.35;
+            ((source_bps as f64) * area_ratio * crf_factor).max(500_000.0) as u64
+        }
+        Quality::Low => {
+            // ≤ 854×480, CRF 30.
+            let max_w = 854u32;
+            let sw = info.width.max(1);
+            let area_ratio = if sw > max_w {
+                let r = max_w as f64 / sw as f64;
+                r * r
+            } else {
+                1.0
+            };
+            // CRF 30 vs 18: roughly 0.18× the bitrate.
+            let crf_factor = 0.18;
+            ((source_bps as f64) * area_ratio * crf_factor).max(300_000.0) as u64
+        }
+    }
+}
+
+/// Estimate the output resolution for a given quality.
+///
+/// Mirrors the logic in `transcode.rs` — scale down to fit within max width
+/// while keeping aspect ratio and rounding height to even.
+fn estimate_resolution(info: &media::probe::StreamInfo, quality: Quality) -> (u32, u32) {
+    let (sw, sh) = (info.width.max(1), info.height.max(1));
+    match quality {
+        Quality::Original | Quality::High => (sw, sh),
+        Quality::Medium => {
+            let max_w = 1280u32;
+            if sw <= max_w {
+                (sw, sh)
+            } else {
+                let r = max_w as f64 / sw as f64;
+                let h = ((sh as f64 * r) as u32) & !1;
+                (max_w, h)
+            }
+        }
+        Quality::Low => {
+            let max_w = 854u32;
+            if sw <= max_w {
+                (sw, sh)
+            } else {
+                let r = max_w as f64 / sw as f64;
+                let h = ((sh as f64 * r) as u32) & !1;
+                (max_w, h)
+            }
+        }
+    }
+}
+
 // ── Startup healthchecks ──────────────────────────────────────────────────────
 
 /// Run detailed healthchecks at startup and log results so they are visible in
@@ -2108,6 +2228,25 @@ async fn get_manifest(
         .map(|c| format!(" codecs=\"{c}\""))
         .unwrap_or_default();
 
+    // Probe resolution and bitrate for accurate DASH manifest bandwidth and
+    // for the quality-info API.
+    let abs_for_stream = abs_path.clone();
+    let stream_info = tokio::task::spawn_blocking(move || {
+        media::probe::probe_stream_info(&abs_for_stream)
+    })
+    .await
+    .unwrap_or_default();
+
+    // Estimate bandwidth for the selected quality.  For Original/High the
+    // source bitrate is accurate; for lower qualities we scale down based
+    // on the resolution ratio and CRF impact.
+    let bandwidth: u64 = estimate_bandwidth(&stream_info, quality);
+    let (rep_width, rep_height) = estimate_resolution(&stream_info, quality);
+    let codecs_attr = codec_info
+        .codecs_string()
+        .map(|c| format!(" codecs=\"{c}\""))
+        .unwrap_or_default();
+
     // Segments are stored in a quality-specific subdirectory.
     let seg_dir = state.cache_dir.join(id.as_str()).join(quality.as_str());
     if let Err(e) = tokio::fs::create_dir_all(&seg_dir).await {
@@ -2144,9 +2283,13 @@ async fn get_manifest(
          subsegmentStartsWithSAP=\"1\">\n"
     ));
     mpd.push_str(&format!(
-        "      <Representation id=\"{quality}\" bandwidth=\"2000000\"{codecs}>\n",
+        "      <Representation id=\"{quality}\" bandwidth=\"{bandwidth}\"\
+         {codecs} width=\"{rep_width}\" height=\"{rep_height}\">\n",
         quality = quality.as_str(),
+        bandwidth = bandwidth,
         codecs = codecs_attr,
+        rep_width = rep_width,
+        rep_height = rep_height,
     ));
 
     // SegmentTemplate with explicit SegmentTimeline for precise duration control.
@@ -3992,6 +4135,10 @@ async fn main() -> std::io::Result<()> {
             .route(
                 "/api/videos/{id}/manifest.mpd",
                 web::get().to(get_manifest),
+            )
+            .route(
+                "/api/videos/{id}/quality-info",
+                web::get().to(get_video_quality_info),
             )
             .route(
                 "/api/videos/{id}/init.mp4",

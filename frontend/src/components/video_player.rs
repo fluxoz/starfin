@@ -463,6 +463,38 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // dash.js player state (Rc for async access)
     let dash_player_ref = use_mut_ref(|| Option::<Rc<DashPlayer>>::None);
 
+    // Dynamic quality labels fetched from the server (resolution + Mbps).
+    // Falls back to static QUALITY_OPTIONS when not yet loaded.
+    let quality_labels: UseStateHandle<Vec<(String, String)>> = use_state(|| Vec::new());
+
+    // Fetch quality info from the server when the video changes.
+    {
+        let video_id = props.video_id.clone();
+        let quality_labels = quality_labels.clone();
+        use_effect_with(video_id.clone(), move |video_id| {
+            let video_id = video_id.clone();
+            let quality_labels = quality_labels.clone();
+            spawn_local(async move {
+                let url = format!("/api/videos/{}/quality-info", video_id);
+                if let Ok(resp) = Request::get(&url).send().await {
+                    if resp.ok() {
+                        if let Ok(items) = resp.json::<Vec<serde_json::Value>>().await {
+                            let labels: Vec<(String, String)> = items.iter().filter_map(|item| {
+                                let value = item.get("value")?.as_str()?.to_string();
+                                let label = item.get("label")?.as_str()?.to_string();
+                                Some((value, label))
+                            }).collect();
+                            if !labels.is_empty() {
+                                quality_labels.set(labels);
+                            }
+                        }
+                    }
+                }
+            });
+            || ()
+        });
+    }
+
     // ── Initialize dash.js player ────────────────────────────────────────────
     {
         let video_ref = video_ref.clone();
@@ -539,6 +571,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     // Configure dash.js v5 settings to match our server
                     let settings = js_sys::eval(&format!(
                         r#"({{
+                            debug: {{
+                                logLevel: 1
+                            }},
                             streaming: {{
                                 buffer: {{
                                     bufferTimeDefault: {buf_target},
@@ -559,6 +594,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 }},
                                 abr: {{
                                     autoSwitchBitrate: {{ video: false, audio: false }}
+                                }},
+                                errors: {{
+                                    recoverAttempts: {{
+                                        mediaErrorDecode: 5
+                                    }}
                                 }},
                                 retryAttempts: {{
                                     MPD: 3,
@@ -642,14 +682,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
                 // Cleanup
                 let dash_player_ref_cleanup = dash_player_ref.clone();
-                let video_ref_cleanup = video_ref.clone();
                 move || {
                     if let Some(player) = dash_player_ref_cleanup.borrow_mut().take() {
                         player.destroy();
                     }
-                    if let Some(video) = video_ref_cleanup.cast::<HtmlVideoElement>() {
-                        video.set_src("");
-                    }
+                    // Note: player.destroy() already tears down MSE and resets the
+                    // video element.  Do NOT call video.set_src("") after destroy —
+                    // it can race with the MediaSource teardown and log errors.
                 }
             },
         );
@@ -1128,11 +1167,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let video_ref = video_ref.clone();
         let playback_speed = playback_speed.clone();
         let speed_menu_open = speed_menu_open.clone();
+        let dash_player_ref = dash_player_ref.clone();
         Callback::from(move |speed: f64| {
             playback_speed.set(speed);
             speed_menu_open.set(false);
             if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-                video.set_playback_rate(speed);
+                dash_set_playback_rate(&dash_player_ref, &video, speed);
             }
         })
     };
@@ -1357,11 +1397,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 last_tap_x.set(x);
                 let video_ref = video_ref.clone();
                 let last_tap_time = last_tap_time.clone();
+                let dash_player_ref = dash_player_ref.clone();
                 spawn_local(async move {
                     TimeoutFuture::new(300).await;
                     if *last_tap_time != 0.0 {
                         if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-                            if video.paused() { let _ = video.play(); } else { let _ = video.pause(); }
+                            dash_play_pause(&dash_player_ref, &video);
                         }
                     }
                 });
@@ -1375,7 +1416,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         Callback::from(move |_| {
             if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
                 dash_seek(&dash_player_ref, &video, 0.0);
-                let _ = video.play();
+                dash_play(&dash_player_ref, &video);
             }
         })
     };

@@ -27,6 +27,18 @@ pub struct CodecInfo {
     pub audio_codec: Option<String>,
 }
 
+/// Video stream properties needed for DASH manifest generation and UI display.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct StreamInfo {
+    /// Width of the first video stream in pixels.
+    pub width: u32,
+    /// Height of the first video stream in pixels.
+    pub height: u32,
+    /// Total bitrate of the container in bits/sec (video + audio).
+    /// Falls back to the sum of individual stream bit_rates.
+    pub bitrate: u64,
+}
+
 impl CodecInfo {
     /// Build a combined codecs string for DASH MPD `@codecs` attribute.
     /// Returns e.g. `"avc1.640029,mp4a.40.2"` or just `"avc1.640029"` if
@@ -70,6 +82,41 @@ pub fn probe_codecs(path: &Path) -> CodecInfo {
         }
     }
 
+    info
+}
+
+/// Probe stream-level info (resolution, bitrate) from a media file.
+///
+/// The returned [`StreamInfo`] contains the first video stream's width/height
+/// and the container-level or summed stream-level bitrate in bits/sec.
+pub fn probe_stream_info(path: &Path) -> StreamInfo {
+    super::ensure_init();
+
+    let input = match ffmpeg_next::format::input(path) {
+        Ok(ctx) => ctx,
+        Err(_) => return StreamInfo::default(),
+    };
+
+    let mut info = StreamInfo::default();
+
+    // Container-level bit_rate (most reliable when set).
+    let container_br = input.bit_rate() as u64;
+
+    let mut stream_br_sum: u64 = 0;
+    for stream in input.streams() {
+        let params = stream.parameters();
+        let ptr = unsafe { params.as_ptr() };
+        let br = unsafe { (*ptr).bit_rate } as u64;
+        stream_br_sum += br;
+
+        if params.medium() == ffmpeg_next::media::Type::Video && info.width == 0 {
+            let (w, h) = unsafe { ((*ptr).width as u32, (*ptr).height as u32) };
+            info.width = w;
+            info.height = h;
+        }
+    }
+
+    info.bitrate = if container_br > 0 { container_br } else { stream_br_sum };
     info
 }
 

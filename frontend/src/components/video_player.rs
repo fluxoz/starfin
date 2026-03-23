@@ -67,6 +67,9 @@ const MAX_FETCH_FAILURES: u32 = 3;
 const MAX_APPEND_FAILURES: u32 = 5;
 // Max QuotaExceeded retries for a single segment before skipping it.
 const MAX_QUOTA_RETRIES: u32 = 3;
+// Safety margin before seek target to keep in SourceBuffer when pruning
+// on seek — matches dash.js BufferController.getAllRangesWithSafetyFactor().
+const SEEK_SAFETY_MARGIN_S: f64 = 1.0;
 
 // ── Lookahead prefetch (mirrors dash.js StreamProcessor._onMediaFragmentNeeded) ──
 /// How many segments ahead of next_seg to prefetch into the SegmentCache.
@@ -428,8 +431,18 @@ fn get_buffered_ranges(video: &HtmlVideoElement) -> Vec<BufferedRange> {
 }
 
 /// Compute the segment index for a given time position.
-fn segment_for_time(t: f64) -> usize {
-    if t <= 0.0 { 0 } else { (t / SEGMENT_DURATION_F) as usize }
+///
+/// Walks `segments` accumulating durations to find the correct index.
+/// This handles variable-duration SegmentTimeline content correctly,
+/// unlike the old hardcoded-constant approach (t / SEGMENT_DURATION_F).
+fn segment_for_time(t: f64, segments: &[SegmentInfo]) -> usize {
+    if t <= 0.0 || segments.is_empty() { return 0; }
+    let mut elapsed = 0.0;
+    for (i, seg) in segments.iter().enumerate() {
+        elapsed += seg.duration;
+        if elapsed > t { return i; }
+    }
+    segments.len() - 1
 }
 
 // ── Thumbnail / Subtitle types ───────────────────────────────────────────────
@@ -1186,11 +1199,50 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
                     let manifest_url = format!("/api/videos/{}/manifest.mpd?quality={}", video_id, quality);
 
-                    // Create MediaSource
-                    let media_source = match web_sys::MediaSource::new() {
-                        Ok(ms) => ms,
-                        Err(_) => {
-                            error_clone.set(Some("MSE not supported".into()));
+                    // Create MediaSource.
+                    //
+                    // Priority (matches dash.js MediaSourceController.createMediaSource()):
+                    //   1. ManagedMediaSource — iOS Safari 17+ and some Android require this.
+                    //      Standard MediaSource either throws or fails addSourceBuffer on these
+                    //      platforms.  Also needs disableRemotePlayback on the video element.
+                    //   2. Standard MediaSource — all other browsers.
+                    //   3. Native <video src> fallback — if MSE is completely unavailable.
+                    let win = js_sys::global();
+                    let has_managed = js_sys::Reflect::has(&win, &JsValue::from_str("ManagedMediaSource"))
+                        .unwrap_or_else(|_| { log::warn!("Reflect::has(ManagedMediaSource) failed"); false });
+
+                    let media_source: Option<web_sys::MediaSource> = if has_managed {
+                        // Construct ManagedMediaSource via reflection and cast to MediaSource
+                        // (ManagedMediaSource extends MediaSource so the cast is valid).
+                        let ctor = js_sys::Reflect::get(&win, &JsValue::from_str("ManagedMediaSource"))
+                            .ok()
+                            .and_then(|c| c.dyn_into::<js_sys::Function>().ok());
+                        if let Some(ctor) = ctor {
+                            // disableRemotePlayback is required by iOS for ManagedMediaSource.
+                            if video.set_attribute("disableremoteplayback", "").is_err() {
+                                log::warn!("Failed to set disableremoteplayback on video element");
+                            }
+                            js_sys::Reflect::construct(&ctor, &js_sys::Array::new())
+                                .ok()
+                                .and_then(|ms| ms.dyn_into::<web_sys::MediaSource>().ok())
+                        } else {
+                            web_sys::MediaSource::new().ok()
+                        }
+                    } else {
+                        web_sys::MediaSource::new().ok()
+                    };
+
+                    let media_source = match media_source {
+                        Some(ms) => ms,
+                        None => {
+                            // MSE is completely unavailable — fall back to native <video src>
+                            // playback, matching dash.js behaviour when supportsMediaSource() is
+                            // false.  The /stream endpoint serves a progressive MP4.
+                            log::warn!("MSE unavailable, falling back to native src playback");
+                            let stream_url = format!("/api/videos/{}/stream?quality=original", video_id);
+                            video.set_attribute("src", &stream_url).ok();
+                            let _ = video.play();
+                            status_clone.set(String::new());
                             return;
                         }
                     };
@@ -1349,7 +1401,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 return;
                             }
 
-                            let start_seg = if start_pos > 0.0 { segment_for_time(start_pos) } else { 0 };
+                            let start_seg = if start_pos > 0.0 { segment_for_time(start_pos, &segments) } else { 0 };
 
                             // Create dashjs-rs MediaPlayer
                             let mut engine = DashMediaPlayer::create();
@@ -1593,7 +1645,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
                 let cb = Closure::<dyn Fn()>::new(move || {
                     let seek_time = video_for_seek.current_time();
-                    let target_seg = segment_for_time(seek_time);
+                    let target_seg = {
+                        let borrow = dash_state.borrow();
+                        if let Some(dp) = borrow.as_ref() {
+                            segment_for_time(seek_time, &dp.segments)
+                        } else { 0 }
+                    };
 
                     // Update dashjs-rs playback controller
                     {
@@ -1612,7 +1669,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         if need_pump { start_pump(&dash_state, &video_for_seek); }
                     } else {
                         log::info!("seek: target {seek_time:.1}s not buffered, restarting from segment {target_seg}");
-                        {
+
+                        // Synchronously: bump gen, update state, abort.
+                        // Matches dash.js BufferController.prepareForPlaybackSeek()
+                        // which calls sourceBufferSink.abort() to cancel pending appends.
+                        let (sb, abort_gen) = {
                             let mut borrow = dash_state.borrow_mut();
                             if let Some(dp) = borrow.as_mut() {
                                 dp.pump_gen = dp.pump_gen.wrapping_add(1);
@@ -1623,27 +1684,47 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 // Clear fatal_error on seek — user is retrying.
                                 dp.fatal_error = false;
                                 // Abort any in-progress SourceBuffer operations.
-                                // Matches dash.js BufferController.prepareForPlaybackSeek()
-                                // which calls sourceBufferSink.abort() to cancel pending
-                                // appends.  dash.js does NOT flush the entire buffer on
-                                // seek — it relies on MSE's coded-frame-removal algorithm
-                                // to handle overlapping data when new segments are appended.
                                 let _ = dp.source_buffer.abort();
+                                (dp.source_buffer.clone(), dp.pump_gen)
+                            } else {
+                                return;
                             }
-                        }
+                        };
 
-                        // ── Do NOT flush the entire SourceBuffer ──
-                        // dash.js keeps existing buffered data and just starts
-                        // fetching from the seek target.  Flushing removes all
-                        // buffered data, creating a visible blank/freeze until
-                        // the first new segment is fetched and appended.
+                        // Async: prune buffer behind the seek target, then start pump.
                         //
-                        // The browser's MSE implementation handles the overlap:
-                        // new segments will replace any stale data at the same
-                        // presentation time via the coded-frame-removal algorithm
-                        // (MSE spec §3.5.1 Coded Frame Processing).
+                        // Matches dash.js StreamProcessor.prepareInnerPeriodPlaybackSeeking()
+                        // which calls bufferController.clearBuffers(getAllRangesWithSafetyFactor(seekTime))
+                        // after prepareForPlaybackSeek().  Firefox specifically requires this:
+                        // without the prune, Firefox's decoder gets confused about which frame
+                        // to decode next at the new seek position, causing visible stutter.
+                        let dash_state_seek = dash_state.clone();
+                        let video_seek = video_for_seek.clone();
+                        spawn_local(async move {
+                            // 1. Wait for abort to settle.
+                            if !wait_for_sb(&sb, &dash_state_seek, abort_gen).await { return; }
 
-                        force_start_pump(&dash_state, &video_for_seek);
+                            // Bail if a newer seek has already superseded us.
+                            if !is_pump_current(&dash_state_seek, abort_gen) { return; }
+
+                            // 2. Prune everything behind the seek target.
+                            //    SEEK_SAFETY_MARGIN_S matches dash.js getAllRangesWithSafetyFactor.
+                            let prune_end = (seek_time - SEEK_SAFETY_MARGIN_S).max(0.0);
+                            if prune_end > 0.0 {
+                                if sb.remove(0.0, prune_end).is_ok() {
+                                    // 3. Wait for remove to complete.
+                                    if !wait_for_sb(&sb, &dash_state_seek, abort_gen).await {
+                                        return;
+                                    }
+                                }
+                            }
+
+                            // Bail again in case a newer seek arrived during the remove.
+                            if !is_pump_current(&dash_state_seek, abort_gen) { return; }
+
+                            // 4. Start the pump from the new position.
+                            force_start_pump(&dash_state_seek, &video_seek);
+                        });
                     }
 
                     // Auto-play after seek (matches dash.js PlaybackController

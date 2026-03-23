@@ -2215,21 +2215,75 @@ async fn get_init_segment(
         None => return HttpResponse::NotFound().body("video not found"),
     };
 
-    // Check cache first.
     let seg_dir = state.cache_dir.join(id.as_str()).join(quality.as_str());
     let init_path = seg_dir.join("init.mp4");
+    let seg0_path = seg_dir.join("seg_00000.m4s");
 
-    if let Ok(data) = tokio::fs::read(&init_path).await {
+    // ── Always derive the init segment from segment 0 ────────────────────
+    //
+    // The init segment (ftyp+moov) MUST come from the same FFmpeg run that
+    // produced the media segments.  Firefox's H264ChangeMonitor compares
+    // the avcC (SPS/PPS) in the init's moov against the media segment
+    // data; any mismatch causes NS_ERROR_DOM_MEDIA_FATAL_ERR.
+    //
+    // Instead of blindly serving a cached init.mp4 (which may be stale —
+    // e.g. from a previous server version that used a separate FFmpeg run),
+    // we always re-derive the init from segment 0.  Extraction is fast
+    // (~microseconds, just parsing MP4 box headers).
+    //
+    // If segment 0 exists in cache → extract ftyp+moov from it directly.
+    // If not → generate segment 0, then extract.
+    // Either way, the result is written to init.mp4 for future requests.
+    if seg0_path.exists() {
+        // Fast path: derive init from the cached segment 0 file.
+        let seg0_path_clone = seg0_path.clone();
+        let init_data = match tokio::task::spawn_blocking(move || {
+            let data = std::fs::read(&seg0_path_clone)
+                .map_err(|e| format!("read segment 0: {e}"))?;
+            media::transcode::extract_ftyp_moov_pub(&data)
+        }).await {
+            Ok(Ok(data)) => data,
+            Ok(Err(e)) => {
+                // Segment 0 exists but is corrupt — delete it and fall through
+                // to regeneration below.
+                warn!(error = %e, "cached segment 0 corrupt, regenerating");
+                let _ = tokio::fs::remove_file(&seg0_path).await;
+                let _ = tokio::fs::remove_file(&init_path).await;
+                // Fall through to generation path below
+                return get_init_segment_generate(
+                    abs_path, quality, &state, seg_dir, init_path,
+                ).await;
+            }
+            Err(e) => {
+                return HttpResponse::InternalServerError()
+                    .body(format!("init extraction task panicked: {e}"));
+            }
+        };
+
+        // Update the cached init.mp4 to match current segment 0.
+        let _ = tokio::fs::write(&init_path, &init_data).await;
+
         return HttpResponse::Ok()
             .content_type("video/mp4")
             .insert_header((
                 header::CACHE_CONTROL,
                 "public, max-age=31536000, immutable",
             ))
-            .body(data);
+            .body(init_data);
     }
 
-    // Generate init segment.
+    // No segment 0 in cache — generate it.
+    get_init_segment_generate(abs_path, quality, &state, seg_dir, init_path).await
+}
+
+/// Generate init segment from scratch (creates segment 0 if needed).
+async fn get_init_segment_generate(
+    abs_path: std::path::PathBuf,
+    quality: media::transcode::Quality,
+    state: &web::Data<AppState>,
+    seg_dir: std::path::PathBuf,
+    init_path: std::path::PathBuf,
+) -> HttpResponse {
     let resolved_path = match abs_path.canonicalize() {
         Ok(p) => p,
         Err(e) => {
@@ -2248,8 +2302,9 @@ async fn get_init_segment(
     }
 
     let hwaccel = state.hwaccel.clone();
+    let seg_dir_clone = seg_dir.clone();
     let init_data = match tokio::task::spawn_blocking(move || {
-        media::transcode::create_init_segment(&abs_str, quality, &hwaccel)
+        media::transcode::create_init_segment(&abs_str, quality, &hwaccel, &seg_dir_clone)
     }).await {
         Ok(Ok(data)) => data,
         Ok(Err(e)) => {

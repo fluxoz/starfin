@@ -503,7 +503,9 @@ fn write_fmp4_trailer(octx: &mut ffmpeg_next::format::context::Output) -> Result
 
 // ── Init segment extraction ──────────────────────────────────────────────────
 
-/// Extract the fMP4 init segment (ftyp + moov atoms) from a source video.
+/// Extract the fMP4 init segment (ftyp + moov atoms) from a source video,
+/// creating segment 0 in the given `seg_cache_dir` so that the very same
+/// file is later served by `get_segment`.
 ///
 /// The init segment contains the codec configuration (SPS/PPS for H.264,
 /// channel layout for AAC) that the browser's MSE SourceBuffer needs before
@@ -517,37 +519,39 @@ fn write_fmp4_trailer(octx: &mut ffmpeg_next::format::context::Output) -> Result
 /// misinterpret baseMediaDecodeTime / sample durations and play at the wrong
 /// speed.  Extracting from a real segment is the approach used by dash.js's
 /// test content generator and by Shaka Packager.
-pub fn create_init_segment(abs_path: &str, quality: Quality, hwaccel: &HwAccel) -> Result<Vec<u8>, String> {
+///
+/// **Critical for Firefox compatibility**: the init segment's `moov` (and
+/// its embedded `avcC` with SPS/PPS) MUST come from the same FFmpeg run
+/// that produced the media segment data.  If the init and media segments
+/// come from *different* FFmpeg runs the SPS/PPS can differ slightly
+/// (e.g. different VUI parameters, different pic_order_cnt_type).  Chrome
+/// tolerates this; Firefox's `H264ChangeMonitor::CheckForChange` does not
+/// and raises `NS_ERROR_DOM_MEDIA_FATAL_ERR: Invalid H264 content`.
+///
+/// By creating segment 0 directly in `seg_cache_dir` (the same directory
+/// from which `get_segment` later serves it), we guarantee byte-level
+/// identity between init and media segment 0.
+pub fn create_init_segment(abs_path: &str, quality: Quality, hwaccel: &HwAccel, seg_cache_dir: &Path) -> Result<Vec<u8>, String> {
     super::ensure_init();
 
-    // Generate segment 0 and extract ftyp+moov from it.
-    // This ensures the init segment's codec params AND timescale match
-    // the media segments exactly — critical for correct MSE playback
-    // timing in both Segments and Sequence SourceBuffer modes.
-    //
-    // Use a unique temp directory per call (thread ID + timestamp) to
-    // avoid races when concurrent requests create the init for the same
-    // video simultaneously.
-    let unique = format!(
-        "starfin_init_{}_{:?}",
-        std::process::id(),
-        std::thread::current().id(),
-    );
-    let tmp_dir = std::env::temp_dir().join(unique);
-    let _ = std::fs::create_dir_all(&tmp_dir);
+    let seg0_path = seg_cache_dir.join("seg_00000.m4s");
 
-    let result = (|| -> Result<Vec<u8>, String> {
-        create_segment(abs_path, &tmp_dir, 0, hwaccel, quality, None)?;
-        let seg0_path = tmp_dir.join("seg_00000.m4s");
+    // If segment 0 already exists in the cache (e.g. from a pre-cache run),
+    // extract ftyp+moov directly from it — no new FFmpeg run needed, and
+    // the init is guaranteed to match the cached segment exactly.
+    if seg0_path.exists() {
         let data = std::fs::read(&seg0_path)
-            .map_err(|e| format!("failed to read segment 0: {e}"))?;
-        extract_ftyp_moov(&data)
-    })();
+            .map_err(|e| format!("failed to read cached segment 0 from {}: {e}", seg0_path.display()))?;
+        return extract_ftyp_moov(&data);
+    }
 
-    // Cleanup regardless of success or failure.
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-
-    result
+    // Generate segment 0 in the cache directory itself.  This file stays
+    // on disk so that `get_segment` serves the exact same bytes the init
+    // segment's moov was derived from.
+    create_segment(abs_path, seg_cache_dir, 0, hwaccel, quality, None)?;
+    let data = std::fs::read(&seg0_path)
+        .map_err(|e| format!("failed to read segment 0 from {}: {e}", seg0_path.display()))?;
+    extract_ftyp_moov(&data)
 }
 
 /// Strip `ftyp` and `moov` boxes from an fMP4 media segment, keeping only
@@ -565,6 +569,7 @@ pub fn create_init_segment(abs_path: &str, quality: Quality, hwaccel: &HwAccel) 
 /// `moof+mdat` fragments.
 pub fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
     let mut result = Vec::new();
+    let mut has_styp = false;
     let mut pos = 0usize;
 
     while pos + 8 <= data.len() {
@@ -573,6 +578,7 @@ pub fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
         // size == 0 means "box extends to EOF" per ISO BMFF; consume the rest.
         if size == 0 {
             let box_type = &data[pos + 4..pos + 8];
+            if box_type == b"styp" { has_styp = true; }
             if box_type != b"ftyp" && box_type != b"moov" {
                 result.extend_from_slice(&data[pos..]);
             }
@@ -582,6 +588,7 @@ pub fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
             break;
         }
         let box_type = &data[pos + 4..pos + 8];
+        if box_type == b"styp" { has_styp = true; }
         // Keep everything except the init-segment boxes.
         if box_type != b"ftyp" && box_type != b"moov" {
             result.extend_from_slice(&data[pos..pos + size]);
@@ -593,9 +600,37 @@ pub fn strip_init_boxes(data: &[u8]) -> Vec<u8> {
     // original data unmodified to avoid serving a broken response.
     if result.is_empty() {
         data.to_vec()
+    } else if !has_styp {
+        // CMAF media segments should start with a `styp` (segment type) box.
+        // FFmpeg's fMP4 muxer with `empty_moov` does not emit `styp`; it
+        // writes `ftyp+moov+moof+mdat`.  After stripping `ftyp+moov`, the
+        // segment starts with bare `moof` — some browsers (particularly
+        // Firefox) may handle this less reliably than a proper CMAF segment
+        // that starts with `styp`.
+        //
+        // Prepend a minimal `styp` box: brand = `msdh`, minor version = 0,
+        // compatible brands = `msdh`, `msix`.  This matches what Bento4 and
+        // Shaka Packager emit for CMAF.
+        // Layout: 4 (size) + 4 (type) + 4 (brand) + 4 (version) + 4+4 (compat) = 24 bytes
+        const STYP_BOX_SIZE: usize = 24;
+        let mut with_styp = Vec::with_capacity(result.len() + STYP_BOX_SIZE);
+        with_styp.extend_from_slice(&(STYP_BOX_SIZE as u32).to_be_bytes());  // size
+        with_styp.extend_from_slice(b"styp");               // type
+        with_styp.extend_from_slice(b"msdh");               // major brand
+        with_styp.extend_from_slice(&0u32.to_be_bytes());   // minor version
+        with_styp.extend_from_slice(b"msdh");               // compatible brand 1
+        with_styp.extend_from_slice(b"msix");               // compatible brand 2
+        with_styp.extend_from_slice(&result);
+        with_styp
     } else {
         result
     }
+}
+
+/// Public wrapper for [`extract_ftyp_moov`] — called by `get_init_segment`
+/// in `main.rs` to re-derive the init segment from a cached segment 0 file.
+pub fn extract_ftyp_moov_pub(data: &[u8]) -> Result<Vec<u8>, String> {
+    extract_ftyp_moov(data)
 }
 
 /// Extract ftyp and moov boxes from an fMP4 byte buffer.
@@ -1275,6 +1310,12 @@ fn hybrid_segment(
                                 aac_enc.set_bit_rate(AAC_ENCODE_BITRATE);
                                 aac_enc.set_time_base(ffmpeg_next::Rational::new(1, dec.rate() as i32));
 
+                                // fMP4 requires global header (extradata) for AAC too.
+                                unsafe {
+                                    let ctx_ptr = aac_enc.as_mut_ptr();
+                                    (*ctx_ptr).flags |= ffmpeg_next::ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+                                }
+
                                 match aac_enc.open_as(aac) {
                                     Ok(opened) => {
                                         let mut out_aud_stream = octx.add_stream(aac)
@@ -1683,6 +1724,23 @@ fn transcode_segment_body(
         enc.set_gop(250);
         enc.set_max_b_frames(0);
 
+        // ── AV_CODEC_FLAG_GLOBAL_HEADER ──────────────────────────────────
+        // For fMP4/CMAF output the encoder MUST store SPS/PPS in extradata
+        // (the moov/avcC box) rather than repeating them inline in each
+        // access unit.  Without this flag, every independently-encoded
+        // segment can produce slightly different SPS/PPS parameters, and
+        // Firefox's H264ChangeMonitor rejects any segment whose SPS/PPS
+        // differ from the init segment's avcC → NS_ERROR_DOM_MEDIA_FATAL_ERR.
+        //
+        // This matches what `ffmpeg` CLI does: it checks
+        // `oformat->flags & AVFMT_GLOBALHEADER` and sets the codec flag
+        // automatically.  Since we always output fMP4, we set it
+        // unconditionally.
+        unsafe {
+            let ctx_ptr = enc.as_mut_ptr();
+            (*ctx_ptr).flags |= ffmpeg_next::ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+        }
+
         if use_hw && !hw_frames_ctx.is_null() {
             enc.set_format(ffmpeg_next::format::Pixel::NV12);
             unsafe {
@@ -1776,6 +1834,12 @@ fn transcode_segment_body(
                                     aac_enc.set_format(enc_format);
                                     aac_enc.set_bit_rate(AAC_ENCODE_BITRATE);
                                     aac_enc.set_time_base(ffmpeg_next::Rational::new(1, dec.rate() as i32));
+
+                                    // fMP4 requires global header (extradata) for AAC too.
+                                    unsafe {
+                                        let ctx_ptr = aac_enc.as_mut_ptr();
+                                        (*ctx_ptr).flags |= ffmpeg_next::ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+                                    }
 
                                     match aac_enc.open_as(aac) {
                                         Ok(opened) => {

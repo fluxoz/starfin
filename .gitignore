@@ -2,3 +2,6 @@ target/
 frontend/dist/
 starfin_cache/
 test_videos/
+.direnv
+.envrc
+result

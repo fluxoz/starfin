@@ -79,17 +79,87 @@ impl DashPlayer {
     }
 
     /// Initialize the player with a video element and manifest URL.
-    fn initialize(&self, video: &HtmlVideoElement, url: &str, auto_play: bool) {
+    ///
+    /// `start_time` is the optional resume position (seconds from start).
+    /// Per the dash.js docs the 4th arg to `initialize()` is `startTime`
+    /// which lets the player seek correctly from the very first segment
+    /// request rather than loading from the beginning and seeking later.
+    fn initialize(&self, video: &HtmlVideoElement, url: &str, auto_play: bool, start_time: f64) {
         let init_fn = js_sys::Reflect::get(&self.player, &"initialize".into())
             .unwrap()
             .dyn_into::<js_sys::Function>()
             .unwrap();
-        let _ = init_fn.call3(
-            &self.player,
-            video,
-            &JsValue::from_str(url),
-            &JsValue::from_bool(auto_play),
-        );
+        let args = js_sys::Array::new();
+        args.push(video);
+        args.push(&JsValue::from_str(url));
+        args.push(&JsValue::from_bool(auto_play));
+        if start_time > 0.0 {
+            args.push(&JsValue::from_f64(start_time));
+        }
+        let _ = js_sys::Reflect::apply(&init_fn, &self.player, &args);
+    }
+
+    /// Seek to a position in seconds.
+    ///
+    /// This MUST be used instead of `video.set_current_time()` because
+    /// dash.js needs to recalculate segment scheduling, buffer ranges,
+    /// and ABR state on seek.  Directly setting `video.currentTime`
+    /// bypasses all of that, causing buffer underruns at the next
+    /// segment boundary.
+    fn seek(&self, time: f64) {
+        if let Ok(func) = js_sys::Reflect::get(&self.player, &"seek".into()) {
+            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                let _ = func.call1(&self.player, &JsValue::from_f64(time));
+            }
+        }
+    }
+
+    /// Start or resume playback via the dash.js API.
+    ///
+    /// Using `player.play()` instead of `video.play()` lets dash.js's
+    /// internal PlaybackController/ScheduleController react immediately
+    /// (e.g. resuming segment scheduling if `scheduleWhilePaused` is
+    /// false).
+    fn play(&self) {
+        if let Ok(func) = js_sys::Reflect::get(&self.player, &"play".into()) {
+            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                let _ = func.call0(&self.player);
+            }
+        }
+    }
+
+    /// Pause playback via the dash.js API.
+    fn pause(&self) {
+        if let Ok(func) = js_sys::Reflect::get(&self.player, &"pause".into()) {
+            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                let _ = func.call0(&self.player);
+            }
+        }
+    }
+
+    /// Set the playback rate via the dash.js API.
+    ///
+    /// Using `player.setPlaybackRate()` rather than setting it directly
+    /// on the video element lets dash.js fire `PLAYBACK_RATE_CHANGED`
+    /// and adjust ABR / scheduling decisions for the new speed.
+    fn set_playback_rate(&self, rate: f64) {
+        if let Ok(func) = js_sys::Reflect::get(&self.player, &"setPlaybackRate".into()) {
+            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                let _ = func.call1(&self.player, &JsValue::from_f64(rate));
+            }
+        }
+    }
+
+    /// Query whether the player is currently paused.
+    fn is_paused(&self) -> bool {
+        if let Ok(func) = js_sys::Reflect::get(&self.player, &"isPaused".into()) {
+            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                if let Ok(val) = func.call0(&self.player) {
+                    return val.as_bool().unwrap_or(true);
+                }
+            }
+        }
+        true
     }
 
     /// Update dash.js settings.
@@ -160,14 +230,18 @@ pub enum ServerCommand {
     SetVolume { volume: f64 },
 }
 
-fn apply_server_command(video: &HtmlVideoElement, cmd: &ServerCommand) -> bool {
+fn apply_server_command(
+    video: &HtmlVideoElement,
+    cmd: &ServerCommand,
+    player_ref: &RefCell<Option<Rc<DashPlayer>>>,
+) -> bool {
     match cmd {
-        ServerCommand::Play => { let _ = video.play(); true }
-        ServerCommand::Pause => { let _ = video.pause(); true }
+        ServerCommand::Play => { dash_play(player_ref, video); true }
+        ServerCommand::Pause => { dash_pause(player_ref, video); true }
         ServerCommand::Seek { time } => {
             let dur = video.duration();
             if dur.is_finite() && *time >= 0.0 {
-                video.set_current_time(time.min(dur));
+                dash_seek(player_ref, video, time.min(dur));
                 true
             } else { false }
         }
@@ -189,6 +263,76 @@ fn format_time(seconds: f64) -> String {
     let secs = total_secs % 60;
     if hours > 0 { format!("{hours}:{mins:02}:{secs:02}") }
     else { format!("{mins}:{secs:02}") }
+}
+
+/// Seek using the dash.js player API when available, otherwise fall back to
+/// setting `video.currentTime` directly.  Using `player.seek()` is critical
+/// because it lets dash.js recalculate segment scheduling and buffer ranges;
+/// setting `currentTime` directly bypasses all internal state management and
+/// causes buffer underruns at the next segment boundary.
+fn dash_seek(
+    player_ref: &RefCell<Option<Rc<DashPlayer>>>,
+    video: &HtmlVideoElement,
+    time: f64,
+) {
+    let t = time.max(0.0);
+    if let Some(player) = player_ref.borrow().as_ref() {
+        player.seek(t);
+    } else {
+        video.set_current_time(t);
+    }
+}
+
+/// Play via dash.js when available, otherwise fall back to the video element.
+fn dash_play(
+    player_ref: &RefCell<Option<Rc<DashPlayer>>>,
+    video: &HtmlVideoElement,
+) {
+    if let Some(player) = player_ref.borrow().as_ref() {
+        player.play();
+    } else {
+        let _ = video.play();
+    }
+}
+
+/// Pause via dash.js when available, otherwise fall back to the video element.
+fn dash_pause(
+    player_ref: &RefCell<Option<Rc<DashPlayer>>>,
+    video: &HtmlVideoElement,
+) {
+    if let Some(player) = player_ref.borrow().as_ref() {
+        player.pause();
+    } else {
+        let _ = video.pause();
+    }
+}
+
+/// Toggle play/pause via dash.js when available.
+fn dash_play_pause(
+    player_ref: &RefCell<Option<Rc<DashPlayer>>>,
+    video: &HtmlVideoElement,
+) {
+    if let Some(player) = player_ref.borrow().as_ref() {
+        if player.is_paused() { player.play(); } else { player.pause(); }
+    } else if video.paused() {
+        let _ = video.play();
+    } else {
+        let _ = video.pause();
+    }
+}
+
+/// Set playback rate via dash.js when available, otherwise directly on the
+/// video element.
+fn dash_set_playback_rate(
+    player_ref: &RefCell<Option<Rc<DashPlayer>>>,
+    video: &HtmlVideoElement,
+    rate: f64,
+) {
+    if let Some(player) = player_ref.borrow().as_ref() {
+        player.set_playback_rate(rate);
+    } else {
+        video.set_playback_rate(rate);
+    }
 }
 
 /// Get the end of the buffered range containing `time`.
@@ -401,13 +545,17 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                     bufferTimeAtTopQuality: {buf_target},
                                     bufferTimeAtTopQualityLongForm: {buf_target},
                                     bufferToKeep: {back_buf},
-                                    bufferPruningInterval: {prune_interval}
+                                    bufferPruningInterval: {prune_interval},
+                                    avoidCurrentTimeRangePruning: true
                                 }},
                                 gaps: {{
                                     jumpGaps: true,
                                     jumpLargeGaps: true,
                                     smallGapLimit: {gap_small},
-                                    threshold: {gap_threshold}
+                                    threshold: {gap_threshold},
+                                    enableSeekFix: true,
+                                    enableStallFix: true,
+                                    stallSeek: 0.1
                                 }},
                                 abr: {{
                                     autoSwitchBitrate: {{ video: false, audio: false }}
@@ -479,15 +627,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     player.on("streamInitialized", on_stream_init.as_ref().unchecked_ref());
                     on_stream_init.forget();
 
-                    // Initialize the player — dash.js handles MSE, MPD, segments
-                    player.initialize(&video, &manifest_url, true);
-
-                    // Seek to resume position if needed
-                    if start_pos > 0.0 {
-                        // Wait a bit for dash.js to set up MSE
-                        TimeoutFuture::new(200).await;
-                        video.set_current_time(start_pos);
-                    }
+                    // Initialize the player — dash.js handles MSE, MPD, segments.
+                    // Pass start_pos as the 4th argument so dash.js requests the
+                    // correct segments from the start instead of loading from 0
+                    // and then seeking (which bypasses internal scheduling).
+                    player.initialize(&video, &manifest_url, true, start_pos);
 
                     status_clone.set(String::new());
 
@@ -615,14 +759,17 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // ── Server integration: WebSocket for playback state reporting ────────────
     {
         let video_ref = video_ref.clone();
+        let dash_player_ref = dash_player_ref.clone();
 
         use_effect_with(props.video_id.clone(), move |video_id| {
             let video_id = video_id.clone();
             let video_ref = video_ref.clone();
+            let dash_player_ref = dash_player_ref.clone();
 
             // Fetch resume position from server on mount
             let video_id_resume = video_id.clone();
             let video_ref_resume = video_ref.clone();
+            let dash_player_ref_resume = dash_player_ref.clone();
             spawn_local(async move {
                 let url = format!("/api/player/position/{}", video_id_resume);
                 if let Ok(resp) = Request::get(&url).send().await {
@@ -634,7 +781,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                     if let Some(video) = video_ref_resume.cast::<HtmlVideoElement>() {
                                         let dur = video.duration();
                                         if dur.is_finite() && time < dur - 5.0 {
-                                            video.set_current_time(time);
+                                            dash_seek(&dash_player_ref_resume, &video, time);
                                             log::info!("Resumed from server position: {time:.1}s");
                                         }
                                     }
@@ -678,11 +825,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             // Handle incoming server commands
             if let Some(ref ws) = ws {
                 let video_ref_cmd = video_ref.clone();
+                let dash_player_ref_cmd = dash_player_ref.clone();
                 let onmessage = Closure::<dyn Fn(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
                     if let Some(text) = e.data().as_string() {
                         if let Ok(cmd) = serde_json::from_str::<ServerCommand>(&text) {
                             if let Some(video) = video_ref_cmd.cast::<HtmlVideoElement>() {
-                                apply_server_command(&video, &cmd);
+                                apply_server_command(&video, &cmd, &dash_player_ref_cmd);
                             }
                         }
                     }
@@ -739,6 +887,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let prev_volume = prev_volume.clone();
         let playback_speed = playback_speed.clone();
         let skip_indicator = skip_indicator.clone();
+        let dash_player_ref = dash_player_ref.clone();
 
         use_effect_with(video_ref.clone(), move |_| {
             let video_ref = video_ref.clone();
@@ -749,6 +898,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let prev_volume = prev_volume.clone();
             let playback_speed = playback_speed.clone();
             let skip_indicator = skip_indicator.clone();
+            let dash_player_ref = dash_player_ref.clone();
 
             let closure = Closure::<dyn Fn(KeyboardEvent)>::new(move |e: KeyboardEvent| {
                 if let Some(target) = e.target() {
@@ -767,19 +917,19 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 match key.as_str() {
                     " " | "k" | "K" => {
                         e.prevent_default();
-                        if video.paused() { let _ = video.play(); } else { let _ = video.pause(); }
+                        dash_play_pause(&dash_player_ref, &video);
                     }
                     "ArrowLeft" => {
                         e.prevent_default();
                         let skip = if e.shift_key() { 10.0 } else { 5.0 };
-                        video.set_current_time((video.current_time() - skip).max(0.0));
+                        dash_seek(&dash_player_ref, &video, (video.current_time() - skip).max(0.0));
                         skip_indicator.set(Some(("backward".to_string(), 25.0)));
                         let si = skip_indicator.clone();
                         spawn_local(async move { TimeoutFuture::new(500).await; si.set(None); });
                     }
                     "j" | "J" => {
                         e.prevent_default();
-                        video.set_current_time((video.current_time() - 10.0).max(0.0));
+                        dash_seek(&dash_player_ref, &video, (video.current_time() - 10.0).max(0.0));
                         skip_indicator.set(Some(("backward".to_string(), 25.0)));
                         let si = skip_indicator.clone();
                         spawn_local(async move { TimeoutFuture::new(500).await; si.set(None); });
@@ -788,7 +938,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         e.prevent_default();
                         let skip = if e.shift_key() { 10.0 } else { 5.0 };
                         let dur = video.duration();
-                        if dur.is_finite() { video.set_current_time((video.current_time() + skip).min(dur)); }
+                        if dur.is_finite() { dash_seek(&dash_player_ref, &video, (video.current_time() + skip).min(dur)); }
                         skip_indicator.set(Some(("forward".to_string(), 75.0)));
                         let si = skip_indicator.clone();
                         spawn_local(async move { TimeoutFuture::new(500).await; si.set(None); });
@@ -796,7 +946,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     "l" | "L" => {
                         e.prevent_default();
                         let dur = video.duration();
-                        if dur.is_finite() { video.set_current_time((video.current_time() + 10.0).min(dur)); }
+                        if dur.is_finite() { dash_seek(&dash_player_ref, &video, (video.current_time() + 10.0).min(dur)); }
                         skip_indicator.set(Some(("forward".to_string(), 75.0)));
                         let si = skip_indicator.clone();
                         spawn_local(async move { TimeoutFuture::new(500).await; si.set(None); });
@@ -839,24 +989,24 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         e.prevent_default();
                         let num: f64 = key.parse().unwrap_or(0.0);
                         let dur = video.duration();
-                        if dur.is_finite() { video.set_current_time(dur * (num / 10.0)); }
+                        if dur.is_finite() { dash_seek(&dash_player_ref, &video, dur * (num / 10.0)); }
                     }
                     "<" | "," => {
                         e.prevent_default();
                         let current = *playback_speed;
                         if let Some(pos) = PLAYBACK_SPEEDS.iter().position(|&s| (s - current).abs() < 0.01) {
-                            if pos > 0 { let ns = PLAYBACK_SPEEDS[pos - 1]; playback_speed.set(ns); video.set_playback_rate(ns); }
+                            if pos > 0 { let ns = PLAYBACK_SPEEDS[pos - 1]; playback_speed.set(ns); dash_set_playback_rate(&dash_player_ref, &video, ns); }
                         }
                     }
                     ">" | "." => {
                         e.prevent_default();
                         let current = *playback_speed;
                         if let Some(pos) = PLAYBACK_SPEEDS.iter().position(|&s| (s - current).abs() < 0.01) {
-                            if pos < PLAYBACK_SPEEDS.len() - 1 { let ns = PLAYBACK_SPEEDS[pos + 1]; playback_speed.set(ns); video.set_playback_rate(ns); }
+                            if pos < PLAYBACK_SPEEDS.len() - 1 { let ns = PLAYBACK_SPEEDS[pos + 1]; playback_speed.set(ns); dash_set_playback_rate(&dash_player_ref, &video, ns); }
                         }
                     }
-                    "Home" => { e.prevent_default(); video.set_current_time(0.0); }
-                    "End" => { e.prevent_default(); let dur = video.duration(); if dur.is_finite() { video.set_current_time(dur); } }
+                    "Home" => { e.prevent_default(); dash_seek(&dash_player_ref, &video, 0.0); }
+                    "End" => { e.prevent_default(); let dur = video.duration(); if dur.is_finite() { dash_seek(&dash_player_ref, &video, dur); } }
                     _ => {}
                 }
             });
@@ -881,10 +1031,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let on_play_pause = {
         let video_ref = video_ref.clone();
         let video_ended = video_ended.clone();
+        let dash_player_ref = dash_player_ref.clone();
         Callback::from(move |_| {
             if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-                if *video_ended { video.set_current_time(0.0); }
-                if video.paused() { let _ = video.play(); } else { let _ = video.pause(); }
+                if *video_ended { dash_seek(&dash_player_ref, &video, 0.0); }
+                dash_play_pause(&dash_player_ref, &video);
             }
         })
     };
@@ -1064,6 +1215,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let just_dragged = just_dragged.clone();
         let hover_time = hover_time.clone();
         let hover_position = hover_position.clone();
+        let dash_player_ref = dash_player_ref.clone();
 
         Callback::from(move |e: MouseEvent| {
             e.prevent_default();
@@ -1100,6 +1252,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
             let closures: Rc<RefCell<Option<(Closure<dyn Fn(MouseEvent)>, Closure<dyn Fn(MouseEvent)>)>>> = Rc::new(RefCell::new(None));
             let closures_for_mouseup = closures.clone();
+            let dash_player_ref_up = dash_player_ref.clone();
 
             let on_mousemove = Closure::<dyn Fn(MouseEvent)>::new(move |e: MouseEvent| {
                 if let Some(el) = progress_ref_move.cast::<web_sys::HtmlElement>() {
@@ -1122,7 +1275,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 is_dragging_up.set(false);
                 just_dragged_up.set(true);
                 let t = shared_up.get();
-                if let Some(video) = video_ref_up.cast::<HtmlVideoElement>() { video.set_current_time(t); }
+                if let Some(video) = video_ref_up.cast::<HtmlVideoElement>() { dash_seek(&dash_player_ref_up, &video, t); }
                 if let Some((mc, uc)) = closures_for_mouseup.borrow_mut().take() {
                     if let Some(win) = window() {
                         let _ = win.remove_event_listener_with_callback("mousemove", mc.as_ref().unchecked_ref());
@@ -1143,12 +1296,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let video_ref = video_ref.clone();
         let progress_ref = progress_ref.clone();
         let just_dragged = just_dragged.clone();
+        let dash_player_ref = dash_player_ref.clone();
         Callback::from(move |e: MouseEvent| {
             if *just_dragged { just_dragged.set(false); return; }
             if let Some(el) = progress_ref.cast::<web_sys::HtmlElement>() {
                 if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
                     if let Some((t, _)) = calculate_seek_time(&e, &el, video.duration()) {
-                        video.set_current_time(t);
+                        dash_seek(&dash_player_ref, &video, t);
                     }
                 }
             }
@@ -1175,6 +1329,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let last_tap_time = last_tap_time.clone();
         let last_tap_x = last_tap_x.clone();
         let skip_indicator = skip_indicator.clone();
+        let dash_player_ref = dash_player_ref.clone();
         Callback::from(move |e: MouseEvent| {
             let now = js_sys::Date::now();
             let x = e.client_x() as f64;
@@ -1184,13 +1339,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     let w = rect.width();
                     let rx = x - rect.left();
                     if rx < w / 3.0 {
-                        video.set_current_time((video.current_time() - 10.0).max(0.0));
+                        dash_seek(&dash_player_ref, &video, (video.current_time() - 10.0).max(0.0));
                         skip_indicator.set(Some(("backward".to_string(), 25.0)));
                         let si = skip_indicator.clone();
                         spawn_local(async move { TimeoutFuture::new(500).await; si.set(None); });
                     } else if rx > w * 2.0 / 3.0 {
                         let dur = video.duration();
-                        if dur.is_finite() { video.set_current_time((video.current_time() + 10.0).min(dur)); }
+                        if dur.is_finite() { dash_seek(&dash_player_ref, &video, (video.current_time() + 10.0).min(dur)); }
                         skip_indicator.set(Some(("forward".to_string(), 75.0)));
                         let si = skip_indicator.clone();
                         spawn_local(async move { TimeoutFuture::new(500).await; si.set(None); });
@@ -1216,9 +1371,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
     let on_replay = {
         let video_ref = video_ref.clone();
+        let dash_player_ref = dash_player_ref.clone();
         Callback::from(move |_| {
             if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-                video.set_current_time(0.0);
+                dash_seek(&dash_player_ref, &video, 0.0);
                 let _ = video.play();
             }
         })

@@ -99,6 +99,16 @@
         };
       };
 
+    # ── Dev-metrics variant of the frontend WASM ─────────────────────────────
+    #
+    # Identical to starfinFrontendWasm but compiled with STARFIN_DEV=1 so that
+    # option_env!("STARFIN_DEV") in video_player.rs evaluates to Some(…) and
+    # the live metrics overlay is compiled in.
+    starfinFrontendWasmDev = starfinFrontendWasm.overrideAttrs (_: {
+      pname = "starfin-frontend-wasm-dev";
+      STARFIN_DEV = "1";
+    });
+
     # ── Phase 2: run wasm-bindgen and assemble the static frontend dist ───────
     #
     # Produces the `dist/` directory consumed by rust-embed in phase 3.
@@ -153,6 +163,23 @@
       '';
     };
 
+    # ── Dev-metrics variant of the frontend dist ─────────────────────────────
+    #
+    # Same as starfinFrontendDist but sourced from starfinFrontendWasmDev so
+    # the embedded WASM was compiled with STARFIN_DEV=1.
+    starfinFrontendDistDev = starfinFrontendDist.overrideAttrs (_: {
+      pname = "starfin-frontend-dist-dev";
+      buildPhase = ''
+        runHook preBuild
+        wasm-bindgen \
+          --target web \
+          --no-typescript \
+          --out-dir dist \
+          ${starfinFrontendWasmDev}/starfin-frontend.wasm
+        runHook postBuild
+      '';
+    });
+
     # ── Phase 3: build the backend binary with the frontend dist embedded ─────
     #
     # rust-embed compiles `frontend/dist/` into the binary at build time, so
@@ -190,6 +217,18 @@
       };
     };
 
+    # ── Dev-metrics variant of the backend binary ────────────────────────────
+    #
+    # Same as starfin but embeds starfinFrontendDistDev (compiled with
+    # STARFIN_DEV=1) so the video player shows the live metrics overlay.
+    starfinDev = starfin.overrideAttrs (_: {
+      pname = "starfin-dev";
+      preBuild = ''
+        mkdir -p frontend/dist
+        cp -r ${starfinFrontendDistDev}/. frontend/dist/
+      '';
+    });
+
   in
   with pkgs;
   {
@@ -197,6 +236,7 @@
     packages.${system} = {
       inherit starfin;
       default = starfin;
+      devMetrics = starfinDev;
     };
 
     # ── NixOS module ──────────────────────────────────────────────────────────

@@ -1062,9 +1062,60 @@ struct AppState {
     /// Last known playback positions per video ID (populated by player_ws).
     /// Used for resume-on-reload support.
     playback_positions: Arc<RwLock<HashMap<String, f64>>>,
+    /// Cached keyframe boundaries per video ID.
+    /// Maps video_id → Vec of keyframe PTS positions (sorted ascending).
+    /// Pre-scanned once on first access and used by the MPD generator and
+    /// segment server for the Original quality remux path.
+    keyframe_cache: Arc<RwLock<HashMap<String, Vec<f64>>>>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Get or lazily scan keyframe boundaries for a video.
+///
+/// For the Original quality remux path, the MPD and segment server need to
+/// know actual keyframe positions so the SegmentTimeline and tfdt match
+/// exactly (zero delta).  Boundaries are scanned once and cached in memory.
+async fn get_keyframe_boundaries(
+    state: &AppState,
+    video_id: &str,
+    abs_path: &str,
+    duration: f64,
+) -> Vec<f64> {
+    // Check cache first.
+    {
+        let cache = state.keyframe_cache.read();
+        if let Some(boundaries) = cache.get(video_id) {
+            return boundaries.clone();
+        }
+    }
+
+    // Scan keyframes (fast packet-level scan, no decoding).
+    let abs_path_owned = abs_path.to_owned();
+    let all_keyframes = tokio::task::spawn_blocking(move || {
+        media::transcode::scan_keyframe_boundaries(&abs_path_owned)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("keyframe scan panicked: {e}")));
+
+    let boundaries = match all_keyframes {
+        Ok(kfs) => media::transcode::pick_segment_boundaries(&kfs, duration),
+        Err(e) => {
+            eprintln!("[keyframe] scan failed for {video_id}: {e}");
+            // Fall back to nominal boundaries.
+            let n = (duration / SEGMENT_DURATION).ceil() as usize;
+            (0..n).map(|i| i as f64 * SEGMENT_DURATION).collect()
+        }
+    };
+
+    // Cache for future requests.
+    {
+        let mut cache = state.keyframe_cache.write();
+        cache.insert(video_id.to_string(), boundaries.clone());
+    }
+
+    boundaries
+}
 
 /// Stable, deterministic video ID derived from the relative path.
 fn video_id(rel_path: &str) -> String {
@@ -2252,7 +2303,19 @@ async fn get_manifest(
 
     // Calculate number of segments based on duration (f64 for sub-second precision).
     let duration = duration_secs;
-    let num_segments = (duration / SEGMENT_DURATION).ceil() as usize;
+
+    // For Original quality (remux path), pre-scan keyframe boundaries so the
+    // MPD SegmentTimeline matches actual segment content exactly (zero delta).
+    // For transcoded qualities, keyframes are forced at exact 6s boundaries
+    // so nominal durations are accurate.
+    let boundaries = if quality == Quality::Original {
+        let abs_str = abs_path.to_str().unwrap_or_default();
+        get_keyframe_boundaries(&state, &id, abs_str, duration).await
+    } else {
+        let n = (duration / SEGMENT_DURATION).ceil() as usize;
+        (0..n).map(|i| i as f64 * SEGMENT_DURATION).collect()
+    };
+    let num_segments = boundaries.len();
 
     // Format duration as ISO 8601 duration for MPD.
     // Use fractional seconds so that the frontend gets sub-second precision,
@@ -2298,38 +2361,49 @@ async fn get_manifest(
         quality = quality.as_str()
     ));
 
-    // Build SegmentTimeline — use the `r` (repeat) attribute per DASH-IF IOP
-    // to compress identical-duration segments into a single <S> element.
+    // Build SegmentTimeline with actual durations derived from keyframe
+    // boundaries.  For Original quality, these reflect real keyframe positions
+    // (zero delta).  For transcoded qualities, boundaries are nominal 6s.
     //
-    // All segments use nominal 6000 ms duration.  For the remux path, source
-    // keyframes may not land exactly at 6-second boundaries; the tolerance-
-    // based tfdt patching in create_segment() snaps each segment's
-    // baseMediaDecodeTime to the nominal start (when within 500 ms), creating
-    // a small overlap that MSE handles via coded-frame-removal.  dash.js gap
-    // handling (stallThreshold: 0.3, jumpGaps, enableStallFix) covers any
-    // residual timing differences.
+    // Each <S> element declares the duration (d) of one segment.  Consecutive
+    // segments with the same duration use the r= (repeat) attribute per
+    // DASH-IF IOP to compress the timeline.
     mpd.push_str("          <SegmentTimeline>\n");
-    let normal_duration_ms = (SEGMENT_DURATION * 1000.0) as u64;
-    if num_segments > 1 {
-        // First (num_segments - 1) segments all have the same duration.
-        // r= gives additional repetitions beyond the first occurrence, so
-        // r=(num_segments - 2) encodes (num_segments - 1) segments total.
-        let repeats = num_segments - 2; // r=N → N+1 segments of this duration
-        mpd.push_str(&format!(
-            "            <S d=\"{normal_duration_ms}\" r=\"{repeats}\"/>\n"
-        ));
-        // Last segment may be shorter.
-        let last_start = (num_segments - 1) as f64 * SEGMENT_DURATION;
-        let last_duration_ms = ((duration - last_start) * 1000.0).max(1.0) as u64;
-        mpd.push_str(&format!(
-            "            <S d=\"{last_duration_ms}\"/>\n"
-        ));
-    } else if num_segments == 1 {
-        let seg_duration_ms = (duration * 1000.0).max(1.0) as u64;
-        mpd.push_str(&format!(
-            "            <S d=\"{seg_duration_ms}\"/>\n"
-        ));
+
+    // Compute per-segment durations in ms from the boundary positions.
+    let mut durations_ms: Vec<u64> = Vec::with_capacity(num_segments);
+    for i in 0..num_segments {
+        let seg_start = boundaries[i];
+        let seg_end = if i + 1 < boundaries.len() {
+            boundaries[i + 1]
+        } else {
+            duration
+        };
+        let dur_ms = ((seg_end - seg_start) * 1000.0).round().max(1.0) as u64;
+        durations_ms.push(dur_ms);
     }
+
+    // Write <S> elements with r= compression for runs of equal durations.
+    let mut i = 0;
+    while i < durations_ms.len() {
+        let d = durations_ms[i];
+        let mut count = 1usize;
+        while i + count < durations_ms.len() && durations_ms[i + count] == d {
+            count += 1;
+        }
+        if count > 1 {
+            mpd.push_str(&format!(
+                "            <S d=\"{d}\" r=\"{}\"/>\n",
+                count - 1
+            ));
+        } else {
+            mpd.push_str(&format!(
+                "            <S d=\"{d}\"/>\n"
+            ));
+        }
+        i += count;
+    }
+
     mpd.push_str("          </SegmentTimeline>\n");
     mpd.push_str("        </SegmentTemplate>\n");
     mpd.push_str("      </Representation>\n");
@@ -2627,7 +2701,29 @@ async fn get_segment(
         };
 
         // We own the transcode job.
-        let result = transcode_segment(&abs_str, &seg_dir, seg_index, &state.hwaccel, quality).await;
+        // For Original quality, look up pre-scanned keyframe boundaries so
+        // the segment uses exact keyframe positions (zero delta).
+        let keyframe_range = if quality == Quality::Original {
+            let abs_path_ref: &Path = abs_str.as_ref();
+            let (duration_secs, _) = probe_video(abs_path_ref).await;
+            let boundaries = get_keyframe_boundaries(&state, &id, &abs_str, duration_secs).await;
+            if seg_index < boundaries.len() {
+                let kf_start = boundaries[seg_index];
+                let kf_end = if seg_index + 1 < boundaries.len() {
+                    boundaries[seg_index + 1]
+                } else {
+                    duration_secs
+                };
+                Some((kf_start, kf_end))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let result = media::transcode::transcode_segment_with_boundaries(
+            &abs_str, &seg_dir, seg_index, &state.hwaccel, quality, keyframe_range,
+        ).await;
 
         // Remove from the inflight map first (no new subscribers can join
         // after this point) then broadcast the result to existing waiters.
@@ -3880,6 +3976,7 @@ async fn main() -> std::io::Result<()> {
         segment_inflight: Arc::new(Mutex::new(HashMap::new())),
         theme_css,
         playback_positions: Arc::new(RwLock::new(HashMap::new())),
+        keyframe_cache: Arc::new(RwLock::new(HashMap::new())),
     });
 
     // One-time background scan at startup to refresh the index immediately.

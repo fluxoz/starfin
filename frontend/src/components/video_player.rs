@@ -46,6 +46,12 @@ const BUFFER_PRUNING_INTERVAL_S: f64 = 30.0;
 const GAP_SMALL_LIMIT_S: f64 = 0.8;
 const GAP_STALL_THRESHOLD_S: f64 = 0.5;
 
+// ── Developer overlay ─────────────────────────────────────────────────────────
+// Set STARFIN_DEV=1 at build time (e.g. `STARFIN_DEV=1 trunk build`) to
+// enable a live metrics overlay in the top-left corner of the player showing
+// resolution, fps, bitrate and PTS.
+const DEV_MODE: bool = option_env!("STARFIN_DEV").is_some();
+
 // ══════════════════════════════════════════════════════════════════════════════
 // dash.js JavaScript interop via wasm-bindgen
 // ══════════════════════════════════════════════════════════════════════════════
@@ -249,8 +255,11 @@ impl DashPlayer {
     /// `quality_index` maps to the Representation order in the MPD:
     ///   0 = original, 1 = high, 2 = medium, 3 = low.
     /// `force_replace` triggers an immediate buffer flush and re-request.
+    ///
+    /// Uses `setRepresentationForTypeByIndex` (dash.js 5 API).
+    /// The dash.js 4 `setQualityFor` was removed in v5.
     fn set_quality_for(&self, media_type: &str, quality_index: i32, force_replace: bool) {
-        if let Ok(func) = js_sys::Reflect::get(&self.player, &"setQualityFor".into()) {
+        if let Ok(func) = js_sys::Reflect::get(&self.player, &"setRepresentationForTypeByIndex".into()) {
             if let Ok(func) = func.dyn_into::<js_sys::Function>() {
                 let args = js_sys::Array::new();
                 args.push(&JsValue::from_str(media_type));
@@ -259,6 +268,34 @@ impl DashPlayer {
                 let _ = js_sys::Reflect::apply(&func, &self.player, &args);
             }
         }
+    }
+
+    /// Return the current video representation's nominal bitrate in kbps,
+    /// or `None` when the player is not yet initialised or no representation
+    /// is active.
+    ///
+    /// Uses `getCurrentRepresentationForType('video').bandwidth` which is the
+    /// correct dash.js 5 API (dash.js 4 `getQualityFor`/`getBitrateInfoListFor`
+    /// were removed in v5).  `bandwidth` is in bits-per-second.
+    fn current_bitrate_kbps(&self) -> Option<u32> {
+        let args = js_sys::Array::new();
+        args.push(&JsValue::from_str("video"));
+
+        let rep = js_sys::Reflect::get(&self.player, &"getCurrentRepresentationForType".into())
+            .ok()?
+            .dyn_into::<js_sys::Function>()
+            .ok()
+            .and_then(|f| js_sys::Reflect::apply(&f, &self.player, &args).ok())?;
+
+        if rep.is_null() || rep.is_undefined() {
+            return None;
+        }
+
+        let bps = js_sys::Reflect::get(&rep, &"bandwidth".into())
+            .ok()?
+            .as_f64()?;
+
+        Some((bps / 1000.0) as u32)
     }
 
     /// Destroy/reset the player.
@@ -536,6 +573,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // dash.js player state (Rc for async access)
     let dash_player_ref = use_mut_ref(|| Option::<Rc<DashPlayer>>::None);
 
+    // Dev overlay metrics — only updated by the polling loop when DEV_MODE is true.
+    // (zero-cost when DEV_MODE = false: state is allocated but never written.)
+    let dev_res = use_state(|| (0u32, 0u32)); // (videoWidth, videoHeight)
+    let dev_fps = use_state(|| 0.0_f64);
+    let dev_bitrate_kbps = use_state(|| 0u32);
+    // Tracks (totalVideoFrames, timestamp_ms) between polling ticks for FPS.
+    let dev_frame_tracker = use_mut_ref(|| (0u32, 0.0_f64));
+
     // Dynamic quality labels fetched from the server (resolution + Mbps).
     // Falls back to static QUALITY_OPTIONS when not yet loaded.
     let quality_labels: UseStateHandle<Vec<(String, String)>> = use_state(|| Vec::new());
@@ -705,9 +750,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     on_error.forget();
 
                     // Stream initialized (one-shot) — clear status and lock the initial
-                    // quality.  setQualityFor MUST be called inside this event because
-                    // attachSource is async: the MPD has not been parsed and the
-                    // representation list does not exist until streamInitialized fires.
+                    // quality.  setRepresentationForTypeByIndex MUST be called inside
+                    // this event because attachSource is async: the MPD has not been
+                    // parsed and the representation list does not exist until
+                    // streamInitialized fires.
                     let status_for_init = status_clone.clone();
                     let player_js_for_init = player.player.clone();
                     let quality_for_init = quality.clone();
@@ -717,12 +763,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         // do NOT call setQualityFor (that would disable ABR).
                         if quality_for_init != "auto" {
                             let quality_index = quality_to_index(&quality_for_init);
-                            if let Ok(func) = js_sys::Reflect::get(&player_js_for_init, &"setQualityFor".into()) {
+                            if let Ok(func) = js_sys::Reflect::get(&player_js_for_init, &"setRepresentationForTypeByIndex".into()) {
                                 if let Ok(func) = func.dyn_into::<js_sys::Function>() {
                                     let args = js_sys::Array::new();
                                     args.push(&JsValue::from_str("video"));
                                     args.push(&JsValue::from_f64(quality_index as f64));
-                                    args.push(&JsValue::from_bool(false));
+                                    args.push(&JsValue::from_bool(true));
                                     let _ = js_sys::Reflect::apply(&func, &player_js_for_init, &args);
                                 }
                             }
@@ -947,6 +993,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let is_dragging = is_dragging.clone();
         let video_ended = video_ended.clone();
         let is_muted = is_muted.clone();
+        let dev_res = dev_res.clone();
+        let dev_fps = dev_fps.clone();
+        let dev_bitrate_kbps = dev_bitrate_kbps.clone();
+        let dev_frame_tracker = dev_frame_tracker.clone();
+        let dash_player_ref = dash_player_ref.clone();
 
         use_effect_with(video_ref.clone(), move |video_ref| {
             let video_ref = video_ref.clone();
@@ -960,6 +1011,40 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     video_ended.set(video.ended());
                     // Sync muted state (may have been changed by autoplay handler)
                     is_muted.set(video.muted());
+
+                    if DEV_MODE {
+                        // Resolution
+                        let (w, h) = (video.video_width(), video.video_height());
+                        if (*dev_res).0 != w || (*dev_res).1 != h {
+                            dev_res.set((w, h));
+                        }
+
+                        // FPS — derived from VideoPlaybackQuality.totalVideoFrames
+                        let quality = video.get_video_playback_quality();
+                        let total_frames = quality.total_video_frames();
+                        let now_ms = js_sys::Date::now();
+                        {
+                            let mut tracker = dev_frame_tracker.borrow_mut();
+                            let (prev_frames, prev_time) = *tracker;
+                            if prev_time > 0.0 && total_frames > prev_frames {
+                                let frame_delta = (total_frames - prev_frames) as f64;
+                                let time_delta_s = (now_ms - prev_time) / 1000.0;
+                                if time_delta_s > 0.0 {
+                                    dev_fps.set(frame_delta / time_delta_s);
+                                }
+                            }
+                            *tracker = (total_frames, now_ms);
+                        }
+
+                        // Bitrate — from the current dash.js representation
+                        if let Some(player) = dash_player_ref.borrow().as_ref() {
+                            if let Some(kbps) = player.current_bitrate_kbps() {
+                                if *dev_bitrate_kbps != kbps {
+                                    dev_bitrate_kbps.set(kbps);
+                                }
+                            }
+                        }
+                    }
                 }
             });
             move || drop(interval)
@@ -1746,6 +1831,15 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             }
 
             <video ref={video_ref} class="video-el" onclick={on_video_click} ondblclick={on_video_dblclick} />
+
+            if DEV_MODE {
+                <div class="player-dev-overlay">
+                    <div>{ format!("{}\u{00d7}{}", (*dev_res).0, (*dev_res).1) }</div>
+                    <div>{ format!("{:.1} fps", *dev_fps) }</div>
+                    <div>{ format!("{} kbps", *dev_bitrate_kbps) }</div>
+                    <div>{ format!("PTS {:.3}s", *current_time) }</div>
+                </div>
+            }
 
             if *video_ended {
                 <div class="video-end-overlay">

@@ -136,9 +136,13 @@
         cp -r dist/.  $out/
         cp -r styles/. $out/styles/
         cp -r fonts/.  $out/fonts/
+        cp -r js/.     $out/js/
         cp favicon.svg $out/favicon.svg
         # Transform index.html: replace data-trunk directives with standard
         # HTML and inject the WASM module initialisation script.
+        # Note: data-trunk rel="copy-dir" lines are removed by the sed rule
+        # below; the actual copies of js/ and fonts/ are done by the explicit
+        # cp commands above.
         sed \
           -e 's|<link data-trunk rel="css" href="\([^\"]*\)" />|<link rel="stylesheet" href="\1" />|g' \
           -e '/data-trunk rel="copy-dir"/d' \

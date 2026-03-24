@@ -151,10 +151,17 @@ impl Quality {
     }
 
     /// Whether this quality level can potentially use the fast remux path
-    /// (no re-encoding).  Only Original uses remux; all others always
-    /// transcode.
+    /// (no re-encoding).
+    ///
+    /// Disabled: the remux path copies source packets unchanged, so keyframes
+    /// land at their original positions (e.g., 648.010s instead of 648.000s).
+    /// This creates non-zero deltas between `actual_keyframe` and
+    /// `nominal_start` that cause dash.js to miscalculate buffer ranges and
+    /// stutter at segment boundaries.  Always transcoding ensures keyframes
+    /// are forced at exact 6-second boundaries (zero delta).  Original
+    /// quality falls through to High settings (CRF 18, same resolution).
     fn can_remux(self) -> bool {
-        self == Quality::Original
+        false
     }
 }
 

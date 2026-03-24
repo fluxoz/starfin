@@ -709,11 +709,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 abr: {{
                                     autoSwitchBitrate: {{ video: false, audio: false }}
                                 }},
-                                errors: {{
-                                    recoverAttempts: {{
-                                        mediaErrorDecode: 5
-                                    }}
-                                }},
                                 retryAttempts: {{
                                     MPD: 3,
                                     MediaSegment: 3,

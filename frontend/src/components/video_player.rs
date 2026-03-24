@@ -561,6 +561,8 @@ pub struct VideoPlayerProps {
     pub video_id: String,
     pub title: String,
     pub on_close: Callback<()>,
+    pub is_favorite: bool,
+    pub on_favorite_toggle: Callback<()>,
 }
 
 #[function_component(VideoPlayer)]
@@ -1481,6 +1483,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let on_close = props.on_close.clone();
     let video_id_for_close = props.video_id.clone();
     let title = props.title.clone();
+    let is_favorite = props.is_favorite;
+    let on_favorite_toggle = props.on_favorite_toggle.clone();
 
     // Play/Pause toggle
     let on_play_pause = {
@@ -2046,7 +2050,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 <div class="sv-buffering"><div class="sv-buffering__spinner"></div></div>
             }
 
-            // Title bar (top) — back button + title
+            // Title bar (top) — back button + title + favorite
             <div class={if *controls_visible { "sv-title" } else { "sv-title sv-title--hidden" }}>
                 <button class="sv-back-btn" onclick={Callback::from(move |_| {
                     let vid = video_id_for_close.clone();
@@ -2056,6 +2060,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     { icon_arrow_back() }
                 </button>
                 <span class="sv-title__text">{ title }</span>
+                <button
+                    class={if is_favorite { "sv-fav-btn sv-fav-btn--active" } else { "sv-fav-btn" }}
+                    onclick={Callback::from(move |_| on_favorite_toggle.emit(()))}
+                    aria-label={if is_favorite { "Remove from favorites" } else { "Add to favorites" }}
+                    aria-pressed={is_favorite.to_string()}
+                >
+                    { icon_favorite() }
+                </button>
             </div>
 
             if let Some(err) = &*error {
@@ -2294,6 +2306,14 @@ fn icon_seek_fwd() -> Html {
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M6.5 8l5 4-5 4" />
             <path d="M11.5 8l5 4-5 4" />
+        </svg>
+    }
+}
+
+fn icon_favorite() -> Html {
+    html! {
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true">
+            <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
         </svg>
     }
 }

@@ -12,7 +12,7 @@ if [[ -z "$1" ]]; then
 	location=$(pwd)
 	cd "$location/frontend"
 	# sops exec-env "../$DEV_SECRETS" "trunk build"
-	trunk build
+	STARFIN_DEV=1 trunk build
 	cd "$location"
 	# sops exec-env "$DEV_SECRETS" "cargo run"
 	cargo run

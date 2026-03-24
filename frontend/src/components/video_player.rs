@@ -698,6 +698,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         None => { error_clone.set(Some("Video element not found".into())); return; }
                     };
 
+                    // Ensure playsinline is set — required for iOS Safari to use MSE/DASH
+                    // instead of falling back to native player (which causes MEDIA_ERR_SRC_NOT_SUPPORTED)
+                    if video.set_attribute("playsinline", "").is_err() {
+                        log::warn!("Failed to set playsinline attribute on video element");
+                    }
+
                     let manifest_url = format!("/api/videos/{}/manifest.mpd", video_id);
 
                     // Create dash.js player
@@ -1881,7 +1887,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 </div>
             }
 
-            <video ref={video_ref} class="video-el" onclick={on_video_click} ondblclick={on_video_dblclick} />
+            <video ref={video_ref} class="video-el" playsinline={true} onclick={on_video_click} ondblclick={on_video_dblclick} />
 
             if DEV_MODE {
                 <div class="player-dev-overlay">

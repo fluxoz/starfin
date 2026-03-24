@@ -249,21 +249,23 @@ impl DashPlayer {
         0.0
     }
 
-    /// Set the quality index for a media type via the dash.js API.
+    /// Set the quality representation for a media type via the dash.js API.
     ///
     /// `media_type` is "video" or "audio".
-    /// `quality_index` maps to the Representation order in the MPD:
-    ///   0 = original, 1 = high, 2 = medium, 3 = low.
+    /// `quality_id` is the Representation `id` attribute from the MPD:
+    ///   "original", "high", "medium", or "low".
     /// `force_replace` triggers an immediate buffer flush and re-request.
     ///
-    /// Uses `setRepresentationForTypeByIndex` (dash.js 5 API).
-    /// The dash.js 4 `setQualityFor` was removed in v5.
-    fn set_quality_for(&self, media_type: &str, quality_index: i32, force_replace: bool) {
-        if let Ok(func) = js_sys::Reflect::get(&self.player, &"setRepresentationForTypeByIndex".into()) {
+    /// Uses `setRepresentationForTypeById` (dash.js 5 API), which selects
+    /// the representation by its ID string rather than a bandwidth-sorted
+    /// index.  This avoids the ordering mismatch that `setRepresentationForTypeByIndex`
+    /// has when dash.js internally sorts representations by bandwidth ascending.
+    fn set_quality_for(&self, media_type: &str, quality_id: &str, force_replace: bool) {
+        if let Ok(func) = js_sys::Reflect::get(&self.player, &"setRepresentationForTypeById".into()) {
             if let Ok(func) = func.dyn_into::<js_sys::Function>() {
                 let args = js_sys::Array::new();
                 args.push(&JsValue::from_str(media_type));
-                args.push(&JsValue::from_f64(quality_index as f64));
+                args.push(&JsValue::from_str(quality_id));
                 args.push(&JsValue::from_bool(force_replace));
                 let _ = js_sys::Reflect::apply(&func, &self.player, &args);
             }
@@ -475,19 +477,6 @@ pub struct SubtitleTracksResponse {
 // UI COMPONENT
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Map a quality string to its Representation index in the MPD.
-///
-/// MPD Representation order: 0 = original, 1 = high, 2 = medium, 3 = low.
-/// "auto" is handled separately — ABR is enabled instead of calling setQualityFor.
-fn quality_to_index(quality: &str) -> i32 {
-    match quality {
-        "original" => 0,
-        "high"     => 1,
-        "medium"   => 2,
-        "low"      => 3,
-        _          => 0,
-    }
-}
 
 #[derive(Properties, PartialEq)]
 pub struct VideoPlayerProps {
@@ -764,12 +753,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         // For "auto" quality, ABR is already enabled via updateSettings —
                         // do NOT call setQualityFor (that would disable ABR).
                         if quality_for_init != "auto" {
-                            let quality_index = quality_to_index(&quality_for_init);
-                            if let Ok(func) = js_sys::Reflect::get(&player_js_for_init, &"setRepresentationForTypeByIndex".into()) {
+                            if let Ok(func) = js_sys::Reflect::get(&player_js_for_init, &"setRepresentationForTypeById".into()) {
                                 if let Ok(func) = func.dyn_into::<js_sys::Function>() {
                                     let args = js_sys::Array::new();
                                     args.push(&JsValue::from_str("video"));
-                                    args.push(&JsValue::from_f64(quality_index as f64));
+                                    args.push(&JsValue::from_str(&quality_for_init));
                                     args.push(&JsValue::from_bool(true));
                                     let _ = js_sys::Reflect::apply(&func, &player_js_for_init, &args);
                                 }
@@ -990,7 +978,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     // Lock to the selected representation with force_replace=true
                     // so that dash.js immediately flushes the buffer and requests
                     // segments at the new quality level.
-                    player.set_quality_for("video", quality_to_index(&quality), true);
+                    player.set_quality_for("video", &quality, true);
                 }
             }
             || ()

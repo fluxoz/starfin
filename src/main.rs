@@ -1103,8 +1103,7 @@ async fn get_keyframe_boundaries(
         Err(e) => {
             eprintln!("[keyframe] scan failed for {video_id}: {e}");
             // Fall back to nominal boundaries.
-            let n = (duration / SEGMENT_DURATION).ceil() as usize;
-            (0..n).map(|i| i as f64 * SEGMENT_DURATION).collect()
+            media::transcode::nominal_boundaries(duration)
         }
     };
 
@@ -2302,7 +2301,12 @@ async fn get_manifest(
 
     // Get keyframe boundaries for accurate SegmentTimeline.
     let abs_str = abs_path.to_str().unwrap_or_default();
-    let boundaries = get_keyframe_boundaries(&state, &id, abs_str, duration).await;
+    let mut boundaries = get_keyframe_boundaries(&state, &id, abs_str, duration).await;
+    // Safety: if boundary scan returned nothing usable, fall back to nominal
+    // boundaries so the MPD always has at least one segment.
+    if boundaries.is_empty() {
+        boundaries = media::transcode::nominal_boundaries(duration);
+    }
     let num_segments = boundaries.len();
 
     // Format ISO 8601 duration.
@@ -2377,7 +2381,7 @@ async fn get_manifest(
     mpd.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     mpd.push_str(&format!(
         "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\"\n\
-         \x20    profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\"\n\
+         \x20    profiles=\"urn:mpeg:dash:profile:isoff-live:2011\"\n\
          \x20    type=\"static\"\n\
          \x20    mediaPresentationDuration=\"{pt_duration}\"\n\
          \x20    minBufferTime=\"PT4S\"\n\

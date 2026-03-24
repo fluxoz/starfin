@@ -650,9 +650,18 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         let msg = if let Some(err_obj) = e.dyn_ref::<js_sys::Object>() {
                             let error_val = js_sys::Reflect::get(err_obj, &"error".into()).unwrap_or(JsValue::UNDEFINED);
                             if let Some(error_obj) = error_val.dyn_ref::<js_sys::Object>() {
-                                let msg = js_sys::Reflect::get(error_obj, &"message".into())
-                                    .unwrap_or(JsValue::UNDEFINED);
-                                msg.as_string().unwrap_or_else(|| format!("{:?}", e))
+                                let message = js_sys::Reflect::get(error_obj, &"message".into())
+                                    .unwrap_or(JsValue::UNDEFINED)
+                                    .as_string();
+                                let code = js_sys::Reflect::get(error_obj, &"code".into())
+                                    .unwrap_or(JsValue::UNDEFINED)
+                                    .as_f64();
+                                match (message, code) {
+                                    (Some(m), Some(c)) => format!("[{c:.0}] {m}"),
+                                    (Some(m), None) => m,
+                                    (None, Some(c)) => format!("dash.js error code {c:.0}"),
+                                    (None, None) => format!("{:?}", e),
+                                }
                             } else {
                                 format!("{:?}", e)
                             }

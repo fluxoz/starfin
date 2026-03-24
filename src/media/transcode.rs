@@ -96,9 +96,19 @@ pub fn scan_keyframe_boundaries(abs_path: &str) -> Result<Vec<f64>, String> {
 /// PTS >= nominal that is closest.  This produces segments that start at
 /// real SAP positions, matching what a DASH packager (MP4Box, Bento4) would
 /// produce.
+/// Compute nominal segment boundaries (0, 6, 12, ...) for a given duration.
+///
+/// Always returns at least one boundary (0.0).
+pub fn nominal_boundaries(duration: f64) -> Vec<f64> {
+    let n = (duration / SEGMENT_DURATION).ceil().max(1.0) as usize;
+    (0..n).map(|i| i as f64 * SEGMENT_DURATION).collect()
+}
+
 pub fn pick_segment_boundaries(all_keyframes: &[f64], duration: f64) -> Vec<f64> {
     if all_keyframes.is_empty() {
-        return vec![];
+        // No keyframes found — return nominal boundaries so the caller
+        // always gets a non-empty list.
+        return nominal_boundaries(duration);
     }
 
     let num_nominal = (duration / SEGMENT_DURATION).ceil() as usize;
@@ -120,6 +130,10 @@ pub fn pick_segment_boundaries(all_keyframes: &[f64], duration: f64) -> Vec<f64>
             boundaries.push(*all_keyframes.last().unwrap());
         }
     }
+
+    // Deduplicate: if multiple nominal boundaries map to the same keyframe,
+    // collapse them so we don't produce zero-duration segments.
+    boundaries.dedup();
 
     boundaries
 }

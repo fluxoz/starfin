@@ -627,11 +627,13 @@ async fn get_video_quality_info(
         None => return HttpResponse::NotFound().body("video not found"),
     };
 
-    let stream_info = tokio::task::spawn_blocking(move || {
-        media::probe::probe_stream_info(&abs)
+    let (stream_info, remuxable) = tokio::task::spawn_blocking(move || {
+        let si = media::probe::probe_stream_info(&abs);
+        let rm = media::probe::is_source_remuxable(&abs);
+        (si, rm)
     })
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|_| (Default::default(), false));
 
     let qualities = [Quality::Original, Quality::High, Quality::Medium, Quality::Low];
     let options: Vec<serde_json::Value> = qualities
@@ -645,13 +647,17 @@ async fn get_video_quality_info(
             } else {
                 format!("{}p · {} Kbps", h, (bw / 1000) as u32)
             };
-            serde_json::json!({
+            let mut entry = serde_json::json!({
                 "value": q.as_str(),
                 "label": label,
                 "width": w,
                 "height": h,
                 "bitrate": bw,
-            })
+            });
+            if q == Quality::Original {
+                entry["remuxable"] = serde_json::Value::Bool(remuxable);
+            }
+            entry
         })
         .collect();
 

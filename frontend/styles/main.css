@@ -1507,6 +1507,25 @@ body{
   to{ transform: rotate(360deg); }
 }
 
+/* ── Developer metrics overlay ───────────────────────────────────────────── */
+/* Enabled at build time with STARFIN_DEV=1 (see video_player.rs DEV_MODE).  */
+.player-dev-overlay{
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 10;
+  background: rgba(0,0,0,.65);
+  color: #00ff88;
+  font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', monospace;
+  font-size: 11px;
+  line-height: 1.7;
+  padding: 6px 10px;
+  border-radius: 4px;
+  pointer-events: none;
+  user-select: none;
+  white-space: pre;
+}
+
 /* ── Skip indicator (for double-tap/keyboard) ────────────────────────────── */
 .skip-indicator{
   position: absolute;

@@ -12,8 +12,9 @@
 
 use crate::models::Element;
 
+use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -44,6 +45,16 @@ const CONTROLS_HIDE_MS: f64 = 4000.0;
 
 /// Seek step for on-screen controls (seconds).
 const SEEK_STEP_S: f64 = 10.0;
+
+/// Stream quality options (mirrored from video_player).
+const QUALITY_OPTIONS: [(&str, &str); 5] = [
+    ("auto",     "Auto (ABR)"),
+    ("original", "Original (Direct)"),
+    ("high",     "High (Transcode)"),
+    ("medium",   "Medium (720p)"),
+    ("low",      "Low (480p)"),
+];
+const QUALITY_STORAGE_KEY: &str = "starfin_quality";
 
 // ── dash.js interop (re-use from video_player) ──────────────────────────────
 
@@ -152,6 +163,18 @@ impl DashPlayer {
         let _ = f.call2(&self.player, &JsValue::from_str(event), callback);
     }
 
+    fn set_quality_for(&self, media_type: &str, quality_id: &str, force_replace: bool) {
+        if let Ok(func) = js_sys::Reflect::get(&self.player, &"setRepresentationForTypeById".into()) {
+            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                let args = js_sys::Array::new();
+                args.push(&JsValue::from_str(media_type));
+                args.push(&JsValue::from_str(quality_id));
+                args.push(&JsValue::from_bool(force_replace));
+                let _ = js_sys::Reflect::apply(&func, &self.player, &args);
+            }
+        }
+    }
+
     fn destroy(&self) {
         if let Ok(f) = js_sys::Reflect::get(&self.player, &"destroy".into()) {
             if let Ok(f) = f.dyn_into::<js_sys::Function>() {
@@ -214,9 +237,18 @@ fn touch_client_y(e: &TouchEvent) -> Option<f64> {
     }
 }
 
-// ── Settings JSON for dash.js ────────────────────────────────────────────────
+fn touch_client_x(e: &TouchEvent) -> Option<f64> {
+    let touches = e.touches();
+    if touches.length() > 0 {
+        touches.get(0).map(|t| t.client_x() as f64)
+    } else {
+        e.changed_touches().get(0).map(|t| t.client_x() as f64)
+    }
+}
 
-fn make_settings_js() -> JsValue {
+/// Build settings JS for dash.js with optional quality lock.
+fn make_settings_js_with_quality(quality: &str) -> JsValue {
+    let auto_abr = quality == "auto";
     js_sys::eval(&format!(
         r#"({{
             debug: {{ logLevel: 1 }},
@@ -243,7 +275,7 @@ fn make_settings_js() -> JsValue {
                     stallSeek: 0.1
                 }},
                 abr: {{
-                    autoSwitchBitrate: {{ video: true, audio: false }}
+                    autoSwitchBitrate: {{ video: {auto_abr}, audio: false }}
                 }},
                 retryAttempts: {{
                     MPD: 3,
@@ -260,6 +292,7 @@ fn make_settings_js() -> JsValue {
         }})"#,
         buf = SV_BUFFER_TARGET_S,
         back = SV_BACK_BUFFER_S,
+        auto_abr = auto_abr,
     ))
     .unwrap()
 }
@@ -333,8 +366,28 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
     let is_muted = use_state(|| false);
     let is_buffering = use_state(|| false);
 
+    // ── Drag-to-seek state ──────────────────────────────────────────────────
+    let is_dragging = use_state(|| false);
+    let drag_time = use_state(|| 0.0_f64);
+    let drag_closures: Rc<RefCell<Option<(Closure<dyn Fn(web_sys::MouseEvent)>, Closure<dyn Fn(web_sys::MouseEvent)>)>>> =
+        use_mut_ref(|| None);
+
+    // ── Quality state ───────────────────────────────────────────────────────
+    let initial_quality = web_sys::window()
+        .and_then(|w| w.local_storage().ok())
+        .flatten()
+        .and_then(|s| s.get_item(QUALITY_STORAGE_KEY).ok())
+        .flatten()
+        .filter(|q| QUALITY_OPTIONS.iter().any(|(v, _)| v == q))
+        .unwrap_or_else(|| "auto".to_string());
+    let selected_quality = use_state(|| initial_quality);
+    let quality_menu_open = use_state(|| false);
+    let quality_labels: UseStateHandle<Vec<(String, String)>> = use_state(Vec::new);
+
     // Title of the active video (displayed in the UI).
     let active_title = use_state(|| String::new());
+    // Track active video ID for quality label fetching.
+    let active_video_id = use_state(|| String::new());
 
     // ── Initialise the three slots on mount / when items change ─────────────
     {
@@ -343,7 +396,9 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
         let video_refs = video_refs.clone();
         let active_slot = active_slot.clone();
         let active_title = active_title.clone();
+        let active_video_id = active_video_id.clone();
         let is_buffering = is_buffering.clone();
+        let selected_quality = selected_quality.clone();
 
         use_effect_with(
             items.len(),
@@ -370,7 +425,11 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
 
                     if let Some(ref e) = elems[slot_idx] {
                         active_title.set(e.title.clone());
+                        active_video_id.set(e.id.clone());
                     }
+
+                    // Read quality at init time.
+                    let quality_str = (*selected_quality).clone();
 
                     // Initialise dash.js for each slot (with a small delay so the
                     // DOM has rendered the <video> elements).
@@ -434,7 +493,29 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
                                     }
 
                                     player.initialize(&video, i == slot_idx);
-                                    player.update_settings(&make_settings_js());
+                                    player.update_settings(&make_settings_js_with_quality(&quality_str));
+
+                                    // If quality is not "auto", lock to the selected representation
+                                    // after stream initialises.
+                                    if quality_str != "auto" {
+                                        let pjs_q = player.player.clone();
+                                        let qs = quality_str.clone();
+                                        let on_stream = Closure::once(Box::new(move || {
+                                            // setRepresentationForTypeById
+                                            if let Ok(func) = js_sys::Reflect::get(&pjs_q, &"setRepresentationForTypeById".into()) {
+                                                if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                                                    let args = js_sys::Array::new();
+                                                    args.push(&JsValue::from_str("video"));
+                                                    args.push(&JsValue::from_str(&qs));
+                                                    args.push(&JsValue::from_bool(true));
+                                                    let _ = js_sys::Reflect::apply(&func, &pjs_q, &args);
+                                                }
+                                            }
+                                        }) as Box<dyn FnOnce()>);
+                                        player.on("streamInitialized", on_stream.as_ref().unchecked_ref());
+                                        on_stream.forget();
+                                    }
+
                                     player.attach_source(&url, start);
 
                                     // Non-active slots: pause after stream initialised.
@@ -490,14 +571,19 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
         let is_muted = is_muted.clone();
         let controls_visible = controls_visible.clone();
         let last_interaction = last_interaction.clone();
+        let is_dragging = is_dragging.clone();
 
         use_effect(move || {
             let interval = gloo_timers::callback::Interval::new(150, move || {
                 let idx = *active_slot;
                 if let Some(video) = video_refs[idx].cast::<HtmlVideoElement>() {
-                    let ct = video.current_time();
                     let dur = video.duration();
-                    current_time.set(ct);
+                    // Don't overwrite current_time while the user is dragging the
+                    // progress bar — use the drag_time instead.
+                    if !*is_dragging {
+                        let ct = video.current_time();
+                        current_time.set(ct);
+                    }
                     if dur.is_finite() && dur > 0.0 {
                         duration.set(dur);
                     }
@@ -517,16 +603,74 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
         });
     }
 
+    // ── Fetch quality labels when active video changes ─────────────────────
+    {
+        let active_video_id = active_video_id.clone();
+        let quality_labels = quality_labels.clone();
+        use_effect_with((*active_video_id).clone(), move |video_id| {
+            let video_id = video_id.clone();
+            let quality_labels = quality_labels.clone();
+            if !video_id.is_empty() {
+                spawn_local(async move {
+                    let url = format!("/api/videos/{}/quality-info", video_id);
+                    if let Ok(resp) = Request::get(&url).send().await {
+                        if resp.ok() {
+                            if let Ok(items) = resp.json::<Vec<serde_json::Value>>().await {
+                                let labels: Vec<(String, String)> = items
+                                    .iter()
+                                    .filter_map(|item| {
+                                        let v = item.get("value")?.as_str()?.to_string();
+                                        let l = item.get("label")?.as_str()?.to_string();
+                                        Some((v, l))
+                                    })
+                                    .collect();
+                                quality_labels.set(labels);
+                            }
+                        }
+                    }
+                });
+            }
+            || ()
+        });
+    }
+
+    // ── Live quality switch — applies to ALL slots ──────────────────────────
+    {
+        let slots = slots.clone();
+        let selected_quality = selected_quality.clone();
+        use_effect_with((*selected_quality).clone(), move |quality| {
+            let quality = quality.clone();
+            let auto_abr = quality == "auto";
+            let abr_settings = js_sys::eval(&format!(
+                r#"({{ streaming: {{ abr: {{ autoSwitchBitrate: {{ video: {auto_abr}, audio: false }} }} }} }})"#,
+                auto_abr = auto_abr,
+            )).unwrap();
+
+            let s = slots.borrow();
+            for slot in s.iter() {
+                if let Some(ref player) = slot.player {
+                    player.update_settings(&abr_settings);
+                    if !auto_abr {
+                        player.set_quality_for("video", &quality, true);
+                    }
+                }
+            }
+            || ()
+        });
+    }
+
     // ── Transition helper ───────────────────────────────────────────────────
     let do_transition = {
         let slots = slots.clone();
         let video_refs = video_refs.clone();
         let active_slot = active_slot.clone();
         let active_title = active_title.clone();
+        let active_video_id = active_video_id.clone();
         let is_animating = is_animating.clone();
         let translate_y = translate_y.clone();
         let items = props.items.clone();
         let is_buffering = is_buffering.clone();
+        let selected_quality = selected_quality.clone();
 
         Rc::new(move |direction: i32| {
             // direction: -1 = swipe up (next), +1 = swipe down (prev)
@@ -564,10 +708,12 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
             let video_refs_post = video_refs.clone();
             let active_slot_post = active_slot.clone();
             let active_title_post = active_title.clone();
+            let active_video_id_post = active_video_id.clone();
             let is_animating_post = is_animating.clone();
             let translate_y_post = translate_y.clone();
             let items_post = items.clone();
             let target_slot = target;
+            let quality_str = (*selected_quality).clone();
 
             spawn_local(async move {
                 TimeoutFuture::new(TRANSITION_MS).await;
@@ -588,6 +734,7 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
                     }
                     if let Some(ref e) = s[target_slot].element {
                         active_title_post.set(e.title.clone());
+                        active_video_id_post.set(e.id.clone());
                     }
                 }
 
@@ -654,7 +801,28 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
                         on_init.forget();
 
                         player.initialize(&video, false);
-                        player.update_settings(&make_settings_js());
+                        player.update_settings(&make_settings_js_with_quality(&quality_str));
+
+                        // If quality is not "auto", lock to the selected representation
+                        // after stream initialises.
+                        if quality_str != "auto" {
+                            let pjs_q = player.player.clone();
+                            let qs = quality_str.clone();
+                            let on_stream = Closure::once(Box::new(move || {
+                                if let Ok(func) = js_sys::Reflect::get(&pjs_q, &"setRepresentationForTypeById".into()) {
+                                    if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                                        let args = js_sys::Array::new();
+                                        args.push(&JsValue::from_str("video"));
+                                        args.push(&JsValue::from_str(&qs));
+                                        args.push(&JsValue::from_bool(true));
+                                        let _ = js_sys::Reflect::apply(&func, &pjs_q, &args);
+                                    }
+                                }
+                            }) as Box<dyn FnOnce()>);
+                            player.on("streamInitialized", on_stream.as_ref().unchecked_ref());
+                            on_stream.forget();
+                        }
+
                         player.attach_source(&url, start);
 
                         slots_post.borrow_mut()[recycle_idx].player = Some(player);
@@ -936,44 +1104,254 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
         })
     };
 
-    // ── Progress bar click-to-seek ──────────────────────────────────────────
+    // ── Progress bar drag-to-seek (mouse) ──────────────────────────────────
     let progress_ref = use_node_ref();
-    let on_progress_click = {
+    let on_progress_mousedown = {
         let slots = slots.clone();
         let active_slot = active_slot.clone();
         let video_refs = video_refs.clone();
         let progress_ref = progress_ref.clone();
+        let is_dragging = is_dragging.clone();
+        let drag_time = drag_time.clone();
+        let current_time = current_time.clone();
+        let duration = duration.clone();
         let controls_visible = controls_visible.clone();
         let last_interaction = last_interaction.clone();
+        let drag_closures = drag_closures.clone();
+
         Callback::from(move |e: MouseEvent| {
+            e.prevent_default();
+            e.stop_propagation();
             controls_visible.set(true);
             *last_interaction.borrow_mut() = js_sys::Date::now();
+
+            let progress_el = match progress_ref.cast::<web_sys::HtmlElement>() { Some(el) => el, None => return };
             let idx = *active_slot;
-            if let Some(bar) = progress_ref.cast::<web_sys::HtmlElement>() {
-                if let Some(video) = video_refs[idx].cast::<HtmlVideoElement>() {
-                    let dur = video.duration();
-                    if !dur.is_finite() || dur <= 0.0 {
-                        return;
-                    }
-                    let rect = bar.get_bounding_client_rect();
+            let video = match video_refs[idx].cast::<HtmlVideoElement>() { Some(v) => v, None => return };
+            let video_duration = video.duration();
+            if !video_duration.is_finite() || video_duration <= 0.0 { return; }
+
+            let rect = progress_el.get_bounding_client_rect();
+            let click_x = e.client_x() as f64 - rect.left();
+            let width = rect.width();
+            if width <= 0.0 { return; }
+
+            let seek_ratio = (click_x / width).clamp(0.0, 1.0);
+            let initial_seek_time = seek_ratio * video_duration;
+
+            is_dragging.set(true);
+            drag_time.set(initial_seek_time);
+            current_time.set(initial_seek_time);
+
+            let shared_seek_time: Rc<Cell<f64>> = Rc::new(Cell::new(initial_seek_time));
+            let shared_move = shared_seek_time.clone();
+            let shared_up = shared_seek_time.clone();
+
+            let progress_ref_move = progress_ref.clone();
+            let duration_for_move = *duration;
+            let drag_time_move = drag_time.clone();
+            let current_time_move = current_time.clone();
+            let is_dragging_up = is_dragging.clone();
+            let video_refs_up = video_refs.clone();
+            let active_slot_up = active_slot.clone();
+            let slots_up = slots.clone();
+            let last_interaction_move = last_interaction.clone();
+            let drag_closures_up = drag_closures.clone();
+
+            let on_mousemove = Closure::<dyn Fn(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| {
+                e.prevent_default();
+                *last_interaction_move.borrow_mut() = js_sys::Date::now();
+                if let Some(el) = progress_ref_move.cast::<web_sys::HtmlElement>() {
+                    let rect = el.get_bounding_client_rect();
                     let x = e.client_x() as f64 - rect.left();
                     let ratio = (x / rect.width()).clamp(0.0, 1.0);
-                    let t = dur * ratio;
-                    let s = slots.borrow();
+                    let t = duration_for_move * ratio;
+                    shared_move.set(t);
+                    drag_time_move.set(t);
+                    current_time_move.set(t);
+                }
+            });
+
+            let on_mouseup = Closure::<dyn Fn(web_sys::MouseEvent)>::new(move |_e: web_sys::MouseEvent| {
+                is_dragging_up.set(false);
+                let t = shared_up.get();
+                let idx = *active_slot_up;
+                if let Some(_video) = video_refs_up[idx].cast::<HtmlVideoElement>() {
+                    let s = slots_up.borrow();
                     if let Some(ref p) = s[idx].player {
                         p.seek(t);
                     }
                 }
+                // Remove window listeners.
+                if let Some((ref mv, ref up)) = *drag_closures_up.borrow() {
+                    if let Some(win) = window() {
+                        let _ = win.remove_event_listener_with_callback("mousemove", mv.as_ref().unchecked_ref());
+                        let _ = win.remove_event_listener_with_callback("mouseup", up.as_ref().unchecked_ref());
+                    }
+                }
+                *drag_closures_up.borrow_mut() = None;
+            });
+
+            if let Some(win) = window() {
+                let _ = win.add_event_listener_with_callback("mousemove", on_mousemove.as_ref().unchecked_ref());
+                let _ = win.add_event_listener_with_callback("mouseup", on_mouseup.as_ref().unchecked_ref());
+                *drag_closures.borrow_mut() = Some((on_mousemove, on_mouseup));
             }
+        })
+    };
+
+    // ── Progress bar drag-to-seek (touch) ───────────────────────────────────
+    let on_progress_touchstart = {
+        let slots = slots.clone();
+        let active_slot = active_slot.clone();
+        let video_refs = video_refs.clone();
+        let progress_ref = progress_ref.clone();
+        let is_dragging = is_dragging.clone();
+        let drag_time = drag_time.clone();
+        let current_time = current_time.clone();
+        let duration = duration.clone();
+        let controls_visible = controls_visible.clone();
+        let last_interaction = last_interaction.clone();
+
+        Callback::from(move |e: TouchEvent| {
+            // Do NOT call e.prevent_default() — Yew registers this as a passive listener.
+            e.stop_propagation();
+            controls_visible.set(true);
+            *last_interaction.borrow_mut() = js_sys::Date::now();
+
+            let client_x = match touch_client_x(&e) { Some(x) => x, None => return };
+            let progress_el = match progress_ref.cast::<web_sys::HtmlElement>() { Some(el) => el, None => return };
+            let idx = *active_slot;
+            let video = match video_refs[idx].cast::<HtmlVideoElement>() { Some(v) => v, None => return };
+            let video_duration = video.duration();
+            if !video_duration.is_finite() || video_duration <= 0.0 { return; }
+
+            let rect = progress_el.get_bounding_client_rect();
+            let touch_x = client_x - rect.left();
+            let width = rect.width();
+            if width <= 0.0 { return; }
+
+            let seek_ratio = (touch_x / width).clamp(0.0, 1.0);
+            let initial_seek_time = seek_ratio * video_duration;
+
+            is_dragging.set(true);
+            drag_time.set(initial_seek_time);
+            current_time.set(initial_seek_time);
+
+            let shared_seek_time: Rc<Cell<f64>> = Rc::new(Cell::new(initial_seek_time));
+            let shared_move = shared_seek_time.clone();
+            let shared_end = shared_seek_time.clone();
+
+            let progress_ref_move = progress_ref.clone();
+            let duration_for_move = *duration;
+            let drag_time_move = drag_time.clone();
+            let current_time_move = current_time.clone();
+            let is_dragging_end = is_dragging.clone();
+            let video_refs_end = video_refs.clone();
+            let active_slot_end = active_slot.clone();
+            let slots_end = slots.clone();
+            let last_interaction_move = last_interaction.clone();
+
+            // Must register with { passive: false } to allow preventDefault in touchmove.
+            let on_touchmove = Closure::<dyn Fn(TouchEvent)>::new(move |e: TouchEvent| {
+                e.prevent_default();
+                *last_interaction_move.borrow_mut() = js_sys::Date::now();
+                if let Some(x) = touch_client_x(&e) {
+                    if let Some(el) = progress_ref_move.cast::<web_sys::HtmlElement>() {
+                        let rect = el.get_bounding_client_rect();
+                        let lx = x - rect.left();
+                        let ratio = (lx / rect.width()).clamp(0.0, 1.0);
+                        let t = duration_for_move * ratio;
+                        shared_move.set(t);
+                        drag_time_move.set(t);
+                        current_time_move.set(t);
+                    }
+                }
+            });
+
+            let closures_ref: Rc<RefCell<Option<(Closure<dyn Fn(TouchEvent)>, Closure<dyn Fn(TouchEvent)>)>>> =
+                Rc::new(RefCell::new(None));
+            let closures_end = closures_ref.clone();
+
+            let on_touchend = Closure::<dyn Fn(TouchEvent)>::new(move |_e: TouchEvent| {
+                is_dragging_end.set(false);
+                let t = shared_end.get();
+                let idx = *active_slot_end;
+                if let Some(_video) = video_refs_end[idx].cast::<HtmlVideoElement>() {
+                    let s = slots_end.borrow();
+                    if let Some(ref p) = s[idx].player {
+                        p.seek(t);
+                    }
+                }
+                if let Some((ref mv, ref up)) = *closures_end.borrow() {
+                    if let Some(win) = window() {
+                        let _ = win.remove_event_listener_with_callback("touchmove", mv.as_ref().unchecked_ref());
+                        let _ = win.remove_event_listener_with_callback("touchend", up.as_ref().unchecked_ref());
+                    }
+                }
+                *closures_end.borrow_mut() = None;
+            });
+
+            if let Some(win) = window() {
+                // Register touchmove as non-passive so we can preventDefault.
+                let opts = web_sys::AddEventListenerOptions::new();
+                opts.set_passive(false);
+                let _ = win.add_event_listener_with_callback_and_add_event_listener_options(
+                    "touchmove",
+                    on_touchmove.as_ref().unchecked_ref(),
+                    &opts,
+                );
+                let _ = win.add_event_listener_with_callback("touchend", on_touchend.as_ref().unchecked_ref());
+                *closures_ref.borrow_mut() = Some((on_touchmove, on_touchend));
+            }
+        })
+    };
+
+    // ── Quality callbacks ───────────────────────────────────────────────────
+    let on_quality_toggle = {
+        let quality_menu_open = quality_menu_open.clone();
+        let controls_visible = controls_visible.clone();
+        let last_interaction = last_interaction.clone();
+        Callback::from(move |e: MouseEvent| {
+            e.stop_propagation();
+            controls_visible.set(true);
+            *last_interaction.borrow_mut() = js_sys::Date::now();
+            quality_menu_open.set(!*quality_menu_open);
+        })
+    };
+
+    let on_quality_select = {
+        let selected_quality = selected_quality.clone();
+        let quality_menu_open = quality_menu_open.clone();
+        Callback::from(move |quality: String| {
+            quality_menu_open.set(false);
+            // Persist to localStorage.
+            if let Some(storage) = web_sys::window()
+                .and_then(|w| w.local_storage().ok())
+                .flatten()
+            {
+                let _ = storage.set_item(QUALITY_STORAGE_KEY, &quality);
+            }
+            selected_quality.set(quality);
         })
     };
 
     // ── Render ──────────────────────────────────────────────────────────────
     let active = *active_slot;
     let progress_pct = if *duration > 0.0 {
-        (*current_time / *duration * 100.0).clamp(0.0, 100.0)
+        (if *is_dragging { *drag_time } else { *current_time } / *duration * 100.0).clamp(0.0, 100.0)
     } else {
         0.0
+    };
+
+    // Quality button label.
+    let current_quality_label: String = {
+        let cur = selected_quality.as_str();
+        if quality_labels.is_empty() {
+            QUALITY_OPTIONS.iter().find(|(v, _)| *v == cur).map(|(_, l)| l.to_string()).unwrap_or_else(|| "Auto (ABR)".to_string())
+        } else {
+            quality_labels.iter().find(|(v, _)| v.as_str() == cur).map(|(_, l)| l.clone()).unwrap_or_else(|| "Auto (ABR)".to_string())
+        }
     };
 
     let controls_class = if *controls_visible {
@@ -1050,15 +1428,21 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
 
             // On-screen controls
             <div class={controls_class}>
-                // Progress bar
-                <div ref={progress_ref} class="sv-progress" onclick={on_progress_click}>
+                // Progress bar with drag-to-seek
+                <div ref={progress_ref}
+                    class={if *is_dragging { "sv-progress sv-progress--dragging" } else { "sv-progress" }}
+                    onmousedown={on_progress_mousedown}
+                    ontouchstart={on_progress_touchstart}
+                >
                     <div class="sv-progress__filled" style={format!("width: {}%", progress_pct)} />
+                    <div class={if *is_dragging { "sv-progress__thumb sv-progress__thumb--dragging" } else { "sv-progress__thumb" }}
+                         style={format!("left: {}%", progress_pct)} />
                 </div>
 
                 <div class="sv-controls__row">
                     <div class="sv-controls__left">
                         <span class="sv-time">
-                            { format_time(*current_time) }
+                            { format_time(if *is_dragging { *drag_time } else { *current_time }) }
                             { " / " }
                             { format_time(*duration) }
                         </span>
@@ -1087,6 +1471,32 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
                     </div>
 
                     <div class="sv-controls__right">
+                        // Quality selector
+                        <div class="sv-quality">
+                            <button class="sv-btn sv-btn--text" onclick={on_quality_toggle} title="Stream quality">
+                                { current_quality_label }
+                            </button>
+                            if *quality_menu_open {
+                                <div class="sv-quality__menu">
+                                    { for QUALITY_OPTIONS.iter().map(|(value, label)| {
+                                        let on_select = on_quality_select.clone();
+                                        let is_active = selected_quality.as_str() == *value;
+                                        let vs = value.to_string();
+                                        let display_label = if quality_labels.is_empty() {
+                                            label.to_string()
+                                        } else {
+                                            quality_labels.iter().find(|(v, _)| v.as_str() == *value).map(|(_, l)| l.clone()).unwrap_or_else(|| label.to_string())
+                                        };
+                                        html! {
+                                            <button class={if is_active { "sv-quality__option sv-quality__option--active" } else { "sv-quality__option" }}
+                                                onclick={Callback::from(move |e: MouseEvent| { e.stop_propagation(); on_select.emit(vs.clone()); })}>
+                                                { display_label }
+                                            </button>
+                                        }
+                                    })}
+                                </div>
+                            }
+                        </div>
                         <button class="sv-btn" onclick={on_mute_toggle} aria-label="Toggle mute">
                             if *is_muted {
                                 { icon_volume_off() }

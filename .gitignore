@@ -1,7 +1,7 @@
-target/
-frontend/dist/
-starfin_cache/
-test_videos/
 .direnv
 .envrc
+frontend/dist/
 result
+starfin_cache/
+target/
+test_videos/

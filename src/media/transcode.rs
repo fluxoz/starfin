@@ -29,6 +29,13 @@ use super::hwaccel::HwAccel;
 /// Duration of each DASH segment in seconds.
 pub const SEGMENT_DURATION: f64 = 6.0;
 
+/// Maximum allowed difference (in seconds) between a segment's actual keyframe
+/// time and its nominal start time before we fall back to the actual time for
+/// the tfdt patch.  Within this tolerance we use the nominal time so that
+/// segments create a small overlap (handled seamlessly by MSE coded-frame-
+/// removal) rather than a small gap that causes dash.js gap-jump stutter.
+const SEGMENT_BOUNDARY_TOLERANCE_S: f64 = 0.5;
+
 /// Error message returned when a background operation is cancelled by a kill
 /// flag (e.g. playback started while a background worker was running).
 pub const CANCELLED: &str = "cancelled";
@@ -36,6 +43,86 @@ pub const CANCELLED: &str = "cancelled";
 /// Bitrate for AAC audio encoding in the transcode and hybrid paths.
 /// 256 kbps stereo AAC-LC is transparent quality for music and dialogue.
 const AAC_ENCODE_BITRATE: usize = 256_000;
+
+/// Pre-scan the source video to find the PTS (in seconds) of every video
+/// keyframe (SAP — Stream Access Point).  These positions define the actual
+/// segment boundaries for the remux path.
+///
+/// This is a packet-level scan (no decoding) so it runs quickly even on
+/// multi-hour videos.  The returned vector is sorted in ascending PTS order.
+///
+/// The MPD SegmentTimeline for Original quality uses durations derived from
+/// these positions, and `create_segment()` passes them to `remux_segment()`
+/// so that tfdt matches exactly — zero delta between MPD and content.
+pub fn scan_keyframe_boundaries(abs_path: &str) -> Result<Vec<f64>, String> {
+    super::ensure_init();
+
+    let mut ictx = ffmpeg_next::format::input(&abs_path)
+        .map_err(|e| format!("scan_keyframe_boundaries: open: {e}"))?;
+
+    let video_stream = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Video)
+        .ok_or_else(|| "scan_keyframe_boundaries: no video stream".to_string())?;
+    let video_idx = video_stream.index();
+    let tb = video_stream.time_base();
+
+    let mut keyframes = Vec::new();
+    for (stream, packet) in ictx.packets() {
+        if stream.index() != video_idx {
+            continue;
+        }
+        if !packet.is_key() {
+            continue;
+        }
+        let pts = match packet.pts() {
+            Some(p) => p,
+            None => continue,
+        };
+        let pts_secs = pts as f64 * f64::from(tb.0) / f64::from(tb.1);
+        keyframes.push(pts_secs);
+    }
+
+    keyframes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(keyframes)
+}
+
+/// Given a sorted list of all keyframe PTS positions, find the keyframe
+/// boundaries that are closest to the nominal 6-second grid.  Returns a
+/// list of keyframe PTS values, one per segment, that the server uses as
+/// actual segment start times.
+///
+/// For each nominal boundary (0, 6, 12, 18, ...), picks the keyframe with
+/// PTS >= nominal that is closest.  This produces segments that start at
+/// real SAP positions, matching what a DASH packager (MP4Box, Bento4) would
+/// produce.
+pub fn pick_segment_boundaries(all_keyframes: &[f64], duration: f64) -> Vec<f64> {
+    if all_keyframes.is_empty() {
+        return vec![];
+    }
+
+    let num_nominal = (duration / SEGMENT_DURATION).ceil() as usize;
+    let mut boundaries = Vec::with_capacity(num_nominal);
+    let mut kf_idx = 0;
+
+    for seg in 0..num_nominal {
+        let nominal = seg as f64 * SEGMENT_DURATION;
+
+        // Advance to the first keyframe at or after the nominal boundary.
+        while kf_idx < all_keyframes.len() && all_keyframes[kf_idx] < nominal - 0.001 {
+            kf_idx += 1;
+        }
+
+        if kf_idx < all_keyframes.len() {
+            boundaries.push(all_keyframes[kf_idx]);
+        } else {
+            // Past the last keyframe — use the last one.
+            boundaries.push(*all_keyframes.last().unwrap());
+        }
+    }
+
+    boundaries
+}
 
 /// Create a single fMP4 segment — remux if possible, transcode otherwise.
 ///
@@ -69,7 +156,38 @@ pub async fn transcode_segment(
     let seg_dir = seg_dir.to_owned();
     let hwaccel = hwaccel.clone();
     tokio::task::spawn_blocking(move || {
-        create_segment(&abs_path, &seg_dir, seg_index, &hwaccel, quality, None)
+        create_segment(&abs_path, &seg_dir, seg_index, &hwaccel, quality, None, None)
+    })
+    .await
+    .map_err(|e| format!("transcode task panicked: {e}"))?
+}
+
+/// Like [`transcode_segment`] but accepts pre-scanned keyframe boundaries.
+///
+/// When `keyframe_range` is `Some((start, end))`, the remux/hybrid path uses
+/// these exact positions so the segment content matches the MPD SegmentTimeline
+/// exactly — zero delta between `actual_keyframe` and the declared segment
+/// position.
+pub async fn transcode_segment_with_boundaries(
+    abs_path: &str,
+    seg_dir: &Path,
+    seg_index: usize,
+    hwaccel: &HwAccel,
+    quality: super::transcode::Quality,
+    keyframe_range: Option<(f64, f64)>,
+) -> Result<(), String> {
+    let filename = format!("seg_{:05}.m4s", seg_index);
+    let seg_path = seg_dir.join(&filename);
+
+    if seg_path.exists() {
+        return Ok(());
+    }
+
+    let abs_path = abs_path.to_owned();
+    let seg_dir = seg_dir.to_owned();
+    let hwaccel = hwaccel.clone();
+    tokio::task::spawn_blocking(move || {
+        create_segment(&abs_path, &seg_dir, seg_index, &hwaccel, quality, None, keyframe_range)
     })
     .await
     .map_err(|e| format!("transcode task panicked: {e}"))?
@@ -100,7 +218,7 @@ pub async fn transcode_segment_with_kill(
     let seg_dir = seg_dir.to_owned();
     let hwaccel = hwaccel.clone();
     tokio::task::spawn_blocking(move || {
-        create_segment(&abs_path, &seg_dir, seg_index, &hwaccel, quality, Some(&kill))
+        create_segment(&abs_path, &seg_dir, seg_index, &hwaccel, quality, Some(&kill), None)
     })
     .await
     .map_err(|e| format!("transcode task panicked: {e}"))?
@@ -548,7 +666,7 @@ pub fn create_init_segment(abs_path: &str, quality: Quality, hwaccel: &HwAccel, 
     // Generate segment 0 in the cache directory itself.  This file stays
     // on disk so that `get_segment` serves the exact same bytes the init
     // segment's moov was derived from.
-    create_segment(abs_path, seg_cache_dir, 0, hwaccel, quality, None)?;
+    create_segment(abs_path, seg_cache_dir, 0, hwaccel, quality, None, None)?;
     let data = std::fs::read(&seg0_path)
         .map_err(|e| format!("failed to read segment 0 from {}: {e}", seg0_path.display()))?;
     extract_ftyp_moov(&data)
@@ -921,6 +1039,13 @@ fn patch_traf_tfdt(
 
 // ── Segment creation: decide remux vs transcode ─────────────────────────────
 
+/// Create a single fMP4 segment.
+///
+/// `keyframe_range`: For the remux path, the actual keyframe PTS that this
+/// segment should start at and the next keyframe PTS (or video duration)
+/// that defines the end.  When provided, the segment uses these exact
+/// positions instead of nominal boundaries, producing zero delta between
+/// the MPD SegmentTimeline and actual segment content.
 fn create_segment(
     abs_path: &str,
     seg_dir: &Path,
@@ -928,10 +1053,11 @@ fn create_segment(
     hwaccel: &HwAccel,
     quality: Quality,
     kill: Option<&AtomicBool>,
+    keyframe_range: Option<(f64, f64)>,
 ) -> Result<(), String> {
     super::ensure_init();
 
-    let start_time = seg_index as f64 * SEGMENT_DURATION;
+    let nominal_start = seg_index as f64 * SEGMENT_DURATION;
     let tmp_filename = format!(".seg_{:05}.m4s.tmp", seg_index);
     let tmp_path = seg_dir.join(&tmp_filename);
     let filename = format!("seg_{:05}.m4s", seg_index);
@@ -942,33 +1068,56 @@ fn create_segment(
         .map_err(|e| format!("failed to open input: {e}"))?;
 
     // Decide: remux (fast copy) or transcode (re-encode).
-    // The remux and hybrid paths return the actual PTS (in seconds) of the
-    // first video keyframe so that patch_segment_tfdt can place the segment
-    // at its true position on the presentation timeline.  The transcode path
-    // forces a keyframe at the segment boundary, so start_time is exact.
+    //
+    // When keyframe_range is provided (from pre-scanned boundaries), the
+    // remux/hybrid paths use the actual keyframe start position.  The
+    // returned actual_start will match the keyframe_range start, so
+    // tfdt == MPD declared position == actual content → zero delta.
+    //
+    // When keyframe_range is not provided, fall back to nominal boundaries.
+    let (seg_start, seg_end) = if let Some((kf_start, kf_end)) = keyframe_range {
+        (kf_start, kf_end)
+    } else {
+        (nominal_start, nominal_start + SEGMENT_DURATION)
+    };
+
     let actual_start = if quality.can_remux() && source_is_remuxable(&ictx) {
         // Pure remux — both video and audio packets copied directly.
-        remux_segment(&mut ictx, start_time, &tmp_path, kill)?
+        remux_segment(&mut ictx, seg_start, seg_end, &tmp_path, kill)?
     } else if quality.can_remux() && video_is_remuxable(&ictx) {
         // Hybrid — video packets copied, audio transcoded to stereo AAC.
-        // This handles multi-channel AAC, non-AAC/MP3 codecs, etc.
-        hybrid_segment(&mut ictx, start_time, &tmp_path, kill)?
+        hybrid_segment(&mut ictx, seg_start, seg_end, &tmp_path, kill)?
     } else {
         // For Original quality with incompatible codecs, fall back to the
         // same settings as High (native resolution, best quality).
         let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
-        transcode_segment_inprocess(&mut ictx, start_time, hwaccel, effective_quality, &tmp_path, kill)?;
-        start_time
+        transcode_segment_inprocess(&mut ictx, nominal_start, hwaccel, effective_quality, &tmp_path, kill)?;
+        nominal_start
     };
 
     // Patch tfdt baseMediaDecodeTime so each segment is positioned at the
-    // correct absolute time on the presentation timeline.  FFmpeg's fMP4
-    // muxer always normalizes DTS to 0, so without this patch all segments
-    // would overlap at time 0 and MSE Segments mode would show only ~6 s.
+    // correct absolute time on the presentation timeline.
+    //
+    // When keyframe_range is provided (remux path with pre-scanned
+    // boundaries), actual_start == keyframe_range.0 == MPD declared
+    // position, so we use it directly — zero delta.
+    //
+    // When no keyframe_range (transcode path or fallback), use nominal
+    // snapping: within 500ms tolerance, snap to nominal to create overlap
+    // rather than gaps.
+    let tfdt_time = if keyframe_range.is_some() {
+        // Pre-scanned: actual_start is the exact keyframe position that
+        // the MPD SegmentTimeline declares.  Use it directly.
+        actual_start
+    } else if (actual_start - nominal_start).abs() < SEGMENT_BOUNDARY_TOLERANCE_S {
+        nominal_start
+    } else {
+        actual_start
+    };
     eprintln!(
-        "[segment] seg {seg_index}: nominal_start={start_time:.3}s, actual_keyframe={actual_start:.3}s",
+        "[segment] seg {seg_index}: nominal_start={nominal_start:.3}s, actual_keyframe={actual_start:.3}s, tfdt={tfdt_time:.3}s",
     );
-    patch_segment_tfdt(&tmp_path, actual_start)?;
+    patch_segment_tfdt(&tmp_path, tfdt_time)?;
 
     // Atomic rename.
     std::fs::rename(&tmp_path, &seg_path)
@@ -990,10 +1139,10 @@ fn create_segment(
 fn remux_segment(
     ictx: &mut ffmpeg_next::format::context::Input,
     start_time: f64,
+    end_time: f64,
     tmp_path: &Path,
     kill: Option<&AtomicBool>,
 ) -> Result<f64, String> {
-    let end_time = start_time + SEGMENT_DURATION;
 
     // Find best video/audio streams.
     let video_idx = ictx
@@ -1183,11 +1332,17 @@ fn remux_segment(
 
     write_fmp4_trailer(&mut octx)?;
 
-    // Return the earliest PTS of all content in the segment (including
-    // audio pre-roll).  This is used by patch_segment_tfdt to set
-    // baseMediaDecodeTime correctly — it must match FFmpeg's DTS
-    // normalization origin (the first packet written).
-    Ok(earliest_pts_secs.unwrap_or(keyframe_pts_secs))
+    // Return the video keyframe PTS.  When pre-scanned boundaries are used,
+    // start_time is already the actual keyframe position, so keyframe_pts_secs
+    // ≈ start_time.  patch_segment_tfdt uses this to set baseMediaDecodeTime.
+    //
+    // We return the keyframe PTS (not earliest_pts including audio pre-roll)
+    // because the MPD SegmentTimeline declares segment positions based on
+    // keyframe boundaries.  The audio pre-roll starts slightly before the
+    // keyframe but FFmpeg's DTS normalization maps the first written packet
+    // (which may be audio pre-roll) to DTS 0, and tfdt offsets everything.
+    // Using keyframe_pts ensures tfdt matches the MPD exactly.
+    Ok(keyframe_pts_secs)
 }
 
 // ── Hybrid path (video remux + audio transcode to stereo AAC) ───────────────
@@ -1202,10 +1357,10 @@ fn remux_segment(
 fn hybrid_segment(
     ictx: &mut ffmpeg_next::format::context::Input,
     start_time: f64,
+    end_time: f64,
     tmp_path: &Path,
     kill: Option<&AtomicBool>,
 ) -> Result<f64, String> {
-    let end_time = start_time + SEGMENT_DURATION;
 
     // Find best video/audio streams.
     let video_idx = ictx
@@ -1550,10 +1705,8 @@ fn hybrid_segment(
 
     write_fmp4_trailer(&mut octx)?;
 
-    // Return the earliest PTS of all content in the segment (including
-    // audio pre-roll).  This is used by patch_segment_tfdt to set
-    // baseMediaDecodeTime correctly.
-    Ok(earliest_pts_secs.unwrap_or(keyframe_pts_secs))
+    // Return the video keyframe PTS (see remux_segment for rationale).
+    Ok(keyframe_pts_secs)
 }
 
 // ── Transcode path (re-encode — used for incompatible codecs or scaling) ────
@@ -1933,7 +2086,15 @@ fn transcode_segment_body(
                     let pts = decoded.pts().unwrap_or(0);
                     let pts_secs = pts as f64 * f64::from(video_time_base.0) / f64::from(video_time_base.1);
 
-                    if pts_secs >= end_time {
+                    // Include the frame AT end_time to create a tiny overlap
+                    // with the next segment (one frame, ~33ms at 30fps).
+                    // MSE handles overlap via coded-frame-removal (seamless).
+                    // Using >= here would EXCLUDE this frame, making the
+                    // segment ~33ms SHORT of its declared 6000ms duration in
+                    // the MPD.  The micro-gap causes the video element to
+                    // stall briefly at every segment boundary (the "stutter
+                    // just prior to next segment fetch" bug).
+                    if pts_secs > end_time {
                         done = true;
                         break;
                     }
@@ -2014,11 +2175,14 @@ fn transcode_segment_body(
                         let mut audio_frame = ffmpeg_next::util::frame::Audio::empty();
                         while adec.receive_frame(&mut audio_frame).is_ok() {
                             // Time-range filter using input time base.
+                            // Use `>` (not `>=`) for the upper bound so that
+                            // audio frames at exactly end_time are INCLUDED,
+                            // matching the video boundary fix above.
                             if let Some(apts) = audio_frame.pts() {
                                 let apts_secs = apts as f64
                                     * f64::from(audio_time_base.0)
                                     / f64::from(audio_time_base.1);
-                                if apts_secs < start_time || apts_secs >= end_time {
+                                if apts_secs < start_time || apts_secs > end_time {
                                     continue;
                                 }
                             }

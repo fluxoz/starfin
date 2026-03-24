@@ -616,6 +616,126 @@ async fn get_quality_options() -> impl Responder {
     ]))
 }
 
+/// `GET /api/videos/{id}/quality-info` – return quality options with estimated
+/// bitrate and resolution specific to this video.
+async fn get_video_quality_info(
+    id: web::Path<String>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let (abs, _title) = match find_video(&state, &id) {
+        Some(v) => v,
+        None => return HttpResponse::NotFound().body("video not found"),
+    };
+
+    let stream_info = tokio::task::spawn_blocking(move || {
+        media::probe::probe_stream_info(&abs)
+    })
+    .await
+    .unwrap_or_default();
+
+    let qualities = [Quality::Original, Quality::High, Quality::Medium, Quality::Low];
+    let options: Vec<serde_json::Value> = qualities
+        .iter()
+        .map(|&q| {
+            let bw = estimate_bandwidth(&stream_info, q);
+            let (w, h) = estimate_resolution(&stream_info, q);
+            let mbps = bw as f64 / 1_000_000.0;
+            let label = if mbps >= 1.0 {
+                format!("{}p · {:.1} Mbps", h, mbps)
+            } else {
+                format!("{}p · {} Kbps", h, (bw / 1000) as u32)
+            };
+            serde_json::json!({
+                "value": q.as_str(),
+                "label": label,
+                "width": w,
+                "height": h,
+                "bitrate": bw,
+            })
+        })
+        .collect();
+
+    HttpResponse::Ok().json(options)
+}
+
+/// Estimate the DASH `bandwidth` attribute (bits/sec) for a given quality.
+///
+/// For `Original` the probed container bitrate is used directly.  For
+/// transcoded qualities we scale by the pixel-count ratio (area) and an
+/// empirical CRF factor so that the MPD advertises a realistic value and
+/// the frontend can display Mbps in the quality selector.
+fn estimate_bandwidth(info: &media::probe::StreamInfo, quality: Quality) -> u64 {
+    // Fallback: if probing returned 0 use a conservative 5 Mbps default.
+    let source_bps = if info.bitrate > 0 { info.bitrate } else { 5_000_000 };
+
+    match quality {
+        Quality::Original => source_bps,
+        Quality::High => {
+            // CRF 18 at native res ≈ 80 % of original (re-encode removes B-frame waste).
+            (source_bps as f64 * 0.8) as u64
+        }
+        Quality::Medium => {
+            // ≤ 1280×720, CRF 26 — resolution ratio + CRF compression.
+            let max_w = 1280u32;
+            let sw = info.width.max(1);
+            let area_ratio = if sw > max_w {
+                let r = max_w as f64 / sw as f64;
+                r * r // both dimensions scale
+            } else {
+                1.0
+            };
+            // CRF 26 vs 18: roughly 0.35× the bitrate for the same content.
+            let crf_factor = 0.35;
+            ((source_bps as f64) * area_ratio * crf_factor).max(500_000.0) as u64
+        }
+        Quality::Low => {
+            // ≤ 854×480, CRF 30.
+            let max_w = 854u32;
+            let sw = info.width.max(1);
+            let area_ratio = if sw > max_w {
+                let r = max_w as f64 / sw as f64;
+                r * r
+            } else {
+                1.0
+            };
+            // CRF 30 vs 18: roughly 0.18× the bitrate.
+            let crf_factor = 0.18;
+            ((source_bps as f64) * area_ratio * crf_factor).max(300_000.0) as u64
+        }
+    }
+}
+
+/// Estimate the output resolution for a given quality.
+///
+/// Mirrors the logic in `transcode.rs` — scale down to fit within max width
+/// while keeping aspect ratio and rounding height to even.
+fn estimate_resolution(info: &media::probe::StreamInfo, quality: Quality) -> (u32, u32) {
+    let (sw, sh) = (info.width.max(1), info.height.max(1));
+    match quality {
+        Quality::Original | Quality::High => (sw, sh),
+        Quality::Medium => {
+            let max_w = 1280u32;
+            if sw <= max_w {
+                (sw, sh)
+            } else {
+                let r = max_w as f64 / sw as f64;
+                let h = ((sh as f64 * r) as u32) & !1;
+                (max_w, h)
+            }
+        }
+        Quality::Low => {
+            let max_w = 854u32;
+            if sw <= max_w {
+                (sw, sh)
+            } else {
+                let r = max_w as f64 / sw as f64;
+                let h = ((sh as f64 * r) as u32) & !1;
+                (max_w, h)
+            }
+        }
+    }
+}
+
 // ── Startup healthchecks ──────────────────────────────────────────────────────
 
 /// Run detailed healthchecks at startup and log results so they are visible in
@@ -942,9 +1062,60 @@ struct AppState {
     /// Last known playback positions per video ID (populated by player_ws).
     /// Used for resume-on-reload support.
     playback_positions: Arc<RwLock<HashMap<String, f64>>>,
+    /// Cached keyframe boundaries per video ID.
+    /// Maps video_id → Vec of keyframe PTS positions (sorted ascending).
+    /// Pre-scanned once on first access and used by the MPD generator and
+    /// segment server for the Original quality remux path.
+    keyframe_cache: Arc<RwLock<HashMap<String, Vec<f64>>>>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Get or lazily scan keyframe boundaries for a video.
+///
+/// For the Original quality remux path, the MPD and segment server need to
+/// know actual keyframe positions so the SegmentTimeline and tfdt match
+/// exactly (zero delta).  Boundaries are scanned once and cached in memory.
+async fn get_keyframe_boundaries(
+    state: &AppState,
+    video_id: &str,
+    abs_path: &str,
+    duration: f64,
+) -> Vec<f64> {
+    // Check cache first.
+    {
+        let cache = state.keyframe_cache.read();
+        if let Some(boundaries) = cache.get(video_id) {
+            return boundaries.clone();
+        }
+    }
+
+    // Scan keyframes (fast packet-level scan, no decoding).
+    let abs_path_owned = abs_path.to_owned();
+    let all_keyframes = tokio::task::spawn_blocking(move || {
+        media::transcode::scan_keyframe_boundaries(&abs_path_owned)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("keyframe scan panicked: {e}")));
+
+    let boundaries = match all_keyframes {
+        Ok(kfs) => media::transcode::pick_segment_boundaries(&kfs, duration),
+        Err(e) => {
+            eprintln!("[keyframe] scan failed for {video_id}: {e}");
+            // Fall back to nominal boundaries.
+            let n = (duration / SEGMENT_DURATION).ceil() as usize;
+            (0..n).map(|i| i as f64 * SEGMENT_DURATION).collect()
+        }
+    };
+
+    // Cache for future requests.
+    {
+        let mut cache = state.keyframe_cache.write();
+        cache.insert(video_id.to_string(), boundaries.clone());
+    }
+
+    boundaries
+}
 
 /// Stable, deterministic video ID derived from the relative path.
 fn video_id(rel_path: &str) -> String {
@@ -2103,6 +2274,21 @@ async fn get_manifest(
     })
     .await
     .unwrap_or_default();
+
+    // Probe resolution and bitrate for accurate DASH manifest bandwidth and
+    // for the quality-info API.
+    let abs_for_stream = abs_path.clone();
+    let stream_info = tokio::task::spawn_blocking(move || {
+        media::probe::probe_stream_info(&abs_for_stream)
+    })
+    .await
+    .unwrap_or_default();
+
+    // Estimate bandwidth for the selected quality.  For Original/High the
+    // source bitrate is accurate; for lower qualities we scale down based
+    // on the resolution ratio and CRF impact.
+    let bandwidth: u64 = estimate_bandwidth(&stream_info, quality);
+    let (rep_width, rep_height) = estimate_resolution(&stream_info, quality);
     let codecs_attr = codec_info
         .codecs_string()
         .map(|c| format!(" codecs=\"{c}\""))
@@ -2117,7 +2303,19 @@ async fn get_manifest(
 
     // Calculate number of segments based on duration (f64 for sub-second precision).
     let duration = duration_secs;
-    let num_segments = (duration / SEGMENT_DURATION).ceil() as usize;
+
+    // For Original quality (remux path), pre-scan keyframe boundaries so the
+    // MPD SegmentTimeline matches actual segment content exactly (zero delta).
+    // For transcoded qualities, keyframes are forced at exact 6s boundaries
+    // so nominal durations are accurate.
+    let boundaries = if quality == Quality::Original {
+        let abs_str = abs_path.to_str().unwrap_or_default();
+        get_keyframe_boundaries(&state, &id, abs_str, duration).await
+    } else {
+        let n = (duration / SEGMENT_DURATION).ceil() as usize;
+        (0..n).map(|i| i as f64 * SEGMENT_DURATION).collect()
+    };
+    let num_segments = boundaries.len();
 
     // Format duration as ISO 8601 duration for MPD.
     // Use fractional seconds so that the frontend gets sub-second precision,
@@ -2144,9 +2342,13 @@ async fn get_manifest(
          subsegmentStartsWithSAP=\"1\">\n"
     ));
     mpd.push_str(&format!(
-        "      <Representation id=\"{quality}\" bandwidth=\"2000000\"{codecs}>\n",
+        "      <Representation id=\"{quality}\" bandwidth=\"{bandwidth}\"\
+         {codecs} width=\"{rep_width}\" height=\"{rep_height}\">\n",
         quality = quality.as_str(),
+        bandwidth = bandwidth,
         codecs = codecs_attr,
+        rep_width = rep_width,
+        rep_height = rep_height,
     ));
 
     // SegmentTemplate with explicit SegmentTimeline for precise duration control.
@@ -2159,30 +2361,49 @@ async fn get_manifest(
         quality = quality.as_str()
     ));
 
-    // Build SegmentTimeline — use the `r` (repeat) attribute per DASH-IF IOP
-    // to compress identical-duration segments into a single <S> element.
+    // Build SegmentTimeline with actual durations derived from keyframe
+    // boundaries.  For Original quality, these reflect real keyframe positions
+    // (zero delta).  For transcoded qualities, boundaries are nominal 6s.
+    //
+    // Each <S> element declares the duration (d) of one segment.  Consecutive
+    // segments with the same duration use the r= (repeat) attribute per
+    // DASH-IF IOP to compress the timeline.
     mpd.push_str("          <SegmentTimeline>\n");
-    let normal_duration_ms = (SEGMENT_DURATION * 1000.0) as u64;
-    if num_segments > 1 {
-        // First (num_segments - 1) segments all have the same duration.
-        // r= gives additional repetitions beyond the first occurrence, so
-        // r=(num_segments - 2) encodes (num_segments - 1) segments total.
-        let repeats = num_segments - 2; // r=N → N+1 segments of this duration
-        mpd.push_str(&format!(
-            "            <S d=\"{normal_duration_ms}\" r=\"{repeats}\"/>\n"
-        ));
-        // Last segment may be shorter.
-        let last_start = (num_segments - 1) as f64 * SEGMENT_DURATION;
-        let last_duration_ms = ((duration - last_start) * 1000.0).max(1.0) as u64;
-        mpd.push_str(&format!(
-            "            <S d=\"{last_duration_ms}\"/>\n"
-        ));
-    } else if num_segments == 1 {
-        let seg_duration_ms = (duration * 1000.0).max(1.0) as u64;
-        mpd.push_str(&format!(
-            "            <S d=\"{seg_duration_ms}\"/>\n"
-        ));
+
+    // Compute per-segment durations in ms from the boundary positions.
+    let mut durations_ms: Vec<u64> = Vec::with_capacity(num_segments);
+    for i in 0..num_segments {
+        let seg_start = boundaries[i];
+        let seg_end = if i + 1 < boundaries.len() {
+            boundaries[i + 1]
+        } else {
+            duration
+        };
+        let dur_ms = ((seg_end - seg_start) * 1000.0).round().max(1.0) as u64;
+        durations_ms.push(dur_ms);
     }
+
+    // Write <S> elements with r= compression for runs of equal durations.
+    let mut i = 0;
+    while i < durations_ms.len() {
+        let d = durations_ms[i];
+        let mut count = 1usize;
+        while i + count < durations_ms.len() && durations_ms[i + count] == d {
+            count += 1;
+        }
+        if count > 1 {
+            mpd.push_str(&format!(
+                "            <S d=\"{d}\" r=\"{}\"/>\n",
+                count - 1
+            ));
+        } else {
+            mpd.push_str(&format!(
+                "            <S d=\"{d}\"/>\n"
+            ));
+        }
+        i += count;
+    }
+
     mpd.push_str("          </SegmentTimeline>\n");
     mpd.push_str("        </SegmentTemplate>\n");
     mpd.push_str("      </Representation>\n");
@@ -2480,7 +2701,29 @@ async fn get_segment(
         };
 
         // We own the transcode job.
-        let result = transcode_segment(&abs_str, &seg_dir, seg_index, &state.hwaccel, quality).await;
+        // For Original quality, look up pre-scanned keyframe boundaries so
+        // the segment uses exact keyframe positions (zero delta).
+        let keyframe_range = if quality == Quality::Original {
+            let abs_path_ref: &Path = abs_str.as_ref();
+            let (duration_secs, _) = probe_video(abs_path_ref).await;
+            let boundaries = get_keyframe_boundaries(&state, &id, &abs_str, duration_secs).await;
+            if seg_index < boundaries.len() {
+                let kf_start = boundaries[seg_index];
+                let kf_end = if seg_index + 1 < boundaries.len() {
+                    boundaries[seg_index + 1]
+                } else {
+                    duration_secs
+                };
+                Some((kf_start, kf_end))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let result = media::transcode::transcode_segment_with_boundaries(
+            &abs_str, &seg_dir, seg_index, &state.hwaccel, quality, keyframe_range,
+        ).await;
 
         // Remove from the inflight map first (no new subscribers can join
         // after this point) then broadcast the result to existing waiters.
@@ -3733,6 +3976,7 @@ async fn main() -> std::io::Result<()> {
         segment_inflight: Arc::new(Mutex::new(HashMap::new())),
         theme_css,
         playback_positions: Arc::new(RwLock::new(HashMap::new())),
+        keyframe_cache: Arc::new(RwLock::new(HashMap::new())),
     });
 
     // One-time background scan at startup to refresh the index immediately.
@@ -3992,6 +4236,10 @@ async fn main() -> std::io::Result<()> {
             .route(
                 "/api/videos/{id}/manifest.mpd",
                 web::get().to(get_manifest),
+            )
+            .route(
+                "/api/videos/{id}/quality-info",
+                web::get().to(get_video_quality_info),
             )
             .route(
                 "/api/videos/{id}/init.mp4",

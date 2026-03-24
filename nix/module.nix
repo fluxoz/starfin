@@ -18,6 +18,7 @@
 #               theme = "nord";          # or "catppuccin", "dracula", "jetson"
 #               design = "editorial";    # or "neubrutalist", "aero"
 #               # themeFile = ./my-theme.toml;   # fully custom TOML theme
+#               # devMetrics = true;             # show live metrics overlay
 #             };
 #           }
 #         ];
@@ -29,6 +30,12 @@
 let
   inherit (lib) mkEnableOption mkOption mkIf types literalExpression getExe;
   cfg = config.services.starfin;
+  # Select the dev-metrics package variant when devMetrics is enabled, unless
+  # the user has explicitly set the 'package' option to a custom value.
+  effectivePkg =
+    if cfg.devMetrics
+    then self.packages.${pkgs.stdenv.hostPlatform.system}.devMetrics
+    else cfg.package;
 in
 {
   options.services.starfin = {
@@ -164,6 +171,23 @@ in
         These take precedence over any module-managed variables.
       '';
     };
+
+    devMetrics = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Enable the developer metrics overlay in the video player.  When set to
+        `true`, a live overlay in the top-left corner of the player shows the
+        current resolution, frame rate, bitrate and playback timestamp, updating
+        in real time.
+
+        When enabled, the service uses a separate package variant compiled with
+        `STARFIN_DEV=1` (`starfin.packages.''${system}.devMetrics`) instead of
+        the `package` option.  To customise the package used for the dev-metrics
+        build, set the `package` option and build your own variant with the
+        `STARFIN_DEV=1` environment variable set during the WASM compile step.
+      '';
+    };
   };
 
   config = mkIf cfg.enable {
@@ -210,7 +234,7 @@ in
       }) // cfg.extraEnvironment;
 
       serviceConfig = {
-        ExecStart = getExe cfg.package;
+        ExecStart = getExe effectivePkg;
         User = cfg.user;
         Group = cfg.group;
         Restart = "on-failure";

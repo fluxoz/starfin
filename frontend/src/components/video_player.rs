@@ -638,6 +638,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let selected_quality = selected_quality.clone();
         let resume_position = resume_position.clone();
         let is_buffering = is_buffering.clone();
+        let dev_bitrate_kbps = dev_bitrate_kbps.clone();
 
         use_effect_with(
             props.video_id.clone(),
@@ -687,6 +688,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 let error_clone = error.clone();
                 let dash_player_ref_clone = dash_player_ref.clone();
                 let is_buffering_clone = is_buffering.clone();
+                let dev_bitrate_kbps_init = dev_bitrate_kbps.clone();
 
                 spawn_local(async move {
                     TimeoutFuture::new(50).await;
@@ -812,6 +814,55 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     });
                     player.on("canPlay", on_can_play.as_ref().unchecked_ref());
                     on_can_play.forget();
+
+                    // ── Real-time bitrate updates (DEV_MODE only) ────────────
+                    // The 150 ms polling loop updates dev_bitrate_kbps on every
+                    // tick, but hooking into qualityChangeRendered ensures the
+                    // overlay reflects a quality switch immediately — without
+                    // waiting for the next poll cycle.
+                    if DEV_MODE {
+                        let dev_bitrate_kbps_qc = dev_bitrate_kbps_init.clone();
+                        let player_js_for_qc = player.player.clone();
+                        let on_quality_change = Closure::<dyn Fn(JsValue)>::new(move |e: JsValue| {
+                            // Only act on video track changes.
+                            let media_type = js_sys::Reflect::get(&e, &"mediaType".into())
+                                .ok()
+                                .and_then(|v| v.as_string());
+                            if media_type.as_deref() != Some("video") {
+                                return;
+                            }
+                            // Read the new representation's bandwidth immediately.
+                            let args = js_sys::Array::new();
+                            args.push(&JsValue::from_str("video"));
+                            let rep = js_sys::Reflect::get(
+                                    &player_js_for_qc,
+                                    &"getCurrentRepresentationForType".into(),
+                                )
+                                .ok()
+                                .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+                                .and_then(|f| {
+                                    js_sys::Reflect::apply(&f, &player_js_for_qc, &args).ok()
+                                });
+                            if let Some(rep) = rep {
+                                if !rep.is_null() && !rep.is_undefined() {
+                                    if let Some(bps) = js_sys::Reflect::get(
+                                            &rep,
+                                            &"bandwidth".into(),
+                                        )
+                                        .ok()
+                                        .and_then(|v| v.as_f64())
+                                    {
+                                        dev_bitrate_kbps_qc.set((bps / 1000.0) as u32);
+                                    }
+                                }
+                            }
+                        });
+                        player.on(
+                            "qualityChangeRendered",
+                            on_quality_change.as_ref().unchecked_ref(),
+                        );
+                        on_quality_change.forget();
+                    }
 
                     // ── Initialize following the reference client pattern ─────
                     //

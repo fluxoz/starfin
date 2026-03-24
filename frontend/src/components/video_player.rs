@@ -78,25 +78,60 @@ impl DashPlayer {
         Self { player }
     }
 
-    /// Initialize the player with a video element and manifest URL.
+    /// Initialize the player internals without loading a source.
     ///
-    /// `start_time` is the optional resume position (seconds from start).
-    /// Per the dash.js docs the 4th arg to `initialize()` is `startTime`
-    /// which lets the player seek correctly from the very first segment
-    /// request rather than loading from the beginning and seeking later.
-    fn initialize(&self, video: &HtmlVideoElement, url: &str, auto_play: bool, start_time: f64) {
+    /// Matches the reference client pattern:
+    ///   `player.initialize(videoElement, null, autoPlay)`
+    ///
+    /// Settings MUST be applied with `update_settings()` AFTER this call
+    /// but BEFORE `attach_source()`, so that gap handling, buffer config,
+    /// and ABR rules are active from the very first segment request.
+    fn initialize(&self) {
         let init_fn = js_sys::Reflect::get(&self.player, &"initialize".into())
             .unwrap()
             .dyn_into::<js_sys::Function>()
             .unwrap();
-        let args = js_sys::Array::new();
-        args.push(video);
-        args.push(&JsValue::from_str(url));
-        args.push(&JsValue::from_bool(auto_play));
-        if start_time > 0.0 {
-            args.push(&JsValue::from_f64(start_time));
+        let _ = init_fn.call0(&self.player);
+    }
+
+    /// Set the autoplay flag.
+    ///
+    /// Must be called after `initialize()` and before `attach_source()`.
+    fn set_auto_play(&self, auto_play: bool) {
+        if let Ok(func) = js_sys::Reflect::get(&self.player, &"setAutoPlay".into()) {
+            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                let _ = func.call1(&self.player, &JsValue::from_bool(auto_play));
+            }
         }
-        let _ = js_sys::Reflect::apply(&init_fn, &self.player, &args);
+    }
+
+    /// Attach the video element to the player.
+    ///
+    /// Matches `player.attachView(videoElement)` from the reference client.
+    fn attach_view(&self, video: &HtmlVideoElement) {
+        if let Ok(func) = js_sys::Reflect::get(&self.player, &"attachView".into()) {
+            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                let _ = func.call1(&self.player, video);
+            }
+        }
+    }
+
+    /// Load a manifest and optionally seek to a start position.
+    ///
+    /// Matches `player.attachSource(url, startTime)` from the reference client.
+    /// The `start_time` parameter (seconds) makes dash.js request the correct
+    /// segments from the start instead of loading from 0 and then seeking.
+    fn attach_source(&self, url: &str, start_time: f64) {
+        if let Ok(func) = js_sys::Reflect::get(&self.player, &"attachSource".into()) {
+            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                let args = js_sys::Array::new();
+                args.push(&JsValue::from_str(url));
+                if start_time > 0.0 {
+                    args.push(&JsValue::from_f64(start_time));
+                }
+                let _ = js_sys::Reflect::apply(&func, &self.player, &args);
+            }
+        }
     }
 
     /// Seek to a position in seconds.
@@ -568,20 +603,36 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     // Create dash.js player
                     let player = DashPlayer::create();
 
-                    // Configure dash.js v5 settings to match our server
+                    // Configure dash.js v5 settings to match the reference client.
+                    //
+                    // The reference client (main.js) uses these defaults:
+                    //   - scheduleWhilePaused: true
+                    //   - jumpGaps: true
+                    //   - stallThreshold: 0.3
+                    //   - fastSwitchEnabled: true
+                    //   - reuseExistingSourceBuffers: true
+                    //
+                    // We MUST apply settings after initialize() but BEFORE
+                    // attachSource() so they're active from the first segment.
                     let settings = js_sys::eval(&format!(
                         r#"({{
                             debug: {{
                                 logLevel: 1
                             }},
                             streaming: {{
+                                scheduling: {{
+                                    scheduleWhilePaused: true
+                                }},
                                 buffer: {{
                                     bufferTimeDefault: {buf_target},
                                     bufferTimeAtTopQuality: {buf_target},
                                     bufferTimeAtTopQualityLongForm: {buf_target},
                                     bufferToKeep: {back_buf},
                                     bufferPruningInterval: {prune_interval},
-                                    avoidCurrentTimeRangePruning: true
+                                    avoidCurrentTimeRangePruning: true,
+                                    stallThreshold: 0.3,
+                                    reuseExistingSourceBuffers: true,
+                                    fastSwitchEnabled: true
                                 }},
                                 gaps: {{
                                     jumpGaps: true,
@@ -667,11 +718,24 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     player.on("streamInitialized", on_stream_init.as_ref().unchecked_ref());
                     on_stream_init.forget();
 
-                    // Initialize the player — dash.js handles MSE, MPD, segments.
-                    // Pass start_pos as the 4th argument so dash.js requests the
-                    // correct segments from the start instead of loading from 0
-                    // and then seeking (which bypasses internal scheduling).
-                    player.initialize(&video, &manifest_url, true, start_pos);
+                    // Initialize the player following the reference client pattern:
+                    //   1. player = dashjs.MediaPlayer().create()     (done above)
+                    //   2. player.initialize()                         (no args — bare init)
+                    //   3. player.updateSettings(config)               (before source!)
+                    //   4. player.setAutoPlay(true)
+                    //   5. player.attachView(videoElement)
+                    //   6. player.attachSource(url, startTime)
+                    //
+                    // This order ensures ALL settings (gaps, buffer, ABR, error
+                    // recovery) are active from the very first segment request.
+                    // Our previous approach passed the URL directly to
+                    // initialize(), which started fetching immediately —
+                    // before settings were applied.
+                    player.initialize();
+                    player.update_settings(&settings);
+                    player.set_auto_play(true);
+                    player.attach_view(&video);
+                    player.attach_source(&manifest_url, start_pos);
 
                     status_clone.set(String::new());
 

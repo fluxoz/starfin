@@ -1955,7 +1955,15 @@ fn transcode_segment_body(
                     let pts = decoded.pts().unwrap_or(0);
                     let pts_secs = pts as f64 * f64::from(video_time_base.0) / f64::from(video_time_base.1);
 
-                    if pts_secs >= end_time {
+                    // Include the frame AT end_time to create a tiny overlap
+                    // with the next segment (one frame, ~33ms at 30fps).
+                    // MSE handles overlap via coded-frame-removal (seamless).
+                    // Using >= here would EXCLUDE this frame, making the
+                    // segment ~33ms SHORT of its declared 6000ms duration in
+                    // the MPD.  The micro-gap causes the video element to
+                    // stall briefly at every segment boundary (the "stutter
+                    // just prior to next segment fetch" bug).
+                    if pts_secs > end_time {
                         done = true;
                         break;
                     }
@@ -2036,11 +2044,14 @@ fn transcode_segment_body(
                         let mut audio_frame = ffmpeg_next::util::frame::Audio::empty();
                         while adec.receive_frame(&mut audio_frame).is_ok() {
                             // Time-range filter using input time base.
+                            // Use `>` (not `>=`) for the upper bound so that
+                            // audio frames at exactly end_time are INCLUDED,
+                            // matching the video boundary fix above.
                             if let Some(apts) = audio_frame.pts() {
                                 let apts_secs = apts as f64
                                     * f64::from(audio_time_base.0)
                                     / f64::from(audio_time_base.1);
-                                if apts_secs < start_time || apts_secs >= end_time {
+                                if apts_secs < start_time || apts_secs > end_time {
                                     continue;
                                 }
                             }

@@ -241,6 +241,44 @@ pub fn probe_video(path: &Path) -> (f64, ProbeMeta) {
     )
 }
 
+/// Return `true` if the source file at `path` can be remuxed (packet-copied)
+/// without transcoding for browser playback.
+///
+/// This mirrors `source_is_remuxable` in `transcode.rs`: the source must have
+/// H.264 video AND either no audio or stereo/mono AAC/MP3 audio.
+pub fn is_source_remuxable(path: &Path) -> bool {
+    super::ensure_init();
+
+    let ictx = match ffmpeg_next::format::input(path) {
+        Ok(ctx) => ctx,
+        Err(_) => return false,
+    };
+
+    let video_ok = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Video)
+        .map(|s| s.parameters().id() == ffmpeg_next::codec::Id::H264)
+        .unwrap_or(false);
+
+    if !video_ok {
+        return false;
+    }
+
+    let audio_ok = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Audio)
+        .map(|s| {
+            use ffmpeg_next::codec::Id;
+            let id = s.parameters().id();
+            let codec_ok = id == Id::AAC || id == Id::MP3;
+            let channels = unsafe { (*s.parameters().as_ptr()).ch_layout.nb_channels };
+            codec_ok && channels <= 2
+        })
+        .unwrap_or(true); // no audio stream → video-only remux is valid
+
+    audio_ok
+}
+
 /// Information about a subtitle stream embedded in a media file.
 #[derive(Debug, Clone)]
 pub struct SubtitleStreamInfo {

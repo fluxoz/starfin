@@ -24,7 +24,8 @@ use yew::prelude::*;
 const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
 
 // ── Stream quality options ────────────────────────────────────────────────────
-const QUALITY_OPTIONS: [(&str, &str); 4] = [
+const QUALITY_OPTIONS: [(&str, &str); 5] = [
+    ("auto",     "Auto (ABR)"),
     ("original", "Original (Direct)"),
     ("high",     "High (Transcode)"),
     ("medium",   "Medium (720p)"),
@@ -537,14 +538,27 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 if let Ok(resp) = Request::get(&url).send().await {
                     if resp.ok() {
                         if let Ok(items) = resp.json::<Vec<serde_json::Value>>().await {
-                            let labels: Vec<(String, String)> = items.iter().filter_map(|item| {
-                                let value = item.get("value")?.as_str()?.to_string();
-                                let label = item.get("label")?.as_str()?.to_string();
-                                Some((value, label))
-                            }).collect();
-                            if !labels.is_empty() {
-                                quality_labels.set(labels);
+                            // "auto" is always the first option — it is client-side only.
+                            let mut labels: Vec<(String, String)> =
+                                vec![("auto".to_string(), "Auto (ABR)".to_string())];
+                            for item in items.iter() {
+                                if let (Some(value), Some(label)) = (
+                                    item.get("value").and_then(|v| v.as_str()),
+                                    item.get("label").and_then(|v| v.as_str()),
+                                ) {
+                                    let display_label = if value == "original" {
+                                        match item.get("remuxable").and_then(|v| v.as_bool()) {
+                                            Some(true)  => "Original (Direct Copy)".to_string(),
+                                            Some(false) => "Original (Re-encode)".to_string(),
+                                            None        => label.to_string(),
+                                        }
+                                    } else {
+                                        label.to_string()
+                                    };
+                                    labels.push((value.to_string(), display_label));
+                                }
                             }
+                            quality_labels.set(labels);
                         }
                     }
                 }
@@ -567,10 +581,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let is_buffering = is_buffering.clone();
 
         use_effect_with(
-            (props.video_id.clone(), (*selected_quality).clone()),
-            move |(video_id, quality)| {
+            props.video_id.clone(),
+            move |video_id| {
                 let video_id = video_id.clone();
-                let quality = quality.clone();
+                // Read quality at effect-fire time (not a dep — quality changes are
+                // handled by the separate live-switch effect below).
+                let quality = (*selected_quality).clone();
 
                 // Fetch thumbnails
                 let thumbnail_info_clone = thumbnail_info.clone();
@@ -674,11 +690,36 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     player.on("error", on_error.as_ref().unchecked_ref());
                     on_error.forget();
 
-                    // Stream initialized event — clear status
+                    // Stream initialized (one-shot) — clear status and lock the initial
+                    // quality.  setQualityFor MUST be called inside this event because
+                    // attachSource is async: the MPD has not been parsed and the
+                    // representation list does not exist until streamInitialized fires.
                     let status_for_init = status_clone.clone();
-                    let on_stream_init = Closure::<dyn Fn()>::new(move || {
+                    let player_js_for_init = player.player.clone();
+                    let quality_for_init = quality.clone();
+                    let on_stream_init = Closure::once(Box::new(move || {
                         status_for_init.set(String::new());
-                    });
+                        // For "auto" quality, ABR is already enabled via updateSettings —
+                        // do NOT call setQualityFor (that would disable ABR).
+                        if quality_for_init != "auto" {
+                            let quality_index: i32 = match quality_for_init.as_str() {
+                                "original" => 0,
+                                "high"     => 1,
+                                "medium"   => 2,
+                                "low"      => 3,
+                                _          => 0,
+                            };
+                            if let Ok(func) = js_sys::Reflect::get(&player_js_for_init, &"setQualityFor".into()) {
+                                if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                                    let args = js_sys::Array::new();
+                                    args.push(&JsValue::from_str("video"));
+                                    args.push(&JsValue::from_f64(quality_index as f64));
+                                    args.push(&JsValue::from_bool(false));
+                                    let _ = js_sys::Reflect::apply(&func, &player_js_for_init, &args);
+                                }
+                            }
+                        }
+                    }) as Box<dyn FnOnce()>);
                     player.on("streamInitialized", on_stream_init.as_ref().unchecked_ref());
                     on_stream_init.forget();
 
@@ -740,6 +781,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     //   - stallThreshold: 0.3
                     //   - fastSwitchEnabled: true
                     //   - reuseExistingSourceBuffers: true
+                    //
+                    // autoSwitchBitrate is enabled only when quality == "auto".
+                    let auto_abr = quality == "auto";
                     let settings = js_sys::eval(&format!(
                         r#"({{
                             debug: {{
@@ -770,7 +814,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                     stallSeek: 0.1
                                 }},
                                 abr: {{
-                                    autoSwitchBitrate: {{ video: false, audio: false }}
+                                    autoSwitchBitrate: {{ video: {auto_abr}, audio: false }}
                                 }},
                                 retryAttempts: {{
                                     MPD: 3,
@@ -790,24 +834,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         prune_interval = BUFFER_PRUNING_INTERVAL_S,
                         gap_small = GAP_SMALL_LIMIT_S,
                         gap_threshold = GAP_STALL_THRESHOLD_S,
+                        auto_abr = auto_abr,
                     )).unwrap();
                     player.update_settings(&settings);
 
                     // Load the manifest — dash.js will start fetching segments.
+                    // Initial quality is applied in the streamInitialized one-shot handler
+                    // above, after the MPD is parsed and representations are available.
                     player.attach_source(&manifest_url, start_pos);
-
-                    // Set the initial quality index based on the selected quality.
-                    // Representation order in MPD: 0=original, 1=high, 2=medium, 3=low.
-                    let quality_index = match quality.as_str() {
-                        "original" => 0i32,
-                        "high"     => 1i32,
-                        "medium"   => 2i32,
-                        "low"      => 3i32,
-                        _          => 0i32,
-                    };
-                    player.set_quality_for("video", quality_index, false);
-
-                    status_clone.set(String::new());
 
                     // Store the player reference
                     let player_rc = Rc::new(player);
@@ -826,6 +860,43 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 }
             },
         );
+    }
+
+    // ── Live quality switch — fires when selected_quality changes ────────────
+    // This is separate from the player-init effect so that quality changes
+    // do NOT tear down and recreate the dash.js player.  Instead they call
+    // setQualityFor (with force_replace=true) on the running player, which
+    // flushes the current buffer and immediately requests the new quality.
+    {
+        let dash_player_ref = dash_player_ref.clone();
+        let selected_quality = selected_quality.clone();
+        use_effect_with((*selected_quality).clone(), move |quality| {
+            let quality = quality.clone();
+            if let Some(player) = dash_player_ref.borrow().as_ref() {
+                let auto_abr = quality == "auto";
+                // Toggle autoSwitchBitrate on/off for the running player.
+                let abr_settings = js_sys::eval(&format!(
+                    r#"({{ streaming: {{ abr: {{ autoSwitchBitrate: {{ video: {auto_abr}, audio: false }} }} }} }})"#,
+                    auto_abr = auto_abr,
+                )).unwrap();
+                player.update_settings(&abr_settings);
+
+                if !auto_abr {
+                    // Lock to the selected representation with force_replace=true
+                    // so that dash.js immediately flushes the buffer and requests
+                    // segments at the new quality level.
+                    let quality_index: i32 = match quality.as_str() {
+                        "original" => 0,
+                        "high"     => 1,
+                        "medium"   => 2,
+                        "low"      => 3,
+                        _          => 0,
+                    };
+                    player.set_quality_for("video", quality_index, true);
+                }
+            }
+            || ()
+        });
     }
 
     // ── Thumbnail canvas effect ──────────────────────────────────────────────
@@ -1327,12 +1398,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let on_quality_select = {
         let selected_quality = selected_quality.clone();
         let quality_menu_open = quality_menu_open.clone();
-        let video_ref = video_ref.clone();
-        let resume_position = resume_position.clone();
         Callback::from(move |quality: String| {
-            if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-                *resume_position.borrow_mut() = video.current_time();
-            }
+            // Quality changes are handled by the live-switch use_effect_with above —
+            // do NOT save resume_position here (that would restart the player).
             quality_menu_open.set(false);
             if let Some(storage) = window().and_then(|w| w.local_storage().ok()).flatten() {
                 let _ = storage.set_item(QUALITY_STORAGE_KEY, &quality);
@@ -1625,6 +1693,16 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
     let preview_time = if *is_dragging { *drag_time } else { *hover_time };
 
+    // Compute the current quality button label outside html! (can't use `let` inside html! blocks).
+    let current_quality_label: String = {
+        let cur = selected_quality.as_str();
+        if quality_labels.is_empty() {
+            QUALITY_OPTIONS.iter().find(|(v, _)| *v == cur).map(|(_, l)| l.to_string()).unwrap_or_else(|| "Original (Direct)".to_string())
+        } else {
+            quality_labels.iter().find(|(v, _)| v.as_str() == cur).map(|(_, l)| l.clone()).unwrap_or_else(|| "Original (Direct)".to_string())
+        }
+    };
+
     html! {
         <div ref={container_ref} class={container_class} onclick={on_container_click} onmousemove={on_mouse_move} onmouseleave={on_mouse_leave}>
             // Header
@@ -1727,7 +1805,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         </div>
                         <div class="player-quality">
                             <button class="player-controls__btn player-controls__btn--text" onclick={on_quality_toggle} title="Stream quality">
-                                { QUALITY_OPTIONS.iter().find(|(v, _)| *v == selected_quality.as_str()).map(|(_, l)| *l).unwrap_or("Original (Direct)") }
+                                { current_quality_label.clone() }
                             </button>
                             if *quality_menu_open {
                                 <div class="player-quality__menu">
@@ -1735,10 +1813,16 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                         let on_select = on_quality_select.clone();
                                         let is_active = selected_quality.as_str() == *value;
                                         let vs = value.to_string();
+                                        // Use server-provided label when available.
+                                        let display_label = if quality_labels.is_empty() {
+                                            label.to_string()
+                                        } else {
+                                            quality_labels.iter().find(|(v, _)| v.as_str() == *value).map(|(_, l)| l.clone()).unwrap_or_else(|| label.to_string())
+                                        };
                                         html! {
                                             <button class={if is_active { "player-quality__option player-quality__option--active" } else { "player-quality__option" }}
                                                 onclick={Callback::from(move |e: MouseEvent| { e.stop_propagation(); on_select.emit(vs.clone()); })}>
-                                                { *label }
+                                                { display_label }
                                             </button>
                                         }
                                     })}

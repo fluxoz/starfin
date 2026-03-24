@@ -164,15 +164,7 @@ impl DashPlayer {
     }
 
     fn set_quality_for(&self, media_type: &str, quality_id: &str, force_replace: bool) {
-        if let Ok(func) = js_sys::Reflect::get(&self.player, &"setRepresentationForTypeById".into()) {
-            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
-                let args = js_sys::Array::new();
-                args.push(&JsValue::from_str(media_type));
-                args.push(&JsValue::from_str(quality_id));
-                args.push(&JsValue::from_bool(force_replace));
-                let _ = js_sys::Reflect::apply(&func, &self.player, &args);
-            }
-        }
+        set_quality_for_raw(&self.player, media_type, quality_id, force_replace);
     }
 
     fn destroy(&self) {
@@ -180,6 +172,20 @@ impl DashPlayer {
             if let Ok(f) = f.dyn_into::<js_sys::Function>() {
                 let _ = f.call0(&self.player);
             }
+        }
+    }
+}
+
+/// Standalone helper so closures that only capture a raw JsValue can lock quality
+/// without duplicating the JS interop code.
+fn set_quality_for_raw(player_js: &JsValue, media_type: &str, quality_id: &str, force_replace: bool) {
+    if let Ok(func) = js_sys::Reflect::get(player_js, &"setRepresentationForTypeById".into()) {
+        if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+            let args = js_sys::Array::new();
+            args.push(&JsValue::from_str(media_type));
+            args.push(&JsValue::from_str(quality_id));
+            args.push(&JsValue::from_bool(force_replace));
+            let _ = js_sys::Reflect::apply(&func, player_js, &args);
         }
     }
 }
@@ -501,16 +507,7 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
                                         let pjs_q = player.player.clone();
                                         let qs = quality_str.clone();
                                         let on_stream = Closure::once(Box::new(move || {
-                                            // setRepresentationForTypeById
-                                            if let Ok(func) = js_sys::Reflect::get(&pjs_q, &"setRepresentationForTypeById".into()) {
-                                                if let Ok(func) = func.dyn_into::<js_sys::Function>() {
-                                                    let args = js_sys::Array::new();
-                                                    args.push(&JsValue::from_str("video"));
-                                                    args.push(&JsValue::from_str(&qs));
-                                                    args.push(&JsValue::from_bool(true));
-                                                    let _ = js_sys::Reflect::apply(&func, &pjs_q, &args);
-                                                }
-                                            }
+                                            set_quality_for_raw(&pjs_q, "video", &qs, true);
                                         }) as Box<dyn FnOnce()>);
                                         player.on("streamInitialized", on_stream.as_ref().unchecked_ref());
                                         on_stream.forget();
@@ -809,15 +806,7 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
                             let pjs_q = player.player.clone();
                             let qs = quality_str.clone();
                             let on_stream = Closure::once(Box::new(move || {
-                                if let Ok(func) = js_sys::Reflect::get(&pjs_q, &"setRepresentationForTypeById".into()) {
-                                    if let Ok(func) = func.dyn_into::<js_sys::Function>() {
-                                        let args = js_sys::Array::new();
-                                        args.push(&JsValue::from_str("video"));
-                                        args.push(&JsValue::from_str(&qs));
-                                        args.push(&JsValue::from_bool(true));
-                                        let _ = js_sys::Reflect::apply(&func, &pjs_q, &args);
-                                    }
-                                }
+                                set_quality_for_raw(&pjs_q, "video", &qs, true);
                             }) as Box<dyn FnOnce()>);
                             player.on("streamInitialized", on_stream.as_ref().unchecked_ref());
                             on_stream.forget();
@@ -1347,10 +1336,13 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
     // Quality button label.
     let current_quality_label: String = {
         let cur = selected_quality.as_str();
+        let fallback = QUALITY_OPTIONS.iter().find(|(v, _)| *v == cur).map(|(_, l)| l.to_string())
+            .unwrap_or_else(|| QUALITY_OPTIONS[0].1.to_string());
         if quality_labels.is_empty() {
-            QUALITY_OPTIONS.iter().find(|(v, _)| *v == cur).map(|(_, l)| l.to_string()).unwrap_or_else(|| "Auto (ABR)".to_string())
+            fallback
         } else {
-            quality_labels.iter().find(|(v, _)| v.as_str() == cur).map(|(_, l)| l.clone()).unwrap_or_else(|| "Auto (ABR)".to_string())
+            quality_labels.iter().find(|(v, _)| v.as_str() == cur).map(|(_, l)| l.clone())
+                .unwrap_or(fallback)
         }
     };
 

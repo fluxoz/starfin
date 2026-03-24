@@ -82,7 +82,10 @@ pub fn scan_keyframe_boundaries(abs_path: &str, duration_secs: f64) -> Result<Ve
         if stream.index() != video_idx || !packet.is_key() {
             continue;
         }
-        let pts = packet.pts().unwrap_or(0);
+        let pts = match packet.pts() {
+            Some(p) => p,
+            None => continue, // skip keyframes without PTS
+        };
         let pts_secs = pts as f64 * f64::from(video_tb.0) / f64::from(video_tb.1);
         keyframe_pts.push(pts_secs);
     }

@@ -2271,10 +2271,19 @@ async fn get_manifest(
         let abs_for_scan = abs_path.to_string_lossy().to_string();
         let dur = duration;
         tokio::task::spawn_blocking(move || {
-            media::transcode::scan_keyframe_boundaries(&abs_for_scan, dur).ok()
+            match media::transcode::scan_keyframe_boundaries(&abs_for_scan, dur) {
+                Ok(boundaries) => Some(boundaries),
+                Err(e) => {
+                    warn!("keyframe scan failed, using nominal timeline: {e}");
+                    None
+                }
+            }
         })
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            warn!("keyframe scan task panicked: {e}");
+            None
+        })
     } else {
         None
     };

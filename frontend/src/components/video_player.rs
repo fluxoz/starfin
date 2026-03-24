@@ -78,20 +78,25 @@ impl DashPlayer {
         Self { player }
     }
 
-    /// Initialize the player internals without loading a source.
+    /// Initialize the player with a video element but NO source URL.
     ///
-    /// Matches the reference client pattern:
+    /// Matches the reference client pattern exactly:
     ///   `player.initialize(videoElement, null, autoPlay)`
     ///
-    /// Settings MUST be applied with `update_settings()` AFTER this call
-    /// but BEFORE `attach_source()`, so that gap handling, buffer config,
-    /// and ABR rules are active from the very first segment request.
-    fn initialize(&self) {
+    /// The source is loaded later via `attach_source()`.  Settings MUST be
+    /// applied with `update_settings()` AFTER this call but BEFORE
+    /// `attach_source()`, so that gap handling, buffer config, and ABR rules
+    /// are active from the very first segment request.
+    fn initialize(&self, video: &HtmlVideoElement, auto_play: bool) {
         let init_fn = js_sys::Reflect::get(&self.player, &"initialize".into())
             .unwrap()
             .dyn_into::<js_sys::Function>()
             .unwrap();
-        let _ = init_fn.call0(&self.player);
+        let args = js_sys::Array::new();
+        args.push(video);
+        args.push(&JsValue::NULL);
+        args.push(&JsValue::from_bool(auto_play));
+        let _ = js_sys::Reflect::apply(&init_fn, &self.player, &args);
     }
 
     /// Set the autoplay flag.
@@ -603,6 +608,67 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     // Create dash.js player
                     let player = DashPlayer::create();
 
+                    // ── Register event listeners (reference client does this
+                    // BEFORE initialize, matching dash.js best practice) ───────
+
+                    // BUFFER_EMPTY / BUFFER_LOADED for buffering indicator
+                    let is_buffering_empty = is_buffering_clone.clone();
+                    let on_buffer_empty = Closure::<dyn Fn()>::new(move || {
+                        is_buffering_empty.set(true);
+                    });
+                    player.on("bufferStalled", on_buffer_empty.as_ref().unchecked_ref());
+                    on_buffer_empty.forget();
+
+                    let is_buffering_loaded = is_buffering_clone.clone();
+                    let on_buffer_loaded = Closure::<dyn Fn()>::new(move || {
+                        is_buffering_loaded.set(false);
+                    });
+                    player.on("bufferLoaded", on_buffer_loaded.as_ref().unchecked_ref());
+                    on_buffer_loaded.forget();
+
+                    // Error handling
+                    let error_handler = error_clone.clone();
+                    let on_error = Closure::<dyn Fn(JsValue)>::new(move |e: JsValue| {
+                        let msg = if let Some(err_obj) = e.dyn_ref::<js_sys::Object>() {
+                            let error_val = js_sys::Reflect::get(err_obj, &"error".into()).unwrap_or(JsValue::UNDEFINED);
+                            if let Some(error_obj) = error_val.dyn_ref::<js_sys::Object>() {
+                                let msg = js_sys::Reflect::get(error_obj, &"message".into())
+                                    .unwrap_or(JsValue::UNDEFINED);
+                                msg.as_string().unwrap_or_else(|| format!("{:?}", e))
+                            } else {
+                                format!("{:?}", e)
+                            }
+                        } else {
+                            format!("{:?}", e)
+                        };
+                        log::error!("dash.js error: {msg}");
+                        error_handler.set(Some(msg));
+                    });
+                    player.on("error", on_error.as_ref().unchecked_ref());
+                    on_error.forget();
+
+                    // Stream initialized event — clear status
+                    let status_for_init = status_clone.clone();
+                    let on_stream_init = Closure::<dyn Fn()>::new(move || {
+                        status_for_init.set(String::new());
+                    });
+                    player.on("streamInitialized", on_stream_init.as_ref().unchecked_ref());
+                    on_stream_init.forget();
+
+                    // ── Initialize following the reference client pattern ─────
+                    //
+                    // Reference client (main.js) order:
+                    //   1. player = dashjs.MediaPlayer().create()
+                    //   2. player.on(events.ERROR, ...)            ← events first
+                    //   3. player.initialize(video, null, autoPlay) ← view + autoPlay, NO source
+                    //   4. player.updateSettings(config)            ← settings before source!
+                    //   5. player.attachSource(url)                 ← load content
+                    //
+                    // This ensures ALL settings (gaps, buffer, ABR, error
+                    // recovery) are active from the very first segment request.
+
+                    player.initialize(&video, true);
+
                     // Configure dash.js v5 settings to match the reference client.
                     //
                     // The reference client (main.js) uses these defaults:
@@ -611,9 +677,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     //   - stallThreshold: 0.3
                     //   - fastSwitchEnabled: true
                     //   - reuseExistingSourceBuffers: true
-                    //
-                    // We MUST apply settings after initialize() but BEFORE
-                    // attachSource() so they're active from the first segment.
                     let settings = js_sys::eval(&format!(
                         r#"({{
                             debug: {{
@@ -670,71 +733,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         gap_small = GAP_SMALL_LIMIT_S,
                         gap_threshold = GAP_STALL_THRESHOLD_S,
                     )).unwrap();
-
                     player.update_settings(&settings);
 
-                    // Listen for dash.js events
-                    // BUFFER_EMPTY / BUFFER_LOADED for buffering indicator
-                    let is_buffering_empty = is_buffering_clone.clone();
-                    let on_buffer_empty = Closure::<dyn Fn()>::new(move || {
-                        is_buffering_empty.set(true);
-                    });
-                    player.on("bufferStalled", on_buffer_empty.as_ref().unchecked_ref());
-                    on_buffer_empty.forget();
-
-                    let is_buffering_loaded = is_buffering_clone.clone();
-                    let on_buffer_loaded = Closure::<dyn Fn()>::new(move || {
-                        is_buffering_loaded.set(false);
-                    });
-                    player.on("bufferLoaded", on_buffer_loaded.as_ref().unchecked_ref());
-                    on_buffer_loaded.forget();
-
-                    // Error handling
-                    let error_handler = error_clone.clone();
-                    let on_error = Closure::<dyn Fn(JsValue)>::new(move |e: JsValue| {
-                        let msg = if let Some(err_obj) = e.dyn_ref::<js_sys::Object>() {
-                            let error_val = js_sys::Reflect::get(err_obj, &"error".into()).unwrap_or(JsValue::UNDEFINED);
-                            if let Some(error_obj) = error_val.dyn_ref::<js_sys::Object>() {
-                                let msg = js_sys::Reflect::get(error_obj, &"message".into())
-                                    .unwrap_or(JsValue::UNDEFINED);
-                                msg.as_string().unwrap_or_else(|| format!("{:?}", e))
-                            } else {
-                                format!("{:?}", e)
-                            }
-                        } else {
-                            format!("{:?}", e)
-                        };
-                        log::error!("dash.js error: {msg}");
-                        error_handler.set(Some(msg));
-                    });
-                    player.on("error", on_error.as_ref().unchecked_ref());
-                    on_error.forget();
-
-                    // Stream initialized event — clear status
-                    let status_for_init = status_clone.clone();
-                    let on_stream_init = Closure::<dyn Fn()>::new(move || {
-                        status_for_init.set(String::new());
-                    });
-                    player.on("streamInitialized", on_stream_init.as_ref().unchecked_ref());
-                    on_stream_init.forget();
-
-                    // Initialize the player following the reference client pattern:
-                    //   1. player = dashjs.MediaPlayer().create()     (done above)
-                    //   2. player.initialize()                         (no args — bare init)
-                    //   3. player.updateSettings(config)               (before source!)
-                    //   4. player.setAutoPlay(true)
-                    //   5. player.attachView(videoElement)
-                    //   6. player.attachSource(url, startTime)
-                    //
-                    // This order ensures ALL settings (gaps, buffer, ABR, error
-                    // recovery) are active from the very first segment request.
-                    // Our previous approach passed the URL directly to
-                    // initialize(), which started fetching immediately —
-                    // before settings were applied.
-                    player.initialize();
-                    player.update_settings(&settings);
-                    player.set_auto_play(true);
-                    player.attach_view(&video);
+                    // Load the manifest — dash.js will start fetching segments.
                     player.attach_source(&manifest_url, start_pos);
 
                     status_clone.set(String::new());

@@ -36,6 +36,9 @@ const TRANSITION_MS: u32 = 300;
 const SV_BUFFER_TARGET_S: f64 = 15.0;
 const SV_BACK_BUFFER_S: f64 = 5.0;
 
+/// Fallback viewport height (px) when `window().inner_height()` is unavailable.
+const DEFAULT_VIEWPORT_HEIGHT_PX: f64 = 800.0;
+
 /// Controls auto-hide timeout.
 const CONTROLS_HIDE_MS: f64 = 4000.0;
 
@@ -169,7 +172,7 @@ fn pick_random(items: &[Element], exclude_id: Option<&str>) -> Option<Element> {
     for _ in 0..10 {
         let idx = (js_sys::Math::random() * items.len() as f64) as usize;
         let idx = idx.min(items.len() - 1);
-        if items.len() == 1 || exclude_id.is_none() || items[idx].id != *exclude_id.unwrap() {
+        if items.len() == 1 || exclude_id.is_none() || items[idx].id != exclude_id.unwrap() {
             return Some(items[idx].clone());
         }
     }
@@ -988,7 +991,7 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
     let drag_offset_vh = if *swiping && *swipe_delta != 0.0 {
         // Convert px delta to vh.
         if let Some(win) = window() {
-            let vh = win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
+            let vh = win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(DEFAULT_VIEWPORT_HEIGHT_PX);
             *swipe_delta / vh * 100.0
         } else {
             0.0

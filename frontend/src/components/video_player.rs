@@ -722,7 +722,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                     let args = js_sys::Array::new();
                                     args.push(&JsValue::from_str("video"));
                                     args.push(&JsValue::from_f64(quality_index as f64));
-                                    args.push(&JsValue::from_bool(false));
+                                    args.push(&JsValue::from_bool(true));
                                     let _ = js_sys::Reflect::apply(&func, &player_js_for_init, &args);
                                 }
                             }

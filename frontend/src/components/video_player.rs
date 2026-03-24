@@ -33,6 +33,12 @@ const QUALITY_OPTIONS: [(&str, &str); 5] = [
 ];
 const QUALITY_STORAGE_KEY: &str = "starfin_quality";
 
+// ── Seek step for on-screen controls ─────────────────────────────────────────
+const SEEK_STEP_S: f64 = 10.0;
+
+// ── Play button icon size (px) ────────────────────────────────────────────────
+const PLAY_ICON_SIZE: u32 = 28;
+
 // ── Controls auto-hide ───────────────────────────────────────────────────────
 const CONTROL_HIDE_TIMEOUT_MS: f64 = 5000.0;
 const CONTROLS_VICINITY_PX: f64 = 80.0;
@@ -1489,6 +1495,32 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
+    // Seek back 10 seconds
+    let on_seek_back = {
+        let video_ref = video_ref.clone();
+        let dash_player_ref = dash_player_ref.clone();
+        Callback::from(move |_: MouseEvent| {
+            if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
+                let t = (video.current_time() - SEEK_STEP_S).max(0.0);
+                dash_seek(&dash_player_ref, &video, t);
+            }
+        })
+    };
+
+    // Seek forward 10 seconds
+    let on_seek_fwd = {
+        let video_ref = video_ref.clone();
+        let dash_player_ref = dash_player_ref.clone();
+        Callback::from(move |_: MouseEvent| {
+            if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
+                let dur = video.duration();
+                let t = video.current_time() + SEEK_STEP_S;
+                let t = if dur.is_finite() { t.min(dur) } else { t };
+                dash_seek(&dash_player_ref, &video, t);
+            }
+        })
+    };
+
     let on_mouse_move = {
         let controls_visible = controls_visible.clone();
         let last_mouse_move = last_mouse_move.clone();
@@ -1616,9 +1648,11 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let on_container_click = {
         let speed_menu_open = speed_menu_open.clone();
         let quality_menu_open = quality_menu_open.clone();
+        let captions_menu_open = captions_menu_open.clone();
         Callback::from(move |_: MouseEvent| {
             speed_menu_open.set(false);
             quality_menu_open.set(false);
+            captions_menu_open.set(false);
         })
     };
 
@@ -1980,24 +2014,15 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
-    // Calculate progress percentages
+    // Calculate progress percentage
     let progress_percent = if *duration > 0.0 { (*current_time / *duration * 100.0).min(100.0) } else { 0.0 };
-    let buffered_percent = if *duration > 0.0 { (*buffered_end / *duration * 100.0).min(100.0) } else { 0.0 };
 
     let time_display = format!("{} / {}", format_time(*current_time), format_time(*duration));
     let play_pause_icon: Html = if *video_ended { icon_replay() } else if *is_playing { icon_pause() } else { icon_play() };
     let volume_icon: Html = if *is_muted || *volume == 0.0 { icon_volume_muted() } else if *volume < 0.5 { icon_volume_low() } else { icon_volume_high() };
     let fullscreen_icon: Html = if *is_fullscreen { icon_fullscreen_exit() } else { icon_fullscreen_enter() };
 
-    let controls_class = if *controls_visible { "player-controls" } else { "player-controls player-controls--hidden" };
-    let container_class = if *is_fullscreen { "player-overlay player-overlay--fullscreen" } else { "player-overlay" };
-
-    let preview_style = if *is_hovering_progress || *is_dragging {
-        let left = (*hover_position).clamp(5.0, 95.0);
-        format!("left: {}%; display: block;", left)
-    } else { "display: none;".to_string() };
-
-    let preview_time = if *is_dragging { *drag_time } else { *hover_time };
+    let controls_class = if *controls_visible { "sv-controls" } else { "sv-controls sv-controls--hidden" };
 
     // Compute the current quality button label outside html! (can't use `let` inside html! blocks).
     let current_quality_label: String = {
@@ -2010,17 +2035,27 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     };
 
     html! {
-        <div ref={container_ref} class={container_class} onclick={on_container_click} onmousemove={on_mouse_move} onmouseleave={on_mouse_leave}>
-            // Header
-            <div class={if *controls_visible { "player-header" } else { "player-header player-header--hidden" }}>
-                <button class="btn btn--back" onclick={Callback::from(move |_| {
+        <div ref={container_ref} class="sv-overlay" onclick={on_container_click} onmousemove={on_mouse_move} onmouseleave={on_mouse_leave}>
+            // Video — full-screen slot (matches sv-* layout)
+            <div class="sv-slot sv-slot--single">
+                <video ref={video_ref} class="sv-video" playsinline={true} onclick={on_video_click} ondblclick={on_video_dblclick} />
+            </div>
+
+            // Buffering spinner
+            if *is_buffering && (*error).is_none() && (*status).is_empty() {
+                <div class="sv-buffering"><div class="sv-buffering__spinner"></div></div>
+            }
+
+            // Title bar (top) — back button + title
+            <div class={if *controls_visible { "sv-title" } else { "sv-title sv-title--hidden" }}>
+                <button class="sv-back-btn" onclick={Callback::from(move |_| {
                     let vid = video_id_for_close.clone();
                     spawn_local(async move { clear_video_cache(&vid).await; });
                     on_close.emit(());
                 })}>
-                    { icon_arrow_back() }{ " Back" }
+                    { icon_arrow_back() }
                 </button>
-                <span class="player-title">{ title }</span>
+                <span class="sv-title__text">{ title }</span>
             </div>
 
             if let Some(err) = &*error {
@@ -2032,10 +2067,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
             if !(*status).is_empty() && (*error).is_none() {
                 <div class="player-status">{ &*status }</div>
-            }
-
-            if *is_buffering && (*error).is_none() && (*status).is_empty() {
-                <div class="player-buffering"><div class="player-buffering__spinner"></div></div>
             }
 
             if let Some((direction, x_pos)) = &*skip_indicator {
@@ -2050,7 +2081,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 </div>
             }
 
-            <video ref={video_ref} class="video-el" playsinline={true} onclick={on_video_click} ondblclick={on_video_dblclick} />
+            // Thumbnail canvas — kept off-screen so the sprite-fetching effect still works
+            <canvas ref={thumbnail_canvas_ref} style="display:none;" width="160" height="90"></canvas>
 
             if DEV_MODE {
                 <div class="player-dev-overlay">
@@ -2070,46 +2102,58 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 </div>
             }
 
+            // Controls — same layout as scroll_view
             <div class={controls_class}>
-                <div class="player-progress-container">
-                    <div class="player-preview" style={preview_style}>
-                        <canvas ref={thumbnail_canvas_ref} class="player-preview__canvas" width="160" height="90"></canvas>
-                        <div class="player-preview__time">{ format_time(preview_time) }</div>
-                    </div>
-                    <div ref={progress_ref} class="player-progress" onclick={on_progress_click} onmousedown={on_progress_mousedown} ontouchstart={on_progress_touchstart} onmousemove={on_progress_hover} onmouseleave={on_progress_leave}>
-                        <div class="player-progress__buffered" style={format!("width: {}%", buffered_percent)} />
-                        <div class="player-progress__played" style={format!("width: {}%", progress_percent)} />
-                        if *is_hovering_progress || *is_dragging {
-                            <div class="player-progress__hover-line" style={format!("left: {}%", if *is_dragging { progress_percent } else { *hover_position })} />
-                        }
-                        <div class={if *is_dragging { "player-progress__thumb player-progress__thumb--dragging" } else { "player-progress__thumb" }} style={format!("left: {}%", progress_percent)} />
-                    </div>
+                // Progress bar with drag-to-seek
+                <div ref={progress_ref}
+                    class={if *is_dragging { "sv-progress sv-progress--dragging" } else { "sv-progress" }}
+                    onclick={on_progress_click}
+                    onmousedown={on_progress_mousedown}
+                    ontouchstart={on_progress_touchstart}
+                    onmousemove={on_progress_hover}
+                    onmouseleave={on_progress_leave}
+                >
+                    <div class="sv-progress__filled" style={format!("width: {}%", progress_percent)} />
+                    <div class={if *is_dragging { "sv-progress__thumb sv-progress__thumb--dragging" } else { "sv-progress__thumb" }}
+                         style={format!("left: {}%", progress_percent)} />
                 </div>
 
-                <div class="player-controls__bottom">
-                    <div class="player-controls__left">
-                        <button class="player-controls__btn" onclick={on_play_pause} title="Play/Pause (k)">{ play_pause_icon }</button>
-                        <div class="player-volume"
-                            onmouseenter={Callback::from({ let v = volume_slider_visible.clone(); move |_| v.set(true) })}
-                            onmouseleave={Callback::from({ let v = volume_slider_visible.clone(); move |_| v.set(false) })}
-                        >
-                            <button class="player-controls__btn" onclick={on_volume_toggle} title="Mute (m)">{ volume_icon }</button>
-                            <div class={if *volume_slider_visible { "player-volume__slider player-volume__slider--visible" } else { "player-volume__slider" }}>
-                                <input type="range" min="0" max="1" step="0.05" value={volume.to_string()} oninput={on_volume_change} class="player-volume__input" />
-                            </div>
-                        </div>
-                        <span class="player-controls__time">{ time_display }</span>
+                <div class="sv-controls__row">
+                    // Left: current time / duration
+                    <div class="sv-controls__left">
+                        <span class="sv-time">{ time_display }</span>
                     </div>
-                    <div class="player-controls__right">
-                        <div class="player-speed">
-                            <button class="player-controls__btn player-controls__btn--text" onclick={on_speed_toggle} title="Playback speed">{ format!("{}x", *playback_speed) }</button>
+
+                    // Center: seek back | play/pause | seek forward
+                    <div class="sv-controls__center">
+                        <button class="sv-btn" onclick={on_seek_back} aria-label="Seek back 10s">
+                            { icon_seek_back() }
+                        </button>
+                        <button class="sv-btn sv-btn--play" onclick={on_play_pause} aria-label="Play/Pause">
+                            { play_pause_icon }
+                        </button>
+                        <button class="sv-btn" onclick={on_seek_fwd} aria-label="Seek forward 10s">
+                            { icon_seek_fwd() }
+                        </button>
+                    </div>
+
+                    // Right: mute | speed | quality | captions | fullscreen
+                    <div class="sv-controls__right">
+                        <button class="sv-btn" onclick={on_volume_toggle} aria-label="Toggle mute (m)">
+                            { volume_icon }
+                        </button>
+
+                        <div class="sv-speed">
+                            <button class="sv-btn sv-btn--text" onclick={on_speed_toggle} title="Playback speed">
+                                { format!("{}x", *playback_speed) }
+                            </button>
                             if *speed_menu_open {
-                                <div class="player-speed__menu">
+                                <div class="sv-speed__menu">
                                     { for PLAYBACK_SPEEDS.iter().map(|&speed| {
                                         let on_select = on_speed_select.clone();
                                         let is_active = (*playback_speed - speed).abs() < 0.01;
                                         html! {
-                                            <button class={if is_active { "player-speed__option player-speed__option--active" } else { "player-speed__option" }}
+                                            <button class={if is_active { "sv-speed__option sv-speed__option--active" } else { "sv-speed__option" }}
                                                 onclick={Callback::from(move |e: MouseEvent| { e.stop_propagation(); on_select.emit(speed); })}>
                                                 { format!("{}x", speed) }
                                             </button>
@@ -2118,24 +2162,24 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 </div>
                             }
                         </div>
-                        <div class="player-quality">
-                            <button class="player-controls__btn player-controls__btn--text" onclick={on_quality_toggle} title="Stream quality">
+
+                        <div class="sv-quality">
+                            <button class="sv-btn sv-btn--text" onclick={on_quality_toggle} title="Stream quality">
                                 { current_quality_label.clone() }
                             </button>
                             if *quality_menu_open {
-                                <div class="player-quality__menu">
+                                <div class="sv-quality__menu">
                                     { for QUALITY_OPTIONS.iter().map(|(value, label)| {
                                         let on_select = on_quality_select.clone();
                                         let is_active = selected_quality.as_str() == *value;
                                         let vs = value.to_string();
-                                        // Use server-provided label when available.
                                         let display_label = if quality_labels.is_empty() {
                                             label.to_string()
                                         } else {
                                             quality_labels.iter().find(|(v, _)| v.as_str() == *value).map(|(_, l)| l.clone()).unwrap_or_else(|| label.to_string())
                                         };
                                         html! {
-                                            <button class={if is_active { "player-quality__option player-quality__option--active" } else { "player-quality__option" }}
+                                            <button class={if is_active { "sv-quality__option sv-quality__option--active" } else { "sv-quality__option" }}
                                                 onclick={Callback::from(move |e: MouseEvent| { e.stop_propagation(); on_select.emit(vs.clone()); })}>
                                                 { display_label }
                                             </button>
@@ -2144,13 +2188,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 </div>
                             }
                         </div>
+
                         if !subtitle_tracks.is_empty() {
-                            <div class="player-captions">
-                                <button class={if active_subtitle.is_some() { "player-controls__btn player-controls__btn--active" } else { "player-controls__btn" }}
+                            <div class="sv-captions">
+                                <button class={if active_subtitle.is_some() { "sv-btn sv-btn--text sv-btn--active" } else { "sv-btn sv-btn--text" }}
                                     onclick={on_captions_toggle} title="Captions (c)">{ "CC" }</button>
                                 if *captions_menu_open {
-                                    <div class="player-captions__menu">
-                                        <button class={if active_subtitle.is_none() { "player-captions__option player-captions__option--active" } else { "player-captions__option" }}
+                                    <div class="sv-captions__menu">
+                                        <button class={if active_subtitle.is_none() { "sv-captions__option sv-captions__option--active" } else { "sv-captions__option" }}
                                             onclick={Callback::from({ let s = on_caption_select.clone(); move |e: MouseEvent| { e.stop_propagation(); s.emit(None); } })}>{ "Off" }</button>
                                         { for subtitle_tracks.iter().map(|track| {
                                             let on_select = on_caption_select.clone();
@@ -2158,7 +2203,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                             let label = track.title.clone().or_else(|| track.language.clone()).unwrap_or_else(|| format!("Track {}", track.index + 1));
                                             let ti = track.index;
                                             html! {
-                                                <button class={if is_active { "player-captions__option player-captions__option--active" } else { "player-captions__option" }}
+                                                <button class={if is_active { "sv-captions__option sv-captions__option--active" } else { "sv-captions__option" }}
                                                     onclick={Callback::from(move |e: MouseEvent| { e.stop_propagation(); on_select.emit(Some(ti)); })}>{ label }</button>
                                             }
                                         })}
@@ -2166,7 +2211,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                 }
                             </div>
                         }
-                        <button class="player-controls__btn" onclick={on_fullscreen_toggle} title="Fullscreen (f)">{ fullscreen_icon }</button>
+
+                        <button class="sv-btn" onclick={on_fullscreen_toggle} title="Fullscreen (f)">
+                            { fullscreen_icon }
+                        </button>
                     </div>
                 </div>
             </div>
@@ -2201,13 +2249,13 @@ async fn clear_video_cache(video_id: &str) {
 // ── SVG Icons ────────────────────────────────────────────────────────────────
 
 fn icon_play() -> Html {
-    html! { <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="1em" height="1em" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg> }
+    html! { <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width={PLAY_ICON_SIZE.to_string()} height={PLAY_ICON_SIZE.to_string()} aria-hidden="true"><path d="M8 5v14l11-7z"/></svg> }
 }
 fn icon_pause() -> Html {
-    html! { <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="1em" height="1em" aria-hidden="true"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg> }
+    html! { <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width={PLAY_ICON_SIZE.to_string()} height={PLAY_ICON_SIZE.to_string()} aria-hidden="true"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg> }
 }
 fn icon_replay() -> Html {
-    html! { <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="1em" height="1em" aria-hidden="true"><path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg> }
+    html! { <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width={PLAY_ICON_SIZE.to_string()} height={PLAY_ICON_SIZE.to_string()} aria-hidden="true"><path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg> }
 }
 fn icon_volume_muted() -> Html {
     html! { <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="1em" height="1em" aria-hidden="true"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg> }
@@ -2232,4 +2280,20 @@ fn icon_skip_forward() -> Html {
 }
 fn icon_skip_backward() -> Html {
     html! { <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="1em" height="1em" aria-hidden="true"><path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z"/></svg> }
+}
+fn icon_seek_back() -> Html {
+    html! {
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12.5 8L7.5 12l5 4" />
+            <path d="M17.5 8L12.5 12l5 4" />
+        </svg>
+    }
+}
+fn icon_seek_fwd() -> Html {
+    html! {
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6.5 8l5 4-5 4" />
+            <path d="M11.5 8l5 4-5 4" />
+        </svg>
+    }
 }

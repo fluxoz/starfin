@@ -6,6 +6,7 @@ use components::{
     grid::ElementsGrid,
     media_edit_modal::MediaEditModal,
     password_modal::PasswordModal,
+    scroll_view::ScrollView,
     video_player::VideoPlayer,
 };
 use crate::models::{Element, MetadataFilter, SortBy};
@@ -140,6 +141,7 @@ fn app_inner() -> Html {
     let error = use_state(|| Option::<String>::None);
     let selected = use_state(|| Option::<Element>::None);
     let editing = use_state(|| Option::<Element>::None);
+    let scroll_mode = use_state(|| false);
     let scanning = use_state(|| false);
     let scan_progress = use_state(|| Option::<(u32, u32)>::None);
 
@@ -660,6 +662,20 @@ fn app_inner() -> Html {
         })
     };
 
+    let on_scroll_mode = {
+        let scroll_mode = scroll_mode.clone();
+        Callback::from(move |_: MouseEvent| {
+            scroll_mode.set(true);
+        })
+    };
+
+    let on_close_scroll = {
+        let scroll_mode = scroll_mode.clone();
+        Callback::from(move |_| {
+            scroll_mode.set(false);
+        })
+    };
+
     let on_scan = {
         let scanning = scanning.clone();
         let items = items.clone();
@@ -875,6 +891,14 @@ fn app_inner() -> Html {
                     />
                 }
 
+                // Scroll view overlay — TikTok-style random video scroller.
+                if *scroll_mode {
+                    <ScrollView
+                        items={(*items).clone()}
+                        on_close={on_close_scroll.clone()}
+                    />
+                }
+
                 // Media edit modal — rendered on top of the library when editing.
                 if let Some(edit_item) = &*editing {
                     <MediaEditModal
@@ -903,6 +927,14 @@ fn app_inner() -> Html {
                                 aria-label="Play a random media file"
                             >
                                 { "?" }
+                            </button>
+                            <button
+                                class="scroll-btn"
+                                onclick={on_scroll_mode}
+                                disabled={(*items).is_empty()}
+                                aria-label="Open scroll view"
+                            >
+                                { "SCROLL" }
                             </button>
                             <div class="scan-area">
                                 <button

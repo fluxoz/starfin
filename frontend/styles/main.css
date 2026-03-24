@@ -2148,3 +2148,229 @@ body{
     font-size: 16px;
   }
 }
+
+/* ── Scroll button (dashboard header) ─────────────────────────────────────── */
+.scroll-btn{
+  font-family: inherit;
+  font-size: .7rem;
+  font-weight: 700;
+  letter-spacing: .08em;
+  color: var(--text);
+  background: transparent;
+  border: var(--border-width) solid var(--text);
+  border-radius: var(--radius);
+  padding: 4px 10px;
+  cursor: pointer;
+  margin-right: 10px;
+  transition: background .15s, color .15s;
+  flex-shrink: 0;
+}
+.scroll-btn:hover:not(:disabled){
+  background: var(--text);
+  color: var(--bg);
+}
+.scroll-btn:disabled{
+  opacity: .35;
+  cursor: default;
+}
+
+/* ── Scroll View (TikTok-style vertical player) ──────────────────────────── */
+.sv-overlay{
+  position: fixed;
+  inset: 0;
+  z-index: 250;
+  background: #000;
+  overflow: hidden;
+  touch-action: none;       /* we handle all gestures */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.sv-slots{
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 300vh;           /* 3 slots × 100vh */
+  will-change: transform;
+}
+
+.sv-slot{
+  width: 100%;
+  height: 100vh;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+}
+
+.sv-video{
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+  display: block;
+}
+
+/* ── Buffering spinner ──────────────────────────────────────────────────── */
+.sv-buffering{
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 260;
+  pointer-events: none;
+}
+.sv-buffering__spinner{
+  width: 52px;
+  height: 52px;
+  border: 3px solid rgba(255,255,255,.2);
+  border-top-color: var(--accent, #fff);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+/* ── Title bar (top) ────────────────────────────────────────────────────── */
+.sv-title{
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  padding-top: max(12px, env(safe-area-inset-top));
+  background: linear-gradient(to bottom, rgba(0,0,0,.7) 0%, transparent 100%);
+  z-index: 270;
+  color: #fff;
+  transition: opacity .3s ease, transform .3s ease;
+}
+.sv-title--hidden{
+  opacity: 0;
+  transform: translateY(-100%);
+  pointer-events: none;
+}
+.sv-title__text{
+  font-size: .95rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sv-back-btn{
+  background: none;
+  border: none;
+  color: #fff;
+  cursor: pointer;
+  padding: 4px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ── Controls (bottom) ──────────────────────────────────────────────────── */
+.sv-controls{
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 270;
+  padding: 0 16px;
+  padding-bottom: max(12px, env(safe-area-inset-bottom));
+  background: linear-gradient(to top, rgba(0,0,0,.7) 0%, transparent 100%);
+  color: #fff;
+  transition: opacity .3s ease, transform .3s ease;
+}
+.sv-controls--hidden{
+  opacity: 0;
+  transform: translateY(100%);
+  pointer-events: none;
+}
+
+/* Progress bar */
+.sv-progress{
+  width: 100%;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  position: relative;
+  margin-bottom: 4px;
+}
+.sv-progress::before{
+  content: '';
+  position: absolute;
+  left: 0; right: 0;
+  height: 3px;
+  background: rgba(255,255,255,.25);
+  border-radius: 2px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+.sv-progress__filled{
+  position: absolute;
+  left: 0;
+  height: 3px;
+  background: var(--accent, #fff);
+  border-radius: 2px;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+/* Controls row */
+.sv-controls__row{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 0 8px;
+}
+.sv-controls__left{
+  flex: 1;
+  text-align: left;
+}
+.sv-controls__center{
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.sv-controls__right{
+  flex: 1;
+  text-align: right;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.sv-time{
+  font-size: .75rem;
+  opacity: .85;
+  font-variant-numeric: tabular-nums;
+}
+
+.sv-btn{
+  background: none;
+  border: none;
+  color: #fff;
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background .15s;
+}
+.sv-btn:hover{
+  background: rgba(255,255,255,.15);
+}
+.sv-btn--play{
+  width: 48px;
+  height: 48px;
+  background: rgba(255,255,255,.15);
+}
+.sv-btn--play:hover{
+  background: rgba(255,255,255,.25);
+}

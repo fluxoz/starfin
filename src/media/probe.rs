@@ -37,6 +37,9 @@ pub struct StreamInfo {
     /// Total bitrate of the container in bits/sec (video + audio).
     /// Falls back to the sum of individual stream bit_rates.
     pub bitrate: u64,
+    /// Sample rate of the first audio stream in Hz (e.g. 44100, 48000).
+    /// Used as the `timescale` in the audio AdaptationSet SegmentTemplate.
+    pub audio_sample_rate: u32,
 }
 
 impl CodecInfo {
@@ -113,6 +116,13 @@ pub fn probe_stream_info(path: &Path) -> StreamInfo {
             let (w, h) = unsafe { ((*ptr).width as u32, (*ptr).height as u32) };
             info.width = w;
             info.height = h;
+        }
+
+        if params.medium() == ffmpeg_next::media::Type::Audio && info.audio_sample_rate == 0 {
+            let sr = unsafe { (*ptr).sample_rate as u32 };
+            if sr > 0 {
+                info.audio_sample_rate = sr;
+            }
         }
     }
 

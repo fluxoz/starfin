@@ -2235,39 +2235,30 @@ async fn remove_non_precached_segments_all_qualities(video_cache_dir: &Path) {
 
 /// `GET /api/videos/{id}/manifest.mpd`
 ///
-/// Generates a DASH MPD (Media Presentation Description) manifest for VOD
-/// playback using fMP4 (CMAF) segments.
+/// Generates a DASH-IF IOP v5 compliant MPD manifest for VOD playback.
 ///
-/// Accepts an optional `?quality=high|medium|low` query parameter (default:
-/// `original`).  Segment URLs embed the same quality token so that the DASH
-/// client fetches segments at the correct quality level.
+/// Uses separate audio and video AdaptationSets (demuxed) with:
+/// - Video AdaptationSet: timescale=90000, all quality Representations
+/// - Audio AdaptationSet: timescale=audio_sample_rate, one Representation
 ///
-/// This follows the DASH-IF IOP guidelines:
-/// - fMP4 segment format (CMAF, requires init segment + media segments)
-/// - Static MPD type for VOD content
-/// - Segments are transcoded on-demand when first requested
+/// The `?quality=` query parameter is accepted for backward compatibility
+/// but ignored — all qualities are included as Representations in the MPD.
 async fn get_manifest(
     id: web::Path<String>,
-    query: web::Query<QualityQuery>,
+    _query: web::Query<QualityQuery>,
     state: web::Data<AppState>,
 ) -> impl Responder {
-    let quality = query.quality;
-
     let (abs_path, _) = match find_video(&state, &id) {
         Some(v) => v,
         None => return HttpResponse::NotFound().body("video not found"),
     };
 
-    // Get video duration via ffprobe (metadata is not needed for manifest generation)
     let (duration_secs, _metadata) = probe_video(&abs_path).await;
     if duration_secs <= 0.0 {
         return HttpResponse::ServiceUnavailable()
-            .body("Could not determine video duration. Ensure ffprobe is installed and the video file is valid.");
+            .body("Could not determine video duration.");
     }
 
-    // Detect codecs from the source file so the MPD includes a `codecs`
-    // attribute — matching dash.js SourceBufferSink._getCodecStringForRepresentation()
-    // which builds `mimeType + ';codecs="' + codecs + '"'` from the MPD.
     let abs_for_codec = abs_path.clone();
     let codec_info = tokio::task::spawn_blocking(move || {
         media::probe::probe_codecs(&abs_for_codec)
@@ -2275,8 +2266,6 @@ async fn get_manifest(
     .await
     .unwrap_or_default();
 
-    // Probe resolution and bitrate for accurate DASH manifest bandwidth and
-    // for the quality-info API.
     let abs_for_stream = abs_path.clone();
     let stream_info = tokio::task::spawn_blocking(move || {
         media::probe::probe_stream_info(&abs_for_stream)
@@ -2284,130 +2273,175 @@ async fn get_manifest(
     .await
     .unwrap_or_default();
 
-    // Estimate bandwidth for the selected quality.  For Original/High the
-    // source bitrate is accurate; for lower qualities we scale down based
-    // on the resolution ratio and CRF impact.
-    let bandwidth: u64 = estimate_bandwidth(&stream_info, quality);
-    let (rep_width, rep_height) = estimate_resolution(&stream_info, quality);
-    let codecs_attr = codec_info
-        .codecs_string()
-        .map(|c| format!(" codecs=\"{c}\""))
-        .unwrap_or_default();
-
-    // Segments are stored in a quality-specific subdirectory.
-    let seg_dir = state.cache_dir.join(id.as_str()).join(quality.as_str());
-    if let Err(e) = tokio::fs::create_dir_all(&seg_dir).await {
+    // Ensure the video and audio cache directories exist.
+    for quality in [Quality::Original, Quality::High, Quality::Medium, Quality::Low] {
+        let video_seg_dir = state.cache_dir.join(id.as_str()).join("video").join(quality.as_str());
+        if let Err(e) = tokio::fs::create_dir_all(&video_seg_dir).await {
+            return HttpResponse::InternalServerError()
+                .body(format!("cache dir error: {e}"));
+        }
+    }
+    let audio_seg_dir = state.cache_dir.join(id.as_str()).join("audio");
+    if let Err(e) = tokio::fs::create_dir_all(&audio_seg_dir).await {
         return HttpResponse::InternalServerError()
             .body(format!("cache dir error: {e}"));
     }
 
-    // Calculate number of segments based on duration (f64 for sub-second precision).
     let duration = duration_secs;
-
-    // For Original quality (remux path), pre-scan keyframe boundaries so the
-    // MPD SegmentTimeline matches actual segment content exactly (zero delta).
-    // For transcoded qualities, keyframes are forced at exact 6s boundaries
-    // so nominal durations are accurate.
-    let boundaries = if quality == Quality::Original {
-        let abs_str = abs_path.to_str().unwrap_or_default();
-        get_keyframe_boundaries(&state, &id, abs_str, duration).await
+    let audio_sample_rate = if stream_info.audio_sample_rate > 0 {
+        stream_info.audio_sample_rate
     } else {
-        let n = (duration / SEGMENT_DURATION).ceil() as usize;
-        (0..n).map(|i| i as f64 * SEGMENT_DURATION).collect()
+        48000
     };
+    let has_audio = codec_info.audio_codec.is_some();
+
+    // Get keyframe boundaries for accurate SegmentTimeline.
+    let abs_str = abs_path.to_str().unwrap_or_default();
+    let boundaries = get_keyframe_boundaries(&state, &id, abs_str, duration).await;
     let num_segments = boundaries.len();
 
-    // Format duration as ISO 8601 duration for MPD.
-    // Use fractional seconds so that the frontend gets sub-second precision,
-    // matching how dash.js MPD parser handles mediaPresentationDuration.
+    // Format ISO 8601 duration.
     let hours = (duration as u64) / 3600;
     let minutes = ((duration as u64) % 3600) / 60;
     let frac_seconds = duration - (hours * 3600 + minutes * 60) as f64;
     let pt_duration = format!("PT{hours}H{minutes}M{frac_seconds:.3}S");
 
-    // Build the DASH MPD manifest.
+    // Estimate max segment duration for MPD attribute.
+    let max_seg_dur = SEGMENT_DURATION.ceil() as u64;
+
+    // Build video Representations.
+    let video_codec = codec_info.video_codec.as_deref().unwrap_or("avc1.640029");
+    let bw_original = estimate_bandwidth(&stream_info, Quality::Original);
+    let bw_high = estimate_bandwidth(&stream_info, Quality::High);
+    let bw_medium = estimate_bandwidth(&stream_info, Quality::Medium);
+    let bw_low = estimate_bandwidth(&stream_info, Quality::Low);
+    let (w_orig, h_orig) = (stream_info.width.max(1), stream_info.height.max(1));
+    let (w_high, h_high) = estimate_resolution(&stream_info, Quality::High);
+    let (w_med, h_med) = estimate_resolution(&stream_info, Quality::Medium);
+    let (w_low, h_low) = estimate_resolution(&stream_info, Quality::Low);
+
+    // Frame rate from stream info.
+    let fps_str = "30"; // simplified; could probe if needed
+
+    // Build SegmentTimeline for video (timescale=90000).
+    let mut video_durations: Vec<u64> = Vec::with_capacity(num_segments);
+    for i in 0..num_segments {
+        let seg_start = boundaries[i];
+        let seg_end = if i + 1 < boundaries.len() { boundaries[i + 1] } else { duration };
+        let dur_ticks = ((seg_end - seg_start) * 90000.0).round().max(1.0) as u64;
+        video_durations.push(dur_ticks);
+    }
+
+    // Build SegmentTimeline for audio (timescale=audio_sample_rate).
+    let mut audio_durations: Vec<u64> = Vec::with_capacity(num_segments);
+    for i in 0..num_segments {
+        let seg_start = boundaries[i];
+        let seg_end = if i + 1 < boundaries.len() { boundaries[i + 1] } else { duration };
+        let dur_ticks = ((seg_end - seg_start) * audio_sample_rate as f64).round().max(1.0) as u64;
+        audio_durations.push(dur_ticks);
+    }
+
+    fn build_segment_timeline(durations: &[u64]) -> String {
+        let mut out = String::new();
+        let mut i = 0;
+        while i < durations.len() {
+            let d = durations[i];
+            let mut count = 1usize;
+            while i + count < durations.len() && durations[i + count] == d {
+                count += 1;
+            }
+            if count > 1 {
+                out.push_str(&format!("            <S d=\"{d}\" r=\"{}\"/>\n", count - 1));
+            } else {
+                out.push_str(&format!("            <S d=\"{d}\"/>\n"));
+            }
+            i += count;
+        }
+        out
+    }
+
+    let video_timeline = build_segment_timeline(&video_durations);
+    let audio_timeline = build_segment_timeline(&audio_durations);
+    let audio_codec = codec_info.audio_codec.as_deref().unwrap_or("mp4a.40.2");
+
+    // GCD of width/height for par attribute.
+    fn gcd(a: u32, b: u32) -> u32 { if b == 0 { a } else { gcd(b, a % b) } }
+    let g = gcd(w_orig, h_orig);
+    let (par_w, par_h) = (w_orig / g, h_orig / g);
+
     let mut mpd = String::new();
     mpd.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     mpd.push_str(&format!(
-        "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" \
-         profiles=\"urn:mpeg:dash:profile:isoff-live:2011\" \
-         type=\"static\" \
-         mediaPresentationDuration=\"{pt_duration}\" \
-         minBufferTime=\"PT2S\">\n"
+        "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\"\n\
+         \x20    profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\"\n\
+         \x20    type=\"static\"\n\
+         \x20    mediaPresentationDuration=\"{pt_duration}\"\n\
+         \x20    minBufferTime=\"PT4S\"\n\
+         \x20    maxSegmentDuration=\"PT{max_seg_dur}S\">\n"
     ));
-    mpd.push_str(&format!("  <Period duration=\"{pt_duration}\">\n"));
+    mpd.push_str(&format!("  <Period id=\"1\" start=\"PT0S\" duration=\"{pt_duration}\">\n"));
+
+    // ── Video AdaptationSet ──
     mpd.push_str(&format!(
-        "    <AdaptationSet mimeType=\"video/mp4\" contentType=\"video\" \
-         segmentAlignment=\"true\" subsegmentAlignment=\"true\" \
-         subsegmentStartsWithSAP=\"1\">\n"
+        "    <AdaptationSet id=\"1\" contentType=\"video\" mimeType=\"video/mp4\"\n\
+         \x20               segmentAlignment=\"true\" subsegmentAlignment=\"true\"\n\
+         \x20               subsegmentStartsWithSAP=\"1\" startWithSAP=\"1\"\n\
+         \x20               par=\"{par_w}:{par_h}\">\n"
     ));
     mpd.push_str(&format!(
-        "      <Representation id=\"{quality}\" bandwidth=\"{bandwidth}\"\
-         {codecs} width=\"{rep_width}\" height=\"{rep_height}\">\n",
-        quality = quality.as_str(),
-        bandwidth = bandwidth,
-        codecs = codecs_attr,
-        rep_width = rep_width,
-        rep_height = rep_height,
+        "      <SegmentTemplate timescale=\"90000\"\n\
+         \x20                   initialization=\"/api/videos/{id}/video/$RepresentationID$/init.mp4\"\n\
+         \x20                   media=\"/api/videos/{id}/video/$RepresentationID$/seg_$Number%05d$.m4s\"\n\
+         \x20                   startNumber=\"1\">\n",
+        id = *id
     ));
-
-    // SegmentTemplate with explicit SegmentTimeline for precise duration control.
+    mpd.push_str("        <SegmentTimeline>\n");
+    mpd.push_str(&video_timeline);
+    mpd.push_str("        </SegmentTimeline>\n");
+    mpd.push_str("      </SegmentTemplate>\n");
     mpd.push_str(&format!(
-        "        <SegmentTemplate timescale=\"1000\" \
-         initialization=\"/api/videos/{id}/init.mp4?quality={quality}\" \
-         media=\"/api/videos/{id}/segments/seg_$Number%05d$.m4s?quality={quality}\" \
-         startNumber=\"0\">\n",
-        id = *id,
-        quality = quality.as_str()
+        "      <Representation id=\"original\" bandwidth=\"{bw_original}\" \
+         width=\"{w_orig}\" height=\"{h_orig}\" codecs=\"{video_codec}\" frameRate=\"{fps_str}\"/>\n"
     ));
-
-    // Build SegmentTimeline with actual durations derived from keyframe
-    // boundaries.  For Original quality, these reflect real keyframe positions
-    // (zero delta).  For transcoded qualities, boundaries are nominal 6s.
-    //
-    // Each <S> element declares the duration (d) of one segment.  Consecutive
-    // segments with the same duration use the r= (repeat) attribute per
-    // DASH-IF IOP to compress the timeline.
-    mpd.push_str("          <SegmentTimeline>\n");
-
-    // Compute per-segment durations in ms from the boundary positions.
-    let mut durations_ms: Vec<u64> = Vec::with_capacity(num_segments);
-    for i in 0..num_segments {
-        let seg_start = boundaries[i];
-        let seg_end = if i + 1 < boundaries.len() {
-            boundaries[i + 1]
-        } else {
-            duration
-        };
-        let dur_ms = ((seg_end - seg_start) * 1000.0).round().max(1.0) as u64;
-        durations_ms.push(dur_ms);
-    }
-
-    // Write <S> elements with r= compression for runs of equal durations.
-    let mut i = 0;
-    while i < durations_ms.len() {
-        let d = durations_ms[i];
-        let mut count = 1usize;
-        while i + count < durations_ms.len() && durations_ms[i + count] == d {
-            count += 1;
-        }
-        if count > 1 {
-            mpd.push_str(&format!(
-                "            <S d=\"{d}\" r=\"{}\"/>\n",
-                count - 1
-            ));
-        } else {
-            mpd.push_str(&format!(
-                "            <S d=\"{d}\"/>\n"
-            ));
-        }
-        i += count;
-    }
-
-    mpd.push_str("          </SegmentTimeline>\n");
-    mpd.push_str("        </SegmentTemplate>\n");
-    mpd.push_str("      </Representation>\n");
+    mpd.push_str(&format!(
+        "      <Representation id=\"high\" bandwidth=\"{bw_high}\" \
+         width=\"{w_high}\" height=\"{h_high}\" codecs=\"avc1.640029\" frameRate=\"{fps_str}\"/>\n"
+    ));
+    mpd.push_str(&format!(
+        "      <Representation id=\"medium\" bandwidth=\"{bw_medium}\" \
+         width=\"{w_med}\" height=\"{h_med}\" codecs=\"avc1.640029\" frameRate=\"{fps_str}\"/>\n"
+    ));
+    mpd.push_str(&format!(
+        "      <Representation id=\"low\" bandwidth=\"{bw_low}\" \
+         width=\"{w_low}\" height=\"{h_low}\" codecs=\"avc1.640029\" frameRate=\"{fps_str}\"/>\n"
+    ));
     mpd.push_str("    </AdaptationSet>\n");
+
+    // ── Audio AdaptationSet (omit if no audio stream) ──
+    if has_audio {
+        mpd.push_str(&format!(
+            "    <AdaptationSet id=\"2\" contentType=\"audio\" mimeType=\"audio/mp4\"\n\
+             \x20               segmentAlignment=\"true\" subsegmentAlignment=\"true\"\n\
+             \x20               lang=\"und\">\n"
+        ));
+        mpd.push_str(&format!(
+            "      <SegmentTemplate timescale=\"{audio_sample_rate}\"\n\
+             \x20                   initialization=\"/api/videos/{id}/audio/init.mp4\"\n\
+             \x20                   media=\"/api/videos/{id}/audio/seg_$Number%05d$.m4s\"\n\
+             \x20                   startNumber=\"1\">\n",
+            id = *id
+        ));
+        mpd.push_str("        <SegmentTimeline>\n");
+        mpd.push_str(&audio_timeline);
+        mpd.push_str("        </SegmentTimeline>\n");
+        mpd.push_str("      </SegmentTemplate>\n");
+        mpd.push_str(&format!(
+            "      <Representation id=\"audio\" bandwidth=\"256000\" \
+             codecs=\"{audio_codec}\" audioSamplingRate=\"{audio_sample_rate}\"/>\n"
+        ));
+        mpd.push_str("    </AdaptationSet>\n");
+    }
+
     mpd.push_str("  </Period>\n");
     mpd.push_str("</MPD>\n");
 
@@ -2761,6 +2795,412 @@ async fn get_segment(
             error!(error = %msg, segment = seg_index, "segment transcoding failed");
             HttpResponse::ServiceUnavailable()
                 .body(format!("segment {seg_index} transcoding failed"))
+        }
+    }
+}
+
+// ── Demuxed (DASH-IF IOP v5) video/audio routes ──────────────────────────────
+
+/// `GET /api/videos/{id}/video/{quality}/init.mp4` — video-only init segment.
+///
+/// Returns the ftyp+moov boxes for the video track at the requested quality.
+/// The init is extracted from a freshly-generated (or cached) segment 0.
+async fn get_video_init(
+    params: web::Path<(String, String)>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let (id, quality_str) = params.into_inner();
+
+    let quality = match quality_str.to_lowercase().as_str() {
+        "original" => Quality::Original,
+        "high"     => Quality::High,
+        "medium"   => Quality::Medium,
+        "low"      => Quality::Low,
+        _          => Quality::Original,
+    };
+
+    let (abs_path, _) = match find_video(&state, &id) {
+        Some(v) => v,
+        None => return HttpResponse::NotFound().body("video not found"),
+    };
+
+    let seg_dir = state.cache_dir.join(&id).join("video").join(quality.as_str());
+    if let Err(e) = tokio::fs::create_dir_all(&seg_dir).await {
+        return HttpResponse::InternalServerError().body(format!("cache dir: {e}"));
+    }
+
+    let seg0_path = seg_dir.join("seg_00000.m4s");
+    if seg0_path.exists() {
+        let seg_dir_clone = seg_dir.clone();
+        let init_data = match tokio::task::spawn_blocking(move || {
+            let data = std::fs::read(&seg_dir_clone.join("seg_00000.m4s"))
+                .map_err(|e| format!("read seg 0: {e}"))?;
+            media::transcode::extract_ftyp_moov_pub(&data)
+        }).await {
+            Ok(Ok(data)) => data,
+            Ok(Err(_e)) => {
+                let _ = tokio::fs::remove_file(&seg0_path).await;
+                return get_video_init_generate(abs_path, quality, &state, seg_dir).await;
+            }
+            Err(e) => return HttpResponse::InternalServerError()
+                .body(format!("task panicked: {e}")),
+        };
+        return HttpResponse::Ok()
+            .content_type("video/mp4")
+            .insert_header((header::CACHE_CONTROL, "public, max-age=31536000, immutable"))
+            .body(init_data);
+    }
+
+    get_video_init_generate(abs_path, quality, &state, seg_dir).await
+}
+
+async fn get_video_init_generate(
+    abs_path: std::path::PathBuf,
+    quality: Quality,
+    state: &web::Data<AppState>,
+    seg_dir: std::path::PathBuf,
+) -> HttpResponse {
+    let resolved = match abs_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("path error: {e}")),
+    };
+    let abs_str = match resolved.to_str() {
+        Some(s) => s.to_owned(),
+        None => return HttpResponse::BadRequest().body("path not UTF-8"),
+    };
+
+    let hwaccel = state.hwaccel.clone();
+    let seg_dir_clone = seg_dir.clone();
+    let init_data = match tokio::task::spawn_blocking(move || {
+        media::transcode::create_video_init_segment(&abs_str, quality, &hwaccel, &seg_dir_clone)
+    }).await {
+        Ok(Ok(data)) => data,
+        Ok(Err(e)) => {
+            error!(error = %e, "video init segment generation failed");
+            return HttpResponse::ServiceUnavailable().body(format!("video init failed: {e}"));
+        }
+        Err(e) => return HttpResponse::InternalServerError().body(format!("task panicked: {e}")),
+    };
+
+    HttpResponse::Ok()
+        .content_type("video/mp4")
+        .insert_header((header::CACHE_CONTROL, "public, max-age=31536000, immutable"))
+        .body(init_data)
+}
+
+/// `GET /api/videos/{id}/audio/init.mp4` — audio-only init segment.
+async fn get_audio_init(
+    id: web::Path<String>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let (abs_path, _) = match find_video(&state, &id) {
+        Some(v) => v,
+        None => return HttpResponse::NotFound().body("video not found"),
+    };
+
+    let seg_dir = state.cache_dir.join(id.as_str()).join("audio");
+    if let Err(e) = tokio::fs::create_dir_all(&seg_dir).await {
+        return HttpResponse::InternalServerError().body(format!("cache dir: {e}"));
+    }
+
+    let seg0_path = seg_dir.join("seg_00000.m4s");
+    if seg0_path.exists() {
+        let seg_dir_clone = seg_dir.clone();
+        let init_data = match tokio::task::spawn_blocking(move || {
+            let data = std::fs::read(&seg_dir_clone.join("seg_00000.m4s"))
+                .map_err(|e| format!("read audio seg 0: {e}"))?;
+            media::transcode::extract_ftyp_moov_pub(&data)
+        }).await {
+            Ok(Ok(data)) => data,
+            Ok(Err(_e)) => {
+                let _ = tokio::fs::remove_file(&seg0_path).await;
+                return get_audio_init_generate(abs_path, &state, seg_dir).await;
+            }
+            Err(e) => return HttpResponse::InternalServerError()
+                .body(format!("task panicked: {e}")),
+        };
+        return HttpResponse::Ok()
+            .content_type("audio/mp4")
+            .insert_header((header::CACHE_CONTROL, "public, max-age=31536000, immutable"))
+            .body(init_data);
+    }
+
+    get_audio_init_generate(abs_path, &state, seg_dir).await
+}
+
+async fn get_audio_init_generate(
+    abs_path: std::path::PathBuf,
+    _state: &web::Data<AppState>,
+    seg_dir: std::path::PathBuf,
+) -> HttpResponse {
+    let resolved = match abs_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("path error: {e}")),
+    };
+    let abs_str = match resolved.to_str() {
+        Some(s) => s.to_owned(),
+        None => return HttpResponse::BadRequest().body("path not UTF-8"),
+    };
+
+    let seg_dir_clone = seg_dir.clone();
+    let init_data = match tokio::task::spawn_blocking(move || {
+        media::transcode::create_audio_init_segment(&abs_str, &seg_dir_clone)
+    }).await {
+        Ok(Ok(data)) => data,
+        Ok(Err(e)) => {
+            error!(error = %e, "audio init segment generation failed");
+            return HttpResponse::ServiceUnavailable().body(format!("audio init failed: {e}"));
+        }
+        Err(e) => return HttpResponse::InternalServerError().body(format!("task panicked: {e}")),
+    };
+
+    HttpResponse::Ok()
+        .content_type("audio/mp4")
+        .insert_header((header::CACHE_CONTROL, "public, max-age=31536000, immutable"))
+        .body(init_data)
+}
+
+/// `GET /api/videos/{id}/video/{quality}/{filename}` — video-only segment.
+///
+/// Serves cached video-only fMP4 segments or generates them on demand.
+/// Strips ftyp+moov so the browser only receives moof+mdat fragments.
+async fn get_video_segment(
+    params: web::Path<(String, String, String)>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let (id, quality_str, filename) = params.into_inner();
+
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return HttpResponse::BadRequest().body("invalid filename");
+    }
+    if !filename.ends_with(".m4s") {
+        return HttpResponse::BadRequest().body("invalid segment type");
+    }
+
+    let quality = match quality_str.to_lowercase().as_str() {
+        "original" => Quality::Original,
+        "high"     => Quality::High,
+        "medium"   => Quality::Medium,
+        "low"      => Quality::Low,
+        _          => Quality::Original,
+    };
+
+    let seg_dir = state.cache_dir.join(&id).join("video").join(quality.as_str());
+
+    // Parse seg_index from filename early so we can check the 0-based cache file.
+    let url_seg_index: usize = match filename
+        .strip_prefix("seg_")
+        .and_then(|s| s.strip_suffix(".m4s"))
+        .and_then(|s| s.parse().ok())
+    {
+        Some(idx) => idx,
+        None => return HttpResponse::BadRequest().body("invalid segment filename"),
+    };
+    // MPD uses startNumber=1 but internal storage is 0-based.
+    let seg_index = if url_seg_index > 0 { url_seg_index - 1 } else { 0 };
+    let internal_seg_path = seg_dir.join(format!("seg_{:05}.m4s", seg_index));
+
+    {
+        let mut map = state.last_segment_access.write();
+        map.insert(id.clone(), Instant::now());
+    }
+    state.playback_tx.send_if_modified(|v| {
+        if *v { false } else { *v = true; true }
+    });
+
+    if let Ok(data) = tokio::fs::read(&internal_seg_path).await {
+        let stripped = media::transcode::strip_init_boxes(&data);
+        return HttpResponse::Ok()
+            .content_type("video/mp4")
+            .insert_header((header::CACHE_CONTROL, "public, max-age=31536000, immutable"))
+            .body(stripped);
+    }
+
+    let (abs_path, _) = match find_video(&state, &id) {
+        Some(v) => v,
+        None => return HttpResponse::NotFound().body("video not found"),
+    };
+
+    let resolved = match abs_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::InternalServerError()
+            .body(format!("path error: {e}")),
+    };
+    let abs_str = match resolved.to_str() {
+        Some(s) => s.to_owned(),
+        None => return HttpResponse::BadRequest().body("path not UTF-8"),
+    };
+
+    if let Err(e) = tokio::fs::create_dir_all(&seg_dir).await {
+        return HttpResponse::InternalServerError().body(format!("cache dir: {e}"));
+    }
+
+    // Acquire a transcode semaphore permit.
+    let _permit = match state.transcode_semaphore.acquire().await {
+        Ok(p) => p,
+        Err(_) => return HttpResponse::InternalServerError().body("transcode unavailable"),
+    };
+
+    // Get keyframe boundaries for accurate segment positioning.
+    let keyframe_range = if quality == Quality::Original {
+        let abs_path_ref: &Path = abs_str.as_ref();
+        let (duration_secs, _) = probe_video(abs_path_ref).await;
+        let boundaries = get_keyframe_boundaries(&state, &id, &abs_str, duration_secs).await;
+        if seg_index < boundaries.len() {
+            let kf_start = boundaries[seg_index];
+            let kf_end = if seg_index + 1 < boundaries.len() {
+                boundaries[seg_index + 1]
+            } else {
+                duration_secs
+            };
+            Some((kf_start, kf_end))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let result = media::transcode::transcode_video_segment(
+        &abs_str, &seg_dir, seg_index, &state.hwaccel, quality, keyframe_range,
+    ).await;
+
+    // The file is stored with 0-based name; serve it regardless of the 1-based URL name.
+    let internal_seg_path = seg_dir.join(format!("seg_{:05}.m4s", seg_index));
+
+    match result {
+        Ok(()) => {
+            match tokio::fs::read(&internal_seg_path).await {
+                Ok(data) => {
+                    let stripped = media::transcode::strip_init_boxes(&data);
+                    HttpResponse::Ok()
+                        .content_type("video/mp4")
+                        .insert_header((header::CACHE_CONTROL, "public, max-age=31536000, immutable"))
+                        .body(stripped)
+                }
+                Err(e) => HttpResponse::InternalServerError()
+                    .body(format!("failed to read video segment: {e}")),
+            }
+        }
+        Err(msg) => {
+            error!(error = %msg, segment = seg_index, "video segment failed");
+            HttpResponse::ServiceUnavailable()
+                .body(format!("video segment {seg_index} failed"))
+        }
+    }
+}
+
+/// `GET /api/videos/{id}/audio/{filename}` — audio-only segment.
+///
+/// Serves cached audio-only fMP4 segments or generates them on demand.
+async fn get_audio_segment(
+    params: web::Path<(String, String)>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let (id, filename) = params.into_inner();
+
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return HttpResponse::BadRequest().body("invalid filename");
+    }
+    if !filename.ends_with(".m4s") {
+        return HttpResponse::BadRequest().body("invalid segment type");
+    }
+
+    let seg_dir = state.cache_dir.join(&id).join("audio");
+
+    // Parse seg_index early so we can check the 0-based cache file.
+    let url_seg_index: usize = match filename
+        .strip_prefix("seg_")
+        .and_then(|s| s.strip_suffix(".m4s"))
+        .and_then(|s| s.parse().ok())
+    {
+        Some(idx) => idx,
+        None => return HttpResponse::BadRequest().body("invalid segment filename"),
+    };
+    // MPD uses startNumber=1 but internal storage is 0-based.
+    let seg_index = if url_seg_index > 0 { url_seg_index - 1 } else { 0 };
+    let internal_seg_path = seg_dir.join(format!("seg_{:05}.m4s", seg_index));
+
+    {
+        let mut map = state.last_segment_access.write();
+        map.insert(id.clone(), Instant::now());
+    }
+    state.playback_tx.send_if_modified(|v| {
+        if *v { false } else { *v = true; true }
+    });
+
+    if let Ok(data) = tokio::fs::read(&internal_seg_path).await {
+        let stripped = media::transcode::strip_init_boxes(&data);
+        return HttpResponse::Ok()
+            .content_type("audio/mp4")
+            .insert_header((header::CACHE_CONTROL, "public, max-age=31536000, immutable"))
+            .body(stripped);
+    }
+
+    let (abs_path, _) = match find_video(&state, &id) {
+        Some(v) => v,
+        None => return HttpResponse::NotFound().body("video not found"),
+    };
+
+    let resolved = match abs_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::InternalServerError()
+            .body(format!("path error: {e}")),
+    };
+    let abs_str = match resolved.to_str() {
+        Some(s) => s.to_owned(),
+        None => return HttpResponse::BadRequest().body("path not UTF-8"),
+    };
+
+    if let Err(e) = tokio::fs::create_dir_all(&seg_dir).await {
+        return HttpResponse::InternalServerError().body(format!("cache dir: {e}"));
+    }
+
+    let _permit = match state.transcode_semaphore.acquire().await {
+        Ok(p) => p,
+        Err(_) => return HttpResponse::InternalServerError().body("transcode unavailable"),
+    };
+
+    // Use keyframe boundaries from the video track for consistent segment boundaries.
+    let keyframe_range = {
+        let abs_path_ref: &Path = abs_str.as_ref();
+        let (duration_secs, _) = probe_video(abs_path_ref).await;
+        let boundaries = get_keyframe_boundaries(&state, &id, &abs_str, duration_secs).await;
+        if seg_index < boundaries.len() {
+            let kf_start = boundaries[seg_index];
+            let kf_end = if seg_index + 1 < boundaries.len() {
+                boundaries[seg_index + 1]
+            } else {
+                duration_secs
+            };
+            Some((kf_start, kf_end))
+        } else {
+            None
+        }
+    };
+
+    let result = media::transcode::transcode_audio_segment(
+        &abs_str, &seg_dir, seg_index, keyframe_range,
+    ).await;
+
+    match result {
+        Ok(()) => {
+            match tokio::fs::read(&internal_seg_path).await {
+                Ok(data) => {
+                    let stripped = media::transcode::strip_init_boxes(&data);
+                    HttpResponse::Ok()
+                        .content_type("audio/mp4")
+                        .insert_header((header::CACHE_CONTROL, "public, max-age=31536000, immutable"))
+                        .body(stripped)
+                }
+                Err(e) => HttpResponse::InternalServerError()
+                    .body(format!("failed to read audio segment: {e}")),
+            }
+        }
+        Err(msg) => {
+            error!(error = %msg, segment = seg_index, "audio segment failed");
+            HttpResponse::ServiceUnavailable()
+                .body(format!("audio segment {seg_index} failed"))
         }
     }
 }
@@ -4249,6 +4689,24 @@ async fn main() -> std::io::Result<()> {
                 "/api/videos/{id}/segments/{filename}",
                 web::get().to(get_segment),
             )
+            // ── Demuxed DASH-IF IOP v5 routes ─────────────────────────────
+            .route(
+                "/api/videos/{id}/video/{quality}/init.mp4",
+                web::get().to(get_video_init),
+            )
+            .route(
+                "/api/videos/{id}/audio/init.mp4",
+                web::get().to(get_audio_init),
+            )
+            .route(
+                "/api/videos/{id}/video/{quality}/{filename}",
+                web::get().to(get_video_segment),
+            )
+            .route(
+                "/api/videos/{id}/audio/{filename}",
+                web::get().to(get_audio_segment),
+            )
+            // ─────────────────────────────────────────────────────────────
             .route(
                 "/api/videos/{id}/cache",
                 web::delete().to(clear_cache),

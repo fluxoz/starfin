@@ -242,6 +242,24 @@ impl DashPlayer {
         0.0
     }
 
+    /// Set the quality index for a media type via the dash.js API.
+    ///
+    /// `media_type` is "video" or "audio".
+    /// `quality_index` maps to the Representation order in the MPD:
+    ///   0 = original, 1 = high, 2 = medium, 3 = low.
+    /// `force_replace` triggers an immediate buffer flush and re-request.
+    fn set_quality_for(&self, media_type: &str, quality_index: i32, force_replace: bool) {
+        if let Ok(func) = js_sys::Reflect::get(&self.player, &"setQualityFor".into()) {
+            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                let args = js_sys::Array::new();
+                args.push(&JsValue::from_str(media_type));
+                args.push(&JsValue::from_f64(quality_index as f64));
+                args.push(&JsValue::from_bool(force_replace));
+                let _ = js_sys::Reflect::apply(&func, &self.player, &args);
+            }
+        }
+    }
+
     /// Destroy/reset the player.
     fn destroy(&self) {
         if let Ok(func) = js_sys::Reflect::get(&self.player, &"destroy".into()) {
@@ -603,7 +621,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         None => { error_clone.set(Some("Video element not found".into())); return; }
                     };
 
-                    let manifest_url = format!("/api/videos/{}/manifest.mpd?quality={}", video_id, quality);
+                    let manifest_url = format!("/api/videos/{}/manifest.mpd", video_id);
 
                     // Create dash.js player
                     let player = DashPlayer::create();
@@ -732,6 +750,17 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
                     // Load the manifest — dash.js will start fetching segments.
                     player.attach_source(&manifest_url, start_pos);
+
+                    // Set the initial quality index based on the selected quality.
+                    // Representation order in MPD: 0=original, 1=high, 2=medium, 3=low.
+                    let quality_index = match quality.as_str() {
+                        "original" => 0i32,
+                        "high"     => 1i32,
+                        "medium"   => 2i32,
+                        "low"      => 3i32,
+                        _          => 0i32,
+                    };
+                    player.set_quality_for("video", quality_index, false);
 
                     status_clone.set(String::new());
 

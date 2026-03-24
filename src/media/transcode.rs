@@ -2288,6 +2288,694 @@ fn transcode_segment_body(
     Ok(())
 }
 
+// ── Demuxed (separate audio/video) segment functions ────────────────────────
+
+/// movflags for audio-only fMP4 output.
+///
+/// - `empty_moov`         — write ftyp+moov init segment.
+/// - `frag_every_frame`   — create a new moof for every audio frame (AAC has
+///                          no keyframes; frag_keyframe would never fragment).
+/// - `default_base_moof`  — make every moof self-contained (DASH/CMAF required).
+const FMP4_MOVFLAGS_AUDIO: &str = "empty_moov+frag_every_frame+default_base_moof";
+
+/// Create an fMP4 output context suitable for audio-only segments.
+///
+/// Uses `frag_every_frame` instead of `frag_keyframe` since AAC audio has no
+/// keyframe concept — every frame is an independent access point.
+fn create_fmp4_audio_output(tmp_path: &Path) -> Result<ffmpeg_next::format::context::Output, String> {
+    let mut octx = ffmpeg_next::format::output_as(tmp_path, "mp4")
+        .map_err(|e| format!("audio output context: {e}"))?;
+
+    unsafe {
+        let key = std::ffi::CString::new("movflags").unwrap();
+        let val = std::ffi::CString::new(FMP4_MOVFLAGS_AUDIO).unwrap();
+        let ret = ffmpeg_next::ffi::av_opt_set(
+            octx.as_mut_ptr() as *mut std::ffi::c_void,
+            key.as_ptr(),
+            val.as_ptr(),
+            ffmpeg_next::ffi::AV_OPT_SEARCH_CHILDREN as i32,
+        );
+        if ret < 0 {
+            return Err(format!("av_opt_set movflags (audio) failed (ret={ret})"));
+        }
+    }
+
+    Ok(octx)
+}
+
+/// Copy only the video stream from input into an fMP4 segment.
+///
+/// Collects video packets from the first keyframe at or after `start_time`
+/// until the next keyframe at or after `end_time`.  Audio is excluded; the
+/// corresponding audio segment is served from a separate `audio/` cache dir.
+///
+/// Returns the actual PTS (in seconds) of the first video keyframe included.
+fn remux_video_only_segment(
+    ictx: &mut ffmpeg_next::format::context::Input,
+    start_time: f64,
+    end_time: f64,
+    tmp_path: &Path,
+    kill: Option<&AtomicBool>,
+) -> Result<f64, String> {
+    let video_idx = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Video)
+        .map(|s| s.index())
+        .ok_or_else(|| "remux_video_only: no video stream".to_string())?;
+
+    let seek_ts = (start_time * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
+    let _ = ictx.seek(seek_ts, ..seek_ts);
+
+    let in_video_tb = ictx.stream(video_idx).unwrap().time_base();
+    let in_video_params = ictx.stream(video_idx).unwrap().parameters();
+
+    let mut octx = create_fmp4_output(tmp_path)?;
+
+    let out_video = octx
+        .add_stream(ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::H264))
+        .map_err(|e| format!("add video stream: {e}"))?;
+    unsafe {
+        ffmpeg_next::ffi::avcodec_parameters_copy(
+            out_video.parameters().as_mut_ptr(),
+            in_video_params.as_ptr(),
+        );
+    }
+    let out_video_idx = out_video.index();
+
+    write_fmp4_header(&mut octx)?;
+    let out_video_tb = octx.stream(out_video_idx).unwrap().time_base();
+
+    let mut got_keyframe = false;
+    let mut keyframe_pts_secs = start_time;
+
+    for (stream, mut packet) in ictx.packets() {
+        if let Some(k) = kill {
+            if k.load(Ordering::Relaxed) {
+                let _ = std::fs::remove_file(tmp_path);
+                return Err(CANCELLED.into());
+            }
+        }
+        if stream.index() != video_idx {
+            continue;
+        }
+
+        let pts = packet.pts().unwrap_or(0);
+        let pts_secs = pts as f64 * f64::from(in_video_tb.0) / f64::from(in_video_tb.1);
+
+        if !got_keyframe {
+            if !packet.is_key() {
+                continue;
+            }
+            if pts_secs < start_time {
+                continue;
+            }
+            got_keyframe = true;
+            keyframe_pts_secs = pts_secs;
+        } else if packet.is_key() && pts_secs >= end_time {
+            break;
+        }
+
+        packet.set_stream(out_video_idx);
+        packet.rescale_ts(in_video_tb, out_video_tb);
+        let _ = packet.write_interleaved(&mut octx);
+    }
+
+    write_fmp4_trailer(&mut octx)?;
+    Ok(keyframe_pts_secs)
+}
+
+/// Copy only the audio stream from input into an audio-only fMP4 segment.
+///
+/// Collects audio packets from `start_time` to `end_time`.  Audio does not
+/// need keyframe alignment — every AAC frame is independently decodable.
+fn remux_audio_only_segment(
+    ictx: &mut ffmpeg_next::format::context::Input,
+    start_time: f64,
+    end_time: f64,
+    tmp_path: &Path,
+    kill: Option<&AtomicBool>,
+) -> Result<(), String> {
+    let audio_idx = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Audio)
+        .map(|s| s.index())
+        .ok_or_else(|| "remux_audio_only: no audio stream".to_string())?;
+
+    let seek_ts = (start_time * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
+    let _ = ictx.seek(seek_ts, ..seek_ts);
+
+    let in_audio_tb = ictx.stream(audio_idx).unwrap().time_base();
+    let in_audio_params = ictx.stream(audio_idx).unwrap().parameters();
+    let audio_codec_id = in_audio_params.id();
+
+    let mut octx = create_fmp4_audio_output(tmp_path)?;
+
+    let out_audio = octx
+        .add_stream(ffmpeg_next::encoder::find(audio_codec_id))
+        .map_err(|e| format!("add audio stream: {e}"))?;
+    unsafe {
+        ffmpeg_next::ffi::avcodec_parameters_copy(
+            out_audio.parameters().as_mut_ptr(),
+            in_audio_params.as_ptr(),
+        );
+    }
+    let out_audio_idx = out_audio.index();
+
+    write_fmp4_header(&mut octx)?;
+    let out_audio_tb = octx.stream(out_audio_idx).unwrap().time_base();
+
+    for (stream, mut packet) in ictx.packets() {
+        if let Some(k) = kill {
+            if k.load(Ordering::Relaxed) {
+                let _ = std::fs::remove_file(tmp_path);
+                return Err(CANCELLED.into());
+            }
+        }
+        if stream.index() != audio_idx {
+            continue;
+        }
+
+        let pts = packet.pts().unwrap_or(0);
+        let pts_secs = pts as f64 * f64::from(in_audio_tb.0) / f64::from(in_audio_tb.1);
+
+        if pts_secs < start_time {
+            continue;
+        }
+        if pts_secs >= end_time {
+            break;
+        }
+
+        packet.set_stream(out_audio_idx);
+        packet.rescale_ts(in_audio_tb, out_audio_tb);
+        let _ = packet.write_interleaved(&mut octx);
+    }
+
+    write_fmp4_trailer(&mut octx)?;
+    Ok(())
+}
+
+/// Decode audio from source and re-encode to stereo AAC into an audio-only fMP4.
+///
+/// Used when the source audio is not directly remuxable (e.g. multi-channel
+/// surround, FLAC, or other non-browser-compatible formats).
+fn audio_transcode_only_segment(
+    ictx: &mut ffmpeg_next::format::context::Input,
+    start_time: f64,
+    end_time: f64,
+    tmp_path: &Path,
+    kill: Option<&AtomicBool>,
+) -> Result<(), String> {
+    let audio_idx = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Audio)
+        .map(|s| s.index())
+        .ok_or_else(|| "audio_transcode_only: no audio stream".to_string())?;
+
+    let seek_ts = (start_time * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
+    let _ = ictx.seek(seek_ts, ..seek_ts);
+
+    let in_audio_tb = ictx.stream(audio_idx).unwrap().time_base();
+    let in_audio_params = ictx.stream(audio_idx).unwrap().parameters();
+
+    // Set up audio decoder.
+    let aud_ctx = ffmpeg_next::codec::context::Context::from_parameters(in_audio_params)
+        .map_err(|e| format!("audio decoder context: {e}"))?;
+    let mut audio_decoder = aud_ctx
+        .decoder()
+        .audio()
+        .map_err(|e| format!("audio decoder: {e}"))?;
+
+    let audio_sample_rate = audio_decoder.rate();
+    let raw_dec_layout = audio_decoder.channel_layout();
+    let approx_channels = if raw_dec_layout.channels() > 0 {
+        raw_dec_layout.channels()
+    } else if audio_decoder.channels() > 0 {
+        audio_decoder.channels() as i32
+    } else {
+        2
+    };
+
+    let enc_layout = if approx_channels == 1 {
+        ffmpeg_next::channel_layout::ChannelLayout::MONO
+    } else {
+        ffmpeg_next::channel_layout::ChannelLayout::STEREO
+    };
+    let enc_format = ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Planar);
+
+    let aac_codec = ffmpeg_next::encoder::find_by_name("aac")
+        .ok_or_else(|| "AAC encoder not found".to_string())?;
+    let aac_ctx = ffmpeg_next::codec::context::Context::new_with_codec(aac_codec);
+    let mut aac_enc = aac_ctx
+        .encoder()
+        .audio()
+        .map_err(|e| format!("AAC encoder setup: {e}"))?;
+    aac_enc.set_rate(audio_sample_rate as i32);
+    aac_enc.set_channel_layout(enc_layout);
+    aac_enc.set_format(enc_format);
+    aac_enc.set_bit_rate(AAC_ENCODE_BITRATE);
+    aac_enc.set_time_base(ffmpeg_next::Rational::new(1, audio_sample_rate as i32));
+    unsafe {
+        let ctx_ptr = aac_enc.as_mut_ptr();
+        (*ctx_ptr).flags |= ffmpeg_next::ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+    }
+    let mut aac_encoder = aac_enc
+        .open_as(aac_codec)
+        .map_err(|e| format!("open AAC encoder: {e}"))?;
+
+    let mut octx = create_fmp4_audio_output(tmp_path)?;
+    let mut out_aud_stream = octx
+        .add_stream(aac_codec)
+        .map_err(|e| format!("add audio stream: {e}"))?;
+    out_aud_stream.set_parameters(&aac_encoder);
+    let out_audio_idx = out_aud_stream.index();
+
+    write_fmp4_header(&mut octx)?;
+    let out_audio_tb = octx.stream(out_audio_idx).unwrap().time_base();
+
+    let mut audio_resampler: Option<ffmpeg_next::software::resampling::Context> = None;
+    let mut audio_sample_count: i64 = 0;
+    let audio_ts_offset = (start_time * audio_sample_rate as f64) as i64;
+
+    for (stream, packet) in ictx.packets() {
+        if let Some(k) = kill {
+            if k.load(Ordering::Relaxed) {
+                let _ = std::fs::remove_file(tmp_path);
+                return Err(CANCELLED.into());
+            }
+        }
+        if stream.index() != audio_idx {
+            continue;
+        }
+
+        let pts = packet.pts().unwrap_or(0);
+        let pts_secs = pts as f64 * f64::from(in_audio_tb.0) / f64::from(in_audio_tb.1);
+        if pts_secs < start_time {
+            continue;
+        }
+        if pts_secs >= end_time {
+            break;
+        }
+
+        if audio_decoder.send_packet(&packet).is_err() {
+            continue;
+        }
+        let mut audio_frame = ffmpeg_next::frame::Audio::empty();
+        while audio_decoder.receive_frame(&mut audio_frame).is_ok() {
+            ensure_frame_channel_layout(&mut audio_frame);
+
+            if audio_resampler.is_none() {
+                let frame_layout = frame_channel_layout(&audio_frame);
+                let frame_format = audio_frame.format();
+                let frame_rate = if audio_frame.rate() > 0 {
+                    audio_frame.rate()
+                } else {
+                    audio_sample_rate
+                };
+                if let Ok(r) = ffmpeg_next::software::resampling::Context::get(
+                    frame_format,
+                    frame_layout,
+                    frame_rate,
+                    enc_format,
+                    enc_layout,
+                    frame_rate,
+                ) {
+                    audio_resampler = Some(r);
+                }
+            }
+
+            let frame_to_encode = if let Some(ref mut resampler) = audio_resampler {
+                let mut resampled = ffmpeg_next::frame::Audio::empty();
+                if resampler.run(&audio_frame, &mut resampled).is_err() {
+                    continue;
+                }
+                resampled
+            } else {
+                audio_frame.clone()
+            };
+
+            encode_audio_frame(
+                &frame_to_encode,
+                &mut aac_encoder,
+                &mut octx,
+                out_audio_idx,
+                audio_sample_rate,
+                out_audio_tb,
+                &mut audio_sample_count,
+                audio_ts_offset,
+            );
+        }
+    }
+
+    // Flush encoder.
+    let _ = aac_encoder.send_eof();
+    let mut pkt = ffmpeg_next::Packet::empty();
+    while aac_encoder.receive_packet(&mut pkt).is_ok() {
+        pkt.set_stream(out_audio_idx);
+        pkt.rescale_ts(
+            ffmpeg_next::Rational::new(1, audio_sample_rate as i32),
+            out_audio_tb,
+        );
+        let _ = pkt.write_interleaved(&mut octx);
+    }
+
+    write_fmp4_trailer(&mut octx)?;
+    Ok(())
+}
+
+/// Video-only transcode path — re-encodes video without audio.
+///
+/// Used when source video is not H.264 or when a lower quality tier is
+/// requested.  This is `transcode_segment_inprocess` with `audio_stream_idx`
+/// forced to `None`, so no audio encoder/resampler setup is performed.
+fn transcode_video_only_inprocess(
+    ictx: &mut ffmpeg_next::format::context::Input,
+    start_time: f64,
+    hwaccel: &HwAccel,
+    quality: Quality,
+    tmp_path: &Path,
+    kill: Option<&AtomicBool>,
+) -> Result<(), String> {
+    let seek_ts = (start_time * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
+    let _ = ictx.seek(seek_ts, ..seek_ts);
+
+    let video_stream_idx = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Video)
+        .map(|s| s.index())
+        .ok_or_else(|| "no video stream found".to_string())?;
+
+    let video_stream = ictx.stream(video_stream_idx).unwrap();
+    let video_time_base = video_stream.time_base();
+    let video_params = video_stream.parameters();
+
+    let (in_width, in_height, frame_rate) = unsafe {
+        let p = video_params.as_ptr();
+        let fr = (*p).framerate;
+        let fps = if fr.den > 0 { fr.num as f64 / fr.den as f64 } else { 0.0 };
+        ((*p).width as u32, (*p).height as u32, fps)
+    };
+    let effective_fps = if frame_rate > 0.0 && frame_rate.is_finite() { frame_rate } else { 30.0 };
+
+    let (out_width, out_height, crf, preset) = match quality {
+        Quality::Original | Quality::High => (in_width, in_height, "18", "veryslow"),
+        Quality::Medium => {
+            let max_w = 1280u32;
+            if in_width <= max_w {
+                (in_width, in_height, "26", "fast")
+            } else {
+                let ratio = max_w as f64 / in_width as f64;
+                let h = ((in_height as f64 * ratio) as u32) & !1;
+                (max_w, h, "26", "fast")
+            }
+        }
+        Quality::Low => {
+            let max_w = 854u32;
+            if in_width <= max_w {
+                (in_width, in_height, "30", "faster")
+            } else {
+                let ratio = max_w as f64 / in_width as f64;
+                let h = ((in_height as f64 * ratio) as u32) & !1;
+                (max_w, h, "30", "faster")
+            }
+        }
+    };
+
+    let use_hw = matches!(quality, Quality::Original | Quality::High) && *hwaccel != HwAccel::Software;
+    let encoder_name = if use_hw { hwaccel.encoder() } else { "libx264" };
+
+    let video_decoder_ctx = ffmpeg_next::codec::context::Context::from_parameters(video_params)
+        .map_err(|e| format!("video decoder context: {e}"))?;
+    let mut video_decoder = video_decoder_ctx
+        .decoder()
+        .video()
+        .map_err(|e| format!("video decoder: {e}"))?;
+
+    let mut hw_device_ctx: *mut ffmpeg_next::ffi::AVBufferRef = std::ptr::null_mut();
+    let mut hw_frames_ctx: *mut ffmpeg_next::ffi::AVBufferRef = std::ptr::null_mut();
+
+    if use_hw {
+        unsafe {
+            let dev_type = super::hwaccel::hwdevice_type_for(hwaccel)
+                .ok_or_else(|| "no hw device type for this backend".to_string())?;
+            let device_path = super::hwaccel::default_device_path(hwaccel);
+            hw_device_ctx = super::hwaccel::create_hw_device_ctx(dev_type, device_path.as_deref())?;
+            hw_frames_ctx = super::hwaccel::create_hw_frames_ctx(
+                hw_device_ctx,
+                super::hwaccel::hw_pix_fmt_for(hwaccel),
+                ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+                out_width as i32,
+                out_height as i32,
+            )?;
+        }
+    }
+
+    let result = transcode_segment_body(
+        ictx,
+        &mut video_decoder,
+        video_stream_idx,
+        video_time_base,
+        None, // audio_stream_idx = None → video-only output
+        in_width, in_height,
+        out_width, out_height,
+        effective_fps,
+        start_time,
+        use_hw,
+        hw_frames_ctx,
+        hwaccel,
+        encoder_name,
+        quality,
+        preset, crf,
+        tmp_path,
+        kill,
+    );
+
+    unsafe {
+        if !hw_frames_ctx.is_null() {
+            ffmpeg_next::ffi::av_buffer_unref(&mut hw_frames_ctx);
+        }
+        if !hw_device_ctx.is_null() {
+            ffmpeg_next::ffi::av_buffer_unref(&mut hw_device_ctx);
+        }
+    }
+
+    result
+}
+
+/// Create a single video-only fMP4 segment.
+///
+/// `seg_dir` should be `{cache}/{id}/video/{quality}/`.
+/// Uses the same remux/transcode logic as `create_segment` but excludes audio.
+fn create_segment_video_only(
+    abs_path: &str,
+    seg_dir: &Path,
+    seg_index: usize,
+    hwaccel: &HwAccel,
+    quality: Quality,
+    kill: Option<&AtomicBool>,
+    keyframe_range: Option<(f64, f64)>,
+) -> Result<(), String> {
+    super::ensure_init();
+
+    let filename = format!("seg_{:05}.m4s", seg_index);
+    let tmp_filename = format!(".seg_{:05}.m4s.tmp", seg_index);
+    let tmp_path = seg_dir.join(&tmp_filename);
+    let seg_path = seg_dir.join(&filename);
+
+    if seg_path.exists() {
+        return Ok(());
+    }
+
+    let nominal_start = seg_index as f64 * SEGMENT_DURATION;
+
+    let mut ictx = ffmpeg_next::format::input(&abs_path)
+        .map_err(|e| format!("failed to open input: {e}"))?;
+
+    let (seg_start, seg_end) = if let Some((kf_start, kf_end)) = keyframe_range {
+        (kf_start, kf_end)
+    } else {
+        (nominal_start, nominal_start + SEGMENT_DURATION)
+    };
+
+    let actual_start = if quality.can_remux() && video_is_remuxable(&ictx) {
+        remux_video_only_segment(&mut ictx, seg_start, seg_end, &tmp_path, kill)?
+    } else {
+        let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
+        transcode_video_only_inprocess(&mut ictx, nominal_start, hwaccel, effective_quality, &tmp_path, kill)?;
+        nominal_start
+    };
+
+    let tfdt_time = if keyframe_range.is_some() {
+        actual_start
+    } else if (actual_start - nominal_start).abs() < SEGMENT_BOUNDARY_TOLERANCE_S {
+        nominal_start
+    } else {
+        actual_start
+    };
+
+    patch_segment_tfdt(&tmp_path, tfdt_time)?;
+
+    std::fs::rename(&tmp_path, &seg_path)
+        .map_err(|e| format!("failed to rename video segment {seg_index}: {e}"))?;
+
+    Ok(())
+}
+
+/// Create a single audio-only fMP4 segment.
+///
+/// `seg_dir` should be `{cache}/{id}/audio/` (quality-independent).
+/// Uses remux for browser-compatible stereo AAC/MP3, transcode otherwise.
+fn create_segment_audio_only(
+    abs_path: &str,
+    seg_dir: &Path,
+    seg_index: usize,
+    kill: Option<&AtomicBool>,
+    keyframe_range: Option<(f64, f64)>,
+) -> Result<(), String> {
+    super::ensure_init();
+
+    let filename = format!("seg_{:05}.m4s", seg_index);
+    let tmp_filename = format!(".seg_{:05}.m4s.tmp", seg_index);
+    let tmp_path = seg_dir.join(&tmp_filename);
+    let seg_path = seg_dir.join(&filename);
+
+    if seg_path.exists() {
+        return Ok(());
+    }
+
+    let nominal_start = seg_index as f64 * SEGMENT_DURATION;
+
+    let mut ictx = ffmpeg_next::format::input(&abs_path)
+        .map_err(|e| format!("failed to open input: {e}"))?;
+
+    if ictx.streams().best(ffmpeg_next::media::Type::Audio).is_none() {
+        return Err("no audio stream found".into());
+    }
+
+    let (seg_start, seg_end) = if let Some((kf_start, kf_end)) = keyframe_range {
+        (kf_start, kf_end)
+    } else {
+        (nominal_start, nominal_start + SEGMENT_DURATION)
+    };
+
+    if audio_is_remuxable(&ictx) {
+        remux_audio_only_segment(&mut ictx, seg_start, seg_end, &tmp_path, kill)?;
+    } else {
+        audio_transcode_only_segment(&mut ictx, seg_start, seg_end, &tmp_path, kill)?;
+    }
+
+    let tfdt_time = if keyframe_range.is_some() { seg_start } else { nominal_start };
+    patch_segment_tfdt(&tmp_path, tfdt_time)?;
+
+    std::fs::rename(&tmp_path, &seg_path)
+        .map_err(|e| format!("failed to rename audio segment {seg_index}: {e}"))?;
+
+    Ok(())
+}
+
+/// Async wrapper — create a demuxed video-only fMP4 segment.
+///
+/// `seg_dir` is the quality-specific video cache directory:
+/// `{cache}/{id}/video/{quality}/`.
+pub async fn transcode_video_segment(
+    abs_path: &str,
+    seg_dir: &Path,
+    seg_index: usize,
+    hwaccel: &HwAccel,
+    quality: Quality,
+    keyframe_range: Option<(f64, f64)>,
+) -> Result<(), String> {
+    let filename = format!("seg_{:05}.m4s", seg_index);
+    let seg_path = seg_dir.join(&filename);
+    if seg_path.exists() {
+        return Ok(());
+    }
+
+    let abs_path = abs_path.to_owned();
+    let seg_dir = seg_dir.to_owned();
+    let hwaccel = hwaccel.clone();
+    tokio::task::spawn_blocking(move || {
+        create_segment_video_only(&abs_path, &seg_dir, seg_index, &hwaccel, quality, None, keyframe_range)
+    })
+    .await
+    .map_err(|e| format!("video segment task panicked: {e}"))?
+}
+
+/// Async wrapper — create a demuxed audio-only fMP4 segment.
+///
+/// `seg_dir` is the quality-independent audio cache directory:
+/// `{cache}/{id}/audio/`.
+pub async fn transcode_audio_segment(
+    abs_path: &str,
+    seg_dir: &Path,
+    seg_index: usize,
+    keyframe_range: Option<(f64, f64)>,
+) -> Result<(), String> {
+    let filename = format!("seg_{:05}.m4s", seg_index);
+    let seg_path = seg_dir.join(&filename);
+    if seg_path.exists() {
+        return Ok(());
+    }
+
+    let abs_path = abs_path.to_owned();
+    let seg_dir = seg_dir.to_owned();
+    tokio::task::spawn_blocking(move || {
+        create_segment_audio_only(&abs_path, &seg_dir, seg_index, None, keyframe_range)
+    })
+    .await
+    .map_err(|e| format!("audio segment task panicked: {e}"))?
+}
+
+/// Extract the fMP4 init segment for the video-only (demuxed) track.
+///
+/// Works like `create_init_segment` but creates a video-only segment 0 in
+/// `seg_cache_dir` (`{cache}/{id}/video/{quality}/`) and extracts ftyp+moov.
+pub fn create_video_init_segment(
+    abs_path: &str,
+    quality: Quality,
+    hwaccel: &HwAccel,
+    seg_cache_dir: &Path,
+) -> Result<Vec<u8>, String> {
+    super::ensure_init();
+
+    let seg0_path = seg_cache_dir.join("seg_00000.m4s");
+
+    if seg0_path.exists() {
+        let data = std::fs::read(&seg0_path)
+            .map_err(|e| format!("failed to read cached video segment 0: {e}"))?;
+        return extract_ftyp_moov(&data);
+    }
+
+    create_segment_video_only(abs_path, seg_cache_dir, 0, hwaccel, quality, None, None)?;
+    let data = std::fs::read(&seg0_path)
+        .map_err(|e| format!("failed to read video segment 0: {e}"))?;
+    extract_ftyp_moov(&data)
+}
+
+/// Extract the fMP4 init segment for the audio-only (demuxed) track.
+///
+/// Works like `create_init_segment` but creates an audio-only segment 0 in
+/// `seg_cache_dir` (`{cache}/{id}/audio/`) and extracts ftyp+moov.
+pub fn create_audio_init_segment(
+    abs_path: &str,
+    seg_cache_dir: &Path,
+) -> Result<Vec<u8>, String> {
+    super::ensure_init();
+
+    let seg0_path = seg_cache_dir.join("seg_00000.m4s");
+
+    if seg0_path.exists() {
+        let data = std::fs::read(&seg0_path)
+            .map_err(|e| format!("failed to read cached audio segment 0: {e}"))?;
+        return extract_ftyp_moov(&data);
+    }
+
+    create_segment_audio_only(abs_path, seg_cache_dir, 0, None, None)?;
+    let data = std::fs::read(&seg0_path)
+        .map_err(|e| format!("failed to read audio segment 0: {e}"))?;
+    extract_ftyp_moov(&data)
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2317,7 +3005,7 @@ mod tests {
         assert!(!audio_is_remuxable(&ictx), "6ch audio should not be directly remuxable");
 
         let out = Path::new("/tmp/test_media/test_hybrid_6ch.m4s");
-        hybrid_segment(&mut ictx, 0.0, out, None).expect("hybrid segment failed");
+        hybrid_segment(&mut ictx, 0.0, 6.0, out, None).expect("hybrid segment failed");
         verify_segment(out, true);
     }
 
@@ -2329,7 +3017,7 @@ mod tests {
 
         let mut ictx = ffmpeg_next::format::input(&test_file).unwrap();
         let out = Path::new("/tmp/test_media/test_hybrid_6ch_seg1.m4s");
-        hybrid_segment(&mut ictx, 6.0, out, None).expect("hybrid segment at t=6s failed");
+        hybrid_segment(&mut ictx, 6.0, 12.0, out, None).expect("hybrid segment at t=6s failed");
         verify_segment(out, true);
     }
 
@@ -2343,7 +3031,7 @@ mod tests {
         assert!(source_is_remuxable(&ictx));
 
         let out = Path::new("/tmp/test_media/test_remux_stereo.m4s");
-        remux_segment(&mut ictx, 0.0, out, None).expect("remux segment failed");
+        remux_segment(&mut ictx, 0.0, 6.0, out, None).expect("remux segment failed");
         verify_segment(out, true);
     }
 
@@ -2369,7 +3057,7 @@ mod tests {
         assert!(!audio_is_remuxable(&ictx), "FLAC is not browser-remuxable");
 
         let out = Path::new("/tmp/test_media/test_hybrid_flac.m4s");
-        hybrid_segment(&mut ictx, 0.0, out, None).expect("hybrid segment with FLAC failed");
+        hybrid_segment(&mut ictx, 0.0, 6.0, out, None).expect("hybrid segment with FLAC failed");
         verify_segment(out, true);
     }
 

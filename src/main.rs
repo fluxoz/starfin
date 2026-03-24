@@ -2233,6 +2233,11 @@ async fn remove_non_precached_segments_all_qualities(video_cache_dir: &Path) {
     }
 }
 
+/// Compute the greatest common divisor of two u32 values.
+fn gcd_u32(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { gcd_u32(b, a % b) }
+}
+
 /// `GET /api/videos/{id}/manifest.mpd`
 ///
 /// Generates a DASH-IF IOP v5 compliant MPD manifest for VOD playback.
@@ -2365,8 +2370,7 @@ async fn get_manifest(
     let audio_codec = codec_info.audio_codec.as_deref().unwrap_or("mp4a.40.2");
 
     // GCD of width/height for par attribute.
-    fn gcd(a: u32, b: u32) -> u32 { if b == 0 { a } else { gcd(b, a % b) } }
-    let g = gcd(w_orig, h_orig);
+    let g = gcd_u32(w_orig, h_orig);
     let (par_w, par_h) = (w_orig / g, h_orig / g);
 
     let mut mpd = String::new();
@@ -2384,15 +2388,15 @@ async fn get_manifest(
     // ── Video AdaptationSet ──
     mpd.push_str(&format!(
         "    <AdaptationSet id=\"1\" contentType=\"video\" mimeType=\"video/mp4\"\n\
-         \x20               segmentAlignment=\"true\" subsegmentAlignment=\"true\"\n\
-         \x20               subsegmentStartsWithSAP=\"1\" startWithSAP=\"1\"\n\
-         \x20               par=\"{par_w}:{par_h}\">\n"
+         \x20    segmentAlignment=\"true\" subsegmentAlignment=\"true\"\n\
+         \x20    subsegmentStartsWithSAP=\"1\" startWithSAP=\"1\"\n\
+         \x20    par=\"{par_w}:{par_h}\">\n"
     ));
     mpd.push_str(&format!(
         "      <SegmentTemplate timescale=\"90000\"\n\
-         \x20                   initialization=\"/api/videos/{id}/video/$RepresentationID$/init.mp4\"\n\
-         \x20                   media=\"/api/videos/{id}/video/$RepresentationID$/seg_$Number%05d$.m4s\"\n\
-         \x20                   startNumber=\"1\">\n",
+         \x20        initialization=\"/api/videos/{id}/video/$RepresentationID$/init.mp4\"\n\
+         \x20        media=\"/api/videos/{id}/video/$RepresentationID$/seg_$Number%05d$.m4s\"\n\
+         \x20        startNumber=\"1\">\n",
         id = *id
     ));
     mpd.push_str("        <SegmentTimeline>\n");
@@ -2421,14 +2425,15 @@ async fn get_manifest(
     if has_audio {
         mpd.push_str(&format!(
             "    <AdaptationSet id=\"2\" contentType=\"audio\" mimeType=\"audio/mp4\"\n\
-             \x20               segmentAlignment=\"true\" subsegmentAlignment=\"true\"\n\
-             \x20               lang=\"und\">\n"
+             \x20    segmentAlignment=\"true\" subsegmentAlignment=\"true\"\n\
+             \x20    lang=\"und\">\n"
         ));
         mpd.push_str(&format!(
             "      <SegmentTemplate timescale=\"{audio_sample_rate}\"\n\
-             \x20                   initialization=\"/api/videos/{id}/audio/init.mp4\"\n\
-             \x20                   media=\"/api/videos/{id}/audio/seg_$Number%05d$.m4s\"\n\
-             \x20                   startNumber=\"1\">\n",
+             \x20        initialization=\"/api/videos/{id}/audio/init.mp4\"\n\
+             \x20        media=\"/api/videos/{id}/audio/seg_$Number%05d$.m4s\"\n\
+             \x20        startNumber=\"1\">\n",
+            audio_sample_rate = audio_sample_rate,
             id = *id
         ));
         mpd.push_str("        <SegmentTimeline>\n");

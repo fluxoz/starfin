@@ -1062,59 +1062,9 @@ struct AppState {
     /// Last known playback positions per video ID (populated by player_ws).
     /// Used for resume-on-reload support.
     playback_positions: Arc<RwLock<HashMap<String, f64>>>,
-    /// Cached keyframe boundaries per video ID.
-    /// Maps video_id → Vec of keyframe PTS positions (sorted ascending).
-    /// Pre-scanned once on first access and used by the MPD generator and
-    /// segment server for the Original quality remux path.
-    keyframe_cache: Arc<RwLock<HashMap<String, Vec<f64>>>>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Get or lazily scan keyframe boundaries for a video.
-///
-/// For the Original quality remux path, the MPD and segment server need to
-/// know actual keyframe positions so the SegmentTimeline and tfdt match
-/// exactly (zero delta).  Boundaries are scanned once and cached in memory.
-async fn get_keyframe_boundaries(
-    state: &AppState,
-    video_id: &str,
-    abs_path: &str,
-    duration: f64,
-) -> Vec<f64> {
-    // Check cache first.
-    {
-        let cache = state.keyframe_cache.read();
-        if let Some(boundaries) = cache.get(video_id) {
-            return boundaries.clone();
-        }
-    }
-
-    // Scan keyframes (fast packet-level scan, no decoding).
-    let abs_path_owned = abs_path.to_owned();
-    let all_keyframes = tokio::task::spawn_blocking(move || {
-        media::transcode::scan_keyframe_boundaries(&abs_path_owned)
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("keyframe scan panicked: {e}")));
-
-    let boundaries = match all_keyframes {
-        Ok(kfs) => media::transcode::pick_segment_boundaries(&kfs, duration),
-        Err(e) => {
-            eprintln!("[keyframe] scan failed for {video_id}: {e}");
-            // Fall back to nominal boundaries.
-            media::transcode::nominal_boundaries(duration)
-        }
-    };
-
-    // Cache for future requests.
-    {
-        let mut cache = state.keyframe_cache.write();
-        cache.insert(video_id.to_string(), boundaries.clone());
-    }
-
-    boundaries
-}
 
 /// Stable, deterministic video ID derived from the relative path.
 fn video_id(rel_path: &str) -> String {
@@ -2299,15 +2249,12 @@ async fn get_manifest(
     };
     let has_audio = codec_info.audio_codec.is_some();
 
-    // Get keyframe boundaries for accurate SegmentTimeline.
-    let abs_str = abs_path.to_str().unwrap_or_default();
-    let mut boundaries = get_keyframe_boundaries(&state, &id, abs_str, duration).await;
-    // Safety: if boundary scan returned nothing usable, fall back to nominal
-    // boundaries so the MPD always has at least one segment.
-    if boundaries.is_empty() {
-        boundaries = media::transcode::nominal_boundaries(duration);
-    }
-    let num_segments = boundaries.len();
+    // Use nominal segment boundaries — standard DASH practice.
+    // Each segment is exactly SEGMENT_DURATION seconds (6s), except possibly
+    // the last one.  The segment generator seeks to the nearest keyframe and
+    // patches the tfdt to match.  dash.js gap-jumping handles any residual
+    // timing differences.
+    let num_segments = (duration / SEGMENT_DURATION).ceil().max(1.0) as usize;
 
     // Format ISO 8601 duration.
     let hours = (duration as u64) / 3600;
@@ -2332,20 +2279,20 @@ async fn get_manifest(
     // Frame rate from stream info.
     let fps_str = "30"; // simplified; could probe if needed
 
-    // Build SegmentTimeline for video (timescale=90000).
+    // Build SegmentTimeline for video (timescale=90000) using nominal durations.
     let mut video_durations: Vec<u64> = Vec::with_capacity(num_segments);
     for i in 0..num_segments {
-        let seg_start = boundaries[i];
-        let seg_end = if i + 1 < boundaries.len() { boundaries[i + 1] } else { duration };
+        let seg_start = i as f64 * SEGMENT_DURATION;
+        let seg_end = ((i + 1) as f64 * SEGMENT_DURATION).min(duration);
         let dur_ticks = ((seg_end - seg_start) * 90000.0).round().max(1.0) as u64;
         video_durations.push(dur_ticks);
     }
 
-    // Build SegmentTimeline for audio (timescale=audio_sample_rate).
+    // Build SegmentTimeline for audio (timescale=audio_sample_rate) using nominal durations.
     let mut audio_durations: Vec<u64> = Vec::with_capacity(num_segments);
     for i in 0..num_segments {
-        let seg_start = boundaries[i];
-        let seg_end = if i + 1 < boundaries.len() { boundaries[i + 1] } else { duration };
+        let seg_start = i as f64 * SEGMENT_DURATION;
+        let seg_end = ((i + 1) as f64 * SEGMENT_DURATION).min(duration);
         let dur_ticks = ((seg_end - seg_start) * audio_sample_rate as f64).round().max(1.0) as u64;
         audio_durations.push(dur_ticks);
     }
@@ -2744,28 +2691,9 @@ async fn get_segment(
         };
 
         // We own the transcode job.
-        // For Original quality, look up pre-scanned keyframe boundaries so
-        // the segment uses exact keyframe positions (zero delta).
-        let keyframe_range = if quality == Quality::Original {
-            let abs_path_ref: &Path = abs_str.as_ref();
-            let (duration_secs, _) = probe_video(abs_path_ref).await;
-            let boundaries = get_keyframe_boundaries(&state, &id, &abs_str, duration_secs).await;
-            if seg_index < boundaries.len() {
-                let kf_start = boundaries[seg_index];
-                let kf_end = if seg_index + 1 < boundaries.len() {
-                    boundaries[seg_index + 1]
-                } else {
-                    duration_secs
-                };
-                Some((kf_start, kf_end))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // Use nominal boundaries — segment generator seeks to nearest keyframe.
         let result = media::transcode::transcode_segment_with_boundaries(
-            &abs_str, &seg_dir, seg_index, &state.hwaccel, quality, keyframe_range,
+            &abs_str, &seg_dir, seg_index, &state.hwaccel, quality, None,
         ).await;
 
         // Remove from the inflight map first (no new subscribers can join
@@ -3050,28 +2978,9 @@ async fn get_video_segment(
         Err(_) => return HttpResponse::InternalServerError().body("transcode unavailable"),
     };
 
-    // Get keyframe boundaries for accurate segment positioning.
-    let keyframe_range = if quality == Quality::Original {
-        let abs_path_ref: &Path = abs_str.as_ref();
-        let (duration_secs, _) = probe_video(abs_path_ref).await;
-        let boundaries = get_keyframe_boundaries(&state, &id, &abs_str, duration_secs).await;
-        if seg_index < boundaries.len() {
-            let kf_start = boundaries[seg_index];
-            let kf_end = if seg_index + 1 < boundaries.len() {
-                boundaries[seg_index + 1]
-            } else {
-                duration_secs
-            };
-            Some((kf_start, kf_end))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
+    // Use nominal boundaries — segment generator seeks to nearest keyframe.
     let result = media::transcode::transcode_video_segment(
-        &abs_str, &seg_dir, seg_index, &state.hwaccel, quality, keyframe_range,
+        &abs_str, &seg_dir, seg_index, &state.hwaccel, quality, None,
     ).await;
 
     // The file is stored with 0-based name; serve it regardless of the 1-based URL name.
@@ -3170,26 +3079,9 @@ async fn get_audio_segment(
         Err(_) => return HttpResponse::InternalServerError().body("transcode unavailable"),
     };
 
-    // Use keyframe boundaries from the video track for consistent segment boundaries.
-    let keyframe_range = {
-        let abs_path_ref: &Path = abs_str.as_ref();
-        let (duration_secs, _) = probe_video(abs_path_ref).await;
-        let boundaries = get_keyframe_boundaries(&state, &id, &abs_str, duration_secs).await;
-        if seg_index < boundaries.len() {
-            let kf_start = boundaries[seg_index];
-            let kf_end = if seg_index + 1 < boundaries.len() {
-                boundaries[seg_index + 1]
-            } else {
-                duration_secs
-            };
-            Some((kf_start, kf_end))
-        } else {
-            None
-        }
-    };
-
+    // Use nominal boundaries — segment generator seeks to nearest keyframe.
     let result = media::transcode::transcode_audio_segment(
-        &abs_str, &seg_dir, seg_index, keyframe_range,
+        &abs_str, &seg_dir, seg_index, None,
     ).await;
 
     match result {
@@ -4425,7 +4317,6 @@ async fn main() -> std::io::Result<()> {
         segment_inflight: Arc::new(Mutex::new(HashMap::new())),
         theme_css,
         playback_positions: Arc::new(RwLock::new(HashMap::new())),
-        keyframe_cache: Arc::new(RwLock::new(HashMap::new())),
     });
 
     // One-time background scan at startup to refresh the index immediately.

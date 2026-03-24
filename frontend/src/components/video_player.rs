@@ -682,6 +682,42 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     player.on("streamInitialized", on_stream_init.as_ref().unchecked_ref());
                     on_stream_init.forget();
 
+                    // Handle autoplay blocked by browser policy.
+                    // When the browser blocks autoplay with sound, dash.js fires
+                    // PLAYBACK_NOT_ALLOWED.  We mute and retry so the video
+                    // starts immediately — the user can unmute manually.
+                    let video_for_autoplay = video.clone();
+                    let player_js_autoplay = player.player.clone();
+                    let on_playback_not_allowed = Closure::<dyn Fn()>::new(move || {
+                        log::warn!("autoplay blocked — muting and retrying");
+                        video_for_autoplay.set_muted(true);
+                        if let Ok(func) = js_sys::Reflect::get(&player_js_autoplay, &"play".into()) {
+                            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                                let _ = func.call0(&player_js_autoplay);
+                            }
+                        }
+                    });
+                    player.on("playbackNotAllowed", on_playback_not_allowed.as_ref().unchecked_ref());
+                    on_playback_not_allowed.forget();
+
+                    // Also listen for CAN_PLAY to try unmuted play after user
+                    // interaction has unlocked the audio context.
+                    let video_for_canplay = video.clone();
+                    let player_js_canplay = player.player.clone();
+                    let on_can_play = Closure::<dyn Fn()>::new(move || {
+                        // If the video is paused and we haven't started yet,
+                        // try playing — the user may have interacted with the page.
+                        if video_for_canplay.paused() && video_for_canplay.current_time() < 0.5 {
+                            if let Ok(func) = js_sys::Reflect::get(&player_js_canplay, &"play".into()) {
+                                if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                                    let _ = func.call0(&player_js_canplay);
+                                }
+                            }
+                        }
+                    });
+                    player.on("canPlay", on_can_play.as_ref().unchecked_ref());
+                    on_can_play.forget();
+
                     // ── Initialize following the reference client pattern ─────
                     //
                     // Reference client (main.js) order:
@@ -838,6 +874,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let is_playing = is_playing.clone();
         let is_dragging = is_dragging.clone();
         let video_ended = video_ended.clone();
+        let is_muted = is_muted.clone();
 
         use_effect_with(video_ref.clone(), move |video_ref| {
             let video_ref = video_ref.clone();
@@ -849,6 +886,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     buffered_end.set(buffered_end_at(&video, video.current_time()));
                     is_playing.set(!video.paused());
                     video_ended.set(video.ended());
+                    // Sync muted state (may have been changed by autoplay handler)
+                    is_muted.set(video.muted());
                 }
             });
             move || drop(interval)

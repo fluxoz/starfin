@@ -29,16 +29,87 @@ use super::hwaccel::HwAccel;
 /// Duration of each DASH segment in seconds.
 pub const SEGMENT_DURATION: f64 = 6.0;
 
-/// Maximum allowed difference (in seconds) between a segment's actual keyframe
-/// time and its nominal start time before we fall back to the actual time for
-/// the tfdt patch.  Within this tolerance we use the nominal time so that
-/// segments create a small overlap (handled seamlessly by MSE coded-frame-
-/// removal) rather than a small gap that causes dash.js gap-jump stutter.
-const SEGMENT_BOUNDARY_TOLERANCE_S: f64 = 0.5;
-
 /// Error message returned when a background operation is cancelled by a kill
 /// flag (e.g. playback started while a background worker was running).
 pub const CANCELLED: &str = "cancelled";
+
+/// A single keyframe-aligned segment boundary for the remux path.
+///
+/// For remuxed (Original quality) content the source keyframes rarely land
+/// exactly at nominal 6-second boundaries.  This struct records the **actual**
+/// keyframe position so the MPD `SegmentTimeline` can declare accurate `@t`
+/// and `@d` values — eliminating any mismatch between declared and actual
+/// segment timing.
+#[derive(Debug, Clone)]
+pub struct KeyframeBoundary {
+    /// Actual PTS (seconds) of the first keyframe at or after the nominal
+    /// boundary.
+    pub time_secs: f64,
+    /// Actual PTS in timescale units (= `time_secs × timescale`).  For our MPD
+    /// with timescale=1000, this is milliseconds.
+    pub time_ms: u64,
+}
+
+/// Pre-scan the source file and return the actual keyframe positions that would
+/// be used as segment boundaries in the remux/hybrid paths.
+///
+/// For each nominal boundary `N × SEGMENT_DURATION` we find the first video
+/// keyframe with PTS ≥ that boundary — exactly what `remux_segment()` does.
+/// The result is a list of `KeyframeBoundary` values, one per segment.
+///
+/// This is a packet-level scan (no decoding), so it's fast even for long
+/// videos.
+pub fn scan_keyframe_boundaries(abs_path: &str, duration_secs: f64) -> Result<Vec<KeyframeBoundary>, String> {
+    super::ensure_init();
+
+    let mut ictx = ffmpeg_next::format::input(&abs_path)
+        .map_err(|e| format!("scan_keyframes: open input: {e}"))?;
+
+    let video_idx = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Video)
+        .map(|s| s.index())
+        .ok_or_else(|| "scan_keyframes: no video stream".to_string())?;
+
+    let video_tb = ictx.stream(video_idx).unwrap().time_base();
+
+    // How many segments do we need?
+    let num_segments = ((duration_secs / SEGMENT_DURATION).ceil() as usize).max(1);
+
+    // Walk all packets once and record keyframe PTS positions.
+    let mut keyframe_pts: Vec<f64> = Vec::new();
+    for (stream, packet) in ictx.packets() {
+        if stream.index() != video_idx || !packet.is_key() {
+            continue;
+        }
+        let pts = packet.pts().unwrap_or(0);
+        let pts_secs = pts as f64 * f64::from(video_tb.0) / f64::from(video_tb.1);
+        keyframe_pts.push(pts_secs);
+    }
+
+    // For each segment, find the first keyframe at or after the nominal start.
+    let mut boundaries = Vec::with_capacity(num_segments);
+    let mut kf_cursor = 0;
+    for seg in 0..num_segments {
+        let nominal_start = seg as f64 * SEGMENT_DURATION;
+        // Advance cursor to first keyframe >= nominal_start.
+        while kf_cursor < keyframe_pts.len() && keyframe_pts[kf_cursor] < nominal_start {
+            kf_cursor += 1;
+        }
+        let actual = if kf_cursor < keyframe_pts.len() {
+            keyframe_pts[kf_cursor]
+        } else {
+            // No more keyframes — use nominal.
+            nominal_start
+        };
+        boundaries.push(KeyframeBoundary {
+            time_secs: actual,
+            time_ms: (actual * 1000.0).round() as u64,
+        });
+    }
+
+    Ok(boundaries)
+}
 
 /// Bitrate for AAC audio encoding in the transcode and hybrid paths.
 /// 256 kbps stereo AAC-LC is transparent quality for music and dialogue.
@@ -153,7 +224,7 @@ impl Quality {
     /// Whether this quality level can potentially use the fast remux path
     /// (no re-encoding).  Only Original uses remux; all others always
     /// transcode.
-    fn can_remux(self) -> bool {
+    pub fn can_remux(self) -> bool {
         self == Quality::Original
     }
 }
@@ -973,20 +1044,15 @@ fn create_segment(
     // muxer always normalizes DTS to 0, so without this patch all segments
     // would overlap at time 0 and MSE Segments mode would show only ~6 s.
     //
-    // When the actual keyframe is close to the nominal segment boundary
-    // (< 500 ms), use the NOMINAL start time.  This creates a tiny overlap
-    // with the previous segment instead of a tiny gap.  MSE handles overlap
-    // via coded-frame-removal (seamless), whereas gaps cause the video
-    // element to stall briefly — then dash.js gap-jumps forward, producing
-    // visible stutter on every segment transition.
+    // For the remux/hybrid paths we use the ACTUAL keyframe PTS.  The MPD's
+    // SegmentTimeline now declares matching `@t` values (via
+    // scan_keyframe_boundaries), so there is zero mismatch between the
+    // declared timeline and the segment content.
     //
-    // For large differences (source keyframes far from segment boundaries),
-    // use the actual keyframe time to preserve A/V sync.
-    let tfdt_time = if (actual_start - start_time).abs() < SEGMENT_BOUNDARY_TOLERANCE_S {
-        start_time
-    } else {
-        actual_start
-    };
+    // For the transcode path the encoder forces a keyframe at the exact
+    // segment boundary, so actual_start == start_time and the value is the
+    // same either way.
+    let tfdt_time = actual_start;
     eprintln!(
         "[segment] seg {seg_index}: nominal_start={start_time:.3}s, actual_keyframe={actual_start:.3}s, tfdt={tfdt_time:.3}s",
     );

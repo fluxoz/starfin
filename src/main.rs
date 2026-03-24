@@ -2258,6 +2258,27 @@ async fn get_manifest(
     let duration = duration_secs;
     let num_segments = (duration / SEGMENT_DURATION).ceil() as usize;
 
+    // ── Keyframe-aligned SegmentTimeline for remux path ──────────────────
+    //
+    // For Original quality (remux), source keyframes rarely land exactly at
+    // nominal 6-second boundaries.  Pre-scan actual keyframe positions so
+    // the SegmentTimeline `@t` and `@d` values match the real segment
+    // content — eliminating any timing mismatch that causes stutter.
+    //
+    // For other qualities (transcode), keyframes are forced at exact
+    // boundaries, so nominal 6000ms durations are accurate.
+    let keyframe_boundaries: Option<Vec<media::transcode::KeyframeBoundary>> = if quality.can_remux() {
+        let abs_for_scan = abs_path.to_string_lossy().to_string();
+        let dur = duration;
+        tokio::task::spawn_blocking(move || {
+            media::transcode::scan_keyframe_boundaries(&abs_for_scan, dur).ok()
+        })
+        .await
+        .unwrap_or_default()
+    } else {
+        None
+    };
+
     // Format duration as ISO 8601 duration for MPD.
     // Use fractional seconds so that the frontend gets sub-second precision,
     // matching how dash.js MPD parser handles mediaPresentationDuration.
@@ -2302,29 +2323,54 @@ async fn get_manifest(
         quality = quality.as_str()
     ));
 
-    // Build SegmentTimeline — use the `r` (repeat) attribute per DASH-IF IOP
-    // to compress identical-duration segments into a single <S> element.
+    // Build SegmentTimeline.
+    //
+    // For remuxed content we use actual keyframe-aligned boundaries so that
+    // the declared @t/@d exactly match what's in the fMP4 segments.  dash.js
+    // uses SegmentTimeline @t values to set MSE appendWindowStart/End, so
+    // they MUST agree with each segment's tfdt + sample data range.
+    //
+    // For transcoded content keyframes are forced at exact boundaries, so
+    // the nominal 6000 ms duration is accurate and we can use the compact
+    // `r` (repeat) attribute.
     mpd.push_str("          <SegmentTimeline>\n");
-    let normal_duration_ms = (SEGMENT_DURATION * 1000.0) as u64;
-    if num_segments > 1 {
-        // First (num_segments - 1) segments all have the same duration.
-        // r= gives additional repetitions beyond the first occurrence, so
-        // r=(num_segments - 2) encodes (num_segments - 1) segments total.
-        let repeats = num_segments - 2; // r=N → N+1 segments of this duration
-        mpd.push_str(&format!(
-            "            <S d=\"{normal_duration_ms}\" r=\"{repeats}\"/>\n"
-        ));
-        // Last segment may be shorter.
-        let last_start = (num_segments - 1) as f64 * SEGMENT_DURATION;
-        let last_duration_ms = ((duration - last_start) * 1000.0).max(1.0) as u64;
-        mpd.push_str(&format!(
-            "            <S d=\"{last_duration_ms}\"/>\n"
-        ));
-    } else if num_segments == 1 {
-        let seg_duration_ms = (duration * 1000.0).max(1.0) as u64;
-        mpd.push_str(&format!(
-            "            <S d=\"{seg_duration_ms}\"/>\n"
-        ));
+    if let Some(ref boundaries) = keyframe_boundaries {
+        // ── Keyframe-aligned timeline (remux path) ─────────────────────
+        // Each <S t="..." d="..." /> entry reflects the actual keyframe
+        // position and duration, eliminating any nominal↔actual mismatch.
+        for i in 0..boundaries.len() {
+            let t = boundaries[i].time_ms;
+            let d = if i + 1 < boundaries.len() {
+                // Duration = start of next segment − start of this segment
+                boundaries[i + 1].time_ms - t
+            } else {
+                // Last segment: runs to the end of the video
+                let end_ms = (duration * 1000.0).round() as u64;
+                end_ms.saturating_sub(t).max(1)
+            };
+            mpd.push_str(&format!(
+                "            <S t=\"{t}\" d=\"{d}\"/>\n"
+            ));
+        }
+    } else {
+        // ── Nominal timeline (transcode path, or scan not available) ───
+        let normal_duration_ms = (SEGMENT_DURATION * 1000.0) as u64;
+        if num_segments > 1 {
+            let repeats = num_segments - 2;
+            mpd.push_str(&format!(
+                "            <S d=\"{normal_duration_ms}\" r=\"{repeats}\"/>\n"
+            ));
+            let last_start = (num_segments - 1) as f64 * SEGMENT_DURATION;
+            let last_duration_ms = ((duration - last_start) * 1000.0).max(1.0) as u64;
+            mpd.push_str(&format!(
+                "            <S d=\"{last_duration_ms}\"/>\n"
+            ));
+        } else if num_segments == 1 {
+            let seg_duration_ms = (duration * 1000.0).max(1.0) as u64;
+            mpd.push_str(&format!(
+                "            <S d=\"{seg_duration_ms}\"/>\n"
+            ));
+        }
     }
     mpd.push_str("          </SegmentTimeline>\n");
     mpd.push_str("        </SegmentTemplate>\n");

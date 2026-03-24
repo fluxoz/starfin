@@ -242,6 +242,24 @@ impl DashPlayer {
         0.0
     }
 
+    /// Set the quality index for a media type via the dash.js API.
+    ///
+    /// `media_type` is "video" or "audio".
+    /// `quality_index` maps to the Representation order in the MPD:
+    ///   0 = original, 1 = high, 2 = medium, 3 = low.
+    /// `force_replace` triggers an immediate buffer flush and re-request.
+    fn set_quality_for(&self, media_type: &str, quality_index: i32, force_replace: bool) {
+        if let Ok(func) = js_sys::Reflect::get(&self.player, &"setQualityFor".into()) {
+            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                let args = js_sys::Array::new();
+                args.push(&JsValue::from_str(media_type));
+                args.push(&JsValue::from_f64(quality_index as f64));
+                args.push(&JsValue::from_bool(force_replace));
+                let _ = js_sys::Reflect::apply(&func, &self.player, &args);
+            }
+        }
+    }
+
     /// Destroy/reset the player.
     fn destroy(&self) {
         if let Ok(func) = js_sys::Reflect::get(&self.player, &"destroy".into()) {
@@ -603,7 +621,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         None => { error_clone.set(Some("Video element not found".into())); return; }
                     };
 
-                    let manifest_url = format!("/api/videos/{}/manifest.mpd?quality={}", video_id, quality);
+                    let manifest_url = format!("/api/videos/{}/manifest.mpd", video_id);
 
                     // Create dash.js player
                     let player = DashPlayer::create();
@@ -632,9 +650,18 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         let msg = if let Some(err_obj) = e.dyn_ref::<js_sys::Object>() {
                             let error_val = js_sys::Reflect::get(err_obj, &"error".into()).unwrap_or(JsValue::UNDEFINED);
                             if let Some(error_obj) = error_val.dyn_ref::<js_sys::Object>() {
-                                let msg = js_sys::Reflect::get(error_obj, &"message".into())
-                                    .unwrap_or(JsValue::UNDEFINED);
-                                msg.as_string().unwrap_or_else(|| format!("{:?}", e))
+                                let message = js_sys::Reflect::get(error_obj, &"message".into())
+                                    .unwrap_or(JsValue::UNDEFINED)
+                                    .as_string();
+                                let code = js_sys::Reflect::get(error_obj, &"code".into())
+                                    .unwrap_or(JsValue::UNDEFINED)
+                                    .as_f64();
+                                match (message, code) {
+                                    (Some(m), Some(c)) => format!("[{c:.0}] {m}"),
+                                    (Some(m), None) => m,
+                                    (None, Some(c)) => format!("dash.js error code {c:.0}"),
+                                    (None, None) => format!("{:?}", e),
+                                }
                             } else {
                                 format!("{:?}", e)
                             }
@@ -654,6 +681,42 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     });
                     player.on("streamInitialized", on_stream_init.as_ref().unchecked_ref());
                     on_stream_init.forget();
+
+                    // Handle autoplay blocked by browser policy.
+                    // When the browser blocks autoplay with sound, dash.js fires
+                    // PLAYBACK_NOT_ALLOWED.  We mute and retry so the video
+                    // starts immediately — the user can unmute manually.
+                    let video_for_autoplay = video.clone();
+                    let player_js_autoplay = player.player.clone();
+                    let on_playback_not_allowed = Closure::<dyn Fn()>::new(move || {
+                        log::warn!("autoplay blocked — muting and retrying");
+                        video_for_autoplay.set_muted(true);
+                        if let Ok(func) = js_sys::Reflect::get(&player_js_autoplay, &"play".into()) {
+                            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                                let _ = func.call0(&player_js_autoplay);
+                            }
+                        }
+                    });
+                    player.on("playbackNotAllowed", on_playback_not_allowed.as_ref().unchecked_ref());
+                    on_playback_not_allowed.forget();
+
+                    // Also listen for CAN_PLAY to try unmuted play after user
+                    // interaction has unlocked the audio context.
+                    let video_for_canplay = video.clone();
+                    let player_js_canplay = player.player.clone();
+                    let on_can_play = Closure::<dyn Fn()>::new(move || {
+                        // If the video is paused and we haven't started yet,
+                        // try playing — the user may have interacted with the page.
+                        if video_for_canplay.paused() && video_for_canplay.current_time() < 0.5 {
+                            if let Ok(func) = js_sys::Reflect::get(&player_js_canplay, &"play".into()) {
+                                if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                                    let _ = func.call0(&player_js_canplay);
+                                }
+                            }
+                        }
+                    });
+                    player.on("canPlay", on_can_play.as_ref().unchecked_ref());
+                    on_can_play.forget();
 
                     // ── Initialize following the reference client pattern ─────
                     //
@@ -733,6 +796,17 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     // Load the manifest — dash.js will start fetching segments.
                     player.attach_source(&manifest_url, start_pos);
 
+                    // Set the initial quality index based on the selected quality.
+                    // Representation order in MPD: 0=original, 1=high, 2=medium, 3=low.
+                    let quality_index = match quality.as_str() {
+                        "original" => 0i32,
+                        "high"     => 1i32,
+                        "medium"   => 2i32,
+                        "low"      => 3i32,
+                        _          => 0i32,
+                    };
+                    player.set_quality_for("video", quality_index, false);
+
                     status_clone.set(String::new());
 
                     // Store the player reference
@@ -800,6 +874,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let is_playing = is_playing.clone();
         let is_dragging = is_dragging.clone();
         let video_ended = video_ended.clone();
+        let is_muted = is_muted.clone();
 
         use_effect_with(video_ref.clone(), move |video_ref| {
             let video_ref = video_ref.clone();
@@ -811,6 +886,8 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     buffered_end.set(buffered_end_at(&video, video.current_time()));
                     is_playing.set(!video.paused());
                     video_ended.set(video.ended());
+                    // Sync muted state (may have been changed by autoplay handler)
+                    is_muted.set(video.muted());
                 }
             });
             move || drop(interval)

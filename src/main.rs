@@ -627,10 +627,9 @@ async fn get_video_quality_info(
         None => return HttpResponse::NotFound().body("video not found"),
     };
 
-    let abs_clone = abs.clone();
     let (stream_info, remuxable) = tokio::task::spawn_blocking(move || {
-        let si = media::probe::probe_stream_info(&abs_clone);
-        let rm = media::probe::is_source_remuxable(&abs_clone);
+        let si = media::probe::probe_stream_info(&abs);
+        let rm = media::probe::is_source_remuxable(&abs);
         (si, rm)
     })
     .await

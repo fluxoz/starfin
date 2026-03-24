@@ -438,6 +438,20 @@ pub struct SubtitleTracksResponse {
 // UI COMPONENT
 // ══════════════════════════════════════════════════════════════════════════════
 
+/// Map a quality string to its Representation index in the MPD.
+///
+/// MPD Representation order: 0 = original, 1 = high, 2 = medium, 3 = low.
+/// "auto" is handled separately — ABR is enabled instead of calling setQualityFor.
+fn quality_to_index(quality: &str) -> i32 {
+    match quality {
+        "original" => 0,
+        "high"     => 1,
+        "medium"   => 2,
+        "low"      => 3,
+        _          => 0,
+    }
+}
+
 #[derive(Properties, PartialEq)]
 pub struct VideoPlayerProps {
     pub video_id: String,
@@ -702,13 +716,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         // For "auto" quality, ABR is already enabled via updateSettings —
                         // do NOT call setQualityFor (that would disable ABR).
                         if quality_for_init != "auto" {
-                            let quality_index: i32 = match quality_for_init.as_str() {
-                                "original" => 0,
-                                "high"     => 1,
-                                "medium"   => 2,
-                                "low"      => 3,
-                                _          => 0,
-                            };
+                            let quality_index = quality_to_index(&quality_for_init);
                             if let Ok(func) = js_sys::Reflect::get(&player_js_for_init, &"setQualityFor".into()) {
                                 if let Ok(func) = func.dyn_into::<js_sys::Function>() {
                                     let args = js_sys::Array::new();
@@ -885,14 +893,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     // Lock to the selected representation with force_replace=true
                     // so that dash.js immediately flushes the buffer and requests
                     // segments at the new quality level.
-                    let quality_index: i32 = match quality.as_str() {
-                        "original" => 0,
-                        "high"     => 1,
-                        "medium"   => 2,
-                        "low"      => 3,
-                        _          => 0,
-                    };
-                    player.set_quality_for("video", quality_index, true);
+                    player.set_quality_for("video", quality_to_index(&quality), true);
                 }
             }
             || ()

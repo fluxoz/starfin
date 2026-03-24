@@ -2205,12 +2205,20 @@ body{
   background: #000;
 }
 
+/* Single-video player: slot fills the full overlay */
+.sv-slot--single{
+  position: absolute;
+  inset: 0;
+  height: 100%;
+}
+
 .sv-video{
   width: 100%;
   height: 100%;
   object-fit: contain;
   background: #000;
   display: block;
+  cursor: pointer;
 }
 
 /* ── Buffering spinner ──────────────────────────────────────────────────── */
@@ -2343,6 +2351,8 @@ body{
   text-align: right;
   display: flex;
   justify-content: flex-end;
+  align-items: center;
+  gap: 4px;
 }
 
 .sv-time{
@@ -2450,4 +2460,87 @@ body{
 }
 .sv-quality__option--active::before{
   content: "✓ ";
+}
+
+/* ── Playback speed menu (mirrors sv-quality) ───────────────────────────── */
+.sv-speed{
+  position: relative;
+}
+.sv-speed__menu{
+  position: absolute;
+  bottom: 100%;
+  right: 0;
+  background: rgba(28,28,28,.95);
+  border-radius: 8px;
+  padding: 8px 0;
+  min-width: 110px;
+  box-shadow: 0 4px 20px rgba(0,0,0,.4);
+  z-index: 300;
+  margin-bottom: 8px;
+}
+.sv-speed__option{
+  display: block;
+  width: 100%;
+  padding: 10px 20px;
+  background: transparent;
+  border: none;
+  color: #fff;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.sv-speed__option:hover{
+  background: rgba(255,255,255,.1);
+}
+.sv-speed__option--active{
+  background: rgba(255,255,255,.15);
+  font-weight: 600;
+}
+.sv-speed__option--active::before{
+  content: "✓ ";
+}
+
+/* ── Captions/subtitles menu (mirrors sv-quality) ────────────────────────── */
+.sv-captions{
+  position: relative;
+}
+.sv-captions__menu{
+  position: absolute;
+  bottom: 100%;
+  right: 0;
+  background: rgba(28,28,28,.95);
+  border-radius: 8px;
+  padding: 8px 0;
+  min-width: 140px;
+  box-shadow: 0 4px 20px rgba(0,0,0,.4);
+  z-index: 300;
+  margin-bottom: 8px;
+}
+.sv-captions__option{
+  display: block;
+  width: 100%;
+  padding: 10px 20px;
+  background: transparent;
+  border: none;
+  color: #fff;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.sv-captions__option:hover{
+  background: rgba(255,255,255,.1);
+}
+.sv-captions__option--active{
+  background: rgba(255,255,255,.15);
+  font-weight: 600;
+}
+.sv-captions__option--active::before{
+  content: "✓ ";
+}
+
+/* Active state for toggle buttons (e.g. CC when enabled) */
+.sv-btn--active{
+  background: rgba(255,255,255,.2) !important;
 }

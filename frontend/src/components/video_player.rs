@@ -255,8 +255,11 @@ impl DashPlayer {
     /// `quality_index` maps to the Representation order in the MPD:
     ///   0 = original, 1 = high, 2 = medium, 3 = low.
     /// `force_replace` triggers an immediate buffer flush and re-request.
+    ///
+    /// Uses `setRepresentationForTypeByIndex` (dash.js 5 API).
+    /// The dash.js 4 `setQualityFor` was removed in v5.
     fn set_quality_for(&self, media_type: &str, quality_index: i32, force_replace: bool) {
-        if let Ok(func) = js_sys::Reflect::get(&self.player, &"setQualityFor".into()) {
+        if let Ok(func) = js_sys::Reflect::get(&self.player, &"setRepresentationForTypeByIndex".into()) {
             if let Ok(func) = func.dyn_into::<js_sys::Function>() {
                 let args = js_sys::Array::new();
                 args.push(&JsValue::from_str(media_type));
@@ -268,26 +271,28 @@ impl DashPlayer {
     }
 
     /// Return the current video representation's nominal bitrate in kbps,
-    /// or `None` when the player is not yet initialised or no quality list
-    /// is available.
+    /// or `None` when the player is not yet initialised or no representation
+    /// is active.
+    ///
+    /// Uses `getCurrentRepresentationForType('video').bandwidth` which is the
+    /// correct dash.js 5 API (dash.js 4 `getQualityFor`/`getBitrateInfoListFor`
+    /// were removed in v5).  `bandwidth` is in bits-per-second.
     fn current_bitrate_kbps(&self) -> Option<u32> {
-        let args_video = js_sys::Array::new();
-        args_video.push(&JsValue::from_str("video"));
+        let args = js_sys::Array::new();
+        args.push(&JsValue::from_str("video"));
 
-        let idx = js_sys::Reflect::get(&self.player, &"getQualityFor".into())
+        let rep = js_sys::Reflect::get(&self.player, &"getCurrentRepresentationForType".into())
             .ok()?
             .dyn_into::<js_sys::Function>()
             .ok()
-            .and_then(|f| js_sys::Reflect::apply(&f, &self.player, &args_video).ok())?
-            .as_f64()? as u32;
+            .and_then(|f| js_sys::Reflect::apply(&f, &self.player, &args).ok())?;
 
-        let bps = js_sys::Reflect::get(&self.player, &"getBitrateInfoListFor".into())
+        if rep.is_null() || rep.is_undefined() {
+            return None;
+        }
+
+        let bps = js_sys::Reflect::get(&rep, &"bandwidth".into())
             .ok()?
-            .dyn_into::<js_sys::Function>()
-            .ok()
-            .and_then(|f| js_sys::Reflect::apply(&f, &self.player, &args_video).ok())
-            .and_then(|list| js_sys::Reflect::get_u32(&list, idx).ok())
-            .and_then(|entry| js_sys::Reflect::get(&entry, &"bitrate".into()).ok())?
             .as_f64()?;
 
         Some((bps / 1000.0) as u32)
@@ -745,9 +750,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     on_error.forget();
 
                     // Stream initialized (one-shot) — clear status and lock the initial
-                    // quality.  setQualityFor MUST be called inside this event because
-                    // attachSource is async: the MPD has not been parsed and the
-                    // representation list does not exist until streamInitialized fires.
+                    // quality.  setRepresentationForTypeByIndex MUST be called inside
+                    // this event because attachSource is async: the MPD has not been
+                    // parsed and the representation list does not exist until
+                    // streamInitialized fires.
                     let status_for_init = status_clone.clone();
                     let player_js_for_init = player.player.clone();
                     let quality_for_init = quality.clone();
@@ -757,7 +763,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         // do NOT call setQualityFor (that would disable ABR).
                         if quality_for_init != "auto" {
                             let quality_index = quality_to_index(&quality_for_init);
-                            if let Ok(func) = js_sys::Reflect::get(&player_js_for_init, &"setQualityFor".into()) {
+                            if let Ok(func) = js_sys::Reflect::get(&player_js_for_init, &"setRepresentationForTypeByIndex".into()) {
                                 if let Ok(func) = func.dyn_into::<js_sys::Function>() {
                                     let args = js_sys::Array::new();
                                     args.push(&JsValue::from_str("video"));

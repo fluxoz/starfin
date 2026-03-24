@@ -17,7 +17,7 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{window, HtmlVideoElement, KeyboardEvent, MouseEvent};
+use web_sys::{window, HtmlVideoElement, KeyboardEvent, MouseEvent, TouchEvent};
 use yew::prelude::*;
 
 // ── Playback speed options ───────────────────────────────────────────────────
@@ -442,6 +442,78 @@ fn buffered_end_at(video: &HtmlVideoElement, time: f64) -> f64 {
         }
     }
     0.0
+}
+
+// ── Fullscreen helpers ────────────────────────────────────────────────────────
+//
+// iOS Safari does not support `requestFullscreen()` on arbitrary elements.
+// It only supports `webkitEnterFullscreen()` on the <video> element itself.
+// We try the standard API first; if unavailable we fall back to the webkit one.
+
+fn fullscreen_is_active() -> bool {
+    let doc = match web_sys::window().and_then(|w| w.document()) { Some(d) => d, None => return false };
+    // Standard API
+    if doc.fullscreen_element().is_some() { return true; }
+    // webkit (iOS / old Safari / old Chrome)
+    js_sys::Reflect::get(doc.as_ref(), &"webkitFullscreenElement".into())
+        .map(|v| !v.is_null() && !v.is_undefined() && v != JsValue::FALSE)
+        .unwrap_or(false)
+}
+
+fn fullscreen_enter(container: &web_sys::HtmlElement, video: &HtmlVideoElement) {
+    // 1. Standard Fullscreen API (Chrome/Firefox/Android/Safari 16.4+)
+    let supported = js_sys::Reflect::get(container.as_ref(), &"requestFullscreen".into())
+        .map(|v| v.is_function())
+        .unwrap_or(false);
+    if supported {
+        let _ = container.request_fullscreen();
+        return;
+    }
+    // 2. webkit prefixed on container (old Safari / old Chrome desktop)
+    let webkit_container = js_sys::Reflect::get(container.as_ref(), &"webkitRequestFullscreen".into())
+        .ok()
+        .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
+    if let Some(f) = webkit_container {
+        let _ = f.call0(container);
+        return;
+    }
+    // 3. iOS Safari: webkitEnterFullscreen() on the <video> element
+    let webkit_video = js_sys::Reflect::get(video.as_ref(), &"webkitEnterFullscreen".into())
+        .ok()
+        .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
+    if let Some(f) = webkit_video {
+        let _ = f.call0(video);
+    }
+}
+
+fn fullscreen_exit() {
+    let doc = match web_sys::window().and_then(|w| w.document()) { Some(d) => d, None => return };
+    // Standard exit
+    if doc.fullscreen_element().is_some() {
+        let _ = doc.exit_fullscreen();
+        return;
+    }
+    // webkit exit
+    if let Ok(f) = js_sys::Reflect::get(doc.as_ref(), &"webkitExitFullscreen".into())
+        .and_then(|v| v.dyn_into::<js_sys::Function>())
+    {
+        let _ = f.call0(&doc);
+    }
+}
+
+// ── Touch helpers ─────────────────────────────────────────────────────────────
+
+/// Extract clientX from the first touch in a touchstart/touchmove event.
+/// For touchstart, `touches` is the authoritative list of active contacts.
+fn touch_client_x_start(e: &TouchEvent) -> Option<f64> {
+    e.touches().get(0)
+        .or_else(|| e.changed_touches().get(0))
+        .map(|t| t.client_x() as f64)
+}
+
+/// Extract clientX from the first changed touch in a touchmove/touchend event.
+fn touch_client_x_move(e: &TouchEvent) -> Option<f64> {
+    e.changed_touches().get(0).map(|t| t.client_x() as f64)
 }
 
 // ── Thumbnail / Subtitle types ───────────────────────────────────────────────
@@ -1367,11 +1439,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     "f" | "F" => {
                         e.prevent_default();
                         if let Some(container) = container_ref.cast::<web_sys::HtmlElement>() {
-                            let doc = web_sys::window().unwrap().document().unwrap();
-                            if doc.fullscreen_element().is_some() {
-                                let _ = doc.exit_fullscreen(); is_fullscreen.set(false);
+                            if fullscreen_is_active() {
+                                fullscreen_exit(); is_fullscreen.set(false);
                             } else {
-                                let _ = container.request_fullscreen(); is_fullscreen.set(true);
+                                fullscreen_enter(&container, &video); is_fullscreen.set(true);
                             }
                         }
                     }
@@ -1491,14 +1562,16 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
     let on_fullscreen_toggle = {
         let container_ref = container_ref.clone();
+        let video_ref = video_ref.clone();
         let is_fullscreen = is_fullscreen.clone();
         Callback::from(move |_| {
             if let Some(container) = container_ref.cast::<web_sys::HtmlElement>() {
-                let doc = web_sys::window().unwrap().document().unwrap();
-                if doc.fullscreen_element().is_some() {
-                    let _ = doc.exit_fullscreen(); is_fullscreen.set(false);
-                } else {
-                    let _ = container.request_fullscreen(); is_fullscreen.set(true);
+                if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
+                    if fullscreen_is_active() {
+                        fullscreen_exit(); is_fullscreen.set(false);
+                    } else {
+                        fullscreen_enter(&container, &video); is_fullscreen.set(true);
+                    }
                 }
             }
         })
@@ -1680,6 +1753,106 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
+    // Touch equivalent of on_progress_mousedown — enables drag-to-seek on mobile.
+    // NOTE: Yew registers ontouchstart as a passive listener, so we must NOT call
+    // e.prevent_default() here. Scroll prevention happens in the touchmove handler
+    // which is added imperatively with { passive: false }.
+    let on_progress_touchstart = {
+        let video_ref = video_ref.clone();
+        let progress_ref = progress_ref.clone();
+        let is_dragging = is_dragging.clone();
+        let drag_time = drag_time.clone();
+        let current_time = current_time.clone();
+        let duration_state = duration.clone();
+        let just_dragged = just_dragged.clone();
+        let hover_time = hover_time.clone();
+        let hover_position = hover_position.clone();
+        let dash_player_ref = dash_player_ref.clone();
+
+        Callback::from(move |e: TouchEvent| {
+            // Do NOT call e.prevent_default() — Yew registers this as a passive listener.
+            let client_x = match touch_client_x_start(&e) { Some(x) => x, None => return };
+            let progress_el = match progress_ref.cast::<web_sys::HtmlElement>() { Some(el) => el, None => return };
+            let video = match video_ref.cast::<HtmlVideoElement>() { Some(v) => v, None => return };
+            let video_duration = video.duration();
+            if !video_duration.is_finite() || video_duration <= 0.0 { return; }
+
+            let rect = progress_el.get_bounding_client_rect();
+            let touch_x = client_x - rect.left();
+            let width = rect.width();
+            if width <= 0.0 { return; }
+
+            let seek_ratio = (touch_x / width).clamp(0.0, 1.0);
+            let initial_seek_time = seek_ratio * video_duration;
+
+            is_dragging.set(true);
+            drag_time.set(initial_seek_time);
+            current_time.set(initial_seek_time);
+
+            let shared_seek_time: Rc<Cell<f64>> = Rc::new(Cell::new(initial_seek_time));
+            let shared_move = shared_seek_time.clone();
+            let shared_end = shared_seek_time.clone();
+
+            let progress_ref_move = progress_ref.clone();
+            let duration_for_move = *duration_state;
+            let drag_time_move = drag_time.clone();
+            let current_time_move = current_time.clone();
+            let is_dragging_end = is_dragging.clone();
+            let video_ref_end = video_ref.clone();
+            let just_dragged_end = just_dragged.clone();
+            let hover_time_move = hover_time.clone();
+            let hover_position_move = hover_position.clone();
+
+            let touch_handlers: Rc<RefCell<Option<(Closure<dyn Fn(TouchEvent)>, Closure<dyn Fn(TouchEvent)>)>>> = Rc::new(RefCell::new(None));
+            let touch_handlers_for_touchend = touch_handlers.clone();
+            let dash_player_ref_end = dash_player_ref.clone();
+
+            let on_touchmove = Closure::<dyn Fn(TouchEvent)>::new(move |e: TouchEvent| {
+                e.prevent_default(); // registered with passive:false below — scroll is suppressed
+                if let Some(cx) = touch_client_x_move(&e) {
+                    if let Some(el) = progress_ref_move.cast::<web_sys::HtmlElement>() {
+                        let rect = el.get_bounding_client_rect();
+                        let tx = cx - rect.left();
+                        let w = rect.width();
+                        if w > 0.0 && duration_for_move > 0.0 {
+                            let ratio = (tx / w).clamp(0.0, 1.0);
+                            let t = ratio * duration_for_move;
+                            shared_move.set(t);
+                            drag_time_move.set(t);
+                            current_time_move.set(t);
+                            hover_time_move.set(t);
+                            hover_position_move.set(ratio * 100.0);
+                        }
+                    }
+                }
+            });
+
+            let on_touchend = Closure::<dyn Fn(TouchEvent)>::new(move |_: TouchEvent| {
+                is_dragging_end.set(false);
+                just_dragged_end.set(true);
+                let t = shared_end.get();
+                if let Some(video) = video_ref_end.cast::<HtmlVideoElement>() { dash_seek(&dash_player_ref_end, &video, t); }
+                if let Some((mc, uc)) = touch_handlers_for_touchend.borrow_mut().take() {
+                    if let Some(win) = window() {
+                        let _ = win.remove_event_listener_with_callback("touchmove", mc.as_ref().unchecked_ref());
+                        let _ = win.remove_event_listener_with_callback("touchend", uc.as_ref().unchecked_ref());
+                    }
+                }
+            });
+
+            if let Some(win) = window() {
+                // passive: false is required so prevent_default() suppresses page scroll during seek
+                let opts = web_sys::AddEventListenerOptions::new();
+                opts.set_passive(false);
+                let _ = win.add_event_listener_with_callback_and_add_event_listener_options(
+                    "touchmove", on_touchmove.as_ref().unchecked_ref(), &opts);
+                let _ = win.add_event_listener_with_callback("touchend", on_touchend.as_ref().unchecked_ref());
+                *touch_handlers.borrow_mut() = Some((on_touchmove, on_touchend));
+            }
+        })
+    };
+
+
     let on_progress_click = {
         let video_ref = video_ref.clone();
         let progress_ref = progress_ref.clone();
@@ -1699,14 +1872,16 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
     let on_video_dblclick = {
         let container_ref = container_ref.clone();
+        let video_ref = video_ref.clone();
         let is_fullscreen = is_fullscreen.clone();
         Callback::from(move |_: MouseEvent| {
             if let Some(container) = container_ref.cast::<web_sys::HtmlElement>() {
-                let doc = web_sys::window().unwrap().document().unwrap();
-                if doc.fullscreen_element().is_some() {
-                    let _ = doc.exit_fullscreen(); is_fullscreen.set(false);
-                } else {
-                    let _ = container.request_fullscreen(); is_fullscreen.set(true);
+                if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
+                    if fullscreen_is_active() {
+                        fullscreen_exit(); is_fullscreen.set(false);
+                    } else {
+                        fullscreen_enter(&container, &video); is_fullscreen.set(true);
+                    }
                 }
             }
         })
@@ -1913,7 +2088,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                         <canvas ref={thumbnail_canvas_ref} class="player-preview__canvas" width="160" height="90"></canvas>
                         <div class="player-preview__time">{ format_time(preview_time) }</div>
                     </div>
-                    <div ref={progress_ref} class="player-progress" onclick={on_progress_click} onmousedown={on_progress_mousedown} onmousemove={on_progress_hover} onmouseleave={on_progress_leave}>
+                    <div ref={progress_ref} class="player-progress" onclick={on_progress_click} onmousedown={on_progress_mousedown} ontouchstart={on_progress_touchstart} onmousemove={on_progress_hover} onmouseleave={on_progress_leave}>
                         <div class="player-progress__buffered" style={format!("width: {}%", buffered_percent)} />
                         <div class="player-progress__played" style={format!("width: {}%", progress_percent)} />
                         if *is_hovering_progress || *is_dragging {

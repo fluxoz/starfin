@@ -867,6 +867,12 @@ fn app_inner() -> Html {
 
     let any_bg_active = thumb_progress.is_some() || sprite_progress.is_some() || precache_progress.is_some() || *scanning;
 
+    // Look up the current favorite state from items (stays in sync with toggles,
+    // unlike `selected` which is a snapshot of the element at selection time).
+    let selected_is_fav = selected.as_ref().map(|video| {
+        (*items).iter().find(|e| e.id == video.id).map(|e| e.favorite).unwrap_or(video.favorite)
+    }).unwrap_or(false);
+
     html! {
         <>
             <div class={app_class}>
@@ -888,6 +894,17 @@ fn app_inner() -> Html {
                         video_id={video.id.clone()}
                         title={video.title.clone()}
                         on_close={on_close_player}
+                        is_favorite={selected_is_fav}
+                        on_favorite_toggle={{
+                            let on_favorite_toggle = on_favorite_toggle.clone();
+                            let items = items.clone();
+                            let video_id = video.id.clone();
+                            Callback::from(move |_| {
+                                if let Some(elem) = (*items).iter().find(|e| e.id == video_id).cloned() {
+                                    on_favorite_toggle.emit(elem);
+                                }
+                            })
+                        }}
                     />
                 }
 
@@ -896,6 +913,7 @@ fn app_inner() -> Html {
                     <ScrollView
                         items={(*items).clone()}
                         on_close={on_close_scroll.clone()}
+                        on_favorite_toggle={on_favorite_toggle.clone()}
                     />
                 }
 

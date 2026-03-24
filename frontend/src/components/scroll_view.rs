@@ -337,6 +337,8 @@ pub struct ScrollViewProps {
     pub items: Vec<Element>,
     /// Called when user taps the close / back button.
     pub on_close: Callback<()>,
+    /// Called when the user toggles the favorite state of the active video.
+    pub on_favorite_toggle: Callback<Element>,
 }
 
 #[function_component(ScrollView)]
@@ -394,6 +396,8 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
     let active_title = use_state(|| String::new());
     // Track active video ID for quality label fetching.
     let active_video_id = use_state(|| String::new());
+    // Track whether the active video is favorited.
+    let active_is_fav = use_state(|| false);
 
     // ── Initialise the three slots on mount / when items change ─────────────
     {
@@ -403,6 +407,7 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
         let active_slot = active_slot.clone();
         let active_title = active_title.clone();
         let active_video_id = active_video_id.clone();
+        let active_is_fav = active_is_fav.clone();
         let is_buffering = is_buffering.clone();
         let selected_quality = selected_quality.clone();
 
@@ -432,6 +437,7 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
                     if let Some(ref e) = elems[slot_idx] {
                         active_title.set(e.title.clone());
                         active_video_id.set(e.id.clone());
+                        active_is_fav.set(e.favorite);
                     }
 
                     // Read quality at init time.
@@ -663,6 +669,7 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
         let active_slot = active_slot.clone();
         let active_title = active_title.clone();
         let active_video_id = active_video_id.clone();
+        let active_is_fav = active_is_fav.clone();
         let is_animating = is_animating.clone();
         let translate_y = translate_y.clone();
         let items = props.items.clone();
@@ -706,6 +713,7 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
             let active_slot_post = active_slot.clone();
             let active_title_post = active_title.clone();
             let active_video_id_post = active_video_id.clone();
+            let active_is_fav_post = active_is_fav.clone();
             let is_animating_post = is_animating.clone();
             let translate_y_post = translate_y.clone();
             let items_post = items.clone();
@@ -732,6 +740,7 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
                     if let Some(ref e) = s[target_slot].element {
                         active_title_post.set(e.title.clone());
                         active_video_id_post.set(e.id.clone());
+                        active_is_fav_post.set(e.favorite);
                     }
                 }
 
@@ -1325,6 +1334,24 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
         })
     };
 
+    // ── Favorite callback ───────────────────────────────────────────────────
+    let on_fav_toggle = {
+        let slots = slots.clone();
+        let active_slot = active_slot.clone();
+        let active_is_fav = active_is_fav.clone();
+        let on_favorite_toggle = props.on_favorite_toggle.clone();
+        Callback::from(move |e: MouseEvent| {
+            e.stop_propagation();
+            let idx = *active_slot;
+            let elem = slots.borrow()[idx].element.clone();
+            if let Some(elem) = elem {
+                // Optimistic update of the visible icon.
+                active_is_fav.set(!*active_is_fav);
+                on_favorite_toggle.emit(elem);
+            }
+        })
+    };
+
     // ── Render ──────────────────────────────────────────────────────────────
     let active = *active_slot;
     let progress_pct = if *duration > 0.0 {
@@ -1416,6 +1443,14 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
                     { icon_arrow_back() }
                 </button>
                 <span class="sv-title__text">{ (*active_title).clone() }</span>
+                <button
+                    class={if *active_is_fav { "sv-fav-btn sv-fav-btn--active" } else { "sv-fav-btn" }}
+                    onclick={on_fav_toggle}
+                    aria-label={if *active_is_fav { "Remove from favorites" } else { "Add to favorites" }}
+                    aria-pressed={(*active_is_fav).to_string()}
+                >
+                    { icon_favorite() }
+                </button>
             </div>
 
             // On-screen controls
@@ -1579,6 +1614,14 @@ fn icon_volume_off() -> Html {
             <path d="M3 9v6h4l5 5V4L7 9H3z"/>
             <line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2"/>
             <line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2"/>
+        </svg>
+    }
+}
+
+fn icon_favorite() -> Html {
+    html! {
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true">
+            <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
         </svg>
     }
 }

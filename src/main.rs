@@ -1036,8 +1036,10 @@ struct AppState {
     precache_progress: Arc<RwLock<PrecacheProgress>>,
     /// Notified to (re-)start the segment pre-caching batch.
     precache_trigger: Arc<tokio::sync::Notify>,
-    /// Detected hardware acceleration backend (detected once at startup).
-    hwaccel: HwAccel,
+    /// Detected hardware acceleration backend.  Starts as `Software` and is
+    /// updated in the background once GPU probe completes, so the server can
+    /// begin accepting requests immediately.
+    hwaccel: Arc<RwLock<HwAccel>>,
     /// Semaphore limiting the number of concurrent on-demand segment transcode
     /// operations.  Used exclusively by the `get_segment` handler for real-time
     /// playback requests.  The pre-cache background worker runs sequentially and
@@ -2530,7 +2532,7 @@ async fn get_init_segment_generate(
             .body(format!("cache dir error: {e}"));
     }
 
-    let hwaccel = state.hwaccel.clone();
+    let hwaccel = state.hwaccel.read().clone();
     let seg_dir_clone = seg_dir.clone();
     let init_data = match tokio::task::spawn_blocking(move || {
         media::transcode::create_init_segment(&abs_str, quality, &hwaccel, &seg_dir_clone)
@@ -2711,7 +2713,7 @@ async fn get_segment(
         // We own the transcode job.
         // Use nominal boundaries — segment generator seeks to nearest keyframe.
         let result = media::transcode::transcode_segment_with_boundaries(
-            &abs_str, &seg_dir, seg_index, &state.hwaccel, quality, None,
+            &abs_str, &seg_dir, seg_index, &state.hwaccel.read().clone(), quality, None,
         ).await;
 
         // Remove from the inflight map first (no new subscribers can join
@@ -2824,7 +2826,7 @@ async fn get_video_init_generate(
         None => return HttpResponse::BadRequest().body("path not UTF-8"),
     };
 
-    let hwaccel = state.hwaccel.clone();
+    let hwaccel = state.hwaccel.read().clone();
     let seg_dir_clone = seg_dir.clone();
     let init_data = match tokio::task::spawn_blocking(move || {
         media::transcode::create_video_init_segment(&abs_str, quality, &hwaccel, &seg_dir_clone)
@@ -2998,7 +3000,7 @@ async fn get_video_segment(
 
     // Use nominal boundaries — segment generator seeks to nearest keyframe.
     let result = media::transcode::transcode_video_segment(
-        &abs_str, &seg_dir, seg_index, &state.hwaccel, quality, None,
+        &abs_str, &seg_dir, seg_index, &state.hwaccel.read().clone(), quality, None,
     ).await;
 
     // The file is stored with 0-based name; serve it regardless of the 1-based URL name.
@@ -3139,9 +3141,10 @@ async fn get_transcode_debug(state: web::Data<AppState>) -> impl Responder {
 
 /// `GET /api/hwaccel` — returns the detected hardware acceleration backend.
 async fn get_hwaccel(state: web::Data<AppState>) -> impl Responder {
+    let hw = state.hwaccel.read();
     HttpResponse::Ok().json(serde_json::json!({
-        "label":   state.hwaccel.label(),
-        "encoder": state.hwaccel.encoder(),
+        "label":   hw.label(),
+        "encoder": hw.encoder(),
     }))
 }
 
@@ -3547,7 +3550,7 @@ async fn run_sprite_worker(
 async fn run_precache_worker(
     library_path: PathBuf,
     cache_dir: PathBuf,
-    hwaccel: HwAccel,
+    hwaccel: Arc<RwLock<HwAccel>>,
     progress: Arc<RwLock<PrecacheProgress>>,
     trigger: Arc<tokio::sync::Notify>,
     mut playback_rx: tokio::sync::watch::Receiver<bool>,
@@ -3732,8 +3735,9 @@ async fn run_precache_worker(
                 // or playback signal wakes us immediately rather than
                 // waiting for the full operation to finish.  The kill flag
                 // ensures the spawn_blocking task also bails out quickly.
+                let hw = hwaccel.read().clone();
                 let result = tokio::select! {
-                    r = media::transcode::transcode_segment_with_kill(&abs_str, &hls_dir, i, &hwaccel, Quality::Original, Arc::clone(&kill)) => r,
+                    r = media::transcode::transcode_segment_with_kill(&abs_str, &hls_dir, i, &hw, Quality::Original, Arc::clone(&kill)) => r,
                     _ = playback_rx.changed() => {
                         if *playback_rx.borrow() {
                             kill.store(true, Ordering::SeqCst);
@@ -4216,8 +4220,25 @@ async fn main() -> std::io::Result<()> {
     cleanup_orphaned_tmp_files(&cache_dir);
 
     // ── Startup healthchecks (logged for journalctl) ─────────────────────
-    run_startup_healthchecks(&library_path, &cache_dir).await;
-    let hwaccel = media::hwaccel::detect_hwaccel().await;
+    // Run in the background so the HTTP server starts immediately.
+    {
+        let hc_library = library_path.clone();
+        let hc_cache = cache_dir.clone();
+        tokio::spawn(async move {
+            run_startup_healthchecks(&hc_library, &hc_cache).await;
+        });
+    }
+
+    // Hardware acceleration detection — start with Software fallback so the
+    // server is usable immediately, then upgrade once the GPU probe completes.
+    let hwaccel: Arc<RwLock<HwAccel>> = Arc::new(RwLock::new(HwAccel::Software));
+    {
+        let hwaccel_bg = Arc::clone(&hwaccel);
+        tokio::spawn(async move {
+            let detected = media::hwaccel::detect_hwaccel().await;
+            *hwaccel_bg.write() = detected;
+        });
+    }
 
     // Load any previously-persisted video index so the server starts with
     // known media immediately.
@@ -4227,11 +4248,21 @@ async fn main() -> std::io::Result<()> {
     }
     let video_cache: Arc<RwLock<Vec<VideoItem>>> = Arc::new(RwLock::new(initial_items));
 
-    // Build the initial path index via a fast, probe-free library walk so that
-    // `find_video` works immediately—before the background scan completes.
-    let initial_index = build_video_index(&library_path);
+    // Path index starts empty; a background task populates it via a fast,
+    // probe-free library walk so the server starts without waiting for the
+    // full directory traversal (which can be slow for large libraries).
     let video_path_index: Arc<RwLock<VideoPathIndex>> =
-        Arc::new(RwLock::new(initial_index));
+        Arc::new(RwLock::new(HashMap::new()));
+    {
+        let idx_library = library_path.clone();
+        let idx_path_index = Arc::clone(&video_path_index);
+        tokio::spawn(async move {
+            let index = tokio::task::spawn_blocking(move || {
+                build_video_index(&idx_library)
+            }).await.unwrap_or_default();
+            *idx_path_index.write() = index;
+        });
+    }
 
     let thumb_progress = Arc::new(RwLock::new(ThumbProgress {
         current: 0,
@@ -4250,7 +4281,7 @@ async fn main() -> std::io::Result<()> {
     }));
     let sprite_trigger = Arc::new(tokio::sync::Notify::new());
     let precache_trigger = Arc::new(tokio::sync::Notify::new());
-    let precache_hwaccel = hwaccel.clone();
+    let precache_hwaccel = Arc::clone(&hwaccel);
     let precache_progress = Arc::new(RwLock::new(PrecacheProgress {
         current: 0,
         total: 0,
@@ -4348,7 +4379,7 @@ async fn main() -> std::io::Result<()> {
         sprite_trigger: Arc::clone(&sprite_trigger),
         precache_progress: Arc::clone(&precache_progress),
         precache_trigger: Arc::clone(&precache_trigger),
-        hwaccel,
+        hwaccel: Arc::clone(&hwaccel),
         transcode_semaphore: Arc::clone(&transcode_semaphore),
         playback_tx: Arc::clone(&playback_tx),
         password_protection,

@@ -146,6 +146,23 @@ pub async fn login(password: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Logout — invalidate the current session.
+pub async fn logout() -> Result<(), String> {
+    let resp = Request::post("/api/auth/logout")
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .map_err(|e| format!("Request error: {e:?}"))?
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e:?}"))?;
+
+    if !resp.ok() {
+        return Err(format!("HTTP error: {}", resp.status()));
+    }
+
+    Ok(())
+}
+
 /// Fetch the detected hardware acceleration backend from `/api/hwaccel`.
 pub async fn fetch_hwaccel() -> Result<HwAccelInfo, String> {
     let resp = Request::get("/api/hwaccel")

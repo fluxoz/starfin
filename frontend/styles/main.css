@@ -238,6 +238,33 @@ body{
   margin-right: 12px;
 }
 
+/* ── Unified topbar button ────────────────────────────────────────────── */
+.topbar-btn{
+  font-family: inherit;
+  font-size: .7rem;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text);
+  background: transparent;
+  border: var(--border-width) solid var(--text);
+  border-radius: var(--radius);
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: background .15s, color .15s;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.topbar-btn:hover:not(:disabled){
+  background: var(--text);
+  color: var(--bg);
+}
+.topbar-btn:disabled,
+.topbar-btn--disabled{
+  opacity: .55;
+  cursor: default;
+}
+
 .scan-btn{
   font-family: inherit;
   font-size: .7rem;

@@ -4037,6 +4037,26 @@ async fn login(
         .json(serde_json::json!({ "ok": true }))
 }
 
+/// `POST /api/auth/logout` — invalidate the current session.
+async fn logout(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
+    if let Some(token) = extract_token(&req) {
+        let mut tokens = state.auth_tokens.write();
+        tokens.remove(&token);
+    }
+
+    // Clear the cookie by setting it with an empty value and max-age 0.
+    HttpResponse::Ok()
+        .cookie(
+            actix_web::cookie::Cookie::build("starfin_token", "")
+                .path("/")
+                .http_only(true)
+                .same_site(actix_web::cookie::SameSite::Lax)
+                .max_age(actix_web::cookie::time::Duration::ZERO)
+                .finish(),
+        )
+        .json(serde_json::json!({ "ok": true }))
+}
+
 /// Middleware: returns `401 Unauthorized` for unauthenticated requests to
 /// protected API routes when password protection is enabled.
 async fn auth_middleware(
@@ -4537,6 +4557,7 @@ async fn main() -> std::io::Result<()> {
             .route("/api/auth/status", web::get().to(auth_status))
             .route("/api/auth/set-password", web::post().to(set_password))
             .route("/api/auth/login", web::post().to(login))
+            .route("/api/auth/logout", web::post().to(logout))
             // ── Theme (always accessible) ────────────────────────────────
             .route("/api/theme.css", web::get().to(get_theme_css))
             // ── Protected API routes ─────────────────────────────────────

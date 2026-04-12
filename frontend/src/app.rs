@@ -96,7 +96,14 @@ pub fn app() -> Html {
         }
     }
 
-    html! { <AppInner /> }
+    let show_logout = *auth_state == AuthState::Authenticated;
+
+    let on_logout = {
+        let auth_state = auth_state.clone();
+        Callback::from(move |_: ()| auth_state.set(AuthState::Locked))
+    };
+
+    html! { <AppInner show_logout={show_logout} on_logout={on_logout} /> }
 }
 
 /// Returns the CSS-grid column count for the given viewport width.
@@ -106,8 +113,20 @@ fn col_count_for_width(win_width: f64) -> usize {
     if win_width >= 900.0 { 3 } else if win_width >= 520.0 { 2 } else { 1 }
 }
 
+/// Props for the inner application component.
+#[derive(Properties, PartialEq)]
+struct AppInnerProps {
+    /// Whether to show the logout button (password protection is on and user
+    /// is authenticated).
+    #[prop_or_default]
+    pub show_logout: bool,
+    /// Called when the user clicks the logout button.
+    #[prop_or_default]
+    pub on_logout: Callback<()>,
+}
+
 #[function_component(AppInner)]
-fn app_inner() -> Html {
+fn app_inner(props: &AppInnerProps) -> Html {
     /// Number of cards kept in the DOM at any one time (the virtual window).
     /// 30 items = 10 rows (3 cols) keeps the DOM very lean: only visible cards
     /// plus a small buffer above/below are ever present.
@@ -676,6 +695,17 @@ fn app_inner() -> Html {
         })
     };
 
+    let on_logout = {
+        let on_logout_prop = props.on_logout.clone();
+        Callback::from(move |_: MouseEvent| {
+            let cb = on_logout_prop.clone();
+            spawn_local(async move {
+                let _ = api::logout().await;
+                cb.emit(());
+            });
+        })
+    };
+
     let on_scan = {
         let scanning = scanning.clone();
         let items = items.clone();
@@ -939,31 +969,38 @@ fn app_inner() -> Html {
                         </div>
                         <div class="topbar__right">
                             <button
-                                class="random-btn"
+                                class="topbar-btn"
                                 onclick={on_random}
                                 disabled={(*items).is_empty()}
                                 aria-label="Play a random media file"
                             >
-                                { "?" }
+                                { "RANDOM" }
                             </button>
                             <button
-                                class="scroll-btn"
+                                class="topbar-btn"
                                 onclick={on_scroll_mode}
                                 disabled={(*items).is_empty()}
                                 aria-label="Open scroll view"
                             >
                                 { "SCROLL" }
                             </button>
-                            <div class="scan-area">
+                            <button
+                                class="topbar-btn"
+                                onclick={on_scan}
+                                disabled={*scanning}
+                                aria-label="Scan for new media"
+                            >
+                                { if *scanning { "SCANNING…" } else { "SCAN MEDIA" } }
+                            </button>
+                            if props.show_logout {
                                 <button
-                                    class={if *scanning { "scan-btn scan-btn--scanning" } else { "scan-btn" }}
-                                    onclick={on_scan}
-                                    disabled={*scanning}
-                                    aria-label="Scan for new media"
+                                    class="topbar-btn"
+                                    onclick={on_logout}
+                                    aria-label="Log out"
                                 >
-                                    { if *scanning { "SCANNING…" } else { "SCAN MEDIA" } }
+                                    { "LOGOUT" }
                                 </button>
-                            </div>
+                            }
                             <button 
                                 class="theme-toggle" 
                                 onclick={on_toggle_dark_mode.clone()}

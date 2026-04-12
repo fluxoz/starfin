@@ -985,7 +985,7 @@ fn app_inner(props: &AppInnerProps) -> Html {
                                 { "SCROLL" }
                             </button>
                             <button
-                                class={if *scanning { "topbar-btn topbar-btn--disabled" } else { "topbar-btn" }}
+                                class="topbar-btn"
                                 onclick={on_scan}
                                 disabled={*scanning}
                                 aria-label="Scan for new media"

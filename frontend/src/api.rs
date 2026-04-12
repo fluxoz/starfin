@@ -60,6 +60,12 @@ pub struct ProgressUpdate {
     pub thumb: ThumbProgressMsg,
     pub sprite: SpriteProgressMsg,
     pub precache: PrecacheProgressMsg,
+    /// Monotonically increasing counter bumped by the server whenever the
+    /// video library changes (scan completion, metadata edit, etc.).
+    /// The frontend uses this to trigger an immediate re-fetch instead of
+    /// waiting for the next polling interval.
+    #[serde(default)]
+    pub library_version: u64,
 }
 
 /// Hardware acceleration info returned by `GET /api/hwaccel`.

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use parking_lot::{Mutex, RwLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use uuid::Uuid;
@@ -1068,6 +1068,11 @@ struct AppState {
     /// Last known playback positions per video ID (populated by player_ws).
     /// Used for resume-on-reload support.
     playback_positions: Arc<RwLock<HashMap<String, f64>>>,
+    /// Monotonically increasing counter bumped every time `video_cache` is
+    /// updated (startup scan, periodic scan, manual scan, metadata edit).
+    /// Streamed to the frontend via the progress WebSocket so it can re-fetch
+    /// the video list immediately instead of polling.
+    library_version: Arc<AtomicU64>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1396,6 +1401,8 @@ async fn update_metadata(
     let items_snapshot = cache.clone();
     drop(cache);
 
+    state.library_version.fetch_add(1, Ordering::Relaxed);
+
     // Persist to disk in the background so the response isn't delayed.
     let cache_dir = state.cache_dir.clone();
     actix_web::rt::spawn(async move {
@@ -1422,6 +1429,7 @@ async fn scan_ws(
     let thumb_trigger = Arc::clone(&state.thumb_trigger);
     let sprite_trigger = Arc::clone(&state.sprite_trigger);
     let precache_trigger = Arc::clone(&state.precache_trigger);
+    let scan_lib_ver = Arc::clone(&state.library_version);
 
     actix_web::rt::spawn(async move {
         // Snapshot the existing cache so we can preserve user-edited metadata.
@@ -1519,6 +1527,7 @@ async fn scan_ws(
         save_video_cache(&items, &cache_dir);
         *video_cache.write() = items;
         *video_path_index.write() = index;
+        scan_lib_ver.fetch_add(1, Ordering::Relaxed);
 
         // Re-trigger deep thumbnail generation for any newly discovered videos.
         thumb_trigger.notify_one();
@@ -1948,6 +1957,7 @@ async fn progress_ws(
     let thumb_progress = Arc::clone(&state.thumb_progress);
     let sprite_progress = Arc::clone(&state.sprite_progress);
     let precache_progress = Arc::clone(&state.precache_progress);
+    let library_version = Arc::clone(&state.library_version);
 
     actix_web::rt::spawn(async move {
         let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(500));
@@ -1968,11 +1978,13 @@ async fn progress_ws(
                 let p = precache_progress.read();
                 (p.current, p.total, p.active, p.current_id.clone())
             };
+            let lv = library_version.load(Ordering::Relaxed);
 
             let msg = serde_json::json!({
                 "thumb":    { "current": tc, "total": tt, "active": ta, "phase": tph, "current_ids": tids },
                 "sprite":   { "current": sc, "total": st, "active": sa, "current_ids": sids },
-                "precache": { "current": pc, "total": pt, "active": pa, "current_id": pid }
+                "precache": { "current": pc, "total": pt, "active": pa, "current_id": pid },
+                "library_version": lv
             })
             .to_string();
 
@@ -4322,6 +4334,8 @@ async fn main() -> std::io::Result<()> {
         format!("{}{}", design_css, theme_css_raw)
     };
 
+    let library_version = Arc::new(AtomicU64::new(0));
+
     let state = web::Data::new(AppState {
         library_path: library_path.clone(),
         cache_dir: cache_dir.clone(),
@@ -4343,6 +4357,7 @@ async fn main() -> std::io::Result<()> {
         segment_inflight: Arc::new(Mutex::new(HashMap::new())),
         theme_css,
         playback_positions: Arc::new(RwLock::new(HashMap::new())),
+        library_version: Arc::clone(&library_version),
     });
 
     // One-time background scan at startup to refresh the index immediately.
@@ -4355,6 +4370,7 @@ async fn main() -> std::io::Result<()> {
         let startup_index = Arc::clone(&video_path_index);
         let startup_thumb_trigger = Arc::clone(&thumb_trigger);
         let startup_sprite_trigger = Arc::clone(&sprite_trigger);
+        let startup_lib_ver = Arc::clone(&library_version);
         tokio::spawn(async move {
             let previous = startup_cache.read().clone();
             let (mut items, index) = scan_library(&startup_library).await;
@@ -4362,6 +4378,7 @@ async fn main() -> std::io::Result<()> {
             save_video_cache(&items, &startup_cache_dir);
             *startup_cache.write() = items;
             *startup_index.write() = index;
+            startup_lib_ver.fetch_add(1, Ordering::Relaxed);
             startup_thumb_trigger.notify_one();
             startup_sprite_trigger.notify_one();
         });
@@ -4375,6 +4392,7 @@ async fn main() -> std::io::Result<()> {
     let bg_thumb_trigger = Arc::clone(&thumb_trigger);
     let bg_sprite_trigger = Arc::clone(&sprite_trigger);
     let bg_precache_trigger = Arc::clone(&precache_trigger);
+    let bg_lib_ver = Arc::clone(&library_version);
     let mut bg_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -4398,6 +4416,7 @@ async fn main() -> std::io::Result<()> {
             save_video_cache(&items, &bg_cache_dir);
             *bg_cache.write() = items;
             *bg_index.write() = index;
+            bg_lib_ver.fetch_add(1, Ordering::Relaxed);
             bg_thumb_trigger.notify_one();
             bg_sprite_trigger.notify_one();
             bg_precache_trigger.notify_one();

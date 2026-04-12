@@ -13,7 +13,6 @@ use crate::models::{Element, MetadataFilter, SortBy};
 
 use futures::StreamExt;
 use gloo_net::websocket::{futures::WebSocket, Message};
-use gloo_timers::callback::Interval;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
@@ -413,54 +412,10 @@ fn app_inner(props: &AppInnerProps) -> Html {
         );
     }
 
-    // Auto-refresh: re-fetch the video list every 60 seconds.
-    {
-        let query_ref = query_ref.clone();
-        let sort_by_ref = sort_by_ref.clone();
-        let meta_filter_ref = meta_filter_ref.clone();
-        let items = items.clone();
-        let raw_items = raw_items.clone();
-        let scanning = scanning.clone();
-
-        use_effect_with((), move |_| {
-            let interval = Interval::new(60_000, move || {
-                // Skip the auto-refresh if a manual scan is already in progress.
-                if *scanning {
-                    return;
-                }
-                // Read the current filter values from the shared refs.
-                // These are always up-to-date because the fetch effect above
-                // writes to them on every query/sort/meta_filter change.  Using
-                // plain UseStateHandle clones here would capture the Rc from
-                // mount time and always see the initial empty-string query.
-                let query = query_ref.borrow().clone();
-                let sort_by = *sort_by_ref.borrow();
-                let mf = meta_filter_ref.borrow().clone();
-
-                // If the user has an active search, sort, or metadata filter,
-                // skip the background refresh so their filtered results are
-                // not disturbed.
-                if !query.is_empty() || sort_by != SortBy::DateAddedNewest || mf.is_active() {
-                    return;
-                }
-
-                let items = items.clone();
-                let raw_items = raw_items.clone();
-                spawn_local(async move {
-                    if let Ok(all) = api::fetch_all_videos().await {
-                        let filtered = api::apply_filters(&all, &query, sort_by, &mf);
-                        raw_items.set(all);
-                        items.set(filtered);
-                    }
-                });
-            });
-            // Keep the interval alive for the lifetime of the component.
-            move || drop(interval)
-        });
-    }
-
     // Connect to /api/progress/ws on mount and keep it open.
     // This streams live thumb + sprite + precache progress updates without polling.
+    // It also detects library-version bumps and re-fetches the video list
+    // immediately, eliminating the need for 60-second polling.
     {
         let thumb_progress = thumb_progress.clone();
         let sprite_progress = sprite_progress.clone();
@@ -468,6 +423,11 @@ fn app_inner(props: &AppInnerProps) -> Html {
         let thumb_current_id = thumb_current_id.clone();
         let sprite_current_id = sprite_current_id.clone();
         let precache_current_id = precache_current_id.clone();
+        let items = items.clone();
+        let raw_items = raw_items.clone();
+        let query_ref = query_ref.clone();
+        let sort_by_ref = sort_by_ref.clone();
+        let meta_filter_ref = meta_filter_ref.clone();
         use_effect_with((), move |_| {
             spawn_local(async move {
                 let ws_url = {
@@ -481,6 +441,7 @@ fn app_inner(props: &AppInnerProps) -> Html {
                 };
                 if let Ok(ws) = WebSocket::open(&ws_url) {
                     let (_, mut read) = ws.split();
+                    let mut last_lib_ver: u64 = 0;
 
                     while let Some(Ok(Message::Text(text))) = read.next().await {
                         if let Ok(update) = serde_json::from_str::<api::ProgressUpdate>(&text) {
@@ -515,6 +476,28 @@ fn app_inner(props: &AppInnerProps) -> Html {
                             thumb_current_id.set(update.thumb.current_ids.clone());
                             sprite_current_id.set(update.sprite.current_ids.clone());
                             precache_current_id.set(update.precache.current_id.clone());
+
+                            // ── Library change detection ────────────────────
+                            // When the server bumps library_version (scan
+                            // completed, metadata edited, etc.) re-fetch the
+                            // video list immediately so the UI updates without
+                            // the user having to refresh.
+                            if update.library_version > last_lib_ver {
+                                last_lib_ver = update.library_version;
+                                let items = items.clone();
+                                let raw_items = raw_items.clone();
+                                let query = query_ref.borrow().clone();
+                                let sort_by = *sort_by_ref.borrow();
+                                let mf = meta_filter_ref.borrow().clone();
+                                spawn_local(async move {
+                                    if let Ok(all) = api::fetch_all_videos().await {
+                                        let filtered =
+                                            api::apply_filters(&all, &query, sort_by, &mf);
+                                        raw_items.set(all);
+                                        items.set(filtered);
+                                    }
+                                });
+                            }
                         }
                     }
                     // WebSocket closed (server restart, etc.) — silently stop updating.

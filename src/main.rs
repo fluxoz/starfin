@@ -4251,15 +4251,24 @@ async fn main() -> std::io::Result<()> {
     // Path index starts empty; a background task populates it via a fast,
     // probe-free library walk so the server starts without waiting for the
     // full directory traversal (which can be slow for large libraries).
+    // The startup scan (below) also rebuilds the full index, so even if
+    // this walk hasn't finished by the time a request arrives, the scan
+    // will fill it shortly after.
     let video_path_index: Arc<RwLock<VideoPathIndex>> =
         Arc::new(RwLock::new(HashMap::new()));
     {
         let idx_library = library_path.clone();
         let idx_path_index = Arc::clone(&video_path_index);
         tokio::spawn(async move {
-            let index = tokio::task::spawn_blocking(move || {
+            let index = match tokio::task::spawn_blocking(move || {
                 build_video_index(&idx_library)
-            }).await.unwrap_or_default();
+            }).await {
+                Ok(idx) => idx,
+                Err(e) => {
+                    warn!(error = %e, "background index walk panicked");
+                    HashMap::new()
+                }
+            };
             *idx_path_index.write() = index;
         });
     }

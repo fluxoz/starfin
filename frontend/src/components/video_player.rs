@@ -827,10 +827,13 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     on_error.forget();
 
                     // Stream initialized (one-shot) — clear status and lock the initial
-                    // quality.  setRepresentationForTypeByIndex MUST be called inside
+                    // quality.  setRepresentationForTypeById MUST be called inside
                     // this event because attachSource is async: the MPD has not been
                     // parsed and the representation list does not exist until
                     // streamInitialized fires.
+                    //
+                    // force_replace is false to avoid re-fetching segments that
+                    // may already be in-flight from the initial ABR selection.
                     let status_for_init = status_clone.clone();
                     let player_js_for_init = player.player.clone();
                     let quality_for_init = quality.clone();
@@ -844,7 +847,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                                     let args = js_sys::Array::new();
                                     args.push(&JsValue::from_str("video"));
                                     args.push(&JsValue::from_str(&quality_for_init));
-                                    args.push(&JsValue::from_bool(true));
+                                    args.push(&JsValue::from_bool(false));
                                     let _ = js_sys::Reflect::apply(&func, &player_js_for_init, &args);
                                 }
                             }

@@ -513,7 +513,7 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
                                         let pjs_q = player.player.clone();
                                         let qs = quality_str.clone();
                                         let on_stream = Closure::once(Box::new(move || {
-                                            set_quality_for_raw(&pjs_q, "video", &qs, true);
+                                            set_quality_for_raw(&pjs_q, "video", &qs, false);
                                         }) as Box<dyn FnOnce()>);
                                         player.on("streamInitialized", on_stream.as_ref().unchecked_ref());
                                         on_stream.forget();
@@ -815,7 +815,7 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
                             let pjs_q = player.player.clone();
                             let qs = quality_str.clone();
                             let on_stream = Closure::once(Box::new(move || {
-                                set_quality_for_raw(&pjs_q, "video", &qs, true);
+                                set_quality_for_raw(&pjs_q, "video", &qs, false);
                             }) as Box<dyn FnOnce()>);
                             player.on("streamInitialized", on_stream.as_ref().unchecked_ref());
                             on_stream.forget();

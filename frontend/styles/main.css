@@ -69,7 +69,7 @@
 }
 
 *{ box-sizing: border-box; margin: 0; padding: 0; }
-html, body { height: 100%; }
+html, body { height: 100%; overflow-x: hidden; }
 body{
   margin: 0;
   font-family: var(--font-body);
@@ -132,6 +132,59 @@ body{
   .sidebar__arrow-svg{
     width: 18px !important;
     height: 18px !important;
+  }
+
+  /* Topbar: stack into two rows (title + button row) */
+  .topbar{
+    padding: 6px 12px;
+  }
+  .topbar__inner{
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+  }
+  .topbar__left{
+    font-size: 10px;
+    letter-spacing: .04em;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .topbar__right{
+    flex-wrap: wrap;
+    gap: 4px;
+    justify-content: flex-start;
+  }
+  .topbar-btn{
+    font-size: .6rem;
+    padding: 3px 7px;
+    letter-spacing: .04em;
+  }
+  .theme-toggle{
+    width: 42px;
+    height: 20px;
+  }
+  .theme-toggle__switch::before{
+    height: 12px;
+    width: 12px;
+  }
+  .theme-toggle__switch.active::before{
+    transform: translateX(22px);
+  }
+
+  /* Content: less padding on narrow screens */
+  .content{
+    padding: 16px;
+  }
+
+  /* Process row: smaller fixed column so it fits on ~375 px */
+  .process-row{
+    grid-template-columns: 90px 1fr auto;
+    gap: 8px;
+  }
+  .process-row__count{
+    min-width: 72px;
   }
 }
 

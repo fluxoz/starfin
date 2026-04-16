@@ -69,7 +69,7 @@
 }
 
 *{ box-sizing: border-box; margin: 0; padding: 0; }
-html, body { height: 100%; }
+html, body { height: 100%; overflow-x: hidden; }
 body{
   margin: 0;
   font-family: var(--font-body);
@@ -132,6 +132,59 @@ body{
   .sidebar__arrow-svg{
     width: 18px !important;
     height: 18px !important;
+  }
+
+  /* Topbar: stack into two rows (title + button row) */
+  .topbar{
+    padding: 6px 12px;
+  }
+  .topbar__inner{
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+  }
+  .topbar__left{
+    font-size: 10px;
+    letter-spacing: .04em;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .topbar__right{
+    flex-wrap: wrap;
+    gap: 4px;
+    justify-content: flex-start;
+  }
+  .topbar-btn{
+    font-size: .6rem;
+    padding: 3px 7px;
+    letter-spacing: .04em;
+  }
+  .theme-toggle{
+    width: 42px;
+    height: 20px;
+  }
+  .theme-toggle__switch::before{
+    height: 12px;
+    width: 12px;
+  }
+  .theme-toggle__switch.active::before{
+    transform: translateX(22px);
+  }
+
+  /* Content: less padding on narrow screens */
+  .content{
+    padding: 16px;
+  }
+
+  /* Process row: smaller fixed column so it fits on ~375 px */
+  .process-row{
+    grid-template-columns: 90px 1fr auto;
+    gap: 8px;
+  }
+  .process-row__count{
+    min-width: 72px;
   }
 }
 
@@ -520,6 +573,18 @@ body{
   min-width: 120px;
 }
 
+/* On narrow screens: switch to a strict 2-column grid so tracks can't overflow */
+@media (max-width: 640px){
+  .filters__row--meta{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    align-items: end;
+  }
+  .filters__row--meta .field{
+    min-width: 0;
+  }
+}
+
 @media (min-width: 720px){
   .filters__row{
     grid-template-columns: 1.5fr .8fr;
@@ -532,6 +597,7 @@ body{
 
 .field{
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 4px;
 }
 .field__label{
@@ -544,7 +610,8 @@ body{
 
 .input, .select{
   width: 100%;
-  padding: 8px 10px;
+  height: 34px;
+  padding: 0 10px;
   border-radius: var(--radius);
   border: var(--border-width) solid var(--input-border);
   background: var(--input-bg);
@@ -552,12 +619,26 @@ body{
   outline: none;
   font-family: var(--font-body);
   font-size: 12px;
+  box-sizing: border-box;
 }
 .input::placeholder{ color: rgba(0,0,0,.4); }
 
 .input:focus, .select:focus{
   border-color: var(--accent);
   box-shadow: 0 0 0 2px rgba(255,69,0,.2);
+}
+
+/* Strip native browser select styling and use the vendored font + custom arrow */
+.select{
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 28px;
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  cursor: pointer;
+}
+/* Dark-mode arrow colour (matches --muted in dark theme) */
+.app.dark-mode .select{
 }
 
 /* ── MultiSelect chip-style dropdown ──────────────────────────────────────── */
@@ -616,6 +697,8 @@ body{
   user-select: none;
   outline: none;
   box-sizing: border-box;
+  overflow: hidden;          /* prevent content from widening the trigger */
+  min-width: 0;              /* allow flex shrinking below content width */
 }
 .multi-select__trigger:focus,
 .multi-select__trigger--open{
@@ -627,6 +710,7 @@ body{
   color: var(--muted);
   font-size: 12px;
   flex: 1;
+  min-width: 0;              /* allow shrinking in a flex container */
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -665,6 +749,7 @@ body{
   gap: 6px;
   padding: 6px 10px;
   cursor: pointer;
+  font-family: var(--font-body);
   font-size: 12px;
   color: var(--text);
 }
@@ -683,13 +768,17 @@ body{
 }
 
 .chip{
-  padding: 8px 12px;
+  display: inline-flex;
+  align-items: center;
+  height: 34px;
+  padding: 0 12px;
   border-radius: var(--radius);
   border: var(--border-width) solid var(--input-border);
   background: var(--input-bg);
   color: var(--text);
   cursor: pointer;
-  font-size: 11px;
+  font-family: var(--font-body);
+  font-size: 12px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 1px;
@@ -2171,7 +2260,7 @@ body{
    override the size on mobile viewports.  Manual pinch-zoom is
    unaffected by this rule. */
 @media (max-width: 768px){
-  .input, .select, .pw-modal__input{
+  .input, .select, .pw-modal__input, .multi-select__trigger, .multi-select__placeholder{
     font-size: 16px;
   }
 }

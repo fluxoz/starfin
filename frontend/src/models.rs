@@ -55,8 +55,6 @@ impl SortBy {
 pub struct MetadataFilter {
     /// Show only favorited items.
     pub only_favorites: bool,
-    /// Minimum star rating (0 = disabled, 1–5 = minimum stars required).
-    pub min_rating: u8,
     /// Selected tag values to filter by (empty = show all).  OR logic: item
     /// must have at least one of the selected tags.
     pub tag: Vec<String>,
@@ -70,7 +68,6 @@ impl MetadataFilter {
     /// Returns `true` if any filter is active.
     pub fn is_active(&self) -> bool {
         self.only_favorites
-            || self.min_rating > 0
             || !self.tag.is_empty()
             || !self.actor.is_empty()
             || !self.category.is_empty()

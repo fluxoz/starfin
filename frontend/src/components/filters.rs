@@ -59,17 +59,6 @@ pub fn filters_bar(props: &Props) -> Html {
         })
     };
 
-    let on_min_rating_change = {
-        let cb = props.on_filter_change.clone();
-        let mf = props.meta_filter.clone();
-        Callback::from(move |e: Event| {
-            let select: web_sys::HtmlSelectElement = e.target_unchecked_into();
-            let mut updated = mf.clone();
-            updated.min_rating = select.value().parse::<u8>().unwrap_or(0);
-            cb.emit(updated);
-        })
-    };
-
     let on_tag_change = {
         let cb = props.on_filter_change.clone();
         let mf = props.meta_filter.clone();
@@ -101,7 +90,6 @@ pub fn filters_bar(props: &Props) -> Html {
     };
 
     let fav_pressed = props.meta_filter.only_favorites.to_string();
-    let min_rating_val = props.meta_filter.min_rating.to_string();
 
     html! {
         <section class="filters">
@@ -148,18 +136,6 @@ pub fn filters_bar(props: &Props) -> Html {
                     </svg>
                     { "Favorites" }
                 </button>
-
-                <label class="field">
-                    <span class="field__label">{ "Min Rating" }</span>
-                    <select class="select" onchange={on_min_rating_change} value={min_rating_val}>
-                        <option value="0">{ "Any" }</option>
-                        <option value="1">{ "★ 1+" }</option>
-                        <option value="2">{ "★★ 2+" }</option>
-                        <option value="3">{ "★★★ 3+" }</option>
-                        <option value="4">{ "★★★★ 4+" }</option>
-                        <option value="5">{ "★★★★★ 5" }</option>
-                    </select>
-                </label>
 
                 <div class="field">
                     <span class="field__label">{ "Tags" }</span>

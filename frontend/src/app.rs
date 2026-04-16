@@ -805,7 +805,6 @@ fn app_inner(props: &AppInnerProps) -> Html {
     let mf = &*meta_filter;
     let is_filtered = !(*query).is_empty()
         || mf.only_favorites
-        || mf.min_rating > 0
         || !mf.tag.is_empty()
         || !mf.actor.is_empty()
         || !mf.category.is_empty();

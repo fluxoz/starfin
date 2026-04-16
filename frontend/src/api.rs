@@ -234,10 +234,6 @@ pub fn apply_filters(
             if meta_filter.only_favorites && !e.favorite {
                 return false;
             }
-            // Minimum rating filter.
-            if meta_filter.min_rating > 0 && (e.rating.round() as u8) < meta_filter.min_rating {
-                return false;
-            }
             // Tag multi-select filter (OR): item must have at least one selected tag.
             if !meta_filter.tag.is_empty()
                 && !meta_filter.tag.iter().any(|sel| e.tags.contains(sel))

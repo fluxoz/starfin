@@ -303,13 +303,14 @@ fn app_inner(props: &AppInnerProps) -> Html {
                     // UseStateHandle captures would be stale in this closure.
                     // Must match the `is_filtered` condition in the render
                     // section below.
-                    let mf = meta_filter_ref.borrow();
-                    let is_filtered = !query_ref.borrow().is_empty()
-                        || mf.only_favorites
-                        || !mf.tag.is_empty()
-                        || !mf.actor.is_empty()
-                        || !mf.category.is_empty();
-                    drop(mf);
+                    let is_filtered = {
+                        let mf = meta_filter_ref.borrow();
+                        !query_ref.borrow().is_empty()
+                            || mf.only_favorites
+                            || !mf.tag.is_empty()
+                            || !mf.actor.is_empty()
+                            || !mf.category.is_empty()
+                    };
                     if !is_filtered {
                         let total = *total_items_len_ref.borrow();
                         if total > WINDOW_SIZE {

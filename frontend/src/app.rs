@@ -289,6 +289,7 @@ fn app_inner(props: &AppInnerProps) -> Html {
         let total_items_len_ref = total_items_len_ref.clone();
         let card_row_height_ref = card_row_height_ref.clone();
         let query_ref = query_ref.clone();
+        let meta_filter_ref = meta_filter_ref.clone();
         use_effect_with((), move |_| {
             let window = web_sys::window().expect("no window");
 
@@ -297,10 +298,19 @@ fn app_inner(props: &AppInnerProps) -> Html {
                     let scroll_y = w.scroll_y().unwrap_or(0.0);
                     show_scroll_top.set(scroll_y > 300.0);
 
-                    // Virtual windowing: only active when no search filter is
-                    // in use.  `query_ref` (a UseRef) is read here because
+                    // Virtual windowing: only active when no search/metadata
+                    // filter is in use.  Refs are read here because
                     // UseStateHandle captures would be stale in this closure.
-                    if query_ref.borrow().is_empty() {
+                    // Must match the `is_filtered` condition in the render
+                    // section below.
+                    let mf = meta_filter_ref.borrow();
+                    let is_filtered = !query_ref.borrow().is_empty()
+                        || mf.only_favorites
+                        || !mf.tag.is_empty()
+                        || !mf.actor.is_empty()
+                        || !mf.category.is_empty();
+                    drop(mf);
+                    if !is_filtered {
                         let total = *total_items_len_ref.borrow();
                         if total > WINDOW_SIZE {
                             let row_height = *card_row_height_ref.borrow();

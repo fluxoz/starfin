@@ -974,8 +974,6 @@ struct ThumbProgress {
     current: u32,
     total: u32,
     active: bool,
-    /// Which generation phase is running: `"quick"` or `"deep"`.
-    phase: &'static str,
     /// The set of video IDs currently being processed (may be > 1 when running
     /// in parallel).  Empty when idle.
     current_ids: HashSet<String>,
@@ -1024,9 +1022,9 @@ struct AppState {
     /// Tracks the last time a segment was served for each video ID.
     /// Used by the background idle-eviction sweep.
     last_segment_access: RwLock<HashMap<String, Instant>>,
-    /// Progress counters for the background deep-thumbnail generation worker.
+    /// Progress counters for the background thumbnail generation worker.
     thumb_progress: Arc<RwLock<ThumbProgress>>,
-    /// Notified to (re-)start the deep thumbnail generation batch.
+    /// Notified to (re-)start the thumbnail generation batch.
     thumb_trigger: Arc<tokio::sync::Notify>,
     /// Progress counters for the background sprite generation worker.
     sprite_progress: Arc<RwLock<SpriteProgress>>,
@@ -1531,7 +1529,7 @@ async fn scan_ws(
         *video_path_index.write() = index;
         scan_lib_ver.fetch_add(1, Ordering::Relaxed);
 
-        // Re-trigger deep thumbnail generation for any newly discovered videos.
+        // Re-trigger thumbnail generation for any newly discovered videos.
         thumb_trigger.notify_one();
 
         // Re-trigger sprite generation for any newly discovered videos.
@@ -1550,8 +1548,8 @@ async fn scan_ws(
 /// `GET /api/videos/{id}/thumbnail` — serve the cached JPEG thumbnail.
 ///
 /// Thumbnails are generated entirely in the background by `run_thumb_worker`
-/// (quick random-frame grab first, then upgraded to a signalstats-selected
-/// frame).  If the thumbnail has not yet been generated this returns 404 so
+/// (seeks to 20% of the video duration and grabs a single keyframe).
+/// If the thumbnail has not yet been generated this returns 404 so
 /// callers can handle the not-ready state gracefully.
 async fn get_thumbnail(
     id: web::Path<String>,
@@ -1569,11 +1567,10 @@ async fn get_thumbnail(
 
 // ── Thumbnail background job ──────────────────────────────────────────────────
 
-/// Quick one-shot thumbnail: seeks to a **fresh random** position within
-/// 20–80% of the video runtime and grabs a single frame.  The position is
-/// Quick thumbnail: seek to a random position in [20%, 80%) of the video and
-/// extract a single frame as JPEG.  Uses the in-process ffmpeg-next library.
-async fn generate_quick_thumbnail(
+/// Fast thumbnail: seek to exactly 20% of the video duration and decode the
+/// nearest available frame as JPEG.  Mirrors the approach used by KDE's
+/// `ffmpegthumbs`.
+async fn generate_thumbnail(
     id: &str,
     video_path: &Path,
     cache_dir: &Path,
@@ -1587,101 +1584,18 @@ async fn generate_quick_thumbnail(
     if duration_secs <= 0.0 {
         return false;
     }
-    let duration = duration_secs;
 
-    // Pick a fresh random position in [20 %, 80 %) of the runtime.
-    let random_byte = Uuid::new_v4().as_bytes()[0];
-    let fraction = random_byte as f64 / 255.0;
-    let seek_secs = (duration * (0.20 + fraction * 0.60)).max(1.0);
+    // Seek to 20% of the runtime, clamped to at least 1 second.
+    let seek_secs = (duration_secs * 0.20).max(1.0);
 
     let video_path = video_path.to_path_buf();
     let thumb_path_clone = thumb_path.clone();
 
-    // Run the CPU-intensive frame extraction on a blocking thread.  The
-    // result is always awaited to completion: letting the task finish means
-    // the thumbnail is saved and won't need to be re-done when workers
-    // resume after playback ends.  The outer worker loop suspends between
-    // tasks while playback is active, so no new work is started during
-    // playback.
     tokio::task::spawn_blocking(move || {
         media::thumbnail::extract_frame_as_jpeg(&video_path, seek_secs, &thumb_path_clone)
     })
     .await
     .unwrap_or(false)
-}
-
-/// Two-pass deep thumbnail using in-process signalstats analysis.
-///
-/// Pass 1 — analyse frames in the 20–80% window using YUV signal statistics
-/// to find the most visually appealing frame (highest saturation, lowest
-/// out-of-range pixel ratio).
-///
-/// Pass 2 — extract and encode that specific frame as JPEG.
-///
-/// A side-car marker file `{id}.deep` is created on success.
-///
-/// When `kill` is set to `true`, pass 1 bails out early and pass 2 is skipped
-/// entirely so that background work yields I/O and CPU to playback.
-async fn generate_deep_thumbnail(
-    id: &str,
-    video_path: &Path,
-    cache_dir: &Path,
-    kill: Arc<AtomicBool>,
-) -> bool {
-    let deep_marker = cache_dir.join(format!("{}.deep", id));
-    if deep_marker.exists() {
-        return true;
-    }
-
-    let (duration_secs, _) = probe_video(video_path).await;
-    if duration_secs <= 0.0 {
-        return false;
-    }
-
-    let duration = duration_secs;
-    let start = duration * 0.20;
-    let length = duration * 0.60;
-
-    let video_path_owned = video_path.to_path_buf();
-    let default_time = start + length * 0.5;
-
-    // Pass 1: find the best frame time via in-process signal analysis.
-    let video_path_for_analysis = video_path_owned.clone();
-    let kill_for_analysis = kill.clone();
-    let best_time = tokio::task::spawn_blocking(move || {
-        media::thumbnail::find_best_frame_via_signalstats(
-            &video_path_for_analysis,
-            start,
-            length,
-            default_time,
-            &kill_for_analysis,
-        )
-    })
-    .await
-    .unwrap_or(default_time);
-
-    // Bail before pass 2 if playback has started.
-    if kill.load(Ordering::Relaxed) {
-        return false;
-    }
-
-    // Pass 2: extract the chosen frame.
-    let thumb_path = cache_dir.join(format!("{}.jpg", id));
-    let video_path_for_extract = video_path_owned.clone();
-    let thumb_path_clone = thumb_path.clone();
-
-    let success = tokio::task::spawn_blocking(move || {
-        media::thumbnail::extract_frame_as_jpeg(&video_path_for_extract, best_time, &thumb_path_clone)
-    })
-    .await
-    .unwrap_or(false);
-
-    if success {
-        let _ = tokio::fs::write(&deep_marker, b"").await;
-        true
-    } else {
-        false
-    }
 }
 
 /// Returns the number of tasks that sprite/thumbnail background workers will
@@ -1701,25 +1615,16 @@ fn worker_concurrency() -> usize {
         .unwrap_or(1)
 }
 
-/// Background worker that processes videos one at a time in two sequential
-/// phases.
+/// Background worker that generates thumbnails for every video in the library.
 ///
-/// **Phase 1 — quick thumbnails**: for every video whose `.jpg` is absent,
-/// grab a single deterministic random frame within 20–80% of the runtime.
-/// This is fast (one short ffmpeg invocation per file) and gives the UI
-/// something to show immediately.
+/// For each video whose `.jpg` is absent, seeks to 20% of the runtime and
+/// extracts a single keyframe as JPEG — the same approach used by KDE's
+/// `ffmpegthumbs`.  This is fast (one short ffmpeg invocation per file) and
+/// gives the UI something to show immediately.
 ///
-/// **Phase 2 — deep thumbnails**: for every video whose `.deep` marker is
-/// absent, run the two-pass signalstats analysis to select and extract the
-/// most visually representative frame, then replace the quick thumbnail with
-/// the better one.
-///
-/// Both phases are triggered by a notification on `trigger` (sent at startup
+/// The worker is triggered by a notification on `trigger` (sent at startup
 /// and after every library re-scan).  Progress counters are written to
 /// `progress` so `GET /api/thumbnails/progress` can drive the frontend bar.
-///
-/// All ffmpeg invocations in this worker suppress their stdout **and** stderr
-/// so no ffmpeg output appears in the main process.
 async fn run_thumb_worker(
     library_path: PathBuf,
     cache_dir: PathBuf,
@@ -1742,9 +1647,7 @@ async fn run_thumb_worker(
             return;
         }
 
-        // ── Phase 1: quick thumbnails ─────────────────────────────────────
-
-        let (quick_done, quick_entries): (Vec<_>, Vec<_>) = WalkDir::new(&library_path)
+        let (done, entries): (Vec<_>, Vec<_>) = WalkDir::new(&library_path)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file() && is_video(e.path()))
@@ -1760,14 +1663,13 @@ async fn run_thumb_worker(
 
         {
             let mut p = progress.write();
-            p.current = quick_done.len() as u32;
-            p.total = (quick_done.len() + quick_entries.len()) as u32;
-            p.active = !quick_entries.is_empty();
-            p.phase = "quick";
+            p.current = done.len() as u32;
+            p.total = (done.len() + entries.len()) as u32;
+            p.active = !entries.is_empty();
         }
 
         let mut join_set: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
-        let mut iter = quick_entries.into_iter().peekable();
+        let mut iter = entries.into_iter().peekable();
         loop {
             // Suspend while a video is being streamed: wait here until
             // playback goes idle, then fill the next batch of tasks.
@@ -1796,7 +1698,7 @@ async fn run_thumb_worker(
                 }
                 let cache_dir = cache_dir.clone();
                 join_set.spawn(async move {
-                    let ok = generate_quick_thumbnail(&id, &abs, &cache_dir).await;
+                    let ok = generate_thumbnail(&id, &abs, &cache_dir).await;
                     (id, ok)
                 });
             }
@@ -1820,95 +1722,6 @@ async fn run_thumb_worker(
                 }
             }
         }
-
-        if *shutdown_rx.borrow() {
-            return;
-        }
-
-        // ── Phase 2: deep thumbnails ──────────────────────────────────────
-
-        let (deep_done, deep_entries): (Vec<_>, Vec<_>) = WalkDir::new(&library_path)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file() && is_video(e.path()))
-            .partition(|e| {
-                let abs = e.path();
-                let rel = abs
-                    .strip_prefix(&library_path)
-                    .unwrap_or(abs)
-                    .to_string_lossy();
-                let id = video_id(&rel);
-                cache_dir.join(format!("{}.deep", id)).exists()
-            });
-
-        {
-            let mut p = progress.write();
-            p.current = deep_done.len() as u32;
-            p.total = (deep_done.len() + deep_entries.len()) as u32;
-            p.active = !deep_entries.is_empty();
-            p.phase = "deep";
-        }
-
-        let kill = Arc::new(AtomicBool::new(false));
-        let mut join_set: tokio::task::JoinSet<(String, bool)> = tokio::task::JoinSet::new();
-        let mut iter = deep_entries.into_iter().peekable();
-        loop {
-            // Suspend while a video is being streamed: signal in-flight
-            // tasks to bail out, drain them, then wait for playback to end.
-            if *playback_rx.borrow() {
-                kill.store(true, Ordering::SeqCst);
-                while join_set.join_next().await.is_some() {}
-                while *playback_rx.borrow() {
-                    let _ = playback_rx.changed().await;
-                }
-                kill.store(false, Ordering::SeqCst);
-            }
-            if *shutdown_rx.borrow() {
-                return;
-            }
-            // Fill empty slots up to the concurrency limit.
-            while join_set.len() < concurrency && iter.peek().is_some() {
-                if *shutdown_rx.borrow() {
-                    return;
-                }
-                let entry = iter.next().unwrap();
-                let abs = entry.path().to_path_buf();
-                let rel = abs
-                    .strip_prefix(&library_path)
-                    .unwrap_or(&abs)
-                    .to_string_lossy()
-                    .to_string();
-                let id = video_id(&rel);
-                {
-                    let mut p = progress.write();
-                    p.current_ids.insert(id.clone());
-                }
-                let cache_dir = cache_dir.clone();
-                let k = Arc::clone(&kill);
-                join_set.spawn(async move {
-                    let ok = generate_deep_thumbnail(&id, &abs, &cache_dir, k).await;
-                    (id, ok)
-                });
-            }
-            if join_set.is_empty() {
-                break;
-            }
-            // Collect the next completed task.  React immediately to
-            // playback or shutdown so in-flight work is cancelled promptly.
-            let next = tokio::select! {
-                r = join_set.join_next() => r,
-                _ = playback_rx.changed() => { continue; }
-                _ = shutdown_rx.changed() => { return; }
-            };
-            if let Some(Ok((id, _ok))) = next {
-                let mut p = progress.write();
-                p.current_ids.remove(&id);
-                p.current += 1;
-                if p.current >= p.total {
-                    p.active = false;
-                }
-            }
-        }
     }
 }
 
@@ -1916,7 +1729,7 @@ async fn run_thumb_worker(
 
 /// `GET /api/thumbnails/progress` — current thumbnail generation progress.
 ///
-/// Returns `{"current":N,"total":M,"active":bool,"phase":"quick"|"deep"}`.
+/// Returns `{"current":N,"total":M,"active":bool}`.
 /// The frontend polls this every few seconds to drive the progress bar on the
 /// homepage.
 #[derive(Clone, Serialize)]
@@ -1924,7 +1737,6 @@ struct ThumbProgressResponse {
     current: u32,
     total: u32,
     active: bool,
-    phase: String,
 }
 
 async fn get_thumb_progress(state: web::Data<AppState>) -> impl Responder {
@@ -1933,7 +1745,6 @@ async fn get_thumb_progress(state: web::Data<AppState>) -> impl Responder {
         current: p.current,
         total: p.total,
         active: p.active,
-        phase: p.phase.to_owned(),
     })
 }
 
@@ -1944,7 +1755,7 @@ async fn get_thumb_progress(state: web::Data<AppState>) -> impl Responder {
 /// Each frame is a JSON text message:
 /// ```json
 /// {
-///   "thumb":    { "current": N, "total": M, "active": bool, "phase": "quick", "current_ids": ["uuid", ...] },
+///   "thumb":    { "current": N, "total": M, "active": bool, "current_ids": ["uuid", ...] },
 ///   "sprite":   { "current": N, "total": M, "active": bool, "current_ids": ["uuid", ...] },
 ///   "precache": { "current": N, "total": M, "active": bool, "current_id": "uuid"|null }
 /// }
@@ -1966,10 +1777,10 @@ async fn progress_ws(
         loop {
             ticker.tick().await;
 
-            let (tc, tt, ta, tph, tids) = {
+            let (tc, tt, ta, tids) = {
                 let p = thumb_progress.read();
                 let ids: Vec<String> = p.current_ids.iter().cloned().collect();
-                (p.current, p.total, p.active, p.phase, ids)
+                (p.current, p.total, p.active, ids)
             };
             let (sc, st, sa, sids) = {
                 let p = sprite_progress.read();
@@ -1983,7 +1794,7 @@ async fn progress_ws(
             let lv = library_version.load(Ordering::Relaxed);
 
             let msg = serde_json::json!({
-                "thumb":    { "current": tc, "total": tt, "active": ta, "phase": tph, "current_ids": tids },
+                "thumb":    { "current": tc, "total": tt, "active": ta, "current_ids": tids },
                 "sprite":   { "current": sc, "total": st, "active": sa, "current_ids": sids },
                 "precache": { "current": pc, "total": pt, "active": pa, "current_id": pid },
                 "library_version": lv
@@ -3263,9 +3074,9 @@ async fn get_sprite_status(
 /// `GET /api/videos/{id}/processing-status` — processing status for a video.
 ///
 /// Returns one of three states:
-/// - `{"status":"processed"}` — all operations complete: quick thumbnail
-///   (`.jpg`), deep thumbnail (`.deep` marker), sprite sheet (`_thumbs/sprite.jpg`),
-///   and segment pre-cache (first [`PRECACHE_SEGMENTS`] `.m4s` files)
+/// - `{"status":"processed"}` — all operations complete: thumbnail (`.jpg`),
+///   sprite sheet (`_thumbs/sprite.jpg`), and segment pre-cache (first
+///   [`PRECACHE_SEGMENTS`] `.m4s` files)
 /// - `{"status":"processing"}` — a background worker is actively working on
 ///   this specific video right now
 /// - `{"status":"pending"}`   — not fully processed and no worker is currently
@@ -3280,8 +3091,7 @@ async fn get_processing_status(
         return HttpResponse::BadRequest().body("invalid video id");
     }
 
-    let quick_marker = state.cache_dir.join(format!("{}.jpg", *id));
-    let deep_marker = state.cache_dir.join(format!("{}.deep", *id));
+    let thumbnail_path = state.cache_dir.join(format!("{}.jpg", *id));
     let sprite_path = state
         .cache_dir
         .join(format!("{}_thumbs", *id))
@@ -3299,8 +3109,7 @@ async fn get_processing_status(
         .join(Quality::Original.as_str())
         .join("seg_00000.m4s");
 
-    let all_done = quick_marker.exists()
-        && deep_marker.exists()
+    let all_done = thumbnail_path.exists()
         && sprite_path.exists()
         && precache_marker.exists();
 
@@ -4277,7 +4086,6 @@ async fn main() -> std::io::Result<()> {
         current: 0,
         total: 0,
         active: false,
-        phase: "quick",
         current_ids: HashSet::new(),
     }));
     let thumb_trigger = Arc::new(tokio::sync::Notify::new());
@@ -4463,7 +4271,7 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
-    // ── Deep thumbnail background worker ─────────────────────────────────────
+    // ── Thumbnail background worker ───────────────────────────────────────────
     {
         let worker_library = library_path.clone();
         let worker_cache = cache_dir.clone();

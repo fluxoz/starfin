@@ -163,8 +163,8 @@ fn app_inner(props: &AppInnerProps) -> Html {
     let scanning = use_state(|| false);
     let scan_progress = use_state(|| Option::<(u32, u32)>::None);
 
-    // Thumbnail generation progress state: (current, total, phase)
-    let thumb_progress = use_state(|| Option::<(u32, u32, String)>::None);
+    // Thumbnail generation progress state: (current, total)
+    let thumb_progress = use_state(|| Option::<(u32, u32)>::None);
 
     // Sprite generation progress state: (current, total)
     let sprite_progress = use_state(|| Option::<(u32, u32)>::None);
@@ -461,7 +461,6 @@ fn app_inner(props: &AppInnerProps) -> Html {
                                 thumb_progress.set(Some((
                                     update.thumb.current,
                                     update.thumb.total,
-                                    update.thumb.phase.clone(),
                                 )));
                             } else {
                                 thumb_progress.set(None);
@@ -855,15 +854,11 @@ fn app_inner(props: &AppInnerProps) -> Html {
     };
 
     // Compute progress percentage and label for the thumbnail generation bar.
-    let (thumb_pct, thumb_label) = match (*thumb_progress).clone() {
-        Some((current, total, ref phase)) if total > 0 => {
-            let label = if phase == "deep" {
-                format!("Deep thumbnails: {} / {}", current, total)
-            } else {
-                format!("Quick thumbnails: {} / {}", current, total)
-            };
-            ((current as f64 / total as f64 * 100.0) as u32, label)
-        }
+    let (thumb_pct, thumb_label) = match *thumb_progress {
+        Some((current, total)) if total > 0 => (
+            (current as f64 / total as f64 * 100.0) as u32,
+            format!("Thumbnails: {} / {}", current, total),
+        ),
         Some(_) => (0, "Generating thumbnails…".to_string()),
         None => (0, String::new()),
     };

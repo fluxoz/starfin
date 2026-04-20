@@ -31,7 +31,7 @@ const SYNC_CIRCLE_PATH: &str = "M0 614Q0 335 137.0 99.5Q274 -136 509.5 -273.0Q74
 
 /// Small badge that shows the thumbnail/processing state for a video card.
 ///
-/// - nf-md-check_circle `\u{f05e0}` (green)   — fully processed: deep thumbnail and sprite both complete
+/// - nf-md-check_circle `\u{f05e0}` (green)   — fully processed: thumbnail and sprite both complete
 /// - nf-md-sync_circle SVG path (orange)       — a background worker is currently active (spins CCW once/s)
 /// - nf-md-circle_double `\u{f0e95}` (grey)   — awaiting processing (no worker currently running)
 ///

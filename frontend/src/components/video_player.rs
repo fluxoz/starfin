@@ -1652,11 +1652,28 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
+    // Show controls on any touch so the user can interact with them after they
+    // auto-hid.  Without this, a touch device had no way to reveal the controls
+    // once they disappeared, making the progress bar permanently inaccessible.
+    let on_touch_overlay = {
+        let controls_visible = controls_visible.clone();
+        let last_mouse_move = last_mouse_move.clone();
+        Callback::from(move |_: TouchEvent| {
+            controls_visible.set(true);
+            *last_mouse_move.borrow_mut() = js_sys::Date::now();
+        })
+    };
+
     let on_container_click = {
         let speed_menu_open = speed_menu_open.clone();
         let quality_menu_open = quality_menu_open.clone();
         let captions_menu_open = captions_menu_open.clone();
+        let controls_visible = controls_visible.clone();
+        let last_mouse_move = last_mouse_move.clone();
         Callback::from(move |_: MouseEvent| {
+            // Show controls on any click so the user can interact after they auto-hid.
+            controls_visible.set(true);
+            *last_mouse_move.borrow_mut() = js_sys::Date::now();
             speed_menu_open.set(false);
             quality_menu_open.set(false);
             captions_menu_open.set(false);
@@ -1922,7 +1939,16 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let last_tap_x = last_tap_x.clone();
         let skip_indicator = skip_indicator.clone();
         let dash_player_ref = dash_player_ref.clone();
+        let controls_visible = controls_visible.clone();
+        let last_mouse_move = last_mouse_move.clone();
         Callback::from(move |e: MouseEvent| {
+            // When controls are hidden the click fell through from the hidden controls
+            // layer.  Just reveal the controls; don't toggle playback.
+            if !*controls_visible {
+                controls_visible.set(true);
+                *last_mouse_move.borrow_mut() = js_sys::Date::now();
+                return;
+            }
             let now = js_sys::Date::now();
             let x = e.client_x() as f64;
             if now - *last_tap_time < 300.0 {
@@ -2042,7 +2068,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     };
 
     html! {
-        <div ref={container_ref} class="sv-overlay" onclick={on_container_click} onmousemove={on_mouse_move} onmouseleave={on_mouse_leave}>
+        <div ref={container_ref} class="sv-overlay" onclick={on_container_click} onmousemove={on_mouse_move} onmouseleave={on_mouse_leave} ontouchstart={on_touch_overlay}>
             // Video — full-screen slot (matches sv-* layout)
             <div class="sv-slot sv-slot--single">
                 <video ref={video_ref} class="sv-video" playsinline={true} onclick={on_video_click} ondblclick={on_video_dblclick} />

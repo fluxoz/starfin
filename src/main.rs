@@ -1063,6 +1063,12 @@ struct AppState {
     /// subscribe to the same channel and await the result, so only one ffmpeg
     /// job is ever spawned per segment at a time.
     segment_inflight: Arc<Mutex<HashMap<(String, usize, Quality), Arc<tokio::sync::watch::Sender<Option<Result<(), String>>>>>>>,
+    /// In-flight demuxed video segment transcode deduplication.
+    /// Maps `(video_id, seg_index, quality)` for the `/api/videos/{id}/video/{q}/seg_N.m4s` route.
+    video_segment_inflight: Arc<Mutex<HashMap<(String, usize, Quality), Arc<tokio::sync::watch::Sender<Option<Result<(), String>>>>>>>,
+    /// In-flight demuxed audio segment transcode deduplication.
+    /// Maps `(video_id, seg_index)` for the `/api/videos/{id}/audio/seg_N.m4s` route.
+    audio_segment_inflight: Arc<Mutex<HashMap<(String, usize), Arc<tokio::sync::watch::Sender<Option<Result<(), String>>>>>>>,
     /// Pre-rendered CSS for the active theme (served at `/api/theme.css`).
     theme_css: String,
     /// Last known playback positions per video ID (populated by player_ws).
@@ -2803,21 +2809,54 @@ async fn get_video_segment(
         return HttpResponse::InternalServerError().body(format!("cache dir: {e}"));
     }
 
-    // Acquire a transcode semaphore permit.
-    let _permit = match state.transcode_semaphore.acquire().await {
-        Ok(p) => p,
-        Err(_) => return HttpResponse::InternalServerError().body("transcode unavailable"),
+    // ── Inflight deduplication ────────────────────────────────────────────────
+    // Only one transcode task per (id, seg_index, quality) at a time.
+    // Concurrent requests wait on the watch channel; the owner does the work.
+    let inflight_key = (id.clone(), seg_index, quality);
+    let maybe_rx = {
+        let mut map = state.video_segment_inflight.lock();
+        if let Some(tx) = map.get(&inflight_key) {
+            Some(tx.subscribe())
+        } else {
+            let (tx, _) = tokio::sync::watch::channel::<Option<Result<(), String>>>(None);
+            map.insert(inflight_key.clone(), Arc::new(tx));
+            None
+        }
     };
 
-    // Use nominal boundaries — segment generator seeks to nearest keyframe.
-    let result = media::transcode::transcode_video_segment(
-        &abs_str, &seg_dir, seg_index, &state.hwaccel.read().clone(), quality, None,
-    ).await;
+    let transcode_result: Result<(), String> = if let Some(mut rx) = maybe_rx {
+        loop {
+            if rx.changed().await.is_err() {
+                break Err(format!("video segment {seg_index} transcoding cancelled"));
+            }
+            if let Some(result) = rx.borrow().clone() {
+                break result;
+            }
+        }
+    } else {
+        let _permit = match state.transcode_semaphore.acquire().await {
+            Ok(p) => p,
+            Err(e) => {
+                error!(error = %e, "transcode semaphore closed");
+                let tx = state.video_segment_inflight.lock().remove(&inflight_key);
+                if let Some(tx) = tx { let _ = tx.send(Some(Err("semaphore closed".into()))); }
+                return HttpResponse::InternalServerError().body("transcode unavailable");
+            }
+        };
+
+        let result = media::transcode::transcode_video_segment(
+            &abs_str, &seg_dir, seg_index, &state.hwaccel.read().clone(), quality, None,
+        ).await;
+
+        let tx = state.video_segment_inflight.lock().remove(&inflight_key);
+        if let Some(tx) = tx { let _ = tx.send(Some(result.clone())); }
+        result
+    };
 
     // The file is stored with 0-based name; serve it regardless of the 1-based URL name.
     let internal_seg_path = seg_dir.join(format!("seg_{:05}.m4s", seg_index));
 
-    match result {
+    match transcode_result {
         Ok(()) => {
             match tokio::fs::read(&internal_seg_path).await {
                 Ok(data) => {
@@ -2905,17 +2944,49 @@ async fn get_audio_segment(
         return HttpResponse::InternalServerError().body(format!("cache dir: {e}"));
     }
 
-    let _permit = match state.transcode_semaphore.acquire().await {
-        Ok(p) => p,
-        Err(_) => return HttpResponse::InternalServerError().body("transcode unavailable"),
+    // ── Inflight deduplication ────────────────────────────────────────────────
+    let inflight_key = (id.clone(), seg_index);
+    let maybe_rx = {
+        let mut map = state.audio_segment_inflight.lock();
+        if let Some(tx) = map.get(&inflight_key) {
+            Some(tx.subscribe())
+        } else {
+            let (tx, _) = tokio::sync::watch::channel::<Option<Result<(), String>>>(None);
+            map.insert(inflight_key.clone(), Arc::new(tx));
+            None
+        }
     };
 
-    // Use nominal boundaries — segment generator seeks to nearest keyframe.
-    let result = media::transcode::transcode_audio_segment(
-        &abs_str, &seg_dir, seg_index, None,
-    ).await;
+    let transcode_result: Result<(), String> = if let Some(mut rx) = maybe_rx {
+        loop {
+            if rx.changed().await.is_err() {
+                break Err(format!("audio segment {seg_index} transcoding cancelled"));
+            }
+            if let Some(result) = rx.borrow().clone() {
+                break result;
+            }
+        }
+    } else {
+        let _permit = match state.transcode_semaphore.acquire().await {
+            Ok(p) => p,
+            Err(e) => {
+                error!(error = %e, "transcode semaphore closed");
+                let tx = state.audio_segment_inflight.lock().remove(&inflight_key);
+                if let Some(tx) = tx { let _ = tx.send(Some(Err("semaphore closed".into()))); }
+                return HttpResponse::InternalServerError().body("transcode unavailable");
+            }
+        };
 
-    match result {
+        let result = media::transcode::transcode_audio_segment(
+            &abs_str, &seg_dir, seg_index, None,
+        ).await;
+
+        let tx = state.audio_segment_inflight.lock().remove(&inflight_key);
+        if let Some(tx) = tx { let _ = tx.send(Some(result.clone())); }
+        result
+    };
+
+    match transcode_result {
         Ok(()) => {
             match tokio::fs::read(&internal_seg_path).await {
                 Ok(data) => {
@@ -4203,6 +4274,8 @@ async fn main() -> std::io::Result<()> {
         password_hash_path,
         auth_tokens,
         segment_inflight: Arc::new(Mutex::new(HashMap::new())),
+        video_segment_inflight: Arc::new(Mutex::new(HashMap::new())),
+        audio_segment_inflight: Arc::new(Mutex::new(HashMap::new())),
         theme_css,
         playback_positions: Arc::new(RwLock::new(HashMap::new())),
         library_version: Arc::clone(&library_version),

@@ -1003,10 +1003,28 @@ fn create_segment(
 
     let actual_start = if quality.can_remux() && source_is_remuxable(&ictx) {
         // Pure remux — both video and audio packets copied directly.
-        remux_segment(&mut ictx, seg_start, seg_end, &tmp_path, kill)?
+        let kf = remux_segment(&mut ictx, seg_start, seg_end, &tmp_path, kill)?;
+        // If the nearest keyframe is far from the nominal boundary (long-GOP source),
+        // fall back to transcoding with a forced keyframe at seg_start.  This prevents
+        // duplicate segments and multi-second gaps that break DASH seeking.
+        if keyframe_range.is_none() && (kf - seg_start).abs() > SEGMENT_BOUNDARY_TOLERANCE_S {
+            let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
+            transcode_segment_inprocess(&mut ictx, seg_start, hwaccel, effective_quality, &tmp_path, kill)?;
+            seg_start
+        } else {
+            kf
+        }
     } else if quality.can_remux() && video_is_remuxable(&ictx) {
         // Hybrid — video packets copied, audio transcoded to stereo AAC.
-        hybrid_segment(&mut ictx, seg_start, seg_end, &tmp_path, kill)?
+        let kf = hybrid_segment(&mut ictx, seg_start, seg_end, &tmp_path, kill)?;
+        // Same long-GOP fallback as above.
+        if keyframe_range.is_none() && (kf - seg_start).abs() > SEGMENT_BOUNDARY_TOLERANCE_S {
+            let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
+            transcode_segment_inprocess(&mut ictx, seg_start, hwaccel, effective_quality, &tmp_path, kill)?;
+            seg_start
+        } else {
+            kf
+        }
     } else {
         // For Original quality with incompatible codecs, fall back to the
         // same settings as High (native resolution, best quality).
@@ -2717,7 +2735,17 @@ fn create_segment_video_only(
     };
 
     let actual_start = if quality.can_remux() && video_is_remuxable(&ictx) {
-        remux_video_only_segment(&mut ictx, seg_start, seg_end, &tmp_path, kill)?
+        let kf = remux_video_only_segment(&mut ictx, seg_start, seg_end, &tmp_path, kill)?;
+        // Long-GOP fallback: if the nearest keyframe is far from the nominal boundary,
+        // retranscode with a forced I-frame at seg_start to avoid duplicate segments
+        // and multi-second gaps in the DASH presentation timeline.
+        if keyframe_range.is_none() && (kf - seg_start).abs() > SEGMENT_BOUNDARY_TOLERANCE_S {
+            let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
+            transcode_video_only_inprocess(&mut ictx, seg_start, hwaccel, effective_quality, &tmp_path, kill)?;
+            seg_start
+        } else {
+            kf
+        }
     } else {
         let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
         transcode_video_only_inprocess(&mut ictx, nominal_start, hwaccel, effective_quality, &tmp_path, kill)?;

@@ -589,7 +589,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // Drag/Seek state
     let is_dragging = use_state(|| false);
     let drag_time = use_state(|| 0.0_f64);
-    let just_dragged = use_state(|| false);
 
     // Hover preview state
     let is_hovering_progress = use_state(|| false);
@@ -1719,7 +1718,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let drag_time = drag_time.clone();
         let current_time = current_time.clone();
         let duration_state = duration.clone();
-        let just_dragged = just_dragged.clone();
         let hover_time = hover_time.clone();
         let hover_position = hover_position.clone();
         let dash_player_ref = dash_player_ref.clone();
@@ -1753,7 +1751,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let current_time_move = current_time.clone();
             let is_dragging_up = is_dragging.clone();
             let video_ref_up = video_ref.clone();
-            let just_dragged_up = just_dragged.clone();
             let hover_time_move = hover_time.clone();
             let hover_position_move = hover_position.clone();
 
@@ -1780,7 +1777,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
             let on_mouseup = Closure::<dyn Fn(MouseEvent)>::new(move |_: MouseEvent| {
                 is_dragging_up.set(false);
-                just_dragged_up.set(true);
                 let t = shared_up.get();
                 if let Some(video) = video_ref_up.cast::<HtmlVideoElement>() { dash_seek(&dash_player_ref_up, &video, t); }
                 if let Some((mc, uc)) = closures_for_mouseup.borrow_mut().take() {
@@ -1810,7 +1806,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let drag_time = drag_time.clone();
         let current_time = current_time.clone();
         let duration_state = duration.clone();
-        let just_dragged = just_dragged.clone();
         let hover_time = hover_time.clone();
         let hover_position = hover_position.clone();
         let dash_player_ref = dash_player_ref.clone();
@@ -1845,7 +1840,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let current_time_move = current_time.clone();
             let is_dragging_end = is_dragging.clone();
             let video_ref_end = video_ref.clone();
-            let just_dragged_end = just_dragged.clone();
             let hover_time_move = hover_time.clone();
             let hover_position_move = hover_position.clone();
 
@@ -1875,7 +1869,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
             let on_touchend = Closure::<dyn Fn(TouchEvent)>::new(move |_: TouchEvent| {
                 is_dragging_end.set(false);
-                just_dragged_end.set(true);
                 let t = shared_end.get();
                 if let Some(video) = video_ref_end.cast::<HtmlVideoElement>() { dash_seek(&dash_player_ref_end, &video, t); }
                 if let Some((mc, uc)) = touch_handlers_for_touchend.borrow_mut().take() {
@@ -1898,23 +1891,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
-
-    let on_progress_click = {
-        let video_ref = video_ref.clone();
-        let progress_ref = progress_ref.clone();
-        let just_dragged = just_dragged.clone();
-        let dash_player_ref = dash_player_ref.clone();
-        Callback::from(move |e: MouseEvent| {
-            if *just_dragged { just_dragged.set(false); return; }
-            if let Some(el) = progress_ref.cast::<web_sys::HtmlElement>() {
-                if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-                    if let Some((t, _)) = calculate_seek_time(&e, &el, video.duration()) {
-                        dash_seek(&dash_player_ref, &video, t);
-                    }
-                }
-            }
-        })
-    };
 
     let on_video_dblclick = {
         let container_ref = container_ref.clone();
@@ -2148,7 +2124,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 // Progress bar with drag-to-seek
                 <div ref={progress_ref}
                     class={if *is_dragging { "sv-progress sv-progress--dragging" } else { "sv-progress" }}
-                    onclick={on_progress_click}
                     onmousedown={on_progress_mousedown}
                     ontouchstart={on_progress_touchstart}
                     onmousemove={on_progress_hover}

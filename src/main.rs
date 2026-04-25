@@ -610,9 +610,11 @@ struct QualityQuery {
 async fn get_quality_options() -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!([
         { "value": "original", "label": Quality::Original.label() },
-        { "value": "high",     "label": Quality::High.label() },
-        { "value": "medium",   "label": Quality::Medium.label() },
-        { "value": "low",      "label": Quality::Low.label() },
+        { "value": "2160p",    "label": Quality::Q2160.label() },
+        { "value": "1080p",    "label": Quality::Q1080.label() },
+        { "value": "720p",     "label": Quality::Q720.label() },
+        { "value": "480p",     "label": Quality::Q480.label() },
+        { "value": "360p",     "label": Quality::Q360.label() },
     ]))
 }
 
@@ -635,7 +637,26 @@ async fn get_video_quality_info(
     .await
     .unwrap_or_else(|_| (Default::default(), false));
 
-    let qualities = [Quality::Original, Quality::High, Quality::Medium, Quality::Low];
+    // Resolution-based transcoded qualities, ordered highest to lowest.
+    // Only include qualities whose target height is ≤ the source height so
+    // we never advertise upscaling options.
+    let res_qualities: &[(Quality, u32)] = &[
+        (Quality::Q2160, 2160),
+        (Quality::Q1080, 1080),
+        (Quality::Q720,  720),
+        (Quality::Q480,  480),
+        (Quality::Q360,  360),
+    ];
+    let source_height = stream_info.height.max(1);
+
+    // Original is always first.
+    let mut qualities = vec![Quality::Original];
+    for &(q, target_h) in res_qualities {
+        if source_height >= target_h {
+            qualities.push(q);
+        }
+    }
+
     let options: Vec<serde_json::Value> = qualities
         .iter()
         .map(|&q| {
@@ -676,26 +697,33 @@ fn estimate_bandwidth(info: &media::probe::StreamInfo, quality: Quality) -> u64 
 
     match quality {
         Quality::Original => source_bps,
-        Quality::High => {
-            // CRF 18 at native res ≈ 80 % of original (re-encode removes B-frame waste).
-            (source_bps as f64 * 0.8) as u64
+        Quality::Q2160 => {
+            // Re-encode at native 4K: ~90% of original bitrate.
+            ((source_bps as f64) * 0.9) as u64
         }
-        Quality::Medium => {
-            // ≤ 1280×720, CRF 26 — resolution ratio + CRF compression.
+        Quality::Q1080 => {
+            let max_w = 1920u32;
+            let sw = info.width.max(1);
+            let area_ratio = if sw > max_w {
+                let r = max_w as f64 / sw as f64;
+                r * r
+            } else {
+                1.0
+            };
+            ((source_bps as f64) * area_ratio * 0.55).max(2_000_000.0) as u64
+        }
+        Quality::Q720 => {
             let max_w = 1280u32;
             let sw = info.width.max(1);
             let area_ratio = if sw > max_w {
                 let r = max_w as f64 / sw as f64;
-                r * r // both dimensions scale
+                r * r
             } else {
                 1.0
             };
-            // CRF 26 vs 18: roughly 0.35× the bitrate for the same content.
-            let crf_factor = 0.35;
-            ((source_bps as f64) * area_ratio * crf_factor).max(500_000.0) as u64
+            ((source_bps as f64) * area_ratio * 0.35).max(1_000_000.0) as u64
         }
-        Quality::Low => {
-            // ≤ 854×480, CRF 30.
+        Quality::Q480 => {
             let max_w = 854u32;
             let sw = info.width.max(1);
             let area_ratio = if sw > max_w {
@@ -704,9 +732,18 @@ fn estimate_bandwidth(info: &media::probe::StreamInfo, quality: Quality) -> u64 
             } else {
                 1.0
             };
-            // CRF 30 vs 18: roughly 0.18× the bitrate.
-            let crf_factor = 0.18;
-            ((source_bps as f64) * area_ratio * crf_factor).max(300_000.0) as u64
+            ((source_bps as f64) * area_ratio * 0.20).max(500_000.0) as u64
+        }
+        Quality::Q360 => {
+            let max_w = 640u32;
+            let sw = info.width.max(1);
+            let area_ratio = if sw > max_w {
+                let r = max_w as f64 / sw as f64;
+                r * r
+            } else {
+                1.0
+            };
+            ((source_bps as f64) * area_ratio * 0.12).max(300_000.0) as u64
         }
     }
 }
@@ -718,22 +755,41 @@ fn estimate_bandwidth(info: &media::probe::StreamInfo, quality: Quality) -> u64 
 fn estimate_resolution(info: &media::probe::StreamInfo, quality: Quality) -> (u32, u32) {
     let (sw, sh) = (info.width.max(1), info.height.max(1));
     match quality {
-        Quality::Original | Quality::High => (sw, sh),
-        Quality::Medium => {
-            let max_w = 1280u32;
-            if sw <= max_w {
-                (sw, sh)
-            } else {
+        Quality::Original | Quality::Q2160 => {
+            let max_w = 3840u32;
+            if sw <= max_w { (sw, sh) } else {
                 let r = max_w as f64 / sw as f64;
                 let h = ((sh as f64 * r) as u32) & !1;
                 (max_w, h)
             }
         }
-        Quality::Low => {
+        Quality::Q1080 => {
+            let max_w = 1920u32;
+            if sw <= max_w { (sw, sh) } else {
+                let r = max_w as f64 / sw as f64;
+                let h = ((sh as f64 * r) as u32) & !1;
+                (max_w, h)
+            }
+        }
+        Quality::Q720 => {
+            let max_w = 1280u32;
+            if sw <= max_w { (sw, sh) } else {
+                let r = max_w as f64 / sw as f64;
+                let h = ((sh as f64 * r) as u32) & !1;
+                (max_w, h)
+            }
+        }
+        Quality::Q480 => {
             let max_w = 854u32;
-            if sw <= max_w {
-                (sw, sh)
-            } else {
+            if sw <= max_w { (sw, sh) } else {
+                let r = max_w as f64 / sw as f64;
+                let h = ((sh as f64 * r) as u32) & !1;
+                (max_w, h)
+            }
+        }
+        Quality::Q360 => {
+            let max_w = 640u32;
+            if sw <= max_w { (sw, sh) } else {
                 let r = max_w as f64 / sw as f64;
                 let h = ((sh as f64 * r) as u32) & !1;
                 (max_w, h)
@@ -2007,14 +2063,25 @@ async fn remove_non_precached_segments(cache_dir: &Path) -> std::io::Result<()> 
 }
 
 /// Remove non-pre-cached segments from **all** quality subdirectories of a
-/// video's cache folder (`{cache_dir}/{video_id}/{quality}/`).
+/// video's cache folder (`{cache_dir}/{video_id}/video/{quality}/` and `{cache_dir}/{video_id}/audio/`).
 async fn remove_non_precached_segments_all_qualities(video_cache_dir: &Path) {
-    for quality_name in [Quality::Original.as_str(), Quality::High.as_str(), Quality::Medium.as_str(), Quality::Low.as_str()] {
-        let q_dir = video_cache_dir.join(quality_name);
-        if q_dir.exists() {
-            if let Err(e) = remove_non_precached_segments(&q_dir).await {
-                error!(dir = %q_dir.display(), error = %e, "cache eviction error");
+    // Scan the demuxed video subdirectory for quality-specific dirs.
+    let video_dir = video_cache_dir.join("video");
+    if let Ok(mut dir) = tokio::fs::read_dir(&video_dir).await {
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                let q_dir = entry.path();
+                if let Err(e) = remove_non_precached_segments(&q_dir).await {
+                    error!(dir = %q_dir.display(), error = %e, "cache eviction error");
+                }
             }
+        }
+    }
+    // Also clean the audio directory (quality-independent).
+    let audio_dir = video_cache_dir.join("audio");
+    if audio_dir.exists() {
+        if let Err(e) = remove_non_precached_segments(&audio_dir).await {
+            error!(dir = %audio_dir.display(), error = %e, "cache eviction error");
         }
     }
 }
@@ -2064,8 +2131,25 @@ async fn get_manifest(
     .await
     .unwrap_or_default();
 
-    // Ensure the video and audio cache directories exist.
-    for quality in [Quality::Original, Quality::High, Quality::Medium, Quality::Low] {
+    // Determine which quality tiers to include based on source resolution.
+    // Only include transcoded resolutions ≤ the source height (no upscaling).
+    let source_height = stream_info.height.max(1);
+    let res_qualities: &[(Quality, u32)] = &[
+        (Quality::Q2160, 2160),
+        (Quality::Q1080, 1080),
+        (Quality::Q720,  720),
+        (Quality::Q480,  480),
+        (Quality::Q360,  360),
+    ];
+    let mut video_qualities = vec![Quality::Original];
+    for &(q, target_h) in res_qualities {
+        if source_height >= target_h {
+            video_qualities.push(q);
+        }
+    }
+
+    // Ensure the video and audio cache directories exist for all applicable tiers.
+    for &quality in &video_qualities {
         let video_seg_dir = state.cache_dir.join(id.as_str()).join("video").join(quality.as_str());
         if let Err(e) = tokio::fs::create_dir_all(&video_seg_dir).await {
             return HttpResponse::InternalServerError()
@@ -2104,14 +2188,7 @@ async fn get_manifest(
 
     // Build video Representations.
     let video_codec = codec_info.video_codec.as_deref().unwrap_or("avc1.640029");
-    let bw_original = estimate_bandwidth(&stream_info, Quality::Original);
-    let bw_high = estimate_bandwidth(&stream_info, Quality::High);
-    let bw_medium = estimate_bandwidth(&stream_info, Quality::Medium);
-    let bw_low = estimate_bandwidth(&stream_info, Quality::Low);
     let (w_orig, h_orig) = (stream_info.width.max(1), stream_info.height.max(1));
-    let (w_high, h_high) = estimate_resolution(&stream_info, Quality::High);
-    let (w_med, h_med) = estimate_resolution(&stream_info, Quality::Medium);
-    let (w_low, h_low) = estimate_resolution(&stream_info, Quality::Low);
 
     // Frame rate from stream info.
     let fps_str = "30"; // simplified; could probe if needed
@@ -2191,22 +2268,23 @@ async fn get_manifest(
     mpd.push_str(&video_timeline);
     mpd.push_str("        </SegmentTimeline>\n");
     mpd.push_str("      </SegmentTemplate>\n");
+
+    // Original representation — uses source codec (may be H.264, HEVC, etc.)
+    let bw_original = estimate_bandwidth(&stream_info, Quality::Original);
     mpd.push_str(&format!(
         "      <Representation id=\"original\" bandwidth=\"{bw_original}\" \
          width=\"{w_orig}\" height=\"{h_orig}\" codecs=\"{video_codec}\" frameRate=\"{fps_str}\"/>\n"
     ));
-    mpd.push_str(&format!(
-        "      <Representation id=\"high\" bandwidth=\"{bw_high}\" \
-         width=\"{w_high}\" height=\"{h_high}\" codecs=\"avc1.640029\" frameRate=\"{fps_str}\"/>\n"
-    ));
-    mpd.push_str(&format!(
-        "      <Representation id=\"medium\" bandwidth=\"{bw_medium}\" \
-         width=\"{w_med}\" height=\"{h_med}\" codecs=\"avc1.640029\" frameRate=\"{fps_str}\"/>\n"
-    ));
-    mpd.push_str(&format!(
-        "      <Representation id=\"low\" bandwidth=\"{bw_low}\" \
-         width=\"{w_low}\" height=\"{h_low}\" codecs=\"avc1.640029\" frameRate=\"{fps_str}\"/>\n"
-    ));
+    // Transcoded resolution representations — all use H.264 avc1.640029.
+    for &quality in video_qualities.iter().skip(1) {
+        let bw = estimate_bandwidth(&stream_info, quality);
+        let (w, h) = estimate_resolution(&stream_info, quality);
+        mpd.push_str(&format!(
+            "      <Representation id=\"{qid}\" bandwidth=\"{bw}\" \
+             width=\"{w}\" height=\"{h}\" codecs=\"avc1.640029\" frameRate=\"{fps_str}\"/>\n",
+            qid = quality.as_str()
+        ));
+    }
     mpd.push_str("    </AdaptationSet>\n");
 
     // ── Audio AdaptationSet (omit if no audio stream) ──
@@ -2585,13 +2663,7 @@ async fn get_video_init(
 ) -> impl Responder {
     let (id, quality_str) = params.into_inner();
 
-    let quality = match quality_str.to_lowercase().as_str() {
-        "original" => Quality::Original,
-        "high"     => Quality::High,
-        "medium"   => Quality::Medium,
-        "low"      => Quality::Low,
-        _          => Quality::Original,
-    };
+    let quality = Quality::from_str(&quality_str.to_lowercase());
 
     let (abs_path, _) = match find_video(&state, &id) {
         Some(v) => v,
@@ -2751,13 +2823,7 @@ async fn get_video_segment(
         return HttpResponse::BadRequest().body("invalid segment type");
     }
 
-    let quality = match quality_str.to_lowercase().as_str() {
-        "original" => Quality::Original,
-        "high"     => Quality::High,
-        "medium"   => Quality::Medium,
-        "low"      => Quality::Low,
-        _          => Quality::Original,
-    };
+    let quality = Quality::from_str(&quality_str.to_lowercase());
 
     let seg_dir = state.cache_dir.join(&id).join("video").join(quality.as_str());
 
@@ -3171,12 +3237,13 @@ async fn get_processing_status(
     // Check whether the pre-cached segments exist.  We only check for
     // seg_00000.m4s as a lightweight proxy — if the pre-cache worker
     // finished, all PRECACHE_SEGMENTS files will be present.
-    // Segments are now stored in quality-specific subdirectories; the
-    // precache worker always operates on the `original` quality level
+    // Segments are stored in quality-specific subdirectories under video/;
+    // the precache worker always operates on the `original` quality level
     // (direct remux for compatible sources, fast transcode fallback).
     let precache_marker = state
         .cache_dir
         .join(id.as_str())
+        .join("video")
         .join(Quality::Original.as_str())
         .join("seg_00000.m4s");
 
@@ -3470,10 +3537,11 @@ async fn run_precache_worker(
                 .unwrap_or(abs)
                 .to_string_lossy();
             let id = video_id(&rel);
-            // Precache always uses the Original quality subdirectory.
-            let hls_dir = cache_dir.join(&id).join(Quality::Original.as_str());
+            // Precache always uses the demuxed video/original subdirectory.
+            let video_dir = cache_dir.join(&id).join("video").join(Quality::Original.as_str());
+            let audio_dir = cache_dir.join(&id).join("audio");
 
-            let is_done = if !hls_dir.join("seg_00000.m4s").exists() {
+            let is_done = if !video_dir.join("seg_00000.m4s").exists() {
                 false
             } else {
                 // First segment exists; check whether the last expected sparse
@@ -3488,7 +3556,7 @@ async fn run_precache_worker(
                         let last_anchor =
                             ((total_segs - 1) / SPARSE_CACHE_STRIDE) * SPARSE_CACHE_STRIDE;
                         if last_anchor >= PRECACHE_SEGMENTS {
-                            hls_dir.join(format!("seg_{:05}.m4s", last_anchor)).exists()
+                            video_dir.join(format!("seg_{:05}.m4s", last_anchor)).exists()
                         } else {
                             true
                         }
@@ -3531,8 +3599,9 @@ async fn run_precache_worker(
                 .to_string_lossy()
                 .to_string();
             let id = video_id(&rel);
-            // Precache always uses the Original quality subdirectory.
-            let hls_dir = cache_dir.join(&id).join(Quality::Original.as_str());
+            // Precache always uses the demuxed video/original subdirectory.
+            let video_dir = cache_dir.join(&id).join("video").join(Quality::Original.as_str());
+            let audio_dir = cache_dir.join(&id).join("audio");
 
             {
                 let mut p = progress.write();
@@ -3553,10 +3622,11 @@ async fn run_precache_worker(
                 .filter(|&i| i < PRECACHE_SEGMENTS || i % SPARSE_CACHE_STRIDE == 0)
                 .collect();
 
-            // Collect only the segments that are missing.
+            // Collect only the segments that are missing (check video dir only;
+            // audio will be generated alongside video).
             let missing: Vec<usize> = segments_to_cache.iter()
                 .copied()
-                .filter(|i| !hls_dir.join(format!("seg_{:05}.m4s", i)).exists())
+                .filter(|i| !video_dir.join(format!("seg_{:05}.m4s", i)).exists())
                 .collect();
             if missing.is_empty() {
                 progress.write().advance();
@@ -3579,8 +3649,13 @@ async fn run_precache_worker(
                 }
             };
 
-            if let Err(e) = tokio::fs::create_dir_all(&hls_dir).await {
-                error!(video_id = %id, error = %e, "precache: cache dir error");
+            if let Err(e) = tokio::fs::create_dir_all(&video_dir).await {
+                error!(video_id = %id, error = %e, "precache: video cache dir error");
+                progress.write().advance();
+                continue;
+            }
+            if let Err(e) = tokio::fs::create_dir_all(&audio_dir).await {
+                error!(video_id = %id, error = %e, "precache: audio cache dir error");
                 progress.write().advance();
                 continue;
             }
@@ -3616,8 +3691,9 @@ async fn run_precache_worker(
                 // waiting for the full operation to finish.  The kill flag
                 // ensures the spawn_blocking task also bails out quickly.
                 let hw = hwaccel.read().clone();
-                let result = tokio::select! {
-                    r = media::transcode::transcode_segment_with_kill(&abs_str, &hls_dir, i, &hw, Quality::Original, Arc::clone(&kill)) => r,
+                // Generate the video-only segment first.
+                let video_result = tokio::select! {
+                    r = media::transcode::transcode_video_segment_with_kill(&abs_str, &video_dir, i, &hw, Quality::Original, Arc::clone(&kill)) => r,
                     _ = playback_rx.changed() => {
                         if *playback_rx.borrow() {
                             kill.store(true, Ordering::SeqCst);
@@ -3626,13 +3702,30 @@ async fn run_precache_worker(
                     }
                     _ = shutdown_rx.changed() => { return; }
                 };
-                if let Err(e) = result {
+                if let Err(e) = video_result {
                     if e == media::transcode::CANCELLED {
-                        // Cancelled by playback — retry this segment later.
                         continue;
                     }
-                    error!(video_id = %id, segment = i, error = %e, "precache: segment transcode failed");
-                    break; // Stop for this video on error.
+                    error!(video_id = %id, segment = i, error = %e, "precache: video segment transcode failed");
+                    break;
+                }
+                // Generate the audio segment (quality-independent).
+                let audio_result = tokio::select! {
+                    r = media::transcode::transcode_audio_segment_with_kill(&abs_str, &audio_dir, i, Arc::clone(&kill)) => r,
+                    _ = playback_rx.changed() => {
+                        if *playback_rx.borrow() {
+                            kill.store(true, Ordering::SeqCst);
+                        }
+                        continue;
+                    }
+                    _ = shutdown_rx.changed() => { return; }
+                };
+                if let Err(e) = audio_result {
+                    if e == media::transcode::CANCELLED {
+                        continue;
+                    }
+                    error!(video_id = %id, segment = i, error = %e, "precache: audio segment transcode failed");
+                    // Non-fatal: continue with next segment even if audio fails.
                 }
             }
 

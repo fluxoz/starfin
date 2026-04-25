@@ -145,39 +145,66 @@ pub async fn transcode_segment_with_kill(
 }
 
 /// Quality / mode for on-demand segment creation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Quality {
     /// Direct remux — copy packets without re-encoding.
     /// Fastest option: pure I/O, no CPU decode/encode.
     /// Requires source to have browser-compatible codecs (H.264 + AAC/MP3).
-    /// Falls back to High transcode if source codecs are incompatible.
+    /// Falls back to Q1080 transcode if source codecs are incompatible.
     #[default]
     Original,
-    /// Re-encode at native resolution (CRF 18, veryslow or HW encoder).
-    High,
-    /// Re-encode at ≤720p (CRF 26, fast preset).
-    Medium,
-    /// Re-encode at ≤480p (CRF 30, faster preset).
-    Low,
+    /// Re-encode at ≤3840×2160 (CRF 18, fast preset or HW encoder).
+    Q2160,
+    /// Re-encode at ≤1920×1080 (CRF 20, fast preset or HW encoder).
+    Q1080,
+    /// Re-encode at ≤1280×720 (CRF 24, fast preset).
+    Q720,
+    /// Re-encode at ≤854×480 (CRF 28, faster preset).
+    Q480,
+    /// Re-encode at ≤640×360 (CRF 32, faster preset).
+    Q360,
+}
+
+impl<'de> serde::Deserialize<'de> for Quality {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = <String as serde::Deserialize>::deserialize(d)?;
+        Ok(Quality::from_str(&s))
+    }
 }
 
 impl Quality {
+    /// Parse a quality string, accepting both new and legacy names.
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "original"        => Quality::Original,
+            "2160p"           => Quality::Q2160,
+            "1080p" | "high"  => Quality::Q1080,
+            "720p"  | "medium"=> Quality::Q720,
+            "480p"  | "low"   => Quality::Q480,
+            "360p"            => Quality::Q360,
+            _                 => Quality::Original,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Quality::Original => "original",
-            Quality::High     => "high",
-            Quality::Medium   => "medium",
-            Quality::Low      => "low",
+            Quality::Q2160    => "2160p",
+            Quality::Q1080    => "1080p",
+            Quality::Q720     => "720p",
+            Quality::Q480     => "480p",
+            Quality::Q360     => "360p",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Quality::Original => "Original",
-            Quality::High     => "High",
-            Quality::Medium   => "Medium",
-            Quality::Low      => "Low",
+            Quality::Q2160    => "2160p",
+            Quality::Q1080    => "1080p",
+            Quality::Q720     => "720p",
+            Quality::Q480     => "480p",
+            Quality::Q360     => "360p",
         }
     }
 
@@ -1008,7 +1035,7 @@ fn create_segment(
         // fall back to transcoding with a forced keyframe at seg_start.  This prevents
         // duplicate segments and multi-second gaps that break DASH seeking.
         if keyframe_range.is_none() && (kf - seg_start).abs() > SEGMENT_BOUNDARY_TOLERANCE_S {
-            let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
+            let effective_quality = if quality == Quality::Original { Quality::Q1080 } else { quality };
             transcode_segment_inprocess(&mut ictx, seg_start, hwaccel, effective_quality, &tmp_path, kill)?;
             seg_start
         } else {
@@ -1019,7 +1046,7 @@ fn create_segment(
         let kf = hybrid_segment(&mut ictx, seg_start, seg_end, &tmp_path, kill)?;
         // Same long-GOP fallback as above.
         if keyframe_range.is_none() && (kf - seg_start).abs() > SEGMENT_BOUNDARY_TOLERANCE_S {
-            let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
+            let effective_quality = if quality == Quality::Original { Quality::Q1080 } else { quality };
             transcode_segment_inprocess(&mut ictx, seg_start, hwaccel, effective_quality, &tmp_path, kill)?;
             seg_start
         } else {
@@ -1027,8 +1054,8 @@ fn create_segment(
         }
     } else {
         // For Original quality with incompatible codecs, fall back to the
-        // same settings as High (native resolution, best quality).
-        let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
+        // same settings as Q1080 (1080p cap, best quality).
+        let effective_quality = if quality == Quality::Original { Quality::Q1080 } else { quality };
         transcode_segment_inprocess(&mut ictx, nominal_start, hwaccel, effective_quality, &tmp_path, kill)?;
         nominal_start
     };
@@ -1691,30 +1718,59 @@ fn transcode_segment_inprocess(
     let effective_fps = if frame_rate > 0.0 && frame_rate.is_finite() { frame_rate } else { 30.0 };
 
     let (out_width, out_height, crf, preset) = match quality {
-        Quality::Original | Quality::High => (in_width, in_height, "18", "veryslow"),
-        Quality::Medium => {
-            let max_w = 1280u32;
+        Quality::Original | Quality::Q2160 => {
+            let max_w = 3840u32;
             if in_width <= max_w {
-                (in_width, in_height, "26", "fast")
+                (in_width, in_height, "18", "fast")
             } else {
                 let ratio = max_w as f64 / in_width as f64;
                 let h = ((in_height as f64 * ratio) as u32) & !1;
-                (max_w, h, "26", "fast")
+                (max_w, h, "18", "fast")
             }
         }
-        Quality::Low => {
-            let max_w = 854u32;
+        Quality::Q1080 => {
+            let max_w = 1920u32;
             if in_width <= max_w {
-                (in_width, in_height, "30", "faster")
+                (in_width, in_height, "20", "fast")
             } else {
                 let ratio = max_w as f64 / in_width as f64;
                 let h = ((in_height as f64 * ratio) as u32) & !1;
-                (max_w, h, "30", "faster")
+                (max_w, h, "20", "fast")
+            }
+        }
+        Quality::Q720 => {
+            let max_w = 1280u32;
+            if in_width <= max_w {
+                (in_width, in_height, "24", "fast")
+            } else {
+                let ratio = max_w as f64 / in_width as f64;
+                let h = ((in_height as f64 * ratio) as u32) & !1;
+                (max_w, h, "24", "fast")
+            }
+        }
+        Quality::Q480 => {
+            let max_w = 854u32;
+            if in_width <= max_w {
+                (in_width, in_height, "28", "faster")
+            } else {
+                let ratio = max_w as f64 / in_width as f64;
+                let h = ((in_height as f64 * ratio) as u32) & !1;
+                (max_w, h, "28", "faster")
+            }
+        }
+        Quality::Q360 => {
+            let max_w = 640u32;
+            if in_width <= max_w {
+                (in_width, in_height, "32", "faster")
+            } else {
+                let ratio = max_w as f64 / in_width as f64;
+                let h = ((in_height as f64 * ratio) as u32) & !1;
+                (max_w, h, "32", "faster")
             }
         }
     };
 
-    let use_hw = matches!(quality, Quality::Original | Quality::High) && *hwaccel != HwAccel::Software;
+    let use_hw = matches!(quality, Quality::Original | Quality::Q2160 | Quality::Q1080) && *hwaccel != HwAccel::Software;
     let encoder_name = if use_hw { hwaccel.encoder() } else { "libx264" };
 
     // Set up video decoder.
@@ -1857,7 +1913,7 @@ fn transcode_segment_body(
             opts.set("preset", preset);
             opts.set("crf", crf);
             opts.set("profile", "high");
-            opts.set("level", if matches!(quality, Quality::Original | Quality::High) { "4.2" } else { "4.1" });
+            opts.set("level", if matches!(quality, Quality::Original | Quality::Q2160 | Quality::Q1080) { "4.2" } else { "4.1" });
         }
 
         let mut video_encoder = enc.open_with(opts).map_err(|e| format!("open video encoder: {e}"))?;
@@ -2615,30 +2671,59 @@ fn transcode_video_only_inprocess(
     let effective_fps = if frame_rate > 0.0 && frame_rate.is_finite() { frame_rate } else { 30.0 };
 
     let (out_width, out_height, crf, preset) = match quality {
-        Quality::Original | Quality::High => (in_width, in_height, "18", "veryslow"),
-        Quality::Medium => {
-            let max_w = 1280u32;
+        Quality::Original | Quality::Q2160 => {
+            let max_w = 3840u32;
             if in_width <= max_w {
-                (in_width, in_height, "26", "fast")
+                (in_width, in_height, "18", "fast")
             } else {
                 let ratio = max_w as f64 / in_width as f64;
                 let h = ((in_height as f64 * ratio) as u32) & !1;
-                (max_w, h, "26", "fast")
+                (max_w, h, "18", "fast")
             }
         }
-        Quality::Low => {
-            let max_w = 854u32;
+        Quality::Q1080 => {
+            let max_w = 1920u32;
             if in_width <= max_w {
-                (in_width, in_height, "30", "faster")
+                (in_width, in_height, "20", "fast")
             } else {
                 let ratio = max_w as f64 / in_width as f64;
                 let h = ((in_height as f64 * ratio) as u32) & !1;
-                (max_w, h, "30", "faster")
+                (max_w, h, "20", "fast")
+            }
+        }
+        Quality::Q720 => {
+            let max_w = 1280u32;
+            if in_width <= max_w {
+                (in_width, in_height, "24", "fast")
+            } else {
+                let ratio = max_w as f64 / in_width as f64;
+                let h = ((in_height as f64 * ratio) as u32) & !1;
+                (max_w, h, "24", "fast")
+            }
+        }
+        Quality::Q480 => {
+            let max_w = 854u32;
+            if in_width <= max_w {
+                (in_width, in_height, "28", "faster")
+            } else {
+                let ratio = max_w as f64 / in_width as f64;
+                let h = ((in_height as f64 * ratio) as u32) & !1;
+                (max_w, h, "28", "faster")
+            }
+        }
+        Quality::Q360 => {
+            let max_w = 640u32;
+            if in_width <= max_w {
+                (in_width, in_height, "32", "faster")
+            } else {
+                let ratio = max_w as f64 / in_width as f64;
+                let h = ((in_height as f64 * ratio) as u32) & !1;
+                (max_w, h, "32", "faster")
             }
         }
     };
 
-    let use_hw = matches!(quality, Quality::Original | Quality::High) && *hwaccel != HwAccel::Software;
+    let use_hw = matches!(quality, Quality::Original | Quality::Q2160 | Quality::Q1080) && *hwaccel != HwAccel::Software;
     let encoder_name = if use_hw { hwaccel.encoder() } else { "libx264" };
 
     let video_decoder_ctx = ffmpeg_next::codec::context::Context::from_parameters(video_params)
@@ -2740,14 +2825,14 @@ fn create_segment_video_only(
         // retranscode with a forced I-frame at seg_start to avoid duplicate segments
         // and multi-second gaps in the DASH presentation timeline.
         if keyframe_range.is_none() && (kf - seg_start).abs() > SEGMENT_BOUNDARY_TOLERANCE_S {
-            let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
+            let effective_quality = if quality == Quality::Original { Quality::Q1080 } else { quality };
             transcode_video_only_inprocess(&mut ictx, seg_start, hwaccel, effective_quality, &tmp_path, kill)?;
             seg_start
         } else {
             kf
         }
     } else {
-        let effective_quality = if quality == Quality::Original { Quality::High } else { quality };
+        let effective_quality = if quality == Quality::Original { Quality::Q1080 } else { quality };
         transcode_video_only_inprocess(&mut ictx, nominal_start, hwaccel, effective_quality, &tmp_path, kill)?;
         nominal_start
     };
@@ -2868,6 +2953,59 @@ pub async fn transcode_audio_segment(
     let seg_dir = seg_dir.to_owned();
     tokio::task::spawn_blocking(move || {
         create_segment_audio_only(&abs_path, &seg_dir, seg_index, None, keyframe_range)
+    })
+    .await
+    .map_err(|e| format!("audio segment task panicked: {e}"))?
+}
+
+/// Async wrapper — create a demuxed video-only fMP4 segment with a kill flag.
+///
+/// Used by the precache worker so that in-flight work can be cancelled when
+/// playback starts or the server shuts down.
+pub async fn transcode_video_segment_with_kill(
+    abs_path: &str,
+    seg_dir: &Path,
+    seg_index: usize,
+    hwaccel: &HwAccel,
+    quality: Quality,
+    kill: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    let filename = format!("seg_{:05}.m4s", seg_index);
+    let seg_path = seg_dir.join(&filename);
+    if seg_path.exists() {
+        return Ok(());
+    }
+
+    let abs_path = abs_path.to_owned();
+    let seg_dir = seg_dir.to_owned();
+    let hwaccel = hwaccel.clone();
+    tokio::task::spawn_blocking(move || {
+        create_segment_video_only(&abs_path, &seg_dir, seg_index, &hwaccel, quality, Some(&kill), None)
+    })
+    .await
+    .map_err(|e| format!("video segment task panicked: {e}"))?
+}
+
+/// Async wrapper — create a demuxed audio-only fMP4 segment with a kill flag.
+///
+/// Used by the precache worker so that in-flight work can be cancelled when
+/// playback starts or the server shuts down.
+pub async fn transcode_audio_segment_with_kill(
+    abs_path: &str,
+    seg_dir: &Path,
+    seg_index: usize,
+    kill: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    let filename = format!("seg_{:05}.m4s", seg_index);
+    let seg_path = seg_dir.join(&filename);
+    if seg_path.exists() {
+        return Ok(());
+    }
+
+    let abs_path = abs_path.to_owned();
+    let seg_dir = seg_dir.to_owned();
+    tokio::task::spawn_blocking(move || {
+        create_segment_audio_only(&abs_path, &seg_dir, seg_index, Some(&kill), None)
     })
     .await
     .map_err(|e| format!("audio segment task panicked: {e}"))?

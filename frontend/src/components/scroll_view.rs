@@ -46,13 +46,15 @@ const CONTROLS_HIDE_MS: f64 = 4000.0;
 /// Seek step for on-screen controls (seconds).
 const SEEK_STEP_S: f64 = 10.0;
 
-/// Stream quality options (mirrored from video_player).
-const QUALITY_OPTIONS: [(&str, &str); 5] = [
+/// Stream quality options (fallback used before quality-info loads from server).
+const QUALITY_OPTIONS: [(&str, &str); 7] = [
     ("auto",     "Auto (ABR)"),
-    ("original", "Original (Direct)"),
-    ("high",     "High (Transcode)"),
-    ("medium",   "Medium (720p)"),
-    ("low",      "Low (480p)"),
+    ("original", "Original (Direct Copy)"),
+    ("2160p",    "2160p"),
+    ("1080p",    "1080p"),
+    ("720p",     "720p"),
+    ("480p",     "480p"),
+    ("360p",     "360p"),
 ];
 const QUALITY_STORAGE_KEY: &str = "starfin_quality";
 
@@ -619,14 +621,26 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
                     if let Ok(resp) = Request::get(&url).send().await {
                         if resp.ok() {
                             if let Ok(items) = resp.json::<Vec<serde_json::Value>>().await {
-                                let labels: Vec<(String, String)> = items
-                                    .iter()
-                                    .filter_map(|item| {
-                                        let v = item.get("value")?.as_str()?.to_string();
-                                        let l = item.get("label")?.as_str()?.to_string();
-                                        Some((v, l))
-                                    })
-                                    .collect();
+                                // "auto" is always first — client-side only.
+                                let mut labels: Vec<(String, String)> =
+                                    vec![("auto".to_string(), "Auto (ABR)".to_string())];
+                                for item in items.iter() {
+                                    if let (Some(value), Some(label)) = (
+                                        item.get("value").and_then(|v| v.as_str()),
+                                        item.get("label").and_then(|v| v.as_str()),
+                                    ) {
+                                        let display_label = if value == "original" {
+                                            match item.get("remuxable").and_then(|v| v.as_bool()) {
+                                                Some(true)  => "Original (Direct Copy)".to_string(),
+                                                Some(false) => "Original (Re-encode)".to_string(),
+                                                None        => label.to_string(),
+                                            }
+                                        } else {
+                                            label.to_string()
+                                        };
+                                        labels.push((value.to_string(), display_label));
+                                    }
+                                }
                                 quality_labels.set(labels);
                             }
                         }
@@ -1505,19 +1519,23 @@ pub fn scroll_view(props: &ScrollViewProps) -> Html {
                             </button>
                             if *quality_menu_open {
                                 <div class="sv-quality__menu">
-                                    { for QUALITY_OPTIONS.iter().map(|(value, label)| {
-                                        let on_select = on_quality_select.clone();
-                                        let is_active = selected_quality.as_str() == *value;
-                                        let vs = value.to_string();
-                                        let display_label = if quality_labels.is_empty() {
-                                            label.to_string()
+                                { for {
+                                        // Use server-provided labels when loaded (already filtered
+                                        // to the video's applicable resolutions); else fall back.
+                                        let items: Vec<(String, String)> = if quality_labels.is_empty() {
+                                            QUALITY_OPTIONS.iter().map(|(v, l)| (v.to_string(), l.to_string())).collect()
                                         } else {
-                                            quality_labels.iter().find(|(v, _)| v.as_str() == *value).map(|(_, l)| l.clone()).unwrap_or_else(|| label.to_string())
+                                            (*quality_labels).clone()
                                         };
+                                        items
+                                    }.into_iter().map(|(value, label)| {
+                                        let on_select = on_quality_select.clone();
+                                        let is_active = selected_quality.as_str() == value.as_str();
+                                        let vs = value.clone();
                                         html! {
                                             <button class={if is_active { "sv-quality__option sv-quality__option--active" } else { "sv-quality__option" }}
                                                 onclick={Callback::from(move |e: MouseEvent| { e.stop_propagation(); on_select.emit(vs.clone()); })}>
-                                                { display_label }
+                                                { label }
                                             </button>
                                         }
                                     })}

@@ -24,12 +24,17 @@ use yew::prelude::*;
 const PLAYBACK_SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
 
 // ── Stream quality options ────────────────────────────────────────────────────
-const QUALITY_OPTIONS: [(&str, &str); 5] = [
+// These are the fallback options shown before quality-info loads from the server.
+// The quality menu is driven by server-provided labels when available (which are
+// filtered to only the resolutions applicable to the current video).
+const QUALITY_OPTIONS: [(&str, &str); 7] = [
     ("auto",     "Auto (ABR)"),
-    ("original", "Original (Direct)"),
-    ("high",     "High (Transcode)"),
-    ("medium",   "Medium (720p)"),
-    ("low",      "Low (480p)"),
+    ("original", "Original (Direct Copy)"),
+    ("2160p",    "2160p"),
+    ("1080p",    "1080p"),
+    ("720p",     "720p"),
+    ("480p",     "480p"),
+    ("360p",     "360p"),
 ];
 const QUALITY_STORAGE_KEY: &str = "starfin_quality";
 
@@ -2037,9 +2042,9 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let current_quality_label: String = {
         let cur = selected_quality.as_str();
         if quality_labels.is_empty() {
-            QUALITY_OPTIONS.iter().find(|(v, _)| *v == cur).map(|(_, l)| l.to_string()).unwrap_or_else(|| "Original (Direct)".to_string())
+            QUALITY_OPTIONS.iter().find(|(v, _)| *v == cur).map(|(_, l)| l.to_string()).unwrap_or_else(|| "Auto (ABR)".to_string())
         } else {
-            quality_labels.iter().find(|(v, _)| v.as_str() == cur).map(|(_, l)| l.clone()).unwrap_or_else(|| "Original (Direct)".to_string())
+            quality_labels.iter().find(|(v, _)| v.as_str() == cur).map(|(_, l)| l.clone()).unwrap_or_else(|| "Auto (ABR)".to_string())
         }
     };
 
@@ -2185,19 +2190,25 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             </button>
                             if *quality_menu_open {
                                 <div class="sv-quality__menu">
-                                    { for QUALITY_OPTIONS.iter().map(|(value, label)| {
-                                        let on_select = on_quality_select.clone();
-                                        let is_active = selected_quality.as_str() == *value;
-                                        let vs = value.to_string();
-                                        let display_label = if quality_labels.is_empty() {
-                                            label.to_string()
+                                    { for {
+                                        // When quality-info has been loaded from the server, use
+                                        // those labels (they're already filtered to the video's
+                                        // applicable resolutions). Otherwise fall back to the
+                                        // static QUALITY_OPTIONS list.
+                                        let items: Vec<(String, String)> = if quality_labels.is_empty() {
+                                            QUALITY_OPTIONS.iter().map(|(v, l)| (v.to_string(), l.to_string())).collect()
                                         } else {
-                                            quality_labels.iter().find(|(v, _)| v.as_str() == *value).map(|(_, l)| l.clone()).unwrap_or_else(|| label.to_string())
+                                            (*quality_labels).clone()
                                         };
+                                        items
+                                    }.into_iter().map(|(value, label)| {
+                                        let on_select = on_quality_select.clone();
+                                        let is_active = selected_quality.as_str() == value.as_str();
+                                        let vs = value.clone();
                                         html! {
                                             <button class={if is_active { "sv-quality__option sv-quality__option--active" } else { "sv-quality__option" }}
                                                 onclick={Callback::from(move |e: MouseEvent| { e.stop_propagation(); on_select.emit(vs.clone()); })}>
-                                                { display_label }
+                                                { label }
                                             </button>
                                         }
                                     })}

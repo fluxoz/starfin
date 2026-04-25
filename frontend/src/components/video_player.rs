@@ -658,6 +658,29 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // Falls back to static QUALITY_OPTIONS when not yet loaded.
     let quality_labels: UseStateHandle<Vec<(String, String)>> = use_state(|| Vec::new());
 
+    // Cache strategy fetched once from /api/config ("on-demand", "balanced",
+    // or "aggressive").  Drives the eviction behaviour on player close.
+    let cache_strategy = use_state(|| "balanced".to_string());
+
+    // Fetch server config once on mount.
+    {
+        let cache_strategy = cache_strategy.clone();
+        use_effect_with((), move |_| {
+            spawn_local(async move {
+                if let Ok(resp) = Request::get("/api/config").send().await {
+                    if resp.ok() {
+                        if let Ok(val) = resp.json::<serde_json::Value>().await {
+                            if let Some(s) = val.get("cache_strategy").and_then(|v| v.as_str()) {
+                                cache_strategy.set(s.to_string());
+                            }
+                        }
+                    }
+                }
+            });
+            || ()
+        });
+    }
+
     // Fetch quality info from the server when the video changes.
     {
         let video_id = props.video_id.clone();
@@ -1492,6 +1515,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let title = props.title.clone();
     let is_favorite = props.is_favorite;
     let on_favorite_toggle = props.on_favorite_toggle.clone();
+    let cache_strategy_for_close = (*cache_strategy).clone();
 
     // Play/Pause toggle
     let on_play_pause = {
@@ -2064,7 +2088,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             <div class={if *controls_visible { "sv-title" } else { "sv-title sv-title--hidden" }}>
                 <button class="sv-back-btn" onclick={Callback::from(move |_| {
                     let vid = video_id_for_close.clone();
-                    spawn_local(async move { clear_video_cache(&vid).await; });
+                    let strat = cache_strategy_for_close.clone();
+                    // In aggressive mode eviction is disabled server-side;
+                    // skip the network call to avoid unnecessary overhead.
+                    if strat != "aggressive" {
+                        spawn_local(async move { clear_video_cache(&vid).await; });
+                    }
                     on_close.emit(());
                 })}>
                     { icon_arrow_back() }

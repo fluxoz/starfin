@@ -1023,6 +1023,45 @@ const CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(60); // 1 minute
 /// inactive and background workers are allowed to resume.
 const PLAYBACK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+// ── Cache strategy ───────────────────────────────────────────────────────────
+
+/// Controls the caching behaviour of the segment pre-cache worker and the
+/// cache-eviction logic.  Selected via the `CACHE_STRATEGY` environment
+/// variable (default: `balanced`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheStrategy {
+    /// No pre-caching.  Segments are transcoded strictly on demand and are
+    /// aggressively evicted after use.  Best for fast disk arrays.
+    OnDemand,
+    /// Pre-cache the first [`PRECACHE_SEGMENTS`] segments for instant
+    /// playback start, and keep every [`SPARSE_CACHE_STRIDE`]-th segment as
+    /// a seek anchor.  All other on-demand segments are evicted.  This is
+    /// the default.
+    Balanced,
+    /// Pre-transcode and cache every segment at every quality level that is
+    /// applicable to the video's native resolution.  Eviction is disabled.
+    /// Best for slow disk arrays where seek performance is critical.
+    Aggressive,
+}
+
+impl CacheStrategy {
+    fn from_str(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "on-demand" | "ondemand" => CacheStrategy::OnDemand,
+            "aggressive" => CacheStrategy::Aggressive,
+            _ => CacheStrategy::Balanced,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            CacheStrategy::OnDemand  => "on-demand",
+            CacheStrategy::Balanced  => "balanced",
+            CacheStrategy::Aggressive => "aggressive",
+        }
+    }
+}
+
 // ── App state ────────────────────────────────────────────────────────────────
 
 /// Tracks the progress of the thumbnail generation background job.
@@ -1135,6 +1174,8 @@ struct AppState {
     /// Streamed to the frontend via the progress WebSocket so it can re-fetch
     /// the video list immediately instead of polling.
     library_version: Arc<AtomicU64>,
+    /// Active caching strategy (from `CACHE_STRATEGY` env var).
+    cache_strategy: CacheStrategy,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -2028,9 +2069,18 @@ async fn transcode_segment(
 }
 
 /// Remove cached segments beyond the pre-cache range from a quality-specific
-/// segment directory.  Segments with index < [`PRECACHE_SEGMENTS`] are
-/// preserved so that playback can always begin instantly.
-async fn remove_non_precached_segments(cache_dir: &Path) -> std::io::Result<()> {
+/// segment directory.  The segments retained depend on the active [`CacheStrategy`]:
+///
+/// - `OnDemand` — remove **all** segments (nothing is retained).
+/// - `Balanced` — keep segments with index < [`PRECACHE_SEGMENTS`] and sparse
+///   seek anchors (`idx % SPARSE_CACHE_STRIDE == 0`).
+/// - `Aggressive` — keep **all** segments (no eviction).
+async fn remove_non_precached_segments(cache_dir: &Path, strategy: CacheStrategy) -> std::io::Result<()> {
+    // Aggressive mode: eviction is disabled — keep everything.
+    if strategy == CacheStrategy::Aggressive {
+        return Ok(());
+    }
+
     let mut entries = match tokio::fs::read_dir(cache_dir).await {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -2047,8 +2097,14 @@ async fn remove_non_precached_segments(cache_dir: &Path) -> std::io::Result<()> 
             .and_then(|s| s.strip_suffix(".m4s"))
             .and_then(|s| s.parse::<usize>().ok())
         {
-            // Keep segments that are either in the dense pre-cache window OR are sparse seek anchors.
-            let should_keep = idx < PRECACHE_SEGMENTS || idx % SPARSE_CACHE_STRIDE == 0;
+            let should_keep = match strategy {
+                // OnDemand: evict everything.
+                CacheStrategy::OnDemand => false,
+                // Balanced: keep dense pre-cache window and sparse seek anchors.
+                CacheStrategy::Balanced => idx < PRECACHE_SEGMENTS || idx % SPARSE_CACHE_STRIDE == 0,
+                // Aggressive already returned early above.
+                CacheStrategy::Aggressive => true,
+            };
             if !should_keep {
                 let _ = tokio::fs::remove_file(entry.path()).await;
             }
@@ -2064,14 +2120,14 @@ async fn remove_non_precached_segments(cache_dir: &Path) -> std::io::Result<()> 
 
 /// Remove non-pre-cached segments from **all** quality subdirectories of a
 /// video's cache folder (`{cache_dir}/{video_id}/video/{quality}/` and `{cache_dir}/{video_id}/audio/`).
-async fn remove_non_precached_segments_all_qualities(video_cache_dir: &Path) {
+async fn remove_non_precached_segments_all_qualities(video_cache_dir: &Path, strategy: CacheStrategy) {
     // Scan the demuxed video subdirectory for quality-specific dirs.
     let video_dir = video_cache_dir.join("video");
     if let Ok(mut dir) = tokio::fs::read_dir(&video_dir).await {
         while let Ok(Some(entry)) = dir.next_entry().await {
             if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
                 let q_dir = entry.path();
-                if let Err(e) = remove_non_precached_segments(&q_dir).await {
+                if let Err(e) = remove_non_precached_segments(&q_dir, strategy).await {
                     error!(dir = %q_dir.display(), error = %e, "cache eviction error");
                 }
             }
@@ -2080,7 +2136,7 @@ async fn remove_non_precached_segments_all_qualities(video_cache_dir: &Path) {
     // Also clean the audio directory (quality-independent).
     let audio_dir = video_cache_dir.join("audio");
     if audio_dir.exists() {
-        if let Err(e) = remove_non_precached_segments(&audio_dir).await {
+        if let Err(e) = remove_non_precached_segments(&audio_dir, strategy).await {
             error!(dir = %audio_dir.display(), error = %e, "cache eviction error");
         }
     }
@@ -3099,10 +3155,11 @@ async fn get_hwaccel(state: web::Data<AppState>) -> impl Responder {
 /// `DELETE /api/videos/{id}/cache` — clear cached segments for a video.
 ///
 /// Removes non-pre-cached segments from all quality subdirectories of
-/// `cache_dir/{id}/`.  The first [`PRECACHE_SEGMENTS`] segments are preserved
-/// so that future playback can begin instantly.  Called by the frontend when
-/// the user navigates away from the player so that disk space is reclaimed
-/// immediately.
+/// `cache_dir/{id}/`.  The segments retained depend on the active
+/// [`CacheStrategy`]: `balanced` keeps the first [`PRECACHE_SEGMENTS`]
+/// segments and sparse seek anchors; `on-demand` removes everything;
+/// `aggressive` keeps everything.  Called by the frontend when the user
+/// navigates away from the player.
 async fn clear_cache(
     id: web::Path<String>,
     state: web::Data<AppState>,
@@ -3116,7 +3173,7 @@ async fn clear_cache(
 
     let video_cache_dir = state.cache_dir.join(&id);
 
-    remove_non_precached_segments_all_qualities(&video_cache_dir).await;
+    remove_non_precached_segments_all_qualities(&video_cache_dir, state.cache_strategy).await;
 
     // Also cancel idle-eviction tracking so a stale entry doesn't
     // trigger a redundant removal on the next sweep.
@@ -3126,6 +3183,17 @@ async fn clear_cache(
         .remove(&id);
 
     HttpResponse::NoContent().finish()
+}
+
+/// `GET /api/config` — return server configuration visible to the frontend.
+///
+/// Exposes the active caching strategy so the player can adjust its
+/// behaviour (e.g. skip the cache-clear call when `aggressive` eviction is
+/// disabled).
+async fn get_config(state: web::Data<AppState>) -> impl Responder {
+    HttpResponse::Ok().json(serde_json::json!({
+        "cache_strategy": state.cache_strategy.as_str(),
+    }))
 }
 
 // ── Thumbnail sprite generation ──────────────────────────────────────────────
@@ -3488,12 +3556,21 @@ async fn run_sprite_worker(
 /// every video so that playback can begin instantly.
 ///
 /// Mirrors `run_thumb_worker` / `run_sprite_worker`: waits for a notification
-/// on `trigger`, walks the library, skips videos whose first
-/// [`PRECACHE_SEGMENTS`] segments already exist in the cache, and transcodes
-/// the missing ones.  Suspends while playback is active (checking between
-/// every individual segment) and resumes automatically once idle.  Progress
-/// counters are written to `progress` so the WS can drive a frontend progress
-/// bar.
+/// on `trigger`, walks the library, skips videos whose segments are already
+/// cached, and transcodes the missing ones.  Behaviour depends on
+/// [`CacheStrategy`]:
+///
+/// - `OnDemand` — skips all work; the worker exits each pass immediately.
+/// - `Balanced` — pre-caches the first [`PRECACHE_SEGMENTS`] segments for
+///   instant start, and every [`SPARSE_CACHE_STRIDE`]-th segment as a seek
+///   anchor (current default).
+/// - `Aggressive` — pre-transcodes every segment at every quality level
+///   applicable to the video's native resolution (no seek latency at any
+///   position or quality).
+///
+/// Suspends while playback is active (checking between every individual
+/// segment) and resumes automatically once idle.  Progress counters are
+/// written to `progress` so the WS can drive a frontend progress bar.
 async fn run_precache_worker(
     library_path: PathBuf,
     cache_dir: PathBuf,
@@ -3502,6 +3579,7 @@ async fn run_precache_worker(
     trigger: Arc<tokio::sync::Notify>,
     mut playback_rx: tokio::sync::watch::Receiver<bool>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    strategy: CacheStrategy,
 ) {
     loop {
         // Fast exit if shutdown was already signaled before we block.
@@ -3516,18 +3594,18 @@ async fn run_precache_worker(
             return;
         }
 
+        // On-demand mode: no pre-caching at all — skip this pass.
+        if strategy == CacheStrategy::OnDemand {
+            continue;
+        }
+
         let entries: Vec<_> = WalkDir::new(&library_path)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file() && is_video(e.path()))
             .collect();
 
-        // Partition into already-cached and needs-work.  A video counts as
-        // "done" when seg_00000.m4s already exists in the high-quality
-        // subdirectory AND the last expected sparse anchor also exists
-        // (so sparse anchors are added on re-runs if they were missing from
-        // a previous precache pass).  We probe the duration here so that we
-        // can compute the last anchor index without re-probing in the loop.
+        // Partition into already-cached and needs-work.
         let mut done_count: usize = 0;
         let mut pending: Vec<_> = Vec::new();
         for e in entries {
@@ -3537,31 +3615,74 @@ async fn run_precache_worker(
                 .unwrap_or(abs)
                 .to_string_lossy();
             let id = video_id(&rel);
-            // Precache always uses the demuxed video/original subdirectory.
             let video_dir = cache_dir.join(&id).join("video").join(Quality::Original.as_str());
-            let audio_dir = cache_dir.join(&id).join("audio");
 
-            let is_done = if !video_dir.join("seg_00000.m4s").exists() {
-                false
-            } else {
-                // First segment exists; check whether the last expected sparse
-                // anchor is also present.
-                let (dur_secs, _) = probe_video(abs).await;
-                if dur_secs <= 0.0 {
-                    // Can't determine duration — treat as done to avoid infinite retry.
-                    true
-                } else {
-                    let total_segs = (dur_secs / SEGMENT_DURATION).ceil() as usize;
-                    if total_segs > PRECACHE_SEGMENTS {
-                        let last_anchor =
-                            ((total_segs - 1) / SPARSE_CACHE_STRIDE) * SPARSE_CACHE_STRIDE;
-                        if last_anchor >= PRECACHE_SEGMENTS {
-                            video_dir.join(format!("seg_{:05}.m4s", last_anchor)).exists()
-                        } else {
-                            true
-                        }
+            let is_done = match strategy {
+                CacheStrategy::OnDemand => unreachable!(),
+                CacheStrategy::Balanced => {
+                    if !video_dir.join("seg_00000.m4s").exists() {
+                        false
                     } else {
-                        true
+                        // First segment exists; check whether the last expected
+                        // sparse anchor is also present.
+                        let (dur_secs, _) = probe_video(abs).await;
+                        if dur_secs <= 0.0 {
+                            true
+                        } else {
+                            let total_segs = (dur_secs / SEGMENT_DURATION).ceil() as usize;
+                            if total_segs > PRECACHE_SEGMENTS {
+                                let last_anchor =
+                                    ((total_segs - 1) / SPARSE_CACHE_STRIDE) * SPARSE_CACHE_STRIDE;
+                                if last_anchor >= PRECACHE_SEGMENTS {
+                                    video_dir.join(format!("seg_{:05}.m4s", last_anchor)).exists()
+                                } else {
+                                    true
+                                }
+                            } else {
+                                true
+                            }
+                        }
+                    }
+                }
+                CacheStrategy::Aggressive => {
+                    if !video_dir.join("seg_00000.m4s").exists() {
+                        false
+                    } else {
+                        let (dur_secs, _) = probe_video(abs).await;
+                        if dur_secs <= 0.0 {
+                            true
+                        } else {
+                            let total_segs = (dur_secs / SEGMENT_DURATION).ceil() as usize;
+                            if total_segs == 0 {
+                                true
+                            } else {
+                                let last_seg = total_segs - 1;
+                                // Check that the last segment of every applicable
+                                // quality tier exists.
+                                let abs_for_probe = abs.to_path_buf();
+                                let source_height = tokio::task::spawn_blocking(move || {
+                                    media::probe::probe_stream_info(&abs_for_probe).height
+                                }).await.unwrap_or(0);
+
+                                let res_qualities: &[(Quality, u32)] = &[
+                                    (Quality::Q2160, 2160),
+                                    (Quality::Q1080, 1080),
+                                    (Quality::Q720,  720),
+                                    (Quality::Q480,  480),
+                                    (Quality::Q360,  360),
+                                ];
+                                let mut all_done = true;
+                                for &(q, target_h) in res_qualities {
+                                    if source_height < target_h { continue; }
+                                    let q_dir = cache_dir.join(&id).join("video").join(q.as_str());
+                                    if !q_dir.join(format!("seg_{:05}.m4s", last_seg)).exists() {
+                                        all_done = false;
+                                        break;
+                                    }
+                                }
+                                all_done
+                            }
+                        }
                     }
                 }
             };
@@ -3599,9 +3720,6 @@ async fn run_precache_worker(
                 .to_string_lossy()
                 .to_string();
             let id = video_id(&rel);
-            // Precache always uses the demuxed video/original subdirectory.
-            let video_dir = cache_dir.join(&id).join("video").join(Quality::Original.as_str());
-            let audio_dir = cache_dir.join(&id).join("audio");
 
             {
                 let mut p = progress.write();
@@ -3615,23 +3733,6 @@ async fn run_precache_worker(
                 continue;
             }
             let total_segments = (duration_secs / SEGMENT_DURATION).ceil() as usize;
-
-            // Dense: every segment in the initial pre-cache window for instant playback start.
-            // Sparse: every SPARSE_CACHE_STRIDE-th segment beyond that window as seek anchors.
-            let segments_to_cache: Vec<usize> = (0..total_segments)
-                .filter(|&i| i < PRECACHE_SEGMENTS || i % SPARSE_CACHE_STRIDE == 0)
-                .collect();
-
-            // Collect only the segments that are missing (check video dir only;
-            // audio will be generated alongside video).
-            let missing: Vec<usize> = segments_to_cache.iter()
-                .copied()
-                .filter(|i| !video_dir.join(format!("seg_{:05}.m4s", i)).exists())
-                .collect();
-            if missing.is_empty() {
-                progress.write().advance();
-                continue;
-            }
 
             // Resolve the source path once for all segments of this video.
             let resolved_path = match abs.canonicalize() {
@@ -3649,83 +3750,203 @@ async fn run_precache_worker(
                 }
             };
 
-            if let Err(e) = tokio::fs::create_dir_all(&video_dir).await {
-                error!(video_id = %id, error = %e, "precache: video cache dir error");
-                progress.write().advance();
-                continue;
-            }
-            if let Err(e) = tokio::fs::create_dir_all(&audio_dir).await {
-                error!(video_id = %id, error = %e, "precache: audio cache dir error");
-                progress.write().advance();
-                continue;
-            }
+            match strategy {
+                CacheStrategy::OnDemand => unreachable!(),
 
-            info!(
-                video_id = %id,
-                missing_segments = missing.len(),
-                total_segments = segments_to_cache.len(),
-                "pre-caching segments"
-            );
+                CacheStrategy::Balanced => {
+                    let video_dir = cache_dir.join(&id).join("video").join(Quality::Original.as_str());
+                    let audio_dir = cache_dir.join(&id).join("audio");
 
-            let kill = Arc::new(AtomicBool::new(false));
-            for i in missing {
-                if *shutdown_rx.borrow() {
-                    return;
-                }
-                // Suspend between individual segments while playback is
-                // active: signal the in-flight transcode to bail out, then
-                // wait for playback to end before starting the next one.
-                if *playback_rx.borrow() {
-                    kill.store(true, Ordering::SeqCst);
-                    while *playback_rx.borrow() {
-                        let _ = playback_rx.changed().await;
+                    // Dense: every segment in the initial pre-cache window for instant playback start.
+                    // Sparse: every SPARSE_CACHE_STRIDE-th segment beyond that window as seek anchors.
+                    let segments_to_cache: Vec<usize> = (0..total_segments)
+                        .filter(|&i| i < PRECACHE_SEGMENTS || i % SPARSE_CACHE_STRIDE == 0)
+                        .collect();
+
+                    // Collect only the segments that are missing (check video dir only;
+                    // audio will be generated alongside video).
+                    let missing: Vec<usize> = segments_to_cache.iter()
+                        .copied()
+                        .filter(|i| !video_dir.join(format!("seg_{:05}.m4s", i)).exists())
+                        .collect();
+                    if missing.is_empty() {
+                        progress.write().advance();
+                        continue;
                     }
-                    kill.store(false, Ordering::SeqCst);
-                }
-                if *shutdown_rx.borrow() {
-                    return;
-                }
 
-                // Run the segment creation inside a select! so a shutdown
-                // or playback signal wakes us immediately rather than
-                // waiting for the full operation to finish.  The kill flag
-                // ensures the spawn_blocking task also bails out quickly.
-                let hw = hwaccel.read().clone();
-                // Generate the video-only segment first.
-                let video_result = tokio::select! {
-                    r = media::transcode::transcode_video_segment_with_kill(&abs_str, &video_dir, i, &hw, Quality::Original, Arc::clone(&kill)) => r,
-                    _ = playback_rx.changed() => {
+                    if let Err(e) = tokio::fs::create_dir_all(&video_dir).await {
+                        error!(video_id = %id, error = %e, "precache: video cache dir error");
+                        progress.write().advance();
+                        continue;
+                    }
+                    if let Err(e) = tokio::fs::create_dir_all(&audio_dir).await {
+                        error!(video_id = %id, error = %e, "precache: audio cache dir error");
+                        progress.write().advance();
+                        continue;
+                    }
+
+                    info!(
+                        video_id = %id,
+                        missing_segments = missing.len(),
+                        total_segments = segments_to_cache.len(),
+                        "pre-caching segments (balanced)"
+                    );
+
+                    let kill = Arc::new(AtomicBool::new(false));
+                    'seg_loop: for i in missing {
+                        if *shutdown_rx.borrow() { return; }
                         if *playback_rx.borrow() {
                             kill.store(true, Ordering::SeqCst);
+                            while *playback_rx.borrow() {
+                                let _ = playback_rx.changed().await;
+                            }
+                            kill.store(false, Ordering::SeqCst);
                         }
-                        continue;
+                        if *shutdown_rx.borrow() { return; }
+
+                        let hw = hwaccel.read().clone();
+                        let video_result = tokio::select! {
+                            r = media::transcode::transcode_video_segment_with_kill(&abs_str, &video_dir, i, &hw, Quality::Original, Arc::clone(&kill)) => r,
+                            _ = playback_rx.changed() => {
+                                if *playback_rx.borrow() { kill.store(true, Ordering::SeqCst); }
+                                continue 'seg_loop;
+                            }
+                            _ = shutdown_rx.changed() => { return; }
+                        };
+                        if let Err(e) = video_result {
+                            if e == media::transcode::CANCELLED { continue 'seg_loop; }
+                            error!(video_id = %id, segment = i, error = %e, "precache: video segment transcode failed");
+                            break 'seg_loop;
+                        }
+                        let audio_result = tokio::select! {
+                            r = media::transcode::transcode_audio_segment_with_kill(&abs_str, &audio_dir, i, Arc::clone(&kill)) => r,
+                            _ = playback_rx.changed() => {
+                                if *playback_rx.borrow() { kill.store(true, Ordering::SeqCst); }
+                                continue 'seg_loop;
+                            }
+                            _ = shutdown_rx.changed() => { return; }
+                        };
+                        if let Err(e) = audio_result {
+                            if e == media::transcode::CANCELLED { continue 'seg_loop; }
+                            error!(video_id = %id, segment = i, error = %e, "precache: audio segment transcode failed");
+                        }
                     }
-                    _ = shutdown_rx.changed() => { return; }
-                };
-                if let Err(e) = video_result {
-                    if e == media::transcode::CANCELLED {
-                        continue;
-                    }
-                    error!(video_id = %id, segment = i, error = %e, "precache: video segment transcode failed");
-                    break;
                 }
-                // Generate the audio segment (quality-independent).
-                let audio_result = tokio::select! {
-                    r = media::transcode::transcode_audio_segment_with_kill(&abs_str, &audio_dir, i, Arc::clone(&kill)) => r,
-                    _ = playback_rx.changed() => {
+
+                CacheStrategy::Aggressive => {
+                    // Probe native resolution to determine applicable quality tiers.
+                    let abs_for_probe = abs.clone();
+                    let source_height = tokio::task::spawn_blocking(move || {
+                        media::probe::probe_stream_info(&abs_for_probe).height
+                    }).await.unwrap_or(0);
+
+                    let res_qualities: &[(Quality, u32)] = &[
+                        (Quality::Q2160, 2160),
+                        (Quality::Q1080, 1080),
+                        (Quality::Q720,  720),
+                        (Quality::Q480,  480),
+                        (Quality::Q360,  360),
+                    ];
+                    // Always include Original (direct remux); add all applicable
+                    // transcoded tiers based on native resolution.
+                    let mut applicable: Vec<Quality> = vec![Quality::Original];
+                    for &(q, target_h) in res_qualities {
+                        if source_height >= target_h {
+                            applicable.push(q);
+                        }
+                    }
+
+                    let audio_dir = cache_dir.join(&id).join("audio");
+
+                    // Transcode audio once (quality-independent).
+                    let audio_missing: Vec<usize> = (0..total_segments)
+                        .filter(|i| !audio_dir.join(format!("seg_{:05}.m4s", i)).exists())
+                        .collect();
+
+                    if let Err(e) = tokio::fs::create_dir_all(&audio_dir).await {
+                        error!(video_id = %id, error = %e, "precache: audio cache dir error");
+                        progress.write().advance();
+                        continue;
+                    }
+
+                    let kill = Arc::new(AtomicBool::new(false));
+
+                    // Cache video segments for each quality tier.
+                    'qual_loop: for quality in applicable {
+                        let q_video_dir = cache_dir.join(&id).join("video").join(quality.as_str());
+                        if let Err(e) = tokio::fs::create_dir_all(&q_video_dir).await {
+                            error!(video_id = %id, quality = %quality.as_str(), error = %e, "precache: video cache dir error");
+                            continue 'qual_loop;
+                        }
+
+                        let missing: Vec<usize> = (0..total_segments)
+                            .filter(|i| !q_video_dir.join(format!("seg_{:05}.m4s", i)).exists())
+                            .collect();
+                        if missing.is_empty() {
+                            continue 'qual_loop;
+                        }
+
+                        info!(
+                            video_id = %id,
+                            quality = %quality.as_str(),
+                            missing_segments = missing.len(),
+                            total_segments,
+                            "pre-caching segments (aggressive)"
+                        );
+
+                        'seg_loop2: for i in missing {
+                            if *shutdown_rx.borrow() { return; }
+                            if *playback_rx.borrow() {
+                                kill.store(true, Ordering::SeqCst);
+                                while *playback_rx.borrow() {
+                                    let _ = playback_rx.changed().await;
+                                }
+                                kill.store(false, Ordering::SeqCst);
+                            }
+                            if *shutdown_rx.borrow() { return; }
+
+                            let hw = hwaccel.read().clone();
+                            let video_result = tokio::select! {
+                                r = media::transcode::transcode_video_segment_with_kill(&abs_str, &q_video_dir, i, &hw, quality, Arc::clone(&kill)) => r,
+                                _ = playback_rx.changed() => {
+                                    if *playback_rx.borrow() { kill.store(true, Ordering::SeqCst); }
+                                    continue 'seg_loop2;
+                                }
+                                _ = shutdown_rx.changed() => { return; }
+                            };
+                            if let Err(e) = video_result {
+                                if e == media::transcode::CANCELLED { continue 'seg_loop2; }
+                                error!(video_id = %id, quality = %quality.as_str(), segment = i, error = %e, "precache: video segment transcode failed");
+                                break 'seg_loop2;
+                            }
+                        }
+                    }
+
+                    // Cache audio segments.
+                    'audio_loop: for i in audio_missing {
+                        if *shutdown_rx.borrow() { return; }
                         if *playback_rx.borrow() {
                             kill.store(true, Ordering::SeqCst);
+                            while *playback_rx.borrow() {
+                                let _ = playback_rx.changed().await;
+                            }
+                            kill.store(false, Ordering::SeqCst);
                         }
-                        continue;
+                        if *shutdown_rx.borrow() { return; }
+
+                        let audio_result = tokio::select! {
+                            r = media::transcode::transcode_audio_segment_with_kill(&abs_str, &audio_dir, i, Arc::clone(&kill)) => r,
+                            _ = playback_rx.changed() => {
+                                if *playback_rx.borrow() { kill.store(true, Ordering::SeqCst); }
+                                continue 'audio_loop;
+                            }
+                            _ = shutdown_rx.changed() => { return; }
+                        };
+                        if let Err(e) = audio_result {
+                            if e == media::transcode::CANCELLED { continue 'audio_loop; }
+                            error!(video_id = %id, segment = i, error = %e, "precache: audio segment transcode failed");
+                        }
                     }
-                    _ = shutdown_rx.changed() => { return; }
-                };
-                if let Err(e) = audio_result {
-                    if e == media::transcode::CANCELLED {
-                        continue;
-                    }
-                    error!(video_id = %id, segment = i, error = %e, "precache: audio segment transcode failed");
-                    // Non-fatal: continue with next segment even if audio fails.
                 }
             }
 
@@ -4334,6 +4555,12 @@ async fn main() -> std::io::Result<()> {
         info!("password protection: disabled");
     }
 
+    // ── Cache strategy ───────────────────────────────────────────────────
+    let cache_strategy = std::env::var("CACHE_STRATEGY")
+        .map(|v| CacheStrategy::from_str(&v))
+        .unwrap_or(CacheStrategy::Balanced);
+    info!(strategy = %cache_strategy.as_str(), "cache strategy (set CACHE_STRATEGY to override)");
+
     // ── Theme & Design ──────────────────────────────────────────────────
     let theme = resolve_theme();
     let design = resolve_design(&theme);
@@ -4372,6 +4599,7 @@ async fn main() -> std::io::Result<()> {
         theme_css,
         playback_positions: Arc::new(RwLock::new(HashMap::new())),
         library_version: Arc::clone(&library_version),
+        cache_strategy,
     });
 
     // One-time background scan at startup to refresh the index immediately.
@@ -4478,7 +4706,7 @@ async fn main() -> std::io::Result<()> {
         let worker_playback_rx = playback_rx.clone();
         let worker_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            run_precache_worker(worker_library, worker_cache, precache_hwaccel, worker_progress, worker_trigger, worker_playback_rx, worker_shutdown_rx).await;
+            run_precache_worker(worker_library, worker_cache, precache_hwaccel, worker_progress, worker_trigger, worker_playback_rx, worker_shutdown_rx, cache_strategy).await;
         });
         // Kick off the first batch immediately after startup.
         precache_trigger.notify_one();
@@ -4564,7 +4792,7 @@ async fn main() -> std::io::Result<()> {
 
                 for id in idle_ids {
                     let video_cache_dir = sweep_state.cache_dir.join(&id);
-                    remove_non_precached_segments_all_qualities(&video_cache_dir).await;
+                    remove_non_precached_segments_all_qualities(&video_cache_dir, sweep_state.cache_strategy).await;
                     info!(video_id = %id, "cache evicted (idle)");
                     sweep_state
                         .last_segment_access
@@ -4595,6 +4823,7 @@ async fn main() -> std::io::Result<()> {
             .route("/api/theme.css", web::get().to(get_theme_css))
             // ── Protected API routes ─────────────────────────────────────
             .route("/api/health", web::get().to(|| async { "ok" }))
+            .route("/api/config", web::get().to(get_config))
             .route("/api/debug/transcode", web::get().to(get_transcode_debug))
             .route("/api/hwaccel", web::get().to(get_hwaccel))
             .route("/api/quality-options", web::get().to(get_quality_options))

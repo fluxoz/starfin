@@ -589,7 +589,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // Drag/Seek state
     let is_dragging = use_state(|| false);
     let drag_time = use_state(|| 0.0_f64);
-    let just_dragged = use_state(|| false);
 
     // Hover preview state
     let is_hovering_progress = use_state(|| false);
@@ -1652,11 +1651,28 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
+    // Show controls on any touch so the user can interact with them after they
+    // auto-hid.  Without this, a touch device had no way to reveal the controls
+    // once they disappeared, making the progress bar permanently inaccessible.
+    let on_touch_overlay = {
+        let controls_visible = controls_visible.clone();
+        let last_mouse_move = last_mouse_move.clone();
+        Callback::from(move |_: TouchEvent| {
+            controls_visible.set(true);
+            *last_mouse_move.borrow_mut() = js_sys::Date::now();
+        })
+    };
+
     let on_container_click = {
         let speed_menu_open = speed_menu_open.clone();
         let quality_menu_open = quality_menu_open.clone();
         let captions_menu_open = captions_menu_open.clone();
+        let controls_visible = controls_visible.clone();
+        let last_mouse_move = last_mouse_move.clone();
         Callback::from(move |_: MouseEvent| {
+            // Show controls on any click so the user can interact after they auto-hid.
+            controls_visible.set(true);
+            *last_mouse_move.borrow_mut() = js_sys::Date::now();
             speed_menu_open.set(false);
             quality_menu_open.set(false);
             captions_menu_open.set(false);
@@ -1702,7 +1718,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let drag_time = drag_time.clone();
         let current_time = current_time.clone();
         let duration_state = duration.clone();
-        let just_dragged = just_dragged.clone();
         let hover_time = hover_time.clone();
         let hover_position = hover_position.clone();
         let dash_player_ref = dash_player_ref.clone();
@@ -1736,7 +1751,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let current_time_move = current_time.clone();
             let is_dragging_up = is_dragging.clone();
             let video_ref_up = video_ref.clone();
-            let just_dragged_up = just_dragged.clone();
             let hover_time_move = hover_time.clone();
             let hover_position_move = hover_position.clone();
 
@@ -1763,7 +1777,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
             let on_mouseup = Closure::<dyn Fn(MouseEvent)>::new(move |_: MouseEvent| {
                 is_dragging_up.set(false);
-                just_dragged_up.set(true);
                 let t = shared_up.get();
                 if let Some(video) = video_ref_up.cast::<HtmlVideoElement>() { dash_seek(&dash_player_ref_up, &video, t); }
                 if let Some((mc, uc)) = closures_for_mouseup.borrow_mut().take() {
@@ -1793,7 +1806,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let drag_time = drag_time.clone();
         let current_time = current_time.clone();
         let duration_state = duration.clone();
-        let just_dragged = just_dragged.clone();
         let hover_time = hover_time.clone();
         let hover_position = hover_position.clone();
         let dash_player_ref = dash_player_ref.clone();
@@ -1828,7 +1840,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             let current_time_move = current_time.clone();
             let is_dragging_end = is_dragging.clone();
             let video_ref_end = video_ref.clone();
-            let just_dragged_end = just_dragged.clone();
             let hover_time_move = hover_time.clone();
             let hover_position_move = hover_position.clone();
 
@@ -1858,7 +1869,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
 
             let on_touchend = Closure::<dyn Fn(TouchEvent)>::new(move |_: TouchEvent| {
                 is_dragging_end.set(false);
-                just_dragged_end.set(true);
                 let t = shared_end.get();
                 if let Some(video) = video_ref_end.cast::<HtmlVideoElement>() { dash_seek(&dash_player_ref_end, &video, t); }
                 if let Some((mc, uc)) = touch_handlers_for_touchend.borrow_mut().take() {
@@ -1881,23 +1891,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         })
     };
 
-
-    let on_progress_click = {
-        let video_ref = video_ref.clone();
-        let progress_ref = progress_ref.clone();
-        let just_dragged = just_dragged.clone();
-        let dash_player_ref = dash_player_ref.clone();
-        Callback::from(move |e: MouseEvent| {
-            if *just_dragged { just_dragged.set(false); return; }
-            if let Some(el) = progress_ref.cast::<web_sys::HtmlElement>() {
-                if let Some(video) = video_ref.cast::<HtmlVideoElement>() {
-                    if let Some((t, _)) = calculate_seek_time(&e, &el, video.duration()) {
-                        dash_seek(&dash_player_ref, &video, t);
-                    }
-                }
-            }
-        })
-    };
 
     let on_video_dblclick = {
         let container_ref = container_ref.clone();
@@ -1922,7 +1915,16 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let last_tap_x = last_tap_x.clone();
         let skip_indicator = skip_indicator.clone();
         let dash_player_ref = dash_player_ref.clone();
+        let controls_visible = controls_visible.clone();
+        let last_mouse_move = last_mouse_move.clone();
         Callback::from(move |e: MouseEvent| {
+            // When controls are hidden the click fell through from the hidden controls
+            // layer.  Just reveal the controls; don't toggle playback.
+            if !*controls_visible {
+                controls_visible.set(true);
+                *last_mouse_move.borrow_mut() = js_sys::Date::now();
+                return;
+            }
             let now = js_sys::Date::now();
             let x = e.client_x() as f64;
             if now - *last_tap_time < 300.0 {
@@ -2042,7 +2044,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     };
 
     html! {
-        <div ref={container_ref} class="sv-overlay" onclick={on_container_click} onmousemove={on_mouse_move} onmouseleave={on_mouse_leave}>
+        <div ref={container_ref} class="sv-overlay" onclick={on_container_click} onmousemove={on_mouse_move} onmouseleave={on_mouse_leave} ontouchstart={on_touch_overlay}>
             // Video — full-screen slot (matches sv-* layout)
             <div class="sv-slot sv-slot--single">
                 <video ref={video_ref} class="sv-video" playsinline={true} onclick={on_video_click} ondblclick={on_video_dblclick} />
@@ -2122,7 +2124,6 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 // Progress bar with drag-to-seek
                 <div ref={progress_ref}
                     class={if *is_dragging { "sv-progress sv-progress--dragging" } else { "sv-progress" }}
-                    onclick={on_progress_click}
                     onmousedown={on_progress_mousedown}
                     ontouchstart={on_progress_touchstart}
                     onmousemove={on_progress_hover}

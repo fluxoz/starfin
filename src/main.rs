@@ -3618,7 +3618,9 @@ async fn run_precache_worker(
             let video_dir = cache_dir.join(&id).join("video").join(Quality::Original.as_str());
 
             let is_done = match strategy {
-                CacheStrategy::OnDemand => unreachable!(),
+                // OnDemand: never reached — the early `continue` above skips
+                // the entire partition loop body for this strategy.
+                CacheStrategy::OnDemand => false,
                 CacheStrategy::Balanced => {
                     if !video_dir.join("seg_00000.m4s").exists() {
                         false
@@ -3751,7 +3753,9 @@ async fn run_precache_worker(
             };
 
             match strategy {
-                CacheStrategy::OnDemand => unreachable!(),
+                // OnDemand: never reached — the early `continue` above skips
+                // the entire pending loop body for this strategy.
+                CacheStrategy::OnDemand => {}
 
                 CacheStrategy::Balanced => {
                     let video_dir = cache_dir.join(&id).join("video").join(Quality::Original.as_str());
@@ -3894,7 +3898,7 @@ async fn run_precache_worker(
                             "pre-caching segments (aggressive)"
                         );
 
-                        'seg_loop2: for i in missing {
+                        'seg_loop: for i in missing {
                             if *shutdown_rx.borrow() { return; }
                             if *playback_rx.borrow() {
                                 kill.store(true, Ordering::SeqCst);
@@ -3910,14 +3914,14 @@ async fn run_precache_worker(
                                 r = media::transcode::transcode_video_segment_with_kill(&abs_str, &q_video_dir, i, &hw, quality, Arc::clone(&kill)) => r,
                                 _ = playback_rx.changed() => {
                                     if *playback_rx.borrow() { kill.store(true, Ordering::SeqCst); }
-                                    continue 'seg_loop2;
+                                    continue 'seg_loop;
                                 }
                                 _ = shutdown_rx.changed() => { return; }
                             };
                             if let Err(e) = video_result {
-                                if e == media::transcode::CANCELLED { continue 'seg_loop2; }
+                                if e == media::transcode::CANCELLED { continue 'seg_loop; }
                                 error!(video_id = %id, quality = %quality.as_str(), segment = i, error = %e, "precache: video segment transcode failed");
-                                break 'seg_loop2;
+                                break 'seg_loop;
                             }
                         }
                     }

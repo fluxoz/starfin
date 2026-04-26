@@ -19,6 +19,7 @@
 #               design = "editorial";    # or "neubrutalist", "aero"
 #               # themeFile = ./my-theme.toml;   # fully custom TOML theme
 #               # devMetrics = true;             # show live metrics overlay
+#               # cacheStrategy = "aggressive";  # or "on-demand", "balanced" (default)
 #             };
 #           }
 #         ];
@@ -188,6 +189,27 @@ in
         `STARFIN_DEV=1` environment variable set during the WASM compile step.
       '';
     };
+
+    cacheStrategy = mkOption {
+      type = types.enum [ "on-demand" "balanced" "aggressive" ];
+      default = "balanced";
+      example = "aggressive";
+      description = ''
+        Segment caching strategy (`CACHE_STRATEGY` environment variable).
+
+        - **on-demand** – no pre-caching; segments are transcoded strictly on
+          demand and aggressively evicted after playback.  Best for fast disk
+          arrays where latency is low.
+        - **balanced** – pre-cache the first 20 segments for instant playback
+          start, and cache every 3rd segment as a seek anchor.  Non-cached
+          on-demand segments are evicted when idle.  This is the default.
+        - **aggressive** – pre-transcode and cache every segment at every
+          applicable quality level based on the video's native resolution
+          (e.g. a 4 K source gets Native, 1080p, 720p, 480p and 360p).  Cache
+          eviction is disabled.  Best for slow disk arrays where seek
+          performance is critical.
+      '';
+    };
   };
 
   config = mkIf cfg.enable {
@@ -227,6 +249,7 @@ in
         CACHE_DIR = toString cfg.cacheDir;
         THEME = cfg.theme;
         DESIGN = cfg.design;
+        CACHE_STRATEGY = cfg.cacheStrategy;
       } // (lib.optionalAttrs cfg.passwordProtection {
         PASSWORD_PROTECTION = "true";
       }) // (lib.optionalAttrs (cfg.themeFile != null) {

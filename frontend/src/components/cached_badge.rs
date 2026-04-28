@@ -34,18 +34,19 @@ const CHECK_DECAGRAM_PATH: &str = "M23 12l-2.44-2.78.34-3.68-3.61-.82-1.89-3.18L
 /// `processing_version` bumps (indicating a worker just finished a video).
 #[function_component(CachedBadge)]
 pub fn cached_badge(props: &Props) -> Html {
-    // Only active in aggressive mode.
-    if props.cache_strategy != "aggressive" {
-        return html! {};
-    }
-
     let fully_cached: UseStateHandle<bool> = use_state(|| false);
 
     {
         let fully_cached = fully_cached.clone();
         let video_id = props.video_id.clone();
         let version = props.processing_version;
-        use_effect_with((video_id, version), move |(video_id, _version)| {
+        let is_aggressive = props.cache_strategy == "aggressive";
+        
+        use_effect_with((video_id, version, is_aggressive), move |(video_id, _version, is_aggressive)| {
+            if !is_aggressive {
+                return || ();
+            }
+            
             let video_id = video_id.clone();
             let fully_cached = fully_cached.clone();
             spawn_local(async move {
@@ -62,7 +63,7 @@ pub fn cached_badge(props: &Props) -> Html {
         });
     }
 
-    if *fully_cached {
+    if props.cache_strategy == "aggressive" && *fully_cached {
         html! {
             <svg
                 class="cached-badge"

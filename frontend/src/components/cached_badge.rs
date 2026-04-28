@@ -43,22 +43,21 @@ pub fn cached_badge(props: &Props) -> Html {
         let is_aggressive = props.cache_strategy == "aggressive";
         
         use_effect_with((video_id, version, is_aggressive), move |(video_id, _version, is_aggressive)| {
-            if !is_aggressive {
-                return || ();
-            }
-            
-            let video_id = video_id.clone();
-            let fully_cached = fully_cached.clone();
-            spawn_local(async move {
-                let url = format!("/api/videos/{video_id}/cache-status");
-                if let Ok(resp) = Request::get(&url).send().await {
-                    if resp.ok() {
-                        if let Ok(data) = resp.json::<CacheStatusResponse>().await {
-                            fully_cached.set(data.fully_cached);
+            if *is_aggressive {
+                let video_id = video_id.clone();
+                let fully_cached = fully_cached.clone();
+                spawn_local(async move {
+                    let url = format!("/api/videos/{video_id}/cache-status");
+                    if let Ok(resp) = Request::get(&url).send().await {
+                        if resp.ok() {
+                            if let Ok(data) = resp.json::<CacheStatusResponse>().await {
+                                fully_cached.set(data.fully_cached);
+                            }
                         }
                     }
-                }
-            });
+                });
+            }
+            
             || ()
         });
     }

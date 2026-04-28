@@ -3672,45 +3672,9 @@ async fn run_precache_worker(
                     }
                 }
                 CacheStrategy::Aggressive => {
-                    if !video_dir.join("seg_00000.m4s").exists() {
-                        false
-                    } else {
-                        let (dur_secs, _) = probe_video(abs).await;
-                        if dur_secs <= 0.0 {
-                            true
-                        } else {
-                            let total_segs = (dur_secs / SEGMENT_DURATION).ceil() as usize;
-                            if total_segs == 0 {
-                                true
-                            } else {
-                                let last_seg = total_segs - 1;
-                                // Check that the last segment of every applicable
-                                // quality tier exists.
-                                let abs_for_probe = abs.to_path_buf();
-                                let source_height = tokio::task::spawn_blocking(move || {
-                                    media::probe::probe_stream_info(&abs_for_probe).height
-                                }).await.unwrap_or(0);
-
-                                let res_qualities: &[(Quality, u32)] = &[
-                                    (Quality::Q2160, 2160),
-                                    (Quality::Q1080, 1080),
-                                    (Quality::Q720,  720),
-                                    (Quality::Q480,  480),
-                                    (Quality::Q360,  360),
-                                ];
-                                let mut all_done = true;
-                                for &(q, target_h) in res_qualities {
-                                    if source_height < target_h { continue; }
-                                    let q_dir = cache_dir.join(&id).join("video").join(q.as_str());
-                                    if !q_dir.join(format!("seg_{:05}.m4s", last_seg)).exists() {
-                                        all_done = false;
-                                        break;
-                                    }
-                                }
-                                all_done
-                            }
-                        }
-                    }
+                    // A video is fully cached when the worker has written the
+                    // `.fully_cached` marker at the end of a successful pass.
+                    cache_dir.join(&id).join(".fully_cached").exists()
                 }
             };
 
@@ -3899,6 +3863,7 @@ async fn run_precache_worker(
                     }
 
                     let kill = Arc::new(AtomicBool::new(false));
+                    let mut all_complete = true;
 
                     // Cache video segments for each quality tier.
                     'qual_loop: for quality in applicable {
@@ -3939,13 +3904,15 @@ async fn run_precache_worker(
                                 r = media::transcode::transcode_video_segment_with_kill(&abs_str, &q_video_dir, i, &hw, quality, Arc::clone(&kill)) => r,
                                 _ = playback_rx.changed() => {
                                     if *playback_rx.borrow() { kill.store(true, Ordering::SeqCst); }
+                                    all_complete = false;
                                     continue 'seg_loop;
                                 }
                                 _ = shutdown_rx.changed() => { return; }
                             };
                             if let Err(e) = video_result {
-                                if e == media::transcode::CANCELLED { continue 'seg_loop; }
+                                if e == media::transcode::CANCELLED { all_complete = false; continue 'seg_loop; }
                                 error!(video_id = %id, quality = %quality.as_str(), segment = i, error = %e, "precache: video segment transcode failed");
+                                all_complete = false;
                                 break 'seg_loop;
                             }
                         }
@@ -3967,24 +3934,23 @@ async fn run_precache_worker(
                             r = media::transcode::transcode_audio_segment_with_kill(&abs_str, &audio_dir, i, Arc::clone(&kill)) => r,
                             _ = playback_rx.changed() => {
                                 if *playback_rx.borrow() { kill.store(true, Ordering::SeqCst); }
+                                all_complete = false;
                                 continue 'audio_loop;
                             }
                             _ = shutdown_rx.changed() => { return; }
                         };
                         if let Err(e) = audio_result {
-                            if e == media::transcode::CANCELLED { continue 'audio_loop; }
+                            if e == media::transcode::CANCELLED { all_complete = false; continue 'audio_loop; }
                             error!(video_id = %id, segment = i, error = %e, "precache: audio segment transcode failed");
+                            all_complete = false;
                         }
                     }
 
-                    // Write a `.fully_cached` marker if the last expected segment of the
-                    // original quality tier now exists.  This is a cheap existence-check
-                    // rather than walking every file, and it means the marker is only
-                    // written when the full video was actually transcoded (not when the
-                    // worker was interrupted mid-way through).
-                    let orig_video_dir = cache_dir.join(&id).join("video").join(Quality::Original.as_str());
-                    let last_seg_idx = total_segments.saturating_sub(1);
-                    if orig_video_dir.join(format!("seg_{:05}.m4s", last_seg_idx)).exists() {
+                    // Unconditionally write `.fully_cached` once all transcode loops
+                    // finish without errors or interruptions.  This avoids a
+                    // float-rounding off-by-one where `ffmpeg` generates one fewer
+                    // segment than `ceil(duration / SEGMENT_DURATION)` predicts.
+                    if all_complete {
                         let marker_path = cache_dir.join(&id).join(".fully_cached");
                         if let Err(e) = tokio::fs::write(&marker_path, b"").await {
                             warn!(video_id = %id, error = %e, "precache: could not write .fully_cached marker");

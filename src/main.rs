@@ -3943,6 +3943,7 @@ async fn run_precache_worker(
                             if e == media::transcode::CANCELLED { all_complete = false; continue 'audio_loop; }
                             error!(video_id = %id, segment = i, error = %e, "precache: audio segment transcode failed");
                             all_complete = false;
+                            break 'audio_loop;
                         }
                     }
 

@@ -3346,6 +3346,31 @@ async fn get_processing_status(
     HttpResponse::Ok().json(serde_json::json!({ "status": status }))
 }
 
+/// `GET /api/videos/{id}/cache-status` — whether a video is fully cached (aggressive mode).
+///
+/// Only meaningful when `cache_strategy` is `aggressive`.  Returns:
+/// - `{"fully_cached": true}`  — the `.fully_cached` marker file exists, meaning the
+///   pre-cache worker has finished transcoding every segment at every quality level
+/// - `{"fully_cached": false}` — not yet fully cached (or strategy is not aggressive)
+///
+/// This is a cheap filesystem check; it never triggers ffmpeg.
+async fn get_cache_status(
+    id: web::Path<String>,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    if Uuid::parse_str(&id).is_err() {
+        return HttpResponse::BadRequest().body("invalid video id");
+    }
+
+    if state.cache_strategy != CacheStrategy::Aggressive {
+        return HttpResponse::Ok().json(serde_json::json!({ "fully_cached": false }));
+    }
+
+    let marker = state.cache_dir.join(id.as_str()).join(".fully_cached");
+    let fully_cached = marker.exists();
+    HttpResponse::Ok().json(serde_json::json!({ "fully_cached": fully_cached }))
+}
+
 /// `GET /api/videos/{id}/thumbnails/sprite.jpg` — get thumbnail sprite image
 async fn get_thumbnail_sprite(
     id: web::Path<String>,
@@ -3949,6 +3974,20 @@ async fn run_precache_worker(
                         if let Err(e) = audio_result {
                             if e == media::transcode::CANCELLED { continue 'audio_loop; }
                             error!(video_id = %id, segment = i, error = %e, "precache: audio segment transcode failed");
+                        }
+                    }
+
+                    // Write a `.fully_cached` marker if the last expected segment of the
+                    // original quality tier now exists.  This is a cheap existence-check
+                    // rather than walking every file, and it means the marker is only
+                    // written when the full video was actually transcoded (not when the
+                    // worker was interrupted mid-way through).
+                    let orig_video_dir = cache_dir.join(&id).join("video").join(Quality::Original.as_str());
+                    let last_seg_idx = total_segments.saturating_sub(1);
+                    if orig_video_dir.join(format!("seg_{:05}.m4s", last_seg_idx)).exists() {
+                        let marker_path = cache_dir.join(&id).join(".fully_cached");
+                        if let Err(e) = tokio::fs::write(&marker_path, b"").await {
+                            warn!(video_id = %id, error = %e, "precache: could not write .fully_cached marker");
                         }
                     }
                 }
@@ -4853,6 +4892,10 @@ async fn main() -> std::io::Result<()> {
             .route(
                 "/api/videos/{id}/processing-status",
                 web::get().to(get_processing_status),
+            )
+            .route(
+                "/api/videos/{id}/cache-status",
+                web::get().to(get_cache_status),
             )
             .route(
                 "/api/videos/{id}/thumbnails/sprite.jpg",

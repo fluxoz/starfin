@@ -868,6 +868,24 @@ body{
   color: #555555;
 }
 
+/* ── Fully-cached badge (aggressive mode only) ───────────────────────────── */
+/* Shown alongside the processing-status badge when all segments are cached.  */
+.card__badges{
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.cached-badge{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  color: #29b6f6;
+}
+
 .card__subtitle{ 
   color: rgba(255,255,255,.7); 
   font-size: 11px; 

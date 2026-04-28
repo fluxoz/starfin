@@ -241,6 +241,28 @@ fn app_inner(props: &AppInnerProps) -> Html {
         });
     }
 
+    // Active cache strategy — fetched once from /api/config on mount.
+    // Drives the fully-cached badge visibility on media cards.
+    let cache_strategy = use_state(|| "balanced".to_string());
+
+    {
+        let cache_strategy = cache_strategy.clone();
+        use_effect_with((), move |_| {
+            spawn_local(async move {
+                if let Ok(resp) = gloo_net::http::Request::get("/api/config").send().await {
+                    if resp.ok() {
+                        if let Ok(val) = resp.json::<serde_json::Value>().await {
+                            if let Some(s) = val.get("cache_strategy").and_then(|v| v.as_str()) {
+                                cache_strategy.set(s.to_string());
+                            }
+                        }
+                    }
+                }
+            });
+            || ()
+        });
+    }
+
     // Keep window_start_ref in sync with window_start so the scroll closure
     // (created once at mount) can always read the latest value.
     {
@@ -1074,6 +1096,7 @@ fn app_inner(props: &AppInnerProps) -> Html {
                         thumb_current_id={(*thumb_current_id).clone()}
                         sprite_current_id={(*sprite_current_id).clone()}
                         precache_current_id={(*precache_current_id).clone()}
+                        cache_strategy={(*cache_strategy).clone()}
                         top_pad={top_pad}
                         bottom_pad={bottom_pad}
                     />

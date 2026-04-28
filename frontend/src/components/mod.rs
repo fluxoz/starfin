@@ -1,3 +1,4 @@
+pub mod cached_badge;
 pub mod filters;
 pub mod grid;
 pub mod media_edit_modal;

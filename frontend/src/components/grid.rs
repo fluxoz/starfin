@@ -1,3 +1,4 @@
+use crate::components::cached_badge::CachedBadge;
 use crate::components::processing_status::ProcessingStatus;
 use crate::components::video_card_thumb::VideoCardThumb;
 use crate::models::Element;
@@ -19,6 +20,10 @@ pub struct Props {
     /// The video ID the pre-cache worker is currently processing (from WS).
     #[prop_or_default]
     pub precache_current_id: Option<String>,
+    /// Active cache strategy string ("on-demand", "balanced", or "aggressive").
+    /// Used to decide whether to render the fully-cached badge.
+    #[prop_or_default]
+    pub cache_strategy: String,
     /// Height in pixels of the virtual spacer above the rendered window.
     #[prop_or_default]
     pub top_pad: f64,
@@ -42,6 +47,9 @@ struct CardProps {
     /// Whether the pre-cache worker is currently processing this video.
     #[prop_or_default]
     pub is_precache_processing: bool,
+    /// Active cache strategy string ("on-demand", "balanced", or "aggressive").
+    #[prop_or_default]
+    pub cache_strategy: String,
 }
 
 fn format_duration(secs: u32) -> String {
@@ -122,13 +130,20 @@ fn video_card(props: &CardProps) -> Html {
 
             <div class="card__top">
                 <div class="card__title">{ item.title.clone() }</div>
-                <ProcessingStatus
-                    video_id={item.id.clone()}
-                    is_thumb_processing={props.is_thumb_processing}
-                    is_sprite_processing={props.is_sprite_processing}
-                    is_precache_processing={props.is_precache_processing}
-                    processing_version={*local_version}
-                />
+                <div class="card__badges">
+                    <CachedBadge
+                        video_id={item.id.clone()}
+                        cache_strategy={props.cache_strategy.clone()}
+                        processing_version={*local_version}
+                    />
+                    <ProcessingStatus
+                        video_id={item.id.clone()}
+                        is_thumb_processing={props.is_thumb_processing}
+                        is_sprite_processing={props.is_sprite_processing}
+                        is_precache_processing={props.is_precache_processing}
+                        processing_version={*local_version}
+                    />
+                </div>
             </div>
 
             <div class="card__meta">
@@ -229,6 +244,7 @@ pub fn elements_grid(props: &Props) -> Html {
                             is_thumb_processing={is_thumb_processing}
                             is_sprite_processing={is_sprite_processing}
                             is_precache_processing={is_precache_processing}
+                            cache_strategy={props.cache_strategy.clone()}
                         />
                     }
                 }) }

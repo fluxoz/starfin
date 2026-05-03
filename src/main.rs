@@ -4573,9 +4573,19 @@ async fn main() -> std::io::Result<()> {
     std::fs::create_dir_all(&cache_dir)?;
 
     // Remove any *.tmp files left behind by a previous shutdown.
-    // These are always incomplete and can never be reused.
-    info!("Cleaning any oprhaned temp files.");
-    cleanup_orphaned_tmp_files(&cache_dir);
+    // These are always incomplete and can never be reused.  Run in the
+    // background so the HTTP server is not delayed by the cache-tree walk.
+    {
+        let cleanup_cache_dir = cache_dir.clone();
+        tokio::spawn(async move {
+            info!("Cleaning any orphaned temp files.");
+            tokio::task::spawn_blocking(move || {
+                cleanup_orphaned_tmp_files(&cleanup_cache_dir);
+            })
+            .await
+            .ok();
+        });
+    }
 
     // ── Startup healthchecks (logged for journalctl) ─────────────────────
     // Run in the background so the HTTP server starts immediately.

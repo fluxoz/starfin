@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 libc = "0.2"
 actix-cors = "0.7"
+bytes = "1"
+futures = "0.3"
 actix-session = { version = "0.10", features = ["cookie-session"] }
 actix-web = "4"
 actix-web-lab = "0.24"

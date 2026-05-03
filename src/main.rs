@@ -10,6 +10,7 @@ use actix_web::{
     dev::{ServiceRequest, ServiceResponse},
     http::header, middleware::{self, Logger, Next}, web,
 };
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use rust_embed::RustEmbed;
 use mime_guess::MimeGuess;
 use serde::{Deserialize, Serialize};
@@ -683,6 +684,161 @@ async fn get_video_quality_info(
         .collect();
 
     HttpResponse::Ok().json(options)
+}
+
+/// `GET /api/videos/{id}/stream` — serve the original video file directly for
+/// "Original (Direct Copy)" playback.
+///
+/// Unlike DASH segment serving, this endpoint streams the entire remuxed file
+/// with HTTP range request support so the browser can seek by byte position.
+/// The output is a standard (non-fragmented) MP4 with `movflags=faststart`.
+///
+/// The remuxed file is cached at `{cache_dir}/{id}/direct.mp4` to avoid
+/// repeated FFmpeg processing.  Video is always stream-copied; audio is
+/// stream-copied when browser-compatible (stereo AAC/MP3) or transcoded to
+/// stereo AAC otherwise.
+async fn stream_video(
+    id: web::Path<String>,
+    req: HttpRequest,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let (abs_path, _) = match find_video(&state, &id) {
+        Some(v) => v,
+        None => return HttpResponse::NotFound().body("video not found"),
+    };
+
+    // Ensure the video-level cache directory exists.
+    let video_cache_dir = state.cache_dir.join(id.as_str());
+    if let Err(e) = tokio::fs::create_dir_all(&video_cache_dir).await {
+        return HttpResponse::InternalServerError()
+            .body(format!("cache dir error: {e}"));
+    }
+
+    let direct_path = video_cache_dir.join("direct.mp4");
+
+    // Generate the remuxed file if it doesn't exist yet.
+    if !direct_path.exists() {
+        let abs_str = match abs_path.to_str() {
+            Some(s) => s.to_owned(),
+            None => return HttpResponse::BadRequest().body("video path is not valid UTF-8"),
+        };
+        let direct_path_clone = direct_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            media::transcode::create_direct_remux(&abs_str, &direct_path_clone)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return HttpResponse::ServiceUnavailable()
+                    .body(format!("remux failed: {e}"));
+            }
+            Err(e) => {
+                return HttpResponse::InternalServerError()
+                    .body(format!("remux task panicked: {e}"));
+            }
+        }
+    }
+
+    // Get the file size.
+    let file_size = match tokio::fs::metadata(&direct_path).await {
+        Ok(m) => m.len(),
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+                .body(format!("file metadata error: {e}"));
+        }
+    };
+
+    if file_size == 0 {
+        return HttpResponse::InternalServerError().body("remux produced empty file");
+    }
+
+    // Parse optional Range header.
+    let range_header = req
+        .headers()
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+
+    let (start, end) = if let Some(ref range) = range_header {
+        // Parse "bytes=start-[end]"
+        let bytes_part = range.strip_prefix("bytes=").unwrap_or("");
+        let mut parts = bytes_part.splitn(2, '-');
+        let start_str = parts.next().unwrap_or("0");
+        let end_str = parts.next().unwrap_or("");
+        let start: u64 = start_str.parse().unwrap_or(0);
+        let end: u64 = if end_str.is_empty() {
+            file_size.saturating_sub(1)
+        } else {
+            end_str.parse().unwrap_or(file_size.saturating_sub(1))
+        };
+        if start > end || start >= file_size {
+            return HttpResponse::RangeNotSatisfiable()
+                .insert_header(("Content-Range", format!("bytes */{file_size}")))
+                .finish();
+        }
+        (start, end.min(file_size.saturating_sub(1)))
+    } else {
+        (0u64, file_size.saturating_sub(1))
+    };
+
+    let content_length = end - start + 1;
+    let is_partial = range_header.is_some() && (start != 0 || end != file_size.saturating_sub(1));
+
+    // Open the file and seek to the requested start position once.
+    let mut file = match tokio::fs::File::open(&direct_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+                .body(format!("open file: {e}"));
+        }
+    };
+    if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
+        return HttpResponse::InternalServerError()
+            .body(format!("seek error: {e}"));
+    }
+
+    // Build a streaming body that reads [start, end] from the already-open file.
+    let stream = futures::stream::unfold(
+        (file, content_length),
+        |(mut file, remaining)| async move {
+            if remaining == 0 {
+                return None;
+            }
+            let chunk_size: u64 = 65536;
+            let to_read = remaining.min(chunk_size) as usize;
+            let mut buf = vec![0u8; to_read];
+            match file.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    buf.truncate(n);
+                    let read = n as u64;
+                    Some((
+                        Ok::<bytes::Bytes, actix_web::Error>(bytes::Bytes::from(buf)),
+                        (file, remaining - read),
+                    ))
+                }
+                Err(e) => Some((Err(actix_web::Error::from(e)), (file, 0))),
+            }
+        },
+    );
+
+    let status = if is_partial {
+        actix_web::http::StatusCode::PARTIAL_CONTENT
+    } else {
+        actix_web::http::StatusCode::OK
+    };
+
+    HttpResponse::build(status)
+        .content_type("video/mp4")
+        .insert_header(("Accept-Ranges", "bytes"))
+        .insert_header(("Content-Length", content_length.to_string()))
+        .insert_header((
+            "Content-Range",
+            format!("bytes {start}-{end}/{file_size}"),
+        ))
+        .streaming(stream)
 }
 
 /// Estimate the DASH `bandwidth` attribute (bits/sec) for a given quality.
@@ -2189,6 +2345,11 @@ async fn get_manifest(
 
     // Determine which quality tiers to include based on source resolution.
     // Only include transcoded resolutions ≤ the source height (no upscaling).
+    // "Original (Direct Copy)" is served via /api/videos/{id}/stream instead
+    // of DASH segments, so it is intentionally excluded from the MPD.
+    // This ensures ABR (autoSwitchBitrate) only switches between cached,
+    // transcoded representations and never accidentally selects the original
+    // source stream (which may use HEVC or other non-universal codecs).
     let source_height = stream_info.height.max(1);
     let res_qualities: &[(Quality, u32)] = &[
         (Quality::Q2160, 2160),
@@ -2197,7 +2358,7 @@ async fn get_manifest(
         (Quality::Q480,  480),
         (Quality::Q360,  360),
     ];
-    let mut video_qualities = vec![Quality::Original];
+    let mut video_qualities: Vec<Quality> = Vec::new();
     for &(q, target_h) in res_qualities {
         if source_height >= target_h {
             video_qualities.push(q);
@@ -2243,7 +2404,6 @@ async fn get_manifest(
     let max_seg_dur = SEGMENT_DURATION.ceil() as u64;
 
     // Build video Representations.
-    let video_codec = codec_info.video_codec.as_deref().unwrap_or("avc1.640029");
     let (w_orig, h_orig) = (stream_info.width.max(1), stream_info.height.max(1));
 
     // Frame rate from stream info.
@@ -2325,14 +2485,8 @@ async fn get_manifest(
     mpd.push_str("        </SegmentTimeline>\n");
     mpd.push_str("      </SegmentTemplate>\n");
 
-    // Original representation — uses source codec (may be H.264, HEVC, etc.)
-    let bw_original = estimate_bandwidth(&stream_info, Quality::Original);
-    mpd.push_str(&format!(
-        "      <Representation id=\"original\" bandwidth=\"{bw_original}\" \
-         width=\"{w_orig}\" height=\"{h_orig}\" codecs=\"{video_codec}\" frameRate=\"{fps_str}\"/>\n"
-    ));
     // Transcoded resolution representations — all use H.264 avc1.640029.
-    for &quality in video_qualities.iter().skip(1) {
+    for &quality in video_qualities.iter() {
         let bw = estimate_bandwidth(&stream_info, quality);
         let (w, h) = estimate_resolution(&stream_info, quality);
         mpd.push_str(&format!(
@@ -4883,6 +5037,10 @@ async fn main() -> std::io::Result<()> {
             .route(
                 "/api/videos/{id}/quality-info",
                 web::get().to(get_video_quality_info),
+            )
+            .route(
+                "/api/videos/{id}/stream",
+                web::get().to(stream_video),
             )
             .route(
                 "/api/videos/{id}/init.mp4",

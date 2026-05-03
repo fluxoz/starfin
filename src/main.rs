@@ -4572,10 +4572,21 @@ async fn main() -> std::io::Result<()> {
     }
     std::fs::create_dir_all(&cache_dir)?;
 
+    // ── Cache strategy ───────────────────────────────────────────────────
+    // Resolved here (early) so it can gate the tmp-file cleanup below.
+    let cache_strategy = std::env::var("CACHE_STRATEGY")
+        .map(|v| CacheStrategy::from_str(&v))
+        .unwrap_or(CacheStrategy::Balanced);
+    info!(strategy = %cache_strategy.as_str(), "cache strategy (set CACHE_STRATEGY to override)");
+
     // Remove any *.tmp files left behind by a previous shutdown.
     // These are always incomplete and can never be reused.  Run in the
     // background so the HTTP server is not delayed by the cache-tree walk.
-    {
+    //
+    // Skipped in Aggressive mode: every media file is fully cached on disk
+    // and no eviction occurs, so orphaned tmp files are harmless disk
+    // artefacts rather than a correctness concern.
+    if cache_strategy != CacheStrategy::Aggressive {
         let cleanup_cache_dir = cache_dir.clone();
         tokio::spawn(async move {
             info!("Cleaning any orphaned temp files.");
@@ -4728,12 +4739,6 @@ async fn main() -> std::io::Result<()> {
     } else {
         info!("password protection: disabled");
     }
-
-    // ── Cache strategy ───────────────────────────────────────────────────
-    let cache_strategy = std::env::var("CACHE_STRATEGY")
-        .map(|v| CacheStrategy::from_str(&v))
-        .unwrap_or(CacheStrategy::Balanced);
-    info!(strategy = %cache_strategy.as_str(), "cache strategy (set CACHE_STRATEGY to override)");
 
     // ── Theme & Design ──────────────────────────────────────────────────
     let theme = resolve_theme();

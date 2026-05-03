@@ -622,7 +622,12 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         .flatten()
         .filter(|q| QUALITY_OPTIONS.iter().any(|(v, _)| v == q))
         .unwrap_or_else(|| "original".to_string());
-    let selected_quality = use_state(|| initial_quality);
+    let selected_quality = use_state(|| initial_quality.clone());
+
+    // True when the player should use native <video src> (Original / Direct Copy mode)
+    // rather than the DASH player.  Changes to this state trigger a full player
+    // tear-down and re-initialisation via the init effect below.
+    let use_native = use_state(|| initial_quality == "original");
 
     let resume_position = use_mut_ref(|| 0.0_f64);
 
@@ -697,18 +702,16 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                             let mut labels: Vec<(String, String)> =
                                 vec![("auto".to_string(), "Auto (ABR)".to_string())];
                             for item in items.iter() {
-                                if let (Some(value), Some(label)) = (
+                                if let (Some(value), Some(_label)) = (
                                     item.get("value").and_then(|v| v.as_str()),
                                     item.get("label").and_then(|v| v.as_str()),
                                 ) {
                                     let display_label = if value == "original" {
-                                        match item.get("remuxable").and_then(|v| v.as_bool()) {
-                                            Some(true)  => "Original (Direct Copy)".to_string(),
-                                            Some(false) => "Original (Re-encode)".to_string(),
-                                            None        => label.to_string(),
-                                        }
+                                        // "original" always uses the native /stream endpoint
+                                        // (direct copy, no re-encoding), so the label is fixed.
+                                        "Original (Direct Copy)".to_string()
                                     } else {
-                                        label.to_string()
+                                        _label.to_string()
                                     };
                                     labels.push((value.to_string(), display_label));
                                 }
@@ -722,7 +725,14 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         });
     }
 
-    // ── Initialize dash.js player ────────────────────────────────────────────
+    // ── Initialize dash.js player (or native stream) ─────────────────────────
+    //
+    // This effect re-runs when `video_id` changes (new video opened) OR when
+    // `use_native` changes (user switches between "Original (Direct Copy)" and
+    // a DASH quality tier).  The dependency tuple ensures:
+    //   • DASH → native: cleanup destroys DASH player, effect sets video.src.
+    //   • native → DASH: cleanup clears video.src, effect creates DASH player.
+    //   • video change: always triggers a full re-initialisation.
     {
         let video_ref = video_ref.clone();
         let status = status.clone();
@@ -735,16 +745,18 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
         let resume_position = resume_position.clone();
         let is_buffering = is_buffering.clone();
         let dev_bitrate_kbps = dev_bitrate_kbps.clone();
+        let use_native = use_native.clone();
 
         use_effect_with(
-            props.video_id.clone(),
-            move |video_id| {
+            (props.video_id.clone(), *use_native),
+            move |(video_id, use_native_val)| {
                 let video_id = video_id.clone();
+                let is_native = *use_native_val;
                 // Read quality at effect-fire time (not a dep — quality changes are
                 // handled by the separate live-switch effect below).
                 let quality = (*selected_quality).clone();
 
-                // Fetch thumbnails
+                // Fetch thumbnails (runs regardless of player mode)
                 let thumbnail_info_clone = thumbnail_info.clone();
                 let thumbnail_image_clone = thumbnail_image.clone();
                 let video_id_clone = video_id.clone();
@@ -766,7 +778,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                     }
                 });
 
-                // Fetch subtitles
+                // Fetch subtitles (runs regardless of player mode)
                 let video_id_for_subs = video_id.clone();
                 let subtitle_tracks_clone = subtitle_tracks.clone();
                 spawn_local(async move {
@@ -778,294 +790,339 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
                 let start_pos = *resume_position.borrow();
                 *resume_position.borrow_mut() = 0.0;
 
-                // Initialize dash.js player
-                let video_ref_clone = video_ref.clone();
-                let status_clone = status.clone();
-                let error_clone = error.clone();
-                let dash_player_ref_clone = dash_player_ref.clone();
-                let is_buffering_clone = is_buffering.clone();
-                let dev_bitrate_kbps_init = dev_bitrate_kbps.clone();
+                if is_native {
+                    // ── Native stream mode ("Original / Direct Copy") ─────────
+                    //
+                    // Bypass DASH entirely.  The server remuxes the source file
+                    // to a faststart MP4 and serves it with HTTP range support,
+                    // so the browser's native <video> element can seek freely.
+                    let video_ref_for_native = video_ref.clone();
+                    let status_native = status.clone();
+                    let error_native = error.clone();
+                    let stream_url = format!("/api/videos/{}/stream", video_id);
 
-                spawn_local(async move {
-                    TimeoutFuture::new(50).await;
+                    spawn_local(async move {
+                        TimeoutFuture::new(50).await;
 
-                    let video = match video_ref_clone.cast::<HtmlVideoElement>() {
-                        Some(v) => v,
-                        None => { error_clone.set(Some("Video element not found".into())); return; }
-                    };
+                        let video = match video_ref_for_native.cast::<HtmlVideoElement>() {
+                            Some(v) => v,
+                            None => {
+                                error_native.set(Some("Video element not found".into()));
+                                return;
+                            }
+                        };
 
-                    // Ensure playsinline is set — required for iOS Safari to use MSE/DASH
-                    // instead of falling back to native player (which causes MEDIA_ERR_SRC_NOT_SUPPORTED)
-                    if video.set_attribute("playsinline", "").is_err() {
-                        log::warn!("Failed to set playsinline attribute on video element");
-                    }
+                        video.set_attribute("playsinline", "").ok();
+                        video.set_src(&stream_url);
+                        status_native.set("Loading original…".to_string());
 
-                    let manifest_url = format!("/api/videos/{}/manifest.mpd", video_id);
+                        if start_pos > 0.0 {
+                            video.set_current_time(start_pos);
+                        }
 
-                    // Create dash.js player
-                    let player = DashPlayer::create();
-
-                    // ── Register event listeners (reference client does this
-                    // BEFORE initialize, matching dash.js best practice) ───────
-
-                    // BUFFER_EMPTY / BUFFER_LOADED for buffering indicator
-                    let is_buffering_empty = is_buffering_clone.clone();
-                    let on_buffer_empty = Closure::<dyn Fn()>::new(move || {
-                        is_buffering_empty.set(true);
+                        let _ = video.play();
+                        status_native.set(String::new());
                     });
-                    player.on("bufferStalled", on_buffer_empty.as_ref().unchecked_ref());
-                    on_buffer_empty.forget();
+                } else {
+                    // ── DASH mode ─────────────────────────────────────────────
+                    let video_ref_clone = video_ref.clone();
+                    let status_clone = status.clone();
+                    let error_clone = error.clone();
+                    let dash_player_ref_clone = dash_player_ref.clone();
+                    let is_buffering_clone = is_buffering.clone();
+                    let dev_bitrate_kbps_init = dev_bitrate_kbps.clone();
 
-                    let is_buffering_loaded = is_buffering_clone.clone();
-                    let on_buffer_loaded = Closure::<dyn Fn()>::new(move || {
-                        is_buffering_loaded.set(false);
-                    });
-                    player.on("bufferLoaded", on_buffer_loaded.as_ref().unchecked_ref());
-                    on_buffer_loaded.forget();
+                    spawn_local(async move {
+                        TimeoutFuture::new(50).await;
 
-                    // Error handling
-                    let error_handler = error_clone.clone();
-                    let on_error = Closure::<dyn Fn(JsValue)>::new(move |e: JsValue| {
-                        let msg = if let Some(err_obj) = e.dyn_ref::<js_sys::Object>() {
-                            let error_val = js_sys::Reflect::get(err_obj, &"error".into()).unwrap_or(JsValue::UNDEFINED);
-                            if let Some(error_obj) = error_val.dyn_ref::<js_sys::Object>() {
-                                let message = js_sys::Reflect::get(error_obj, &"message".into())
-                                    .unwrap_or(JsValue::UNDEFINED)
-                                    .as_string();
-                                let code = js_sys::Reflect::get(error_obj, &"code".into())
-                                    .unwrap_or(JsValue::UNDEFINED)
-                                    .as_f64();
-                                match (message, code) {
-                                    (Some(m), Some(c)) => format!("[{c:.0}] {m}"),
-                                    (Some(m), None) => m,
-                                    (None, Some(c)) => format!("dash.js error code {c:.0}"),
-                                    (None, None) => format!("{:?}", e),
+                        let video = match video_ref_clone.cast::<HtmlVideoElement>() {
+                            Some(v) => v,
+                            None => { error_clone.set(Some("Video element not found".into())); return; }
+                        };
+
+                        // Ensure playsinline is set — required for iOS Safari to use MSE/DASH
+                        // instead of falling back to native player (which causes MEDIA_ERR_SRC_NOT_SUPPORTED)
+                        if video.set_attribute("playsinline", "").is_err() {
+                            log::warn!("Failed to set playsinline attribute on video element");
+                        }
+
+                        let manifest_url = format!("/api/videos/{}/manifest.mpd", video_id);
+
+                        // Create dash.js player
+                        let player = DashPlayer::create();
+
+                        // ── Register event listeners (reference client does this
+                        // BEFORE initialize, matching dash.js best practice) ───────
+
+                        // BUFFER_EMPTY / BUFFER_LOADED for buffering indicator
+                        let is_buffering_empty = is_buffering_clone.clone();
+                        let on_buffer_empty = Closure::<dyn Fn()>::new(move || {
+                            is_buffering_empty.set(true);
+                        });
+                        player.on("bufferStalled", on_buffer_empty.as_ref().unchecked_ref());
+                        on_buffer_empty.forget();
+
+                        let is_buffering_loaded = is_buffering_clone.clone();
+                        let on_buffer_loaded = Closure::<dyn Fn()>::new(move || {
+                            is_buffering_loaded.set(false);
+                        });
+                        player.on("bufferLoaded", on_buffer_loaded.as_ref().unchecked_ref());
+                        on_buffer_loaded.forget();
+
+                        // Error handling
+                        let error_handler = error_clone.clone();
+                        let on_error = Closure::<dyn Fn(JsValue)>::new(move |e: JsValue| {
+                            let msg = if let Some(err_obj) = e.dyn_ref::<js_sys::Object>() {
+                                let error_val = js_sys::Reflect::get(err_obj, &"error".into()).unwrap_or(JsValue::UNDEFINED);
+                                if let Some(error_obj) = error_val.dyn_ref::<js_sys::Object>() {
+                                    let message = js_sys::Reflect::get(error_obj, &"message".into())
+                                        .unwrap_or(JsValue::UNDEFINED)
+                                        .as_string();
+                                    let code = js_sys::Reflect::get(error_obj, &"code".into())
+                                        .unwrap_or(JsValue::UNDEFINED)
+                                        .as_f64();
+                                    match (message, code) {
+                                        (Some(m), Some(c)) => format!("[{c:.0}] {m}"),
+                                        (Some(m), None) => m,
+                                        (None, Some(c)) => format!("dash.js error code {c:.0}"),
+                                        (None, None) => format!("{:?}", e),
+                                    }
+                                } else {
+                                    format!("{:?}", e)
                                 }
                             } else {
                                 format!("{:?}", e)
-                            }
-                        } else {
-                            format!("{:?}", e)
-                        };
-                        log::error!("dash.js error: {msg}");
-                        error_handler.set(Some(msg));
-                    });
-                    player.on("error", on_error.as_ref().unchecked_ref());
-                    on_error.forget();
+                            };
+                            log::error!("dash.js error: {msg}");
+                            error_handler.set(Some(msg));
+                        });
+                        player.on("error", on_error.as_ref().unchecked_ref());
+                        on_error.forget();
 
-                    // Stream initialized (one-shot) — clear status and lock the initial
-                    // quality.  setRepresentationForTypeById MUST be called inside
-                    // this event because attachSource is async: the MPD has not been
-                    // parsed and the representation list does not exist until
-                    // streamInitialized fires.
-                    //
-                    // force_replace is false to avoid re-fetching segments that
-                    // may already be in-flight from the initial ABR selection.
-                    let status_for_init = status_clone.clone();
-                    let player_js_for_init = player.player.clone();
-                    let quality_for_init = quality.clone();
-                    let on_stream_init = Closure::once(Box::new(move || {
-                        status_for_init.set(String::new());
-                        // For "auto" quality, ABR is already enabled via updateSettings —
-                        // do NOT call setQualityFor (that would disable ABR).
-                        if quality_for_init != "auto" {
-                            if let Ok(func) = js_sys::Reflect::get(&player_js_for_init, &"setRepresentationForTypeById".into()) {
-                                if let Ok(func) = func.dyn_into::<js_sys::Function>() {
-                                    let args = js_sys::Array::new();
-                                    args.push(&JsValue::from_str("video"));
-                                    args.push(&JsValue::from_str(&quality_for_init));
-                                    args.push(&JsValue::from_bool(false));
-                                    let _ = js_sys::Reflect::apply(&func, &player_js_for_init, &args);
+                        // Stream initialized (one-shot) — clear status and lock the initial
+                        // quality.  setRepresentationForTypeById MUST be called inside
+                        // this event because attachSource is async: the MPD has not been
+                        // parsed and the representation list does not exist until
+                        // streamInitialized fires.
+                        //
+                        // force_replace is false to avoid re-fetching segments that
+                        // may already be in-flight from the initial ABR selection.
+                        let status_for_init = status_clone.clone();
+                        let player_js_for_init = player.player.clone();
+                        let quality_for_init = quality.clone();
+                        let on_stream_init = Closure::once(Box::new(move || {
+                            status_for_init.set(String::new());
+                            // For "auto" quality, ABR is already enabled via updateSettings —
+                            // do NOT call setQualityFor (that would disable ABR).
+                            if quality_for_init != "auto" {
+                                if let Ok(func) = js_sys::Reflect::get(&player_js_for_init, &"setRepresentationForTypeById".into()) {
+                                    if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                                        let args = js_sys::Array::new();
+                                        args.push(&JsValue::from_str("video"));
+                                        args.push(&JsValue::from_str(&quality_for_init));
+                                        args.push(&JsValue::from_bool(false));
+                                        let _ = js_sys::Reflect::apply(&func, &player_js_for_init, &args);
+                                    }
                                 }
                             }
-                        }
-                    }) as Box<dyn FnOnce()>);
-                    player.on("streamInitialized", on_stream_init.as_ref().unchecked_ref());
-                    on_stream_init.forget();
+                        }) as Box<dyn FnOnce()>);
+                        player.on("streamInitialized", on_stream_init.as_ref().unchecked_ref());
+                        on_stream_init.forget();
 
-                    // Handle autoplay blocked by browser policy.
-                    // When the browser blocks autoplay with sound, dash.js fires
-                    // PLAYBACK_NOT_ALLOWED.  We mute and retry so the video
-                    // starts immediately — the user can unmute manually.
-                    let video_for_autoplay = video.clone();
-                    let player_js_autoplay = player.player.clone();
-                    let on_playback_not_allowed = Closure::<dyn Fn()>::new(move || {
-                        log::warn!("autoplay blocked — muting and retrying");
-                        video_for_autoplay.set_muted(true);
-                        if let Ok(func) = js_sys::Reflect::get(&player_js_autoplay, &"play".into()) {
-                            if let Ok(func) = func.dyn_into::<js_sys::Function>() {
-                                let _ = func.call0(&player_js_autoplay);
-                            }
-                        }
-                    });
-                    player.on("playbackNotAllowed", on_playback_not_allowed.as_ref().unchecked_ref());
-                    on_playback_not_allowed.forget();
-
-                    // Also listen for CAN_PLAY to try unmuted play after user
-                    // interaction has unlocked the audio context.
-                    let video_for_canplay = video.clone();
-                    let player_js_canplay = player.player.clone();
-                    let on_can_play = Closure::<dyn Fn()>::new(move || {
-                        // If the video is paused and we haven't started yet,
-                        // try playing — the user may have interacted with the page.
-                        if video_for_canplay.paused() && video_for_canplay.current_time() < 0.5 {
-                            if let Ok(func) = js_sys::Reflect::get(&player_js_canplay, &"play".into()) {
+                        // Handle autoplay blocked by browser policy.
+                        // When the browser blocks autoplay with sound, dash.js fires
+                        // PLAYBACK_NOT_ALLOWED.  We mute and retry so the video
+                        // starts immediately — the user can unmute manually.
+                        let video_for_autoplay = video.clone();
+                        let player_js_autoplay = player.player.clone();
+                        let on_playback_not_allowed = Closure::<dyn Fn()>::new(move || {
+                            log::warn!("autoplay blocked — muting and retrying");
+                            video_for_autoplay.set_muted(true);
+                            if let Ok(func) = js_sys::Reflect::get(&player_js_autoplay, &"play".into()) {
                                 if let Ok(func) = func.dyn_into::<js_sys::Function>() {
-                                    let _ = func.call0(&player_js_canplay);
+                                    let _ = func.call0(&player_js_autoplay);
                                 }
                             }
-                        }
-                    });
-                    player.on("canPlay", on_can_play.as_ref().unchecked_ref());
-                    on_can_play.forget();
+                        });
+                        player.on("playbackNotAllowed", on_playback_not_allowed.as_ref().unchecked_ref());
+                        on_playback_not_allowed.forget();
 
-                    // ── Real-time bitrate updates (DEV_MODE only) ────────────
-                    // The 150 ms polling loop updates dev_bitrate_kbps on every
-                    // tick, but hooking into qualityChangeRendered ensures the
-                    // overlay reflects a quality switch immediately — without
-                    // waiting for the next poll cycle.
-                    if DEV_MODE {
-                        let dev_bitrate_kbps_qc = dev_bitrate_kbps_init.clone();
-                        let player_js_for_qc = player.player.clone();
-                        let on_quality_change = Closure::<dyn Fn(JsValue)>::new(move |e: JsValue| {
-                            // Only act on video track changes.
-                            let media_type = js_sys::Reflect::get(&e, &"mediaType".into())
-                                .ok()
-                                .and_then(|v| v.as_string());
-                            if media_type.as_deref() != Some("video") {
-                                return;
-                            }
-                            // Read the new representation's bandwidth immediately.
-                            let args = js_sys::Array::new();
-                            args.push(&JsValue::from_str("video"));
-                            let rep = js_sys::Reflect::get(
-                                    &player_js_for_qc,
-                                    &"getCurrentRepresentationForType".into(),
-                                )
-                                .ok()
-                                .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
-                                .and_then(|f| {
-                                    js_sys::Reflect::apply(&f, &player_js_for_qc, &args).ok()
-                                });
-                            if let Some(rep) = rep {
-                                if !rep.is_null() && !rep.is_undefined() {
-                                    if let Some(bps) = js_sys::Reflect::get(
-                                            &rep,
-                                            &"bandwidth".into(),
-                                        )
-                                        .ok()
-                                        .and_then(|v| v.as_f64())
-                                    {
-                                        dev_bitrate_kbps_qc.set((bps / 1000.0) as u32);
+                        // Also listen for CAN_PLAY to try unmuted play after user
+                        // interaction has unlocked the audio context.
+                        let video_for_canplay = video.clone();
+                        let player_js_canplay = player.player.clone();
+                        let on_can_play = Closure::<dyn Fn()>::new(move || {
+                            // If the video is paused and we haven't started yet,
+                            // try playing — the user may have interacted with the page.
+                            if video_for_canplay.paused() && video_for_canplay.current_time() < 0.5 {
+                                if let Ok(func) = js_sys::Reflect::get(&player_js_canplay, &"play".into()) {
+                                    if let Ok(func) = func.dyn_into::<js_sys::Function>() {
+                                        let _ = func.call0(&player_js_canplay);
                                     }
                                 }
                             }
                         });
-                        player.on(
-                            "qualityChangeRendered",
-                            on_quality_change.as_ref().unchecked_ref(),
-                        );
-                        on_quality_change.forget();
-                    }
+                        player.on("canPlay", on_can_play.as_ref().unchecked_ref());
+                        on_can_play.forget();
 
-                    // ── Initialize following the reference client pattern ─────
-                    //
-                    // Reference client (main.js) order:
-                    //   1. player = dashjs.MediaPlayer().create()
-                    //   2. player.on(events.ERROR, ...)            ← events first
-                    //   3. player.initialize(video, null, autoPlay) ← view + autoPlay, NO source
-                    //   4. player.updateSettings(config)            ← settings before source!
-                    //   5. player.attachSource(url)                 ← load content
-                    //
-                    // This ensures ALL settings (gaps, buffer, ABR, error
-                    // recovery) are active from the very first segment request.
+                        // ── Real-time bitrate updates (DEV_MODE only) ────────────
+                        // The 150 ms polling loop updates dev_bitrate_kbps on every
+                        // tick, but hooking into qualityChangeRendered ensures the
+                        // overlay reflects a quality switch immediately — without
+                        // waiting for the next poll cycle.
+                        if DEV_MODE {
+                            let dev_bitrate_kbps_qc = dev_bitrate_kbps_init.clone();
+                            let player_js_for_qc = player.player.clone();
+                            let on_quality_change = Closure::<dyn Fn(JsValue)>::new(move |e: JsValue| {
+                                // Only act on video track changes.
+                                let media_type = js_sys::Reflect::get(&e, &"mediaType".into())
+                                    .ok()
+                                    .and_then(|v| v.as_string());
+                                if media_type.as_deref() != Some("video") {
+                                    return;
+                                }
+                                // Read the new representation's bandwidth immediately.
+                                let args = js_sys::Array::new();
+                                args.push(&JsValue::from_str("video"));
+                                let rep = js_sys::Reflect::get(
+                                        &player_js_for_qc,
+                                        &"getCurrentRepresentationForType".into(),
+                                    )
+                                    .ok()
+                                    .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+                                    .and_then(|f| {
+                                        js_sys::Reflect::apply(&f, &player_js_for_qc, &args).ok()
+                                    });
+                                if let Some(rep) = rep {
+                                    if !rep.is_null() && !rep.is_undefined() {
+                                        if let Some(bps) = js_sys::Reflect::get(
+                                                &rep,
+                                                &"bandwidth".into(),
+                                            )
+                                            .ok()
+                                            .and_then(|v| v.as_f64())
+                                        {
+                                            dev_bitrate_kbps_qc.set((bps / 1000.0) as u32);
+                                        }
+                                    }
+                                }
+                            });
+                            player.on(
+                                "qualityChangeRendered",
+                                on_quality_change.as_ref().unchecked_ref(),
+                            );
+                            on_quality_change.forget();
+                        }
 
-                    player.initialize(&video, true);
+                        // ── Initialize following the reference client pattern ─────
+                        //
+                        // Reference client (main.js) order:
+                        //   1. player = dashjs.MediaPlayer().create()
+                        //   2. player.on(events.ERROR, ...)            ← events first
+                        //   3. player.initialize(video, null, autoPlay) ← view + autoPlay, NO source
+                        //   4. player.updateSettings(config)            ← settings before source!
+                        //   5. player.attachSource(url)                 ← load content
+                        //
+                        // This ensures ALL settings (gaps, buffer, ABR, error
+                        // recovery) are active from the very first segment request.
 
-                    // Configure dash.js v5 settings to match the reference client.
-                    //
-                    // The reference client (main.js) uses these defaults:
-                    //   - scheduleWhilePaused: true
-                    //   - jumpGaps: true
-                    //   - stallThreshold: 0.3
-                    //   - fastSwitchEnabled: true
-                    //   - reuseExistingSourceBuffers: true
-                    //
-                    // autoSwitchBitrate is enabled only when quality == "auto".
-                    let auto_abr = quality == "auto";
-                    let settings = js_sys::eval(&format!(
-                        r#"({{
-                            debug: {{
-                                logLevel: 1
-                            }},
-                            streaming: {{
-                                scheduling: {{
-                                    scheduleWhilePaused: true
-                                }},
-                                buffer: {{
-                                    bufferTimeDefault: {buf_target},
-                                    bufferTimeAtTopQuality: {buf_target},
-                                    bufferTimeAtTopQualityLongForm: {buf_target},
-                                    bufferToKeep: {back_buf},
-                                    bufferPruningInterval: {prune_interval},
-                                    avoidCurrentTimeRangePruning: true,
-                                    stallThreshold: 0.3,
-                                    reuseExistingSourceBuffers: true,
-                                    fastSwitchEnabled: true
-                                }},
-                                gaps: {{
-                                    jumpGaps: true,
-                                    jumpLargeGaps: true,
-                                    smallGapLimit: {gap_small},
-                                    threshold: {gap_threshold},
-                                    enableSeekFix: true,
-                                    enableStallFix: true,
-                                    stallSeek: 0.1
-                                }},
-                                abr: {{
-                                    autoSwitchBitrate: {{ video: {auto_abr}, audio: false }}
-                                }},
-                                retryAttempts: {{
-                                    MPD: 3,
-                                    MediaSegment: 3,
-                                    InitializationSegment: 3
-                                }},
-                                retryIntervals: {{
-                                    MPD: 1000,
-                                    MediaSegment: 1000,
-                                    InitializationSegment: 1000
-                                }},
-                                cacheInitSegments: true
-                            }}
-                        }})"#,
-                        buf_target = BUFFER_TARGET_S,
-                        back_buf = BACK_BUFFER_S,
-                        prune_interval = BUFFER_PRUNING_INTERVAL_S,
-                        gap_small = GAP_SMALL_LIMIT_S,
-                        gap_threshold = GAP_STALL_THRESHOLD_S,
-                        auto_abr = auto_abr,
-                    )).unwrap();
-                    player.update_settings(&settings);
+                        player.initialize(&video, true);
 
-                    // Load the manifest — dash.js will start fetching segments.
-                    // Initial quality is applied in the streamInitialized one-shot handler
-                    // above, after the MPD is parsed and representations are available.
-                    player.attach_source(&manifest_url, start_pos);
+                        // Configure dash.js v5 settings to match the reference client.
+                        //
+                        // The reference client (main.js) uses these defaults:
+                        //   - scheduleWhilePaused: true
+                        //   - jumpGaps: true
+                        //   - stallThreshold: 0.3
+                        //   - fastSwitchEnabled: true
+                        //   - reuseExistingSourceBuffers: true
+                        //
+                        // autoSwitchBitrate is enabled only when quality == "auto".
+                        let auto_abr = quality == "auto";
+                        let settings = js_sys::eval(&format!(
+                            r#"({{
+                                debug: {{
+                                    logLevel: 1
+                                }},
+                                streaming: {{
+                                    scheduling: {{
+                                        scheduleWhilePaused: true
+                                    }},
+                                    buffer: {{
+                                        bufferTimeDefault: {buf_target},
+                                        bufferTimeAtTopQuality: {buf_target},
+                                        bufferTimeAtTopQualityLongForm: {buf_target},
+                                        bufferToKeep: {back_buf},
+                                        bufferPruningInterval: {prune_interval},
+                                        avoidCurrentTimeRangePruning: true,
+                                        stallThreshold: 0.3,
+                                        reuseExistingSourceBuffers: true,
+                                        fastSwitchEnabled: true
+                                    }},
+                                    gaps: {{
+                                        jumpGaps: true,
+                                        jumpLargeGaps: true,
+                                        smallGapLimit: {gap_small},
+                                        threshold: {gap_threshold},
+                                        enableSeekFix: true,
+                                        enableStallFix: true,
+                                        stallSeek: 0.1
+                                    }},
+                                    abr: {{
+                                        autoSwitchBitrate: {{ video: {auto_abr}, audio: false }}
+                                    }},
+                                    retryAttempts: {{
+                                        MPD: 3,
+                                        MediaSegment: 3,
+                                        InitializationSegment: 3
+                                    }},
+                                    retryIntervals: {{
+                                        MPD: 1000,
+                                        MediaSegment: 1000,
+                                        InitializationSegment: 1000
+                                    }},
+                                    cacheInitSegments: true
+                                }}
+                            }})"#,
+                            buf_target = BUFFER_TARGET_S,
+                            back_buf = BACK_BUFFER_S,
+                            prune_interval = BUFFER_PRUNING_INTERVAL_S,
+                            gap_small = GAP_SMALL_LIMIT_S,
+                            gap_threshold = GAP_STALL_THRESHOLD_S,
+                            auto_abr = auto_abr,
+                        )).unwrap();
+                        player.update_settings(&settings);
 
-                    // Store the player reference
-                    let player_rc = Rc::new(player);
-                    *dash_player_ref_clone.borrow_mut() = Some(player_rc);
-                });
+                        // Load the manifest — dash.js will start fetching segments.
+                        // Initial quality is applied in the streamInitialized one-shot handler
+                        // above, after the MPD is parsed and representations are available.
+                        player.attach_source(&manifest_url, start_pos);
 
-                // Cleanup
+                        // Store the player reference
+                        let player_rc = Rc::new(player);
+                        *dash_player_ref_clone.borrow_mut() = Some(player_rc);
+                    });
+                }
+
+                // Unified cleanup — tears down whichever mode was active.
+                let video_ref_cleanup = video_ref.clone();
                 let dash_player_ref_cleanup = dash_player_ref.clone();
                 move || {
-                    if let Some(player) = dash_player_ref_cleanup.borrow_mut().take() {
-                        player.destroy();
+                    if is_native {
+                        // Clear native video src to stop buffering.
+                        if let Some(video) = video_ref_cleanup.cast::<HtmlVideoElement>() {
+                            let _ = video.pause();
+                            video.set_src("");
+                            video.load();
+                        }
+                    } else {
+                        // Destroy DASH player (this resets the video element internally).
+                        // Do NOT call video.set_src("") after destroy — it can race with
+                        // the MediaSource teardown and log errors.
+                        if let Some(player) = dash_player_ref_cleanup.borrow_mut().take() {
+                            player.destroy();
+                        }
                     }
-                    // Note: player.destroy() already tears down MSE and resets the
-                    // video element.  Do NOT call video.set_src("") after destroy —
-                    // it can race with the MediaSource teardown and log errors.
                 }
             },
         );
@@ -1076,25 +1133,31 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     // do NOT tear down and recreate the dash.js player.  Instead they call
     // setQualityFor (with force_replace=true) on the running player, which
     // flushes the current buffer and immediately requests the new quality.
+    //
+    // Skipped for "original" quality — that mode uses native <video src>
+    // streaming (no DASH player) and is handled by the init effect above.
     {
         let dash_player_ref = dash_player_ref.clone();
         let selected_quality = selected_quality.clone();
         use_effect_with((*selected_quality).clone(), move |quality| {
             let quality = quality.clone();
-            if let Some(player) = dash_player_ref.borrow().as_ref() {
-                let auto_abr = quality == "auto";
-                // Toggle autoSwitchBitrate on/off for the running player.
-                let abr_settings = js_sys::eval(&format!(
-                    r#"({{ streaming: {{ abr: {{ autoSwitchBitrate: {{ video: {auto_abr}, audio: false }} }} }} }})"#,
-                    auto_abr = auto_abr,
-                )).unwrap();
-                player.update_settings(&abr_settings);
+            // "original" triggers the init effect (use_native change) — skip here.
+            if quality != "original" {
+                if let Some(player) = dash_player_ref.borrow().as_ref() {
+                    let auto_abr = quality == "auto";
+                    // Toggle autoSwitchBitrate on/off for the running player.
+                    let abr_settings = js_sys::eval(&format!(
+                        r#"({{ streaming: {{ abr: {{ autoSwitchBitrate: {{ video: {auto_abr}, audio: false }} }} }} }})"#,
+                        auto_abr = auto_abr,
+                    )).unwrap();
+                    player.update_settings(&abr_settings);
 
-                if !auto_abr {
-                    // Lock to the selected representation with force_replace=true
-                    // so that dash.js immediately flushes the buffer and requests
-                    // segments at the new quality level.
-                    player.set_quality_for("video", &quality, true);
+                    if !auto_abr {
+                        // Lock to the selected representation with force_replace=true
+                        // so that dash.js immediately flushes the buffer and requests
+                        // segments at the new quality level.
+                        player.set_quality_for("video", &quality, true);
+                    }
                 }
             }
             || ()
@@ -1669,6 +1732,7 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
     let on_quality_select = {
         let selected_quality = selected_quality.clone();
         let quality_menu_open = quality_menu_open.clone();
+        let use_native = use_native.clone();
         Callback::from(move |quality: String| {
             // Quality changes are handled by the live-switch use_effect_with above —
             // do NOT save resume_position here (that would restart the player).
@@ -1676,6 +1740,10 @@ pub fn video_player(props: &VideoPlayerProps) -> Html {
             if let Some(storage) = window().and_then(|w| w.local_storage().ok()).flatten() {
                 let _ = storage.set_item(QUALITY_STORAGE_KEY, &quality);
             }
+            // "original" uses native <video src> streaming instead of DASH.
+            // Updating use_native triggers the init effect to switch player modes.
+            let native_mode = quality == "original";
+            use_native.set(native_mode);
             selected_quality.set(quality);
         })
     };

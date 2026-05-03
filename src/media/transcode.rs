@@ -3062,6 +3062,317 @@ pub fn create_audio_init_segment(
 }
 
 
+// ── Direct remux for "Original (Direct Copy)" streaming ────────────────────
+
+/// Create a seekable MP4 remux of the source video for direct HTTP streaming.
+///
+/// This is the backend for the `/api/videos/{id}/stream` endpoint ("Original
+/// (Direct Copy)" quality).  Unlike DASH segment generation, the output is a
+/// single MP4 file rather than a sequence of `.m4s` fragments.
+///
+/// - Video is **always** stream-copied (no re-encoding, no quality loss).
+/// - Audio is stream-copied if it is browser-compatible (stereo/mono AAC or
+///   MP3).  Multi-channel or incompatible audio (AC-3, DTS, FLAC, …) is
+///   transcoded to stereo AAC so the browser can play the file.
+/// - Output uses `movflags=faststart` so the `moov` atom is at the front of
+///   the file, enabling browsers to start playback and seek immediately via
+///   HTTP byte-range requests.
+///
+/// The file is written atomically (temp → rename) and stored at `out_path`.
+/// Callers should cache this file to avoid repeated remux work.
+pub fn create_direct_remux(abs_path: &str, out_path: &Path) -> Result<(), String> {
+    super::ensure_init();
+
+    let tmp_path = {
+        let mut p = out_path.to_path_buf();
+        let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("direct");
+        p.set_file_name(format!(".{fname}.tmp"));
+        p
+    };
+
+    let mut ictx = ffmpeg_next::format::input(abs_path)
+        .map_err(|e| format!("failed to open input: {e}"))?;
+
+    let video_idx = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Video)
+        .map(|s| s.index())
+        .ok_or_else(|| "no video stream in source".to_string())?;
+
+    let audio_idx = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Audio)
+        .map(|s| s.index());
+
+    let needs_audio_transcode = audio_idx.is_some() && !audio_is_remuxable(&ictx);
+
+    // ── Create output MP4 with faststart ──────────────────────────────────
+    // `faststart` rewrites the file after av_write_trailer, moving moov to
+    // the front so browsers can seek immediately via HTTP byte-range requests.
+    let mut octx = ffmpeg_next::format::output_as(&tmp_path, "mp4")
+        .map_err(|e| format!("output context: {e}"))?;
+
+    unsafe {
+        let key = std::ffi::CString::new("movflags").unwrap();
+        let val = std::ffi::CString::new("faststart").unwrap();
+        let ret = ffmpeg_next::ffi::av_opt_set(
+            octx.as_mut_ptr() as *mut std::ffi::c_void,
+            key.as_ptr(),
+            val.as_ptr(),
+            ffmpeg_next::ffi::AV_OPT_SEARCH_CHILDREN as i32,
+        );
+        if ret < 0 {
+            return Err(format!("av_opt_set movflags=faststart failed (ret={ret})"));
+        }
+    }
+
+    // ── Add video stream (stream copy) ────────────────────────────────────
+    let in_video_params = ictx.stream(video_idx).unwrap().parameters();
+    let in_video_tb = ictx.stream(video_idx).unwrap().time_base();
+
+    let out_video = octx
+        .add_stream(ffmpeg_next::encoder::find(in_video_params.id()))
+        .map_err(|e| format!("add video stream: {e}"))?;
+    unsafe {
+        ffmpeg_next::ffi::avcodec_parameters_copy(
+            out_video.parameters().as_mut_ptr(),
+            in_video_params.as_ptr(),
+        );
+    }
+    let out_video_idx = out_video.index();
+
+    // ── Add audio stream (copy or transcode) ──────────────────────────────
+    let mut out_audio_idx: Option<usize> = None;
+    let in_audio_tb: Option<ffmpeg_next::Rational>;
+
+    let mut audio_decoder: Option<ffmpeg_next::decoder::Audio> = None;
+    let mut audio_encoder_handle: Option<ffmpeg_next::encoder::Audio> = None;
+    let mut audio_resampler: Option<ffmpeg_next::software::resampling::Context> = None;
+    let mut enc_format_saved: Option<ffmpeg_next::format::Sample> = None;
+    let mut enc_layout_saved: Option<ffmpeg_next::channel_layout::ChannelLayout> = None;
+    let mut audio_sample_rate: u32 = 48000;
+    let mut audio_sample_count: i64 = 0;
+
+    if let Some(ai) = audio_idx {
+        in_audio_tb = Some(ictx.stream(ai).unwrap().time_base());
+        let in_params = ictx.stream(ai).unwrap().parameters();
+
+        if !needs_audio_transcode {
+            // Direct audio copy.
+            let out_audio = octx
+                .add_stream(ffmpeg_next::encoder::find(in_params.id()))
+                .map_err(|e| format!("add audio stream: {e}"))?;
+            unsafe {
+                ffmpeg_next::ffi::avcodec_parameters_copy(
+                    out_audio.parameters().as_mut_ptr(),
+                    in_params.as_ptr(),
+                );
+            }
+            out_audio_idx = Some(out_audio.index());
+        } else {
+            // Audio needs transcoding to stereo AAC.
+            match ffmpeg_next::codec::context::Context::from_parameters(in_params.clone()) {
+                Ok(aud_ctx) => match aud_ctx.decoder().audio() {
+                    Ok(dec) => {
+                        audio_sample_rate = dec.rate();
+                        let raw_dec_layout = dec.channel_layout();
+                        let approx_channels = if raw_dec_layout.channels() > 0 {
+                            raw_dec_layout.channels()
+                        } else if dec.channels() > 0 {
+                            dec.channels() as i32
+                        } else {
+                            2
+                        };
+                        let enc_layout = if approx_channels == 1 {
+                            ffmpeg_next::channel_layout::ChannelLayout::MONO
+                        } else {
+                            ffmpeg_next::channel_layout::ChannelLayout::STEREO
+                        };
+                        let enc_format = ffmpeg_next::format::Sample::F32(
+                            ffmpeg_next::format::sample::Type::Planar,
+                        );
+                        if let Some(aac) = ffmpeg_next::encoder::find_by_name("aac") {
+                            let aac_ctx = ffmpeg_next::codec::context::Context::new_with_codec(aac);
+                            if let Ok(mut aac_enc) = aac_ctx.encoder().audio() {
+                                aac_enc.set_rate(dec.rate() as i32);
+                                aac_enc.set_channel_layout(enc_layout);
+                                aac_enc.set_format(enc_format);
+                                aac_enc.set_bit_rate(AAC_ENCODE_BITRATE);
+                                aac_enc.set_time_base(ffmpeg_next::Rational::new(
+                                    1,
+                                    dec.rate() as i32,
+                                ));
+                                unsafe {
+                                    (*aac_enc.as_mut_ptr()).flags |=
+                                        ffmpeg_next::ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+                                }
+                                if let Ok(opened) = aac_enc.open_as(aac) {
+                                    let mut out_aud = octx
+                                        .add_stream(aac)
+                                        .map_err(|e| format!("add audio stream: {e}"))?;
+                                    out_aud.set_parameters(&opened);
+                                    out_audio_idx = Some(out_aud.index());
+                                    enc_format_saved = Some(enc_format);
+                                    enc_layout_saved = Some(enc_layout);
+                                    audio_encoder_handle = Some(opened);
+                                    audio_decoder = Some(dec);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[direct_remux] audio decoder init failed: {e}");
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[direct_remux] audio codec context failed: {e}");
+                }
+            }
+        }
+    } else {
+        in_audio_tb = None;
+    }
+
+    // ── Write header ──────────────────────────────────────────────────────
+    unsafe {
+        let ret = ffmpeg_next::ffi::avformat_write_header(
+            octx.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        if ret < 0 {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("write header failed (ret={ret})"));
+        }
+    }
+
+    // Re-read output time bases after write_header.
+    let out_video_tb = octx.stream(out_video_idx).unwrap().time_base();
+    let out_audio_tb = out_audio_idx
+        .map(|i| octx.stream(i).unwrap().time_base())
+        .unwrap_or(ffmpeg_next::Rational::new(1, 48000));
+
+    // ── Copy / transcode all packets ──────────────────────────────────────
+    for (stream, mut packet) in ictx.packets() {
+        let si = stream.index();
+
+        if si == video_idx {
+            packet.set_stream(out_video_idx);
+            packet.rescale_ts(in_video_tb, out_video_tb);
+            if packet.dts().is_none() {
+                if let Some(pts) = packet.pts() {
+                    packet.set_dts(Some(pts));
+                }
+            }
+            let _ = packet.write_interleaved(&mut octx);
+        } else if Some(si) == audio_idx {
+            if let Some(out_ai) = out_audio_idx {
+                if !needs_audio_transcode {
+                    // Direct copy.
+                    let iatb = in_audio_tb.unwrap_or(ffmpeg_next::Rational::new(1, 44100));
+                    packet.set_stream(out_ai);
+                    packet.rescale_ts(iatb, out_audio_tb);
+                    let _ = packet.write_interleaved(&mut octx);
+                } else {
+                    // Decode → (optionally resample) → encode.
+                    if let Some(ref mut dec) = audio_decoder {
+                        if dec.send_packet(&packet).is_ok() {
+                            let mut audio_frame = ffmpeg_next::frame::Audio::empty();
+                            while dec.receive_frame(&mut audio_frame).is_ok() {
+                                ensure_frame_channel_layout(&mut audio_frame);
+
+                                // Lazy resampler creation from first decoded frame.
+                                if audio_resampler.is_none() {
+                                    if let (Some(ef), Some(el)) =
+                                        (enc_format_saved, enc_layout_saved)
+                                    {
+                                        let frame_layout = frame_channel_layout(&audio_frame);
+                                        let frame_fmt = audio_frame.format();
+                                        let frame_rate = if audio_frame.rate() > 0 {
+                                            audio_frame.rate()
+                                        } else {
+                                            audio_sample_rate
+                                        };
+                                        match ffmpeg_next::software::resampling::Context::get(
+                                            frame_fmt,
+                                            frame_layout,
+                                            frame_rate,
+                                            ef,
+                                            el,
+                                            frame_rate,
+                                        ) {
+                                            Ok(r) => audio_resampler = Some(r),
+                                            Err(e) => eprintln!(
+                                                "[direct_remux] resampler init failed: {e}"
+                                            ),
+                                        }
+                                    }
+                                }
+
+                                let frame_to_encode =
+                                    if let Some(ref mut resampler) = audio_resampler {
+                                        let mut resampled = ffmpeg_next::frame::Audio::empty();
+                                        if resampler.run(&audio_frame, &mut resampled).is_err() {
+                                            continue;
+                                        }
+                                        resampled
+                                    } else {
+                                        audio_frame.clone()
+                                    };
+
+                                if let Some(ref mut aenc) = audio_encoder_handle {
+                                    encode_audio_frame(
+                                        &frame_to_encode,
+                                        aenc,
+                                        &mut octx,
+                                        out_ai,
+                                        audio_sample_rate,
+                                        out_audio_tb,
+                                        &mut audio_sample_count,
+                                        0,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Flush audio encoder ───────────────────────────────────────────────
+    if let Some(ref mut aenc) = audio_encoder_handle {
+        let _ = aenc.send_eof();
+        let mut aenc_pkt = ffmpeg_next::Packet::empty();
+        while aenc.receive_packet(&mut aenc_pkt).is_ok() {
+            if let Some(out_ai) = out_audio_idx {
+                aenc_pkt.set_stream(out_ai);
+                aenc_pkt.rescale_ts(
+                    ffmpeg_next::Rational::new(1, audio_sample_rate as i32),
+                    out_audio_tb,
+                );
+                let _ = aenc_pkt.write_interleaved(&mut octx);
+            }
+        }
+    }
+
+    // ── Write trailer (faststart post-processing happens here) ────────────
+    unsafe {
+        let ret = ffmpeg_next::ffi::av_write_trailer(octx.as_mut_ptr());
+        if ret < 0 {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("write trailer failed (ret={ret})"));
+        }
+    }
+    drop(octx);
+
+    // Atomic rename.
+    std::fs::rename(&tmp_path, out_path)
+        .map_err(|e| format!("failed to rename remux output: {e}"))?;
+
+    Ok(())
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
